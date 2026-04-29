@@ -1,0 +1,10 @@
+AW Notetaker (forked from Vexa)
+Copyright 2026 AbroadWorks-Inc
+
+This product is a fork of Vexa (https://github.com/Vexa-ai/vexa),
+which is licensed under the Apache License, Version 2.0. The
+upstream LICENSE file is preserved unmodified.
+
+Modifications by AbroadWorks-Inc are documented in
+aw-overrides/CHANGELOG.md (created in Phase 2 per the
+multi-platform-notetaker-technical-design.md \xc2\xa73.4 fork integration map).
