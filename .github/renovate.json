@@ -1,0 +1,47 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":dependencyDashboardApproval",
+    ":semanticCommits",
+    "schedule:weekly"
+  ],
+  "baseBranches": ["aw/main"],
+  "labels": ["dependencies", "renovate"],
+  "timezone": "Asia/Kolkata",
+  "prConcurrentLimit": 5,
+  "rebaseWhen": "behind-base-branch",
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"],
+    "automerge": false
+  },
+  "packageRules": [
+    {
+      "description": "AbroadWorks fork posture (Phase 0 baseline): never auto-merge anything. The auto-merge gate per aw-notetaker canonical design doc §14 #14 is aw-output-adapter integration tests, deferred to Phase 1; until they exist, all PRs require manual review. §14 #20 separately mandates manual triage of transitive vulnerability bumps (prefer upstream Vexa patches over local).",
+      "matchPackageNames": ["*"],
+      "automerge": false
+    },
+    {
+      "description": "Group GitHub Actions bumps to one PR.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group Dockerfile base image bumps to one PR.",
+      "matchManagers": ["dockerfile"],
+      "groupName": "docker-base-images"
+    },
+    {
+      "description": "Group Python transitive dep bumps to one PR (covers requirements.txt, pyproject.toml, requirements.in, poetry).",
+      "matchManagers": ["pip_requirements", "pep621", "pip-compile", "poetry"],
+      "groupName": "python-deps"
+    },
+    {
+      "description": "Group npm dep bumps to one PR.",
+      "matchManagers": ["npm"],
+      "groupName": "npm-deps"
+    }
+  ]
+}
