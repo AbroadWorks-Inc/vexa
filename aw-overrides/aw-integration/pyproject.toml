@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aw-integration"
+version = "0.1.0"
+description = "Vexa to AbroadWorks schema adapter (§13.15)"
+requires-python = ">=3.11"
+dependencies = [
+    "notetaker-common>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio",
+    "moto[s3]",
+    "respx",
+    "black",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aw_integration*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+pythonpath = [".", "../../../notetaker-common"]
+addopts = ["--import-mode=importlib"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
