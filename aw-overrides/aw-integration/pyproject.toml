@@ -20,6 +20,7 @@ dev = [
     "black",
     "ruff",
     "mypy",
+    "fakeredis",
 ]
 
 [tool.setuptools.packages.find]

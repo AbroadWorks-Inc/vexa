@@ -4,9 +4,11 @@ import io
 import os
 import wave
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
+
+import redis
 
 from notetaker_common.schemas import (
     BotJob,
@@ -269,5 +271,107 @@ async def run_from_redis(
     s3_writer: S3Writer | None = None,
     notetaker_client: NoteTakerClientWrapper | None = None,
 ) -> None:
-    """Phase 1 stub — Redis drain is Phase 2 work."""
-    raise NotImplementedError("Phase 2 — Redis drain not yet implemented")
+    """Drain Redis streams for session_uid and run the output pipeline. §13.7 Phase 2."""
+    import json as _json
+
+    r = redis.Redis.from_url(redis_url, decode_responses=True)
+
+    raw_ts = r.xrange("transcription_segments", count=50000)
+    segments: list[VexaSegment] = []
+    session_start_ts: datetime | None = None
+
+    for _eid, fields in raw_ts:
+        try:
+            payload = _json.loads(fields["payload"])
+        except (KeyError, ValueError):
+            continue
+        if payload.get("uid") != session_uid:
+            continue
+
+        msg_type = payload.get("type")
+        if msg_type == "session_start":
+            raw_ts_str = payload.get("start_timestamp")
+            if raw_ts_str and session_start_ts is None:
+                session_start_ts = datetime.fromisoformat(
+                    raw_ts_str.replace("Z", "+00:00")
+                )
+        elif msg_type == "transcription":
+            for seg_dict in payload.get("segments", []):
+                try:
+                    abs_start_raw = seg_dict.get("absolute_start_time")
+                    abs_end_raw = seg_dict.get("absolute_end_time")
+                    abs_start = (
+                        datetime.fromisoformat(abs_start_raw.replace("Z", "+00:00"))
+                        if abs_start_raw
+                        else None
+                    )
+                    abs_end = (
+                        datetime.fromisoformat(abs_end_raw.replace("Z", "+00:00"))
+                        if abs_end_raw
+                        else None
+                    )
+                    segments.append(
+                        VexaSegment(
+                            speaker=seg_dict["speaker"],
+                            text=seg_dict["text"],
+                            start=float(seg_dict["start"]),
+                            end=float(seg_dict["end"]),
+                            language=seg_dict.get("language", "en"),
+                            completed=bool(seg_dict.get("completed", True)),
+                            segment_id=seg_dict.get("segment_id"),
+                            absolute_start_time=abs_start,
+                            absolute_end_time=abs_end,
+                        )
+                    )
+                except (KeyError, ValueError):
+                    continue
+
+    raw_se = r.xrange("speaker_events_relative", count=50000)
+    speaker_events: list[VexaSpeakerEvent] = []
+    for _eid, fields in raw_se:
+        if fields.get("uid") != session_uid:
+            continue
+        try:
+            speaker_events.append(
+                VexaSpeakerEvent(
+                    uid=fields["uid"],
+                    relative_ms=int(fields["relative_client_timestamp_ms"]),
+                    event_type=fields["event_type"],
+                    participant_name=fields["participant_name"],
+                    meeting_id=str(fields["meeting_id"]),
+                )
+            )
+        except (KeyError, ValueError):
+            continue
+
+    if session_start_ts is None and segments:
+        earliest = min(
+            (s.absolute_start_time for s in segments if s.absolute_start_time),
+            default=None,
+        )
+        if earliest:
+            session_start_ts = earliest
+
+    if session_start_ts is None:
+        session_start_ts = session_end_wall_clock - timedelta(
+            minutes=job.expected_duration_min
+        )
+
+    vexa_session = VexaSession(
+        uid=session_uid,
+        platform=job.platform,
+        meeting_id=job.meeting_id,
+        session_start_ts=session_start_ts,
+        session_end_ts=session_end_wall_clock,
+        segments=segments,
+        speaker_events=speaker_events,
+    )
+
+    adapter = VexaSessionAdapter(
+        session=vexa_session,
+        job=job,
+        audio_raw_path=audio_raw_path,
+        s3_writer=s3_writer or S3Writer(),
+        notetaker_client=notetaker_client or NoteTakerClientWrapper(),
+    )
+    await adapter.run(bot_left_reason=bot_left_reason)
