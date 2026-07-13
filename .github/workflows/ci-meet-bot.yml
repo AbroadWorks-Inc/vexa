@@ -1,0 +1,71 @@
+name: CI — meet-bot
+
+on:
+  push:
+    branches: [aw/main, "aw/feat/**"]
+    paths:
+      - "aw-overrides/services/meet-bot/**"
+      - "aw-overrides/aw-integration/**"
+      - ".github/workflows/ci-meet-bot.yml"
+
+jobs:
+  test:
+    name: black · ruff · mypy · pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: AbroadWorks-Inc/vexa
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.7"
+
+      - name: Checkout aw-notetaker for notetaker-common
+        uses: actions/checkout@v4
+        with:
+          repository: AbroadWorks-Inc/aw-notetaker
+          path: aw-notetaker-repo
+
+      - name: Install notetaker-common
+        run: pip install ./aw-notetaker-repo/notetaker-common
+
+      - name: Install aw-integration
+        run: pip install ./aw-overrides/aw-integration
+
+      - name: Install test deps
+        run: |
+          pip install "fastapi==0.109.0" "uvicorn[standard]==0.27.0" httpx \
+            python-multipart pytest pytest-asyncio fakeredis black ruff mypy
+
+      - name: black — aw_output_hook
+        working-directory: aw-overrides/services/meet-bot
+        run: black --check aw_output_hook.py tests/
+
+      - name: ruff — aw_output_hook
+        working-directory: aw-overrides/services/meet-bot
+        run: ruff check aw_output_hook.py
+
+      - name: mypy — aw_output_hook
+        working-directory: aw-overrides/services/meet-bot
+        run: mypy aw_output_hook.py --ignore-missing-imports
+
+      - name: pytest — aw_output_hook
+        working-directory: aw-overrides/services/meet-bot
+        run: pytest tests/ -v
+
+      - name: black — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: black --check aw_integration/ tests/
+
+      - name: ruff — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: ruff check aw_integration/
+
+      - name: mypy — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: mypy aw_integration/
+
+      - name: pytest — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: pytest tests/ -v
