@@ -171,3 +171,6 @@ tests3/.state-compose
 tests3/.state-helm
 
 tests3/.current-stage
+
+# Tool artifacts
+.claude-flow/

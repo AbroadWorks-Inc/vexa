@@ -525,3 +525,114 @@ class TestNoteTakerClientWrapper:
         await wrapper.post_process(job)
         _, kwargs = mock_inner.post_process.call_args
         assert kwargs.get("idempotency_key") == job.job_id
+
+
+# ── Tests for run_from_redis() ─────────────────────────────────────────────
+
+import json as _json  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+from unittest.mock import (
+    AsyncMock as _AsyncMock,
+    MagicMock as _MagicMock,
+    patch as _patch,
+)  # noqa: E402
+
+import fakeredis as _fakeredis  # noqa: E402
+
+_FIXTURE = _json.loads(
+    (_Path(__file__).parent / "fixtures/vexa_v0.10.4_meet_sample.json").read_text()
+)
+_SESSION_UID = "conn-abc123def456"
+_JOB = make_test_job()
+
+
+def _seed_fake_redis(r: _fakeredis.FakeRedis) -> None:
+    for entry in _FIXTURE["redis_messages"]["transcription_segments"]:
+        r.xadd("transcription_segments", {"payload": _json.dumps(entry["payload"])})
+    for entry in _FIXTURE["redis_messages"]["speaker_events_relative"]:
+        r.xadd("speaker_events_relative", entry["fields"])
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_calls_adapter_run(tmp_path: _Path) -> None:
+    """run_from_redis drains streams, assembles session, calls VexaSessionAdapter.run()."""
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    _seed_fake_redis(fake_r)
+
+    mock_s3 = _MagicMock()
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="last_participant",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    mock_s3.write_all.assert_called_once()
+    mock_client.post_process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_filters_by_session_uid(tmp_path: _Path) -> None:
+    """Entries with a different uid are ignored."""
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    fake_r.xadd(
+        "transcription_segments",
+        {
+            "payload": _json.dumps(
+                {
+                    "type": "transcription",
+                    "uid": "OTHER_SESSION",
+                    "meeting_id": "99",
+                    "platform": "google_meet",
+                    "segments": [
+                        {
+                            "start": 0.0,
+                            "end": 1.0,
+                            "text": "noise",
+                            "language": "en",
+                            "completed": True,
+                            "speaker": "Eve",
+                            "segment_id": "x",
+                            "absolute_start_time": "2024-01-15T09:00:00Z",
+                            "absolute_end_time": "2024-01-15T09:00:01Z",
+                        }
+                    ],
+                }
+            )
+        },
+    )
+
+    mock_s3 = _MagicMock()
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    mock_s3.write_all.assert_called_once()
+    mock_client.post_process.assert_awaited_once()
