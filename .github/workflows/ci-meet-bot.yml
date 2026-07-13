@@ -2,7 +2,7 @@ name: CI — meet-bot
 
 on:
   push:
-    branches: [aw/main, "aw/feat/**"]
+    branches: [aw/main,aw-overrides, "aw/feat/**"]
     paths:
       - "aw-overrides/services/meet-bot/**"
       - "aw-overrides/aw-integration/**"
@@ -13,7 +13,7 @@ jobs:
     name: black · ruff · mypy · pytest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: AbroadWorks-Inc/vexa
 
@@ -22,10 +22,11 @@ jobs:
           python-version: "3.11.7"
 
       - name: Checkout aw-notetaker for notetaker-common
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: AbroadWorks-Inc/aw-notetaker
           path: aw-notetaker-repo
+          token: ${{ secrets.CROSS_REPO_PAT }}
 
       - name: Install notetaker-common
         run: pip install ./aw-notetaker-repo/notetaker-common
