@@ -6,13 +6,12 @@
 # ── Stage 1: TypeScript build ────────────────────────────────────────────────
 FROM node:20-slim AS ts-build
 WORKDIR /build
-COPY vexa-fork/services/vexa-bot/core/package*.json ./
-RUN npm ci --omit=dev
 COPY vexa-fork/services/vexa-bot/core/ ./
+RUN npm install --omit=dev
 RUN npm run build
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
-FROM mcr.microsoft.com/playwright/python:v1.50.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.50.0-noble
 
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
@@ -47,8 +46,7 @@ ENV PYTHONUNBUFFERED=1 \
     NODE_ENV=production \
     DISPLAY=:99
 
-RUN useradd --no-create-home --uid 1000 meetbot
-USER 1000
+USER ubuntu
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/start.sh"]
