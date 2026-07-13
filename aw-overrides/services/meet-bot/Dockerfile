@@ -6,9 +6,8 @@
 # ── Stage 1: TypeScript build ────────────────────────────────────────────────
 FROM node:20-slim AS ts-build
 WORKDIR /build
-COPY vexa-fork/services/vexa-bot/core/package*.json ./
-RUN npm ci --omit=dev
 COPY vexa-fork/services/vexa-bot/core/ ./
+RUN npm install --omit=dev
 RUN npm run build
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
