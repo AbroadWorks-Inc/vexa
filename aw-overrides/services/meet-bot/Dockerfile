@@ -46,8 +46,7 @@ ENV PYTHONUNBUFFERED=1 \
     NODE_ENV=production \
     DISPLAY=:99
 
-RUN useradd --no-create-home --uid 1000 meetbot
-USER 1000
+USER ubuntu
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/start.sh"]
