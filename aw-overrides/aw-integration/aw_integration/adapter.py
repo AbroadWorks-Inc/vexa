@@ -6,7 +6,7 @@ import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import redis
 
@@ -276,7 +276,10 @@ async def run_from_redis(
 
     r = redis.Redis.from_url(redis_url, decode_responses=True)
 
-    raw_ts = r.xrange("transcription_segments", count=50000)
+    raw_ts = cast(
+        list[tuple[str, dict[str, str]]],
+        r.xrange("transcription_segments", count=50000),
+    )
     segments: list[VexaSegment] = []
     session_start_ts: datetime | None = None
 
@@ -326,7 +329,10 @@ async def run_from_redis(
                 except (KeyError, ValueError):
                     continue
 
-    raw_se = r.xrange("speaker_events_relative", count=50000)
+    raw_se = cast(
+        list[tuple[str, dict[str, str]]],
+        r.xrange("speaker_events_relative", count=50000),
+    )
     speaker_events: list[VexaSpeakerEvent] = []
     for _eid, fields in raw_se:
         if fields.get("uid") != session_uid:
