@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from aw_integration.adapter import run_from_redis
 from aw_integration.notetaker_client import NoteTakerClientWrapper
@@ -48,6 +49,7 @@ _REASON_MAP: dict[
 }
 
 app = FastAPI(title="aw-output-hook")
+Instrumentator().instrument(app).expose(app)
 
 
 @app.get("/healthz")
