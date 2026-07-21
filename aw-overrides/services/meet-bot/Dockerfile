@@ -35,7 +35,7 @@ COPY vexa-fork/aw-overrides/aw-integration/pyproject.toml aw-integration/pyproje
 COPY vexa-fork/aw-overrides/aw-integration/aw_integration/ aw-integration/aw_integration/
 RUN pip install --no-cache-dir ./aw-integration
 
-RUN pip install --no-cache-dir "fastapi==0.109.0" "uvicorn[standard]==0.27.0" "python-multipart"
+RUN pip install --no-cache-dir "fastapi==0.109.0" "uvicorn[standard]==0.27.0" "python-multipart" "prometheus-fastapi-instrumentator==6.1.0"
 
 COPY vexa-fork/aw-overrides/services/meet-bot/aw_output_hook.py /app/aw_output_hook.py
 COPY vexa-fork/aw-overrides/services/meet-bot/start.sh /app/start.sh
