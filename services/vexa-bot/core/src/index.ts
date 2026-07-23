@@ -2033,6 +2033,34 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     }
   }
 
+  // --- AW: load a pre-seeded Google session from GOOGLE_NOTETAKER_STORAGE_STATE ---
+  // Design §5.2.4: the Meet bot boots signed-in as notetaker@abroadworks.com via a
+  // Playwright storage_state (cookies + localStorage) injected through the
+  // meet-bot-secrets envFrom. Empty/placeholder secret -> skip -> unchanged anonymous
+  // path. We only set `authenticated` (NOT userdataS3Path), so the S3 persistent-profile
+  // branch below stays inactive and control reaches the standard Meet branch, while
+  // join.ts takes the authenticated ("Join now") flow.
+  let awStorageStatePath: string | undefined;
+  const awStorageStateRaw = process.env.GOOGLE_NOTETAKER_STORAGE_STATE;
+  if (awStorageStateRaw && awStorageStateRaw.trim().length > 8) {
+    try {
+      // Accept both seeding formats: raw storage_state JSON (--from-file) and
+      // base64-encoded JSON (--from-literal). '{' is not in the base64 alphabet.
+      const trimmed = awStorageStateRaw.trim();
+      const decoded = trimmed.startsWith("{")
+        ? trimmed
+        : Buffer.from(trimmed, "base64").toString("utf8");
+      JSON.parse(decoded); // validate real storage_state JSON before trusting it
+      awStorageStatePath = "/tmp/google_storage_state.json";
+      require("fs").writeFileSync(awStorageStatePath, decoded, { mode: 0o600 });
+      botConfig.authenticated = true;
+      log("[Bot] AW: Google storage_state loaded -> authenticated Meet join enabled");
+    } catch (e: any) {
+      awStorageStatePath = undefined;
+      log(`[Bot] AW: GOOGLE_NOTETAKER_STORAGE_STATE present but invalid (${e?.message}); anonymous fallback`);
+    }
+  }
+
   // --- Authenticated bot: use persistent context with userdata from S3 ---
   if (botConfig.authenticated && botConfig.userdataS3Path) {
     log('[Bot] Authenticated mode: downloading userdata from S3...');
@@ -2159,16 +2187,25 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     stealthPlugin.enabledEvasions.delete("media.codecs");
     chromium.use(stealthPlugin);
 
+    // AW: when a seeded Google session is present, use the clean authenticated
+    // args (getAuthenticatedBrowserArgs omits --incognito / --disable-web-security /
+    // --ignore-certificate-errors, which trigger Google bot-detection blocks — see
+    // constans.ts). Otherwise keep the original anonymous args unchanged.
     browserInstance = await chromium.launch({
       headless: false,
-      args: getBrowserArgs(!!botConfig.voiceAgentEnabled),
+      args: awStorageStatePath
+        ? getAuthenticatedBrowserArgs()
+        : getBrowserArgs(!!botConfig.voiceAgentEnabled),
     });
 
-    // Create a new page with permissions and viewport for non-Teams
+    // Create a new page with permissions and viewport for non-Teams.
+    // AW: load the seeded storage_state when present (design §5.2.4); undefined
+    // otherwise -> Playwright creates an anonymous context (unchanged behavior).
     const context = await browserInstance.newContext({
       permissions: ["camera", "microphone"],
       userAgent: userAgent,
       viewport: null, // CDP fullscreen removes browser chrome; window fills the 1920x1080 Xvfb display
+      ...(awStorageStatePath ? { storageState: awStorageStatePath } : {}),
     });
 
     // Set voice agent flag before virtual camera script so it knows
