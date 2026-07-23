@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.4
 # Build context: repo root (aw-notetaker/)
 # docker build -f vexa-fork/aw-overrides/services/meet-bot/Dockerfile \
-#              -t ghcr.io/voyantt-consultancy-services-llp/meet-bot:v0.2.0 .
+#              -t ghcr.io/voyantt-consultancy-services-llp/meet-bot:v0.4.0 .
 
 # ── Stage 1: TypeScript build ────────────────────────────────────────────────
 FROM node:20-slim AS ts-build
@@ -13,11 +13,8 @@ RUN npm run build
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/playwright/python:v1.50.0-noble
 
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true \
+    && apt-get install -y --allow-unauthenticated --no-install-recommends \
     ffmpeg \
     tini \
     && rm -rf /var/lib/apt/lists/*
@@ -26,6 +23,7 @@ WORKDIR /app
 
 COPY --from=ts-build /build/dist ./dist
 COPY --from=ts-build /build/node_modules ./node_modules
+COPY --from=ts-build /usr/local/bin/node /usr/local/bin/node
 
 COPY notetaker-common/pyproject.toml notetaker-common/pyproject.toml
 COPY notetaker-common/notetaker_common/ notetaker-common/notetaker_common/
