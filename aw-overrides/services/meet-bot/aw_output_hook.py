@@ -21,14 +21,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile
-from prometheus_fastapi_instrumentator import Instrumentator
-
 from aw_integration.adapter import run_from_redis
 from aw_integration.notetaker_client import NoteTakerClientWrapper
 from aw_integration.s3_writer import S3Writer
+from fastapi import FastAPI, File, Form, UploadFile
 from notetaker_common.s3 import S3Client
 from notetaker_common.schemas import BotJob
+from prometheus_fastapi_instrumentator import Instrumentator
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +106,7 @@ async def healthz() -> dict[str, str]:
 
 @app.post("/chunks")
 async def receive_chunk(
-    file: UploadFile = File(...),
+    file: UploadFile = File(...),  # noqa: B008 - FastAPI requires File() in the default
     metadata: str = Form(...),
 ) -> dict[str, str]:
     data = await file.read()
@@ -163,7 +162,7 @@ async def _run_pipeline_and_signal(
     """
     try:
         await _run_pipeline(bot_left_reason=bot_left_reason)
-    except Exception:  # noqa: BLE001 - always signal; never leave start.sh hanging
+    except Exception:
         logger.exception("pipeline failed for session %s", _SESSION_UID)
     finally:
         try:
