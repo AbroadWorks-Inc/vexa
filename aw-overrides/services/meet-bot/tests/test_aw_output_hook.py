@@ -99,6 +99,45 @@ def test_post_callback_triggers_pipeline(client: TestClient) -> None:
     mock_pipeline.assert_awaited_once()
 
 
+def test_post_callback_joining_status_does_not_trigger_pipeline(
+    client: TestClient, tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The "joining" callback fires at bot-join time, long before the meeting
+    # ends. It must NOT schedule the end-of-session pipeline (which would
+    # write the sentinel and cause start.sh to tear the sidecar down early —
+    # the live-confirmed bug: S3 only got audio_chunks/, no audio.wav etc.).
+    sentinel = tmp_path / "pipeline_done"
+    monkeypatch.setattr(hook, "_PIPELINE_DONE_SENTINEL", sentinel)
+    payload = {"connection_id": "job001", "status": "joining"}
+    with patch(
+        "aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock
+    ) as mock_pipeline:
+        resp = client.post("/callback", json=payload)
+    assert resp.status_code == 200
+    mock_pipeline.assert_not_called()
+    assert not sentinel.exists()
+
+
+def test_post_callback_completed_status_triggers_pipeline(
+    client: TestClient, tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A terminal ("completed") callback must still schedule the end pipeline.
+    sentinel = tmp_path / "pipeline_done"
+    monkeypatch.setattr(hook, "_PIPELINE_DONE_SENTINEL", sentinel)
+    payload = {
+        "connection_id": "job001",
+        "status": "completed",
+        "reason": "meeting_ended",
+    }
+    with patch(
+        "aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock
+    ) as mock_pipeline:
+        resp = client.post("/callback", json=payload)
+    assert resp.status_code == 200
+    mock_pipeline.assert_awaited_once()
+    assert mock_pipeline.call_args.kwargs["bot_left_reason"] == "host_ended"
+
+
 def test_post_callback_maps_reason_from_both_fields(client: TestClient) -> None:
     # (payload field, value, expected bot_left_reason). Vexa sends `reason` on
     # abrupt ends; `completion_reason` only in some flows — both must map.

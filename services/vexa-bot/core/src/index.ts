@@ -138,6 +138,7 @@ export async function enterBrowserFullscreen(): Promise<void> {
 let ttsPlaybackService: TTSPlaybackService | null = null;
 let microphoneService: MicrophoneService | null = null;
 let chatService: MeetingChatService | null = null;
+let recordingNoticePosted = false;
 let screenContentService: ScreenContentService | null = null;
 let screenShareService: ScreenShareService | null = null;
 let redisPublisher: RedisClientType | null = null;
@@ -2301,6 +2302,19 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     await initChatService(botConfig, page);
   } catch (err: any) {
     log(`[Chat] Initialization failed (non-fatal): ${err.message}`);
+  }
+
+  // §5.2.4 #11 — post the recording disclosure once, after admission (non-fatal).
+  if (botConfig.platform === 'google_meet' && chatService && !recordingNoticePosted) {
+    try {
+      const ok = await chatService.sendMessage(
+        "AW Notetaker is recording this meeting for transcription. See https://abroadworks.com/notetaker-privacy for details."
+      );
+      recordingNoticePosted = ok;
+      log(`[Chat] Recording notice posted: ${ok}`);
+    } catch (err: any) {
+      log(`[Chat] Recording notice failed (non-fatal): ${err.message}`);
+    }
   }
 
   // Always initialize TTS + mic so any bot can speak on demand

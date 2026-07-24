@@ -76,6 +76,12 @@ def _persist_chunk_to_s3(seq: int, data: bytes) -> None:
 
 _PIPELINE_DONE_SENTINEL = Path("/tmp/pipeline_done")
 
+# Only these callback statuses mean the session is actually over. Vexa also
+# posts a "joining" callback at join time; running the end pipeline then
+# writes the sentinel early and start.sh tears the sidecar down before the
+# real end-of-meeting pipeline runs (§2).
+_TERMINAL_STATUSES = {"completed", "failed"}
+
 # Maps Vexa's completion_reason / leave `reason` -> our bot_left_reason (§4).
 # Vexa sends the leave reason in `reason` (and sometimes `completion_reason`).
 _REASON_MAP: dict[
@@ -145,6 +151,10 @@ async def receive_callback(payload: dict[str, Any]) -> dict[str, str]:
     # error_message on join/leave errors). Without this we debug blind.
     if payload.get("status") == "failed" or payload.get("error_details"):
         logger.error("bot reported failure; callback payload=%s", payload)
+    status = str(payload.get("status") or "")
+    if status not in _TERMINAL_STATUSES:
+        logger.info("callback status=%s (non-terminal); skipping end pipeline", status)
+        return {"status": "ok"}
     asyncio.create_task(_run_pipeline_and_signal(bot_left_reason=bot_left_reason))
     # Vexa's unified-callback only accepts: processed | ok | container_updated | ignored.
     return {"status": "ok"}
