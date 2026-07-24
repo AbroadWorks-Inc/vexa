@@ -174,3 +174,7 @@ tests3/.current-stage
 
 # Tool artifacts
 .claude-flow/
+
+# Local agent tooling artifacts (not source)
+.claude/
+ruvector.db

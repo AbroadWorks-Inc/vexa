@@ -34,6 +34,21 @@ function generateReasonTokens(platform: string): {
   };
 }
 
+// A destroyed page/context or closed target means the meeting ended (a host ended
+// it, or the bot was removed) — Playwright surfaces it as one of these messages
+// mid-operation. Treat as a normal completion, not a post_join_setup_error (§2).
+function isMeetingEndedNavigation(msg: string): boolean {
+  const m = (msg || "").toLowerCase();
+  return (
+    m.includes("execution context was destroyed") ||
+    m.includes("target closed") ||
+    m.includes("target page, context or browser has been closed") ||
+    m.includes("frame was detached") ||
+    m.includes("page has been closed") ||
+    m.includes("browser has been closed")
+  );
+}
+
 export type PlatformStrategies = {
   join: (page: Page | null, botConfig: BotConfig) => Promise<void>;
   waitForAdmission: (page: Page | null, timeoutMs: number, botConfig: BotConfig) => Promise<AdmissionResult>;
@@ -214,6 +229,13 @@ export async function runMeetingFlow(
         await gracefulLeaveFunction(page, 0, "startup_alone_timeout");
         return;
       }
+      // §2: the meeting ended (host ended it / bot removed) mid-recording — the
+      // page/context was torn down. Finalize as a normal end, not an error.
+      if (isMeetingEndedNavigation(msg)) {
+        log("Meeting ended (page/context destroyed) during recording — normal end.");
+        await gracefulLeaveFunction(page, 0, "meeting_ended");
+        return;
+      }
 
       const errorDetails = {
         error_message: error?.message,
@@ -240,6 +262,12 @@ export async function runMeetingFlow(
     }
     if (msg.includes(tokens.startupAloneToken)) {
       await gracefulLeaveFunction(page, 0, "startup_alone_timeout");
+      return;
+    }
+    // §2: meeting ended (host ended it / bot removed) — page/context torn down.
+    if (isMeetingEndedNavigation(msg)) {
+      log("Meeting ended (page/context destroyed) during setup — normal end.");
+      await gracefulLeaveFunction(page, 0, "meeting_ended");
       return;
     }
 

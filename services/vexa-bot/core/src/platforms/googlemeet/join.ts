@@ -66,45 +66,70 @@ export async function joinGoogleMeeting(
     const switchHereSelector = 'button:has-text("Switch here")';
     const askToJoinSelector = googleJoinButtonSelectors[0];
 
-    try {
-      // Race: wait for any join button
-      const joinButton = await Promise.race([
-        page.waitForSelector(joinNowSelector, { timeout: 30000 }).then(el => ({ el, type: 'join_now' as const })),
-        page.waitForSelector(switchHereSelector, { timeout: 30000 }).then(el => ({ el, type: 'switch_here' as const })),
-        page.waitForSelector(askToJoinSelector, { timeout: 30000 }).then(el => ({ el, type: 'ask_to_join' as const })),
-      ]);
+    // §1 "wait at the door": the bot may arrive before the meeting is joinable
+    // (spawned ahead of start / host not yet present). Instead of a single 30s
+    // look, keep re-checking for a join button — reloading between attempts in
+    // case the pre-join screen does not auto-transition — until the waiting-room
+    // budget is exhausted.
+    let joinButton:
+      | { el: any; type: "join_now" | "switch_here" | "ask_to_join" }
+      | null = null;
+    const joinDeadline = Date.now() + botConfig.automaticLeave.waitingRoomTimeout;
+    let attempt = 0;
 
-      if (joinButton.type === 'join_now') {
-        await joinButton.el!.click();
-        log("Bot joined Google Meet as authenticated user (Join now).");
-      } else if (joinButton.type === 'switch_here') {
-        await joinButton.el!.click();
-        log("Bot joined Google Meet as authenticated user (Switch here — same account already in call).");
-      } else {
-        // Cookies didn't work — fall back to anonymous join
-        log("WARNING: Authenticated mode but 'Ask to join' found instead of 'Join now'. Cookies may not be loaded.");
-        log("Falling back to anonymous-style join...");
-
-        // Fill name since we're in anonymous territory
+    while (!joinButton && Date.now() < joinDeadline) {
+      attempt++;
+      try {
+        joinButton = await Promise.race([
+          page.waitForSelector(joinNowSelector, { timeout: 20000 }).then(el => ({ el, type: 'join_now' as const })),
+          page.waitForSelector(switchHereSelector, { timeout: 20000 }).then(el => ({ el, type: 'switch_here' as const })),
+          page.waitForSelector(askToJoinSelector, { timeout: 20000 }).then(el => ({ el, type: 'ask_to_join' as const })),
+        ]);
+      } catch {
+        const remainingSec = Math.max(0, Math.round((joinDeadline - Date.now()) / 1000));
+        if (remainingSec <= 0) break;
+        log(`No join button yet (attempt ${attempt}); reloading & retrying (~${remainingSec}s left)...`);
         try {
-          const nameFieldSelector = googleNameInputSelectors[0];
-          const nameField = await page.$(nameFieldSelector);
-          if (nameField) {
-            await page.fill(nameFieldSelector, botName);
-            log(`Filled bot name: ${botName}`);
-          }
-        } catch (e) {
-          log("No name field to fill.");
+          await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+          await page.waitForTimeout(3000);
+        } catch {
+          await page.waitForTimeout(3000);
         }
-
-        await joinButton.el!.click();
-        log(`Bot joined Google Meet via fallback (Ask to join).`);
       }
-    } catch (e) {
-      // No button found — take diagnostic screenshot and fail
+    }
+
+    if (!joinButton) {
       await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-failed.png', fullPage: true });
-      log("📸 Screenshot: No join button found after 30s");
-      throw e;
+      const waitedSec = Math.round(botConfig.automaticLeave.waitingRoomTimeout / 1000);
+      log(`📸 Screenshot: no join button appeared after ~${waitedSec}s (${attempt} attempts)`);
+      throw new Error(`No join button appeared within the waiting-room timeout (${waitedSec}s)`);
+    }
+
+    if (joinButton.type === 'join_now') {
+      await joinButton.el!.click();
+      log("Bot joined Google Meet as authenticated user (Join now).");
+    } else if (joinButton.type === 'switch_here') {
+      await joinButton.el!.click();
+      log("Bot joined Google Meet as authenticated user (Switch here — same account already in call).");
+    } else {
+      // Cookies didn't work — fall back to anonymous join
+      log("WARNING: Authenticated mode but 'Ask to join' found instead of 'Join now'. Cookies may not be loaded.");
+      log("Falling back to anonymous-style join...");
+
+      // Fill name since we're in anonymous territory
+      try {
+        const nameFieldSelector = googleNameInputSelectors[0];
+        const nameField = await page.$(nameFieldSelector);
+        if (nameField) {
+          await page.fill(nameFieldSelector, botName);
+          log(`Filled bot name: ${botName}`);
+        }
+      } catch (e) {
+        log("No name field to fill.");
+      }
+
+      await joinButton.el!.click();
+      log(`Bot joined Google Meet via fallback (Ask to join).`);
     }
 
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-join-now.png', fullPage: true });

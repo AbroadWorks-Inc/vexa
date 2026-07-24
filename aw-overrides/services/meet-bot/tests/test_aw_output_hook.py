@@ -7,7 +7,7 @@ import os
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -91,38 +91,41 @@ def test_post_callback_triggers_pipeline(client: TestClient) -> None:
         "session_start": "2026-07-10T10:00:00Z",
         "session_end": "2026-07-10T11:00:00Z",
     }
-    with patch("aw_output_hook._run_pipeline", new_callable=AsyncMock) as mock_pipeline:
+    with patch(
+        "aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock
+    ) as mock_pipeline:
         resp = client.post("/callback", json=payload)
     assert resp.status_code == 200
     mock_pipeline.assert_awaited_once()
 
 
-def test_post_callback_maps_completion_reason(client: TestClient) -> None:
+def test_post_callback_maps_reason_from_both_fields(client: TestClient) -> None:
+    # (payload field, value, expected bot_left_reason). Vexa sends `reason` on
+    # abrupt ends; `completion_reason` only in some flows — both must map.
     cases = [
-        ("left_alone", "last_participant"),
-        ("timeout", "hard_deadline"),
-        ("error", "error"),
-        ("host_ended", "host_ended"),
-        ("anything_else", "host_ended"),
+        ("completion_reason", "left_alone", "last_participant"),
+        ("completion_reason", "timeout", "hard_deadline"),
+        ("completion_reason", "error", "error"),
+        ("reason", "meeting_ended", "host_ended"),
+        ("reason", "removed_by_admin", "host_ended"),
+        ("reason", "normal_completion", "host_ended"),
+        ("reason", "left_alone_timeout", "last_participant"),
+        ("reason", "post_join_setup_error", "error"),
+        ("reason", "totally_unknown", "host_ended"),
     ]
-    for completion_reason, expected_reason in cases:
+    for field, value, expected in cases:
         payload: dict[str, Any] = {
             "connection_id": "job001",
-            "meeting_id": "42",
-            "platform": "google_meet",
             "status": "completed",
-            "completion_reason": completion_reason,
-            "session_start": "2026-07-10T10:00:00Z",
-            "session_end": "2026-07-10T11:00:00Z",
+            field: value,
         }
         with patch(
-            "aw_output_hook._run_pipeline", new_callable=AsyncMock
+            "aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock
         ) as mock_pipeline:
             client.post("/callback", json=payload)
-        call_kwargs = mock_pipeline.call_args.kwargs
         assert (
-            call_kwargs["bot_left_reason"] == expected_reason
-        ), f"completion_reason={completion_reason!r} → expected {expected_reason!r}"
+            mock_pipeline.call_args.kwargs["bot_left_reason"] == expected
+        ), f"{field}={value!r} → expected {expected!r}"
 
 
 def test_run_pipeline_calls_run_from_redis(tmp_path: Path) -> None:
@@ -143,3 +146,96 @@ def test_run_pipeline_calls_run_from_redis(tmp_path: Path) -> None:
     assert call_kwargs["bot_left_reason"] == "last_participant"
     assert call_kwargs["session_uid"] == "job001"
     assert call_kwargs["audio_raw_path"] == fake_pcm
+
+
+# --- §3 durability: incremental chunk persistence to S3 ---------------------
+
+
+@pytest.fixture(autouse=True)
+def hermetic_s3() -> Any:
+    """Patch S3Client so no test touches real AWS; expose the fake instance."""
+    hook._s3_client = None
+    fake_instance = MagicMock()
+    with patch("aw_output_hook.S3Client", return_value=fake_instance):
+        yield fake_instance
+    hook._s3_client = None
+
+
+def test_chunk_s3_key_zero_padded_under_job_prefix() -> None:
+    assert hook._chunk_s3_key(5) == f"{hook._JOB.s3_key}audio_chunks/chunk_000005.webm"
+    assert hook._chunk_s3_key(0).endswith("audio_chunks/chunk_000000.webm")
+
+
+def test_persist_chunk_to_s3_puts_object(hermetic_s3: Any) -> None:
+    hook._persist_chunk_to_s3(7, b"audio-bytes")
+    hermetic_s3.put_object.assert_called_once()
+    kwargs = hermetic_s3.put_object.call_args.kwargs
+    assert kwargs["key"] == hook._chunk_s3_key(7)
+    assert kwargs["body"] == b"audio-bytes"
+    assert kwargs["content_type"] == "audio/webm"
+
+
+def test_persist_chunk_to_s3_reuses_client(hermetic_s3: Any) -> None:
+    hook._persist_chunk_to_s3(0, b"a")
+    hook._persist_chunk_to_s3(1, b"b")
+    assert hermetic_s3.put_object.call_count == 2  # same cached client
+
+
+def test_persist_chunk_to_s3_non_fatal_on_error(hermetic_s3: Any) -> None:
+    hermetic_s3.put_object.side_effect = RuntimeError("s3 down")
+    hook._persist_chunk_to_s3(1, b"x")  # must NOT raise — capture continues
+
+
+def test_post_chunk_persists_to_s3(client: TestClient, hermetic_s3: Any) -> None:
+    resp = client.post(
+        "/chunks",
+        files={"file": ("rec.3.webm", BytesIO(b"\x00" * 128), "video/webm")},
+        data={"metadata": json.dumps({"chunk_seq": 3, "is_final": False})},
+    )
+    assert resp.status_code == 200
+    hermetic_s3.put_object.assert_called_once()
+    assert hermetic_s3.put_object.call_args.kwargs["key"].endswith("chunk_000003.webm")
+
+
+def test_post_chunk_still_ok_when_s3_fails(
+    client: TestClient, hermetic_s3: Any
+) -> None:
+    hermetic_s3.put_object.side_effect = RuntimeError("s3 down")
+    resp = client.post(
+        "/chunks",
+        files={"file": ("rec.0.webm", BytesIO(b"\x00" * 64), "video/webm")},
+        data={"metadata": json.dumps({"chunk_seq": 0, "is_final": False})},
+    )
+    assert resp.status_code == 200  # capture unaffected by S3 failure
+    assert len(hook._chunk_store.get("job001", [])) == 1  # still buffered
+
+
+# --- §2 end-of-meeting: pipeline-done sentinel ------------------------------
+
+
+def test_run_pipeline_and_signal_writes_sentinel(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import asyncio
+
+    sentinel = tmp_path / "pipeline_done"
+    monkeypatch.setattr(hook, "_PIPELINE_DONE_SENTINEL", sentinel)
+    with patch("aw_output_hook._run_pipeline", new_callable=AsyncMock):
+        asyncio.run(hook._run_pipeline_and_signal(bot_left_reason="host_ended"))
+    assert sentinel.exists()  # start.sh waits on this before teardown
+
+
+def test_run_pipeline_and_signal_writes_sentinel_even_on_error(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import asyncio
+
+    sentinel = tmp_path / "pipeline_done"
+    monkeypatch.setattr(hook, "_PIPELINE_DONE_SENTINEL", sentinel)
+    with patch(
+        "aw_output_hook._run_pipeline",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("boom"),
+    ):
+        asyncio.run(hook._run_pipeline_and_signal(bot_left_reason="host_ended"))
+    assert sentinel.exists()  # sentinel written even when the pipeline fails

@@ -21,13 +21,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile
-from prometheus_fastapi_instrumentator import Instrumentator
-
 from aw_integration.adapter import run_from_redis
 from aw_integration.notetaker_client import NoteTakerClientWrapper
 from aw_integration.s3_writer import S3Writer
+from fastapi import FastAPI, File, Form, UploadFile
+from notetaker_common.s3 import S3Client
 from notetaker_common.schemas import BotJob
+from prometheus_fastapi_instrumentator import Instrumentator
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,59 @@ _REDIS_URL = os.environ.get(
 
 _chunk_store: dict[str, list[bytes]] = {}
 
+# Lazily-created S3 client for durable, incremental chunk persistence. Created on
+# first use so the module imports without AWS creds (tests, tooling).
+_s3_client: S3Client | None = None
+
+
+def _chunk_s3_key(seq: int) -> str:
+    """S3 key for a durable raw audio chunk under the job's prefix.
+
+    Zero-padded so lexical order == capture order (recovery/concat, §13.12).
+    """
+    return f"{_JOB.s3_key}audio_chunks/chunk_{seq:06d}.webm"
+
+
+def _persist_chunk_to_s3(seq: int, data: bytes) -> None:
+    """Durably copy one raw chunk to S3 the moment it arrives.
+
+    This is the §3 durability fix: captured audio must leave the pod immediately
+    so it survives sidecar/pod termination (previously chunks lived only in the
+    in-memory ``_chunk_store`` and were lost when the pod died mid-session).
+
+    Best-effort: an S3 error is logged but never breaks audio capture — the
+    in-memory buffer + end-of-session pipeline remain the primary path.
+    """
+    global _s3_client
+    try:
+        if _s3_client is None:
+            _s3_client = S3Client()
+        _s3_client.put_object(
+            key=_chunk_s3_key(seq), body=data, content_type="audio/webm"
+        )
+    except Exception as exc:  # noqa: BLE001 - durability is best-effort
+        logger.error("failed to persist chunk seq=%s to S3: %s", seq, exc)
+
+
+_PIPELINE_DONE_SENTINEL = Path("/tmp/pipeline_done")
+
+# Maps Vexa's completion_reason / leave `reason` -> our bot_left_reason (§4).
+# Vexa sends the leave reason in `reason` (and sometimes `completion_reason`).
 _REASON_MAP: dict[
     str, Literal["host_ended", "last_participant", "hard_deadline", "error"]
 ] = {
+    # completion_reason values
     "left_alone": "last_participant",
     "timeout": "hard_deadline",
     "error": "error",
+    # leave `reason` values (meetingFlow.ts)
+    "normal_completion": "host_ended",
+    "meeting_ended": "host_ended",
+    "removed_by_admin": "host_ended",
+    "left_alone_timeout": "last_participant",
+    "startup_alone_timeout": "last_participant",
+    "post_join_setup_error": "error",
+    "join_meeting_error": "error",
 }
 
 app = FastAPI(title="aw-output-hook")
@@ -59,7 +106,7 @@ async def healthz() -> dict[str, str]:
 
 @app.post("/chunks")
 async def receive_chunk(
-    file: UploadFile = File(...),
+    file: UploadFile = File(...),  # noqa: B008 - FastAPI requires File() in the default
     metadata: str = Form(...),
 ) -> dict[str, str]:
     data = await file.read()
@@ -71,20 +118,57 @@ async def receive_chunk(
         meta.get("is_final"),
         len(data),
     )
+    # Durability (§3): persist this chunk to S3 before acking, off the event loop
+    # (boto3 is blocking). Ordering falls back to arrival index if seq is missing.
+    try:
+        seq = int(meta.get("chunk_seq"))
+    except (TypeError, ValueError):
+        seq = len(_chunk_store[_SESSION_UID]) - 1
+    await asyncio.to_thread(_persist_chunk_to_s3, seq, data)
     return {"status": "ok"}
 
 
 @app.post("/callback")
 async def receive_callback(payload: dict[str, Any]) -> dict[str, str]:
-    completion_reason = str(payload.get("completion_reason", ""))
-    bot_left_reason = _REASON_MAP.get(completion_reason, "host_ended")
+    # Vexa sends the leave reason in `reason`; `completion_reason` is set only in
+    # some flows. Prefer completion_reason, fall back to reason (§2 fix — we were
+    # reading only completion_reason, which was empty on abrupt ends).
+    reason = str(payload.get("completion_reason") or payload.get("reason") or "")
+    bot_left_reason = _REASON_MAP.get(reason, "host_ended")
     logger.info(
-        "callback status=%s completion_reason=%s",
+        "callback status=%s reason=%s -> bot_left_reason=%s",
         payload.get("status"),
-        completion_reason,
+        reason,
+        bot_left_reason,
     )
-    asyncio.create_task(_run_pipeline(bot_left_reason=bot_left_reason))
-    return {"status": "queued"}
+    # Surface the bot's own diagnostics on failure (Vexa attaches error_details /
+    # error_message on join/leave errors). Without this we debug blind.
+    if payload.get("status") == "failed" or payload.get("error_details"):
+        logger.error("bot reported failure; callback payload=%s", payload)
+    asyncio.create_task(_run_pipeline_and_signal(bot_left_reason=bot_left_reason))
+    # Vexa's unified-callback only accepts: processed | ok | container_updated | ignored.
+    return {"status": "ok"}
+
+
+async def _run_pipeline_and_signal(
+    *,
+    bot_left_reason: Literal[
+        "host_ended", "last_participant", "hard_deadline", "error"
+    ],
+) -> None:
+    """Run the end-of-session pipeline, then drop a sentinel file so start.sh can
+    tear down the container only AFTER delivery completes (§2 end-of-meeting
+    handling). Always signals — even on failure — so start.sh never hangs.
+    """
+    try:
+        await _run_pipeline(bot_left_reason=bot_left_reason)
+    except Exception:
+        logger.exception("pipeline failed for session %s", _SESSION_UID)
+    finally:
+        try:
+            _PIPELINE_DONE_SENTINEL.touch()
+        except OSError as exc:
+            logger.error("failed to write pipeline-done sentinel: %s", exc)
 
 
 async def _run_pipeline(
@@ -94,6 +178,13 @@ async def _run_pipeline(
     ],
 ) -> None:
     chunks = _chunk_store.get(_SESSION_UID, [])
+    if not chunks:
+        logger.warning(
+            "no audio chunks for session %s (bot never joined/recorded); "
+            "skipping conversion + upload",
+            _SESSION_UID,
+        )
+        return
     audio_path = await _convert_webm_to_pcm(chunks)
 
     await run_from_redis(

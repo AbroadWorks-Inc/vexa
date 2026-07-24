@@ -17,9 +17,9 @@ dev = [
     "pytest-asyncio",
     "moto[s3]",
     "respx",
-    "black",
-    "ruff",
-    "mypy",
+    "black==25.1.0",
+    "ruff==0.15.3",
+    "mypy==1.17.1",
     "fakeredis",
 ]
 
