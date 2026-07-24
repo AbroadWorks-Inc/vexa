@@ -2304,19 +2304,6 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     log(`[Chat] Initialization failed (non-fatal): ${err.message}`);
   }
 
-  // §5.2.4 #11 — post the recording disclosure once, after admission (non-fatal).
-  if (botConfig.platform === 'google_meet' && chatService && !recordingNoticePosted) {
-    try {
-      const ok = await chatService.sendMessage(
-        "AW Notetaker is recording this meeting for transcription. See https://abroadworks.com/notetaker-privacy for details."
-      );
-      recordingNoticePosted = ok;
-      log(`[Chat] Recording notice posted: ${ok}`);
-    } catch (err: any) {
-      log(`[Chat] Recording notice failed (non-fatal): ${err.message}`);
-    }
-  }
-
   // Always initialize TTS + mic so any bot can speak on demand
   if (!ttsPlaybackService) {
     ttsPlaybackService = new TTSPlaybackService();
@@ -2353,7 +2340,21 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
   // Call the appropriate platform handler
   try {
     if (botConfig.platform === "google_meet") {
-      await handleGoogleMeet(botConfig, page, performGracefulLeave);
+      await handleGoogleMeet(botConfig, page, performGracefulLeave, async () => {
+        // §5.2.4 #11 — post the recording disclosure once, after admission
+        // (the chat panel only exists post-admission; non-fatal on failure).
+        if (chatService && !recordingNoticePosted) {
+          try {
+            const ok = await chatService.sendMessage(
+              "AW Notetaker is recording this meeting for transcription. See https://abroadworks.com/notetaker-privacy for details."
+            );
+            recordingNoticePosted = ok;
+            log(`[Chat] Recording notice posted: ${ok}`);
+          } catch (err: any) {
+            log(`[Chat] Recording notice failed (non-fatal): ${err.message}`);
+          }
+        }
+      });
     } else if (botConfig.platform === "zoom") {
       await handleZoom(botConfig, page, performGracefulLeave);
     } else if (botConfig.platform === "teams") {

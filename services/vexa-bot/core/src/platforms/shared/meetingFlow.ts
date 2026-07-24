@@ -57,6 +57,7 @@ export type PlatformStrategies = {
   startRecording: (page: Page | null, botConfig: BotConfig) => Promise<void>;
   startRemovalMonitor: (page: Page | null, onRemoval?: () => void | Promise<void>) => () => void;
   leave: (page: Page | null, botConfig?: BotConfig, reason?: LeaveReason) => Promise<boolean>;
+  afterAdmission?: (page: Page | null, botConfig: BotConfig) => Promise<void>;
 };
 
 export async function runMeetingFlow(
@@ -192,6 +193,14 @@ export async function runMeetingFlow(
     } catch (error: any) {
       log(`Error during startup callback or verification: ${error?.message || String(error)}`);
       // Continue to recording phase even if callback/verification fails
+    }
+
+    // Platform-specific post-admission hook (e.g. posting the recording notice
+    // once the chat panel actually exists). Non-fatal — never blocks recording.
+    try {
+      await strategies.afterAdmission?.(page, botConfig);
+    } catch (err: any) {
+      log(`[Chat] afterAdmission hook failed (non-fatal): ${err.message}`);
     }
 
     // Enter fullscreen via CDP to hide tabs/address bar before recording starts.
