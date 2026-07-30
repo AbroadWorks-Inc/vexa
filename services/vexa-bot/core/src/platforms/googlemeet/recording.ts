@@ -789,7 +789,21 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             (window as any).getGoogleMeetActiveParticipantsCount = () => {
               return (window as any).getGoogleMeetActiveParticipants().length;
             };
-            
+
+            // Detect an active presentation / screen-share. A share hides the participant
+            // tiles, so the "everyone left" finalize below must NOT treat tiles==0 as empty
+            // while a presentation is active (that was the old false-empty bug).
+            const isPresentationActive = () => {
+              if (
+                document.querySelector('button[aria-label*="Stop presenting"]') !== null ||
+                document.querySelector('[aria-label*="is presenting"]') !== null ||
+                document.querySelector('[aria-label*="Pin presentation"]') !== null ||
+                document.querySelector('[aria-label*="Unpin presentation"]') !== null
+              ) return true;
+              const bodyText = document.body ? document.body.innerText : '';
+              return /\bis presenting\b|you are presenting|presenting to everyone/i.test(bodyText);
+            };
+
             // Setup Google Meet meeting monitoring (browser context)
             const setupGoogleMeetingMonitoring = (botConfigData: any, audioService: any, resolve: any) => {
               (window as any).logBot("Setting up Google Meet meeting monitoring...");
@@ -817,19 +831,39 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 finish();
               };
 
-              // POLICY (host-controlled exit): the bot NEVER leaves on its own due to being
-              // alone/empty, screen-share, camera, chat, or ANY participant activity. It
-              // records continuously and exits ONLY when the host ends the call — handled
-              // OUTSIDE this loop by the removal monitor / page teardown in meetingFlow.ts
-              // (removed_by_admin / meeting_ended) — or by the hard deadline (SIGTERM at the
-              // K8s activeDeadline). This interval only logs participant-count changes.
+              // POLICY: the bot records continuously and does NOT leave on transient blips
+              // or screen-share. It finalizes (leaves + produces the transcript) when the
+              // meeting is genuinely over: (a) everyone has left the room for a continuous
+              // grace period (below) — this is how the host hitting "Leave"/red on mobile
+              // still ends it, since mobile has no "End for everyone"; (b) explicit removal /
+              // meeting end (removal monitor + page teardown in meetingFlow.ts); or (c) the
+              // K8s hard deadline. The empty check uses the RAW tile count plus a presentation
+              // guard, so an active screen-share (which hides tiles) can never false-finalize.
+              let emptyTicks = 0;
+              const EMPTY_GRACE_TICKS = 90; // 90 x 1s = 90s continuous empty before finalizing
               const checkInterval = setInterval(() => {
                 const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount
                   ? (window as any).getGoogleMeetActiveParticipantsCount()
                   : 0;
                 if (currentParticipantCount !== lastParticipantCount) {
-                  (window as any).logBot(`Participant check: ${currentParticipantCount} participant(s) visible (informational — bot stays until the host ends the call).`);
+                  (window as any).logBot(`Participant check: ${currentParticipantCount} participant(s) visible.`);
                   lastParticipantCount = currentParticipantCount;
+                }
+                // Finalize-on-empty: RAW tile count (not the screen-share-guarded count) so a
+                // genuine empty is detected, but gated by isPresentationActive() so a share
+                // never false-triggers it. Grace period tolerates brief drops / a rejoin.
+                const rawTiles = countParticipantTiles();
+                const presenting = isPresentationActive();
+                if (rawTiles <= 1 && !presenting) {
+                  emptyTicks++;
+                  if (emptyTicks >= EMPTY_GRACE_TICKS) {
+                    (window as any).logBot(`All participants left (empty ${emptyTicks}s, no presentation) — finalizing meeting.`);
+                    void stopWithFlush("everyone_left", () => resolve());
+                  } else if (emptyTicks % 15 === 0) {
+                    (window as any).logBot(`Room empty ${emptyTicks}s (will finalize at ${EMPTY_GRACE_TICKS}s if it stays empty)...`);
+                  }
+                } else {
+                  emptyTicks = 0;
                 }
               }, 1000);
 
