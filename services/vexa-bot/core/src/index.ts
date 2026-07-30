@@ -2252,10 +2252,47 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     log(`[Frame] New frame attached: ${frame.url() || '(empty)'}`);
   });
   page.on('framenavigated', (frame) => {
-    if (frame !== page!.mainFrame()) {
+    if (frame === page!.mainFrame()) {
+      // MAIN-frame navigation = the whole meeting page reloaded/redirected. Previously
+      // this was NOT logged (only sub-frames were), which is why the screen-share
+      // "page unloaded" cause was invisible. Log it explicitly now.
+      log(`[Frame] ⚠️ MAIN-frame navigated: ${frame.url()}`);
+    } else {
       log(`[Frame] Sub-frame navigated: ${frame.url()}`);
     }
   });
+
+  // --- Crash / failure instrumentation (screen-share exit diagnosis) --------------
+  // A renderer crash (e.g. /dev/shm exhaustion decoding a 1080p screen-share) destroys
+  // the page and superficially looks like a clean "meeting ended". These handlers make
+  // the real cause visible instead of leaving a silent exit.
+  page.on('crash', () => {
+    log("[BotCore] 🔴 PAGE CRASH — renderer process died (suspect /dev/shm exhaustion or OOM).");
+  });
+  page.on('pageerror', (err: any) => {
+    log(`[BotCore] 🔴 PAGE JS ERROR: ${err?.message || err}`);
+  });
+  try {
+    const browserForEvents = page.context().browser();
+    if (browserForEvents) {
+      browserForEvents.on('disconnected', () => {
+        log("[BotCore] 🔴 BROWSER DISCONNECTED — Chromium process is gone.");
+      });
+    }
+  } catch { /* persistent context may not expose a browser handle; non-fatal */ }
+  page.context().on('close', () => {
+    log("[BotCore] 🔴 BROWSER CONTEXT CLOSED.");
+  });
+  // NOTE: adding these process-level handlers also makes a stray rejection/exception
+  // NON-fatal (Node would otherwise terminate on them) — desirable here, but a
+  // behaviour change worth knowing.
+  process.on('unhandledRejection', (reason: any) => {
+    log(`[BotCore] 🔴 UNHANDLED REJECTION: ${reason?.message || reason}`);
+  });
+  process.on('uncaughtException', (err: any) => {
+    log(`[BotCore] 🔴 UNCAUGHT EXCEPTION: ${err?.message || err}`);
+  });
+  // --- -------------------------------------------------------------------------- ---
 
   // --- ADDED: Expose a function for browser to trigger Node.js graceful leave ---
   await page.exposeFunction("triggerNodeGracefulLeave", async () => {
@@ -2304,19 +2341,6 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     log(`[Chat] Initialization failed (non-fatal): ${err.message}`);
   }
 
-  // §5.2.4 #11 — post the recording disclosure once, after admission (non-fatal).
-  if (botConfig.platform === 'google_meet' && chatService && !recordingNoticePosted) {
-    try {
-      const ok = await chatService.sendMessage(
-        "AW Notetaker is recording this meeting for transcription. See https://abroadworks.com/notetaker-privacy for details."
-      );
-      recordingNoticePosted = ok;
-      log(`[Chat] Recording notice posted: ${ok}`);
-    } catch (err: any) {
-      log(`[Chat] Recording notice failed (non-fatal): ${err.message}`);
-    }
-  }
-
   // Always initialize TTS + mic so any bot can speak on demand
   if (!ttsPlaybackService) {
     ttsPlaybackService = new TTSPlaybackService();
@@ -2353,7 +2377,21 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
   // Call the appropriate platform handler
   try {
     if (botConfig.platform === "google_meet") {
-      await handleGoogleMeet(botConfig, page, performGracefulLeave);
+      await handleGoogleMeet(botConfig, page, performGracefulLeave, async () => {
+        // §5.2.4 #11 — post the recording disclosure once, after admission
+        // (the chat panel only exists post-admission; non-fatal on failure).
+        if (chatService && !recordingNoticePosted) {
+          try {
+            const ok = await chatService.sendMessage(
+              "AW Notetaker is recording this meeting for transcription. See https://abroadworks.com/notetaker-privacy for details."
+            );
+            recordingNoticePosted = ok;
+            log(`[Chat] Recording notice posted: ${ok}`);
+          } catch (err: any) {
+            log(`[Chat] Recording notice failed (non-fatal): ${err.message}`);
+          }
+        }
+      });
     } else if (botConfig.platform === "zoom") {
       await handleZoom(botConfig, page, performGracefulLeave);
     } else if (botConfig.platform === "teams") {

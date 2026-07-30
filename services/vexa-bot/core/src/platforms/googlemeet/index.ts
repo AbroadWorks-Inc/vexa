@@ -14,9 +14,10 @@ import { startGoogleRemovalMonitor } from "./removal";
 export async function handleGoogleMeet(
   botConfig: BotConfig,
   page: Page,
-  gracefulLeaveFunction: (page: Page | null, exitCode: number, reason: string, errorDetails?: any) => Promise<void>
+  gracefulLeaveFunction: (page: Page | null, exitCode: number, reason: string, errorDetails?: any) => Promise<void>,
+  afterAdmission?: (page: Page | null, botConfig: BotConfig) => Promise<void>
 ): Promise<void> {
-  
+
   // Google Meet is browser-based, so page is always non-null
   // Cast to satisfy PlatformStrategies interface which supports SDK-based platforms (Page | null)
   const strategies: PlatformStrategies = {
@@ -28,7 +29,8 @@ export async function handleGoogleMeet(
     prepare: prepareForRecording as any,
     startRecording: startGoogleRecording as any,
     startRemovalMonitor: startGoogleRemovalMonitor as any,
-    leave: leaveGoogleMeet
+    leave: leaveGoogleMeet,
+    afterAdmission,
   };
 
   await runMeetingFlow(

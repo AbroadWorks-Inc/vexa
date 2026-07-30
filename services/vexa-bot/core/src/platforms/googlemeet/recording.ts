@@ -745,9 +745,27 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             };
 
             const isBotStillInMeeting = (): boolean => {
-              // "Leave call" button is the most reliable signal — it's always visible while in a meeting
-              const leaveBtn = document.querySelector('button[aria-label*="Leave call"]');
-              return leaveBtn !== null;
+              // The in-call control bar (Leave call / mic / camera) AUTO-HIDES during
+              // presentation and idle, so keying "in meeting" off a single "Leave call"
+              // selector gives false negatives — this is what caused the screen-share
+              // early-exit bug (log: `0 tiles, inMeeting=false`). Instead: we are still
+              // in the meeting UNLESS the explicit "left / removed / rejoin" screen shows.
+              const bodyText = document.body ? document.body.innerText : '';
+              const leftScreen =
+                document.querySelector('button[aria-label*="Rejoin"]') !== null ||
+                document.querySelector('button[aria-label*="Ask to rejoin"]') !== null ||
+                document.querySelector('button[aria-label*="Return to home"]') !== null ||
+                /you left the meeting|you've been removed|removed you from the meeting|return to home screen/i.test(bodyText);
+              if (leftScreen) return false;
+              // Positive confirmation of a live call surface that survives toolbar hiding:
+              // participant tiles, the shared-screen/camera <video>, the meeting title,
+              // or the (possibly hidden) Leave button.
+              const onCallSurface =
+                document.querySelector('[data-participant-id]') !== null ||
+                document.querySelector('video') !== null ||
+                document.querySelector('[data-meeting-title]') !== null ||
+                document.querySelector('button[aria-label*="Leave call"]') !== null;
+              return onCallSurface;
             };
 
             (window as any).getGoogleMeetActiveParticipants = () => {
@@ -771,24 +789,26 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             (window as any).getGoogleMeetActiveParticipantsCount = () => {
               return (window as any).getGoogleMeetActiveParticipants().length;
             };
-            
+
+            // Detect an active presentation / screen-share. A share hides the participant
+            // tiles, so the "everyone left" finalize below must NOT treat tiles==0 as empty
+            // while a presentation is active (that was the old false-empty bug).
+            const isPresentationActive = () => {
+              if (
+                document.querySelector('button[aria-label*="Stop presenting"]') !== null ||
+                document.querySelector('[aria-label*="is presenting"]') !== null ||
+                document.querySelector('[aria-label*="Pin presentation"]') !== null ||
+                document.querySelector('[aria-label*="Unpin presentation"]') !== null
+              ) return true;
+              const bodyText = document.body ? document.body.innerText : '';
+              return /\bis presenting\b|you are presenting|presenting to everyone/i.test(bodyText);
+            };
+
             // Setup Google Meet meeting monitoring (browser context)
             const setupGoogleMeetingMonitoring = (botConfigData: any, audioService: any, resolve: any) => {
               (window as any).logBot("Setting up Google Meet meeting monitoring...");
               
-              const leaveCfg = (botConfigData && (botConfigData as any).automaticLeave) || {};
-              // Config values are in milliseconds, convert to seconds
-              const startupAloneTimeoutSeconds = leaveCfg.noOneJoinedTimeout
-                ? Math.floor(Number(leaveCfg.noOneJoinedTimeout) / 1000)
-                : Number(leaveCfg.startupAloneTimeoutSeconds ?? (20 * 60));
-              const everyoneLeftTimeoutSeconds = leaveCfg.everyoneLeftTimeout
-                ? Math.floor(Number(leaveCfg.everyoneLeftTimeout) / 1000)
-                : Number(leaveCfg.everyoneLeftTimeoutSeconds ?? 60);
-              
-              let aloneTime = 0;
-              let lastParticipantCount = 0;
-              let speakersIdentified = false;
-              let hasEverHadMultipleParticipants = false;
+              let lastParticipantCount = -1;
               let monitoringStopped = false;
 
               const stopWithFlush = async (
@@ -811,56 +831,39 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 finish();
               };
 
+              // POLICY: the bot records continuously and does NOT leave on transient blips
+              // or screen-share. It finalizes (leaves + produces the transcript) when the
+              // meeting is genuinely over: (a) everyone has left the room for a continuous
+              // grace period (below) — this is how the host hitting "Leave"/red on mobile
+              // still ends it, since mobile has no "End for everyone"; (b) explicit removal /
+              // meeting end (removal monitor + page teardown in meetingFlow.ts); or (c) the
+              // K8s hard deadline. The empty check uses the RAW tile count plus a presentation
+              // guard, so an active screen-share (which hides tiles) can never false-finalize.
+              let emptyTicks = 0;
+              const EMPTY_GRACE_TICKS = 90; // 90 x 1s = 90s continuous empty before finalizing
               const checkInterval = setInterval(() => {
-                // Check participant count using the comprehensive helper
-                const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount ? (window as any).getGoogleMeetActiveParticipantsCount() : 0;
-                
+                const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount
+                  ? (window as any).getGoogleMeetActiveParticipantsCount()
+                  : 0;
                 if (currentParticipantCount !== lastParticipantCount) {
-                  (window as any).logBot(`Participant check: Found ${currentParticipantCount} unique participants from central list.`);
+                  (window as any).logBot(`Participant check: ${currentParticipantCount} participant(s) visible.`);
                   lastParticipantCount = currentParticipantCount;
-                  
-                  // Track if we've ever had multiple participants
-                  if (currentParticipantCount > 1) {
-                    hasEverHadMultipleParticipants = true;
-                    speakersIdentified = true; // Once we see multiple participants, we've identified speakers
-                    (window as any).logBot("Speakers identified - switching to post-speaker monitoring mode");
-                  }
                 }
-
-                if (currentParticipantCount <= 1) {
-                  aloneTime++;
-                  
-                  // Determine timeout based on whether speakers have been identified
-                  const currentTimeout = speakersIdentified ? everyoneLeftTimeoutSeconds : startupAloneTimeoutSeconds;
-                  const timeoutDescription = speakersIdentified ? "post-speaker" : "startup";
-                  
-                  if (aloneTime >= currentTimeout) {
-                    if (speakersIdentified) {
-                      (window as any).logBot(`Google Meet meeting ended or bot has been alone for ${everyoneLeftTimeoutSeconds} seconds after speakers were identified. Stopping recorder...`);
-                      void stopWithFlush("left_alone_timeout", () =>
-                        reject(new Error("GOOGLE_MEET_BOT_LEFT_ALONE_TIMEOUT"))
-                      );
-                    } else {
-                      (window as any).logBot(`Google Meet bot has been alone for ${startupAloneTimeoutSeconds/60} minutes during startup with no other participants. Stopping recorder...`);
-                      void stopWithFlush("startup_alone_timeout", () =>
-                        reject(new Error("GOOGLE_MEET_BOT_STARTUP_ALONE_TIMEOUT"))
-                      );
-                    }
-                  } else if (aloneTime > 0 && aloneTime % 10 === 0) { // Log every 10 seconds to avoid spam
-                    if (speakersIdentified) {
-                      (window as any).logBot(`Bot has been alone for ${aloneTime} seconds (${timeoutDescription} mode). Will leave in ${currentTimeout - aloneTime} more seconds.`);
-                    } else {
-                      const remainingMinutes = Math.floor((currentTimeout - aloneTime) / 60);
-                      const remainingSeconds = (currentTimeout - aloneTime) % 60;
-                      (window as any).logBot(`Bot has been alone for ${aloneTime} seconds during startup. Will leave in ${remainingMinutes}m ${remainingSeconds}s.`);
-                    }
+                // Finalize-on-empty: RAW tile count (not the screen-share-guarded count) so a
+                // genuine empty is detected, but gated by isPresentationActive() so a share
+                // never false-triggers it. Grace period tolerates brief drops / a rejoin.
+                const rawTiles = countParticipantTiles();
+                const presenting = isPresentationActive();
+                if (rawTiles <= 1 && !presenting) {
+                  emptyTicks++;
+                  if (emptyTicks >= EMPTY_GRACE_TICKS) {
+                    (window as any).logBot(`All participants left (empty ${emptyTicks}s, no presentation) — finalizing meeting.`);
+                    void stopWithFlush("everyone_left", () => resolve());
+                  } else if (emptyTicks % 15 === 0) {
+                    (window as any).logBot(`Room empty ${emptyTicks}s (will finalize at ${EMPTY_GRACE_TICKS}s if it stays empty)...`);
                   }
                 } else {
-                  aloneTime = 0; // Reset if others are present
-                  if (hasEverHadMultipleParticipants && !speakersIdentified) {
-                    speakersIdentified = true;
-                    (window as any).logBot("Speakers identified - switching to post-speaker monitoring mode");
-                  }
+                  emptyTicks = 0;
                 }
               }, 1000);
 
