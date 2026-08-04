@@ -304,6 +304,43 @@ export class SegmentPublisher {
   }
 
   /**
+   * Publish a DOM-derived speaker event whose timestamp is ALREADY relative to
+   * session (audio) start in milliseconds.
+   *
+   * Unlike publishSpeakerEvent (which expects an absolute wall-clock timestamp and
+   * subtracts sessionStartMs), this writes the relative value verbatim, so it must
+   * NOT be re-offset. `eventType` is passed through and is expected to already be
+   * the collector's literal value ("SPEAKER_START" / "SPEAKER_END").
+   *
+   * Used to bridge the in-page __vexaSpeakerEvents timeline (roster + active
+   * speaker) into the speaker_events_relative stream that the aw-integration
+   * adapter reads to build speaker_timeline.json / participants.json.
+   *
+   * Errors are logged but do not throw.
+   */
+  async publishRelativeSpeakerEvent(
+    eventType: string,
+    participantName: string,
+    relativeTimestampMs: number,
+  ): Promise<void> {
+    try {
+      const client = await this.ensureConnected();
+
+      const fields: Record<string, string> = {
+        uid: this.sessionUid,
+        relative_client_timestamp_ms: String(Math.round(relativeTimestampMs)),
+        event_type: eventType,
+        participant_name: participantName,
+        meeting_id: this.meetingId,
+      };
+
+      await client.xAdd(this.speakerEventStreamKey, '*', fields);
+    } catch (err: any) {
+      log(`[SegmentPublisher] Failed to publish relative speaker event: ${err.message}`);
+    }
+  }
+
+  /**
    * Disconnect from Redis and clean up.
    */
   async close(): Promise<void> {

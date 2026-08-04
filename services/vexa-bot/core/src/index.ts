@@ -795,6 +795,36 @@ async function performGracefulLeave(
     log(`[Speaker Events] Failed to read: ${e?.message}`);
   }
 
+  // Bridge DOM-captured speaker events into the speaker_events_relative Redis stream
+  // BEFORE sending the terminal status callback (which triggers downstream artifact
+  // building). Without this, the in-page roster + active-speaker timeline is delivered
+  // ONLY via the HTTP status callback and is discarded by the aw-notetaker sidecar,
+  // leaving speaker_timeline.json / participants.json empty and transcripts stuck on
+  // SPEAKER_XX. The DOM relative_timestamp_ms is already relative to audio start, so it
+  // is published verbatim (see SegmentPublisher.publishRelativeSpeakerEvent).
+  if (speakerEvents.length > 0) {
+    const sp = getSegmentPublisher();
+    if (sp) {
+      let bridged = 0;
+      for (const ev of speakerEvents) {
+        const eventType = ev?.event_type;
+        const name = ev?.participant_name;
+        const relMs = ev?.relative_timestamp_ms;
+        if (
+          (eventType === "SPEAKER_START" || eventType === "SPEAKER_END") &&
+          typeof name === "string" && name.length > 0 &&
+          typeof relMs === "number"
+        ) {
+          await sp.publishRelativeSpeakerEvent(eventType, name, relMs);
+          bridged++;
+        }
+      }
+      log(`[Speaker Events] Bridged ${bridged}/${speakerEvents.length} events to speaker_events_relative`);
+    } else {
+      log(`[Speaker Events] No SegmentPublisher available; speaker events NOT bridged to Redis`);
+    }
+  }
+
   if (meetingApiCallbackUrl && currentConnectionId) {
     // Use unified callback for exit status
     const statusMapping = mapExitReasonToStatus(finalCallbackReason, finalCallbackExitCode);
