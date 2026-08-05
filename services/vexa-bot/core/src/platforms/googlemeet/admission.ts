@@ -69,6 +69,17 @@ export async function checkForGoogleAdmissionSilent(page: Page): Promise<boolean
   return await checkForGoogleAdmissionIndicators(page);
 }
 
+// Stability-confirmed admission check. Returns true only if the admission signal
+// PERSISTS across a short debounce. An early-join pre-meeting preview momentarily
+// shows meeting-like controls, so a single positive check false-fires "admitted"
+// (the root cause of the admission_false_positive early-join bailout). Fast-negative:
+// no delay is paid unless the first check is already positive, so polling stays cheap.
+export async function checkForGoogleAdmissionStable(page: Page, confirmMs = 1500): Promise<boolean> {
+  if (!(await checkForGoogleAdmissionIndicators(page))) return false;
+  await page.waitForTimeout(confirmMs);
+  return await checkForGoogleAdmissionIndicators(page);
+}
+
 // Helper function to check for waiting room indicators
 export async function checkForWaitingRoomIndicators(page: Page): Promise<boolean> {
   for (const waitingIndicator of googleWaitingRoomIndicators) {
@@ -102,7 +113,7 @@ export async function waitForGoogleMeetingAdmission(
     
     // Check for any visible admission indicator (multiple selectors for robustness)
     // If meeting controls are visible, the bot is admitted — lobby indicators are unreliable
-    const initialAdmissionFound = await checkForGoogleAdmissionIndicators(page);
+    const initialAdmissionFound = await checkForGoogleAdmissionStable(page);
 
     if (initialAdmissionFound) {
       log(`Found Google Meet admission indicator: visible meeting controls - Bot is already admitted to the meeting!`);
@@ -173,7 +184,7 @@ export async function waitForGoogleMeetingAdmission(
           }
 
           // Check for admission indicators since waiting room disappeared and no rejection found
-          const admissionFound = await checkForGoogleAdmissionIndicators(page);
+          const admissionFound = await checkForGoogleAdmissionStable(page);
 
           if (admissionFound) {
             log(`✅ Bot was admitted to the Google Meet meeting: meeting controls confirmed`);
@@ -220,7 +231,7 @@ export async function waitForGoogleMeetingAdmission(
 
         // Admission indicators — if meeting controls are visible, bot is admitted
         // regardless of any residual lobby-like elements in the DOM
-        const admissionFound = await checkForGoogleAdmissionIndicators(page);
+        const admissionFound = await checkForGoogleAdmissionStable(page);
         if (admissionFound) {
           log("✅ Bot admitted during polling window (meeting controls visible)");
           return true;
