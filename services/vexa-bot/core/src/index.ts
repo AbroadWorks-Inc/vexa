@@ -802,9 +802,19 @@ async function performGracefulLeave(
   // leaving speaker_timeline.json / participants.json empty and transcripts stuck on
   // SPEAKER_XX. The DOM relative_timestamp_ms is already relative to audio start, so it
   // is published verbatim (see SegmentPublisher.publishRelativeSpeakerEvent).
+  // NOTE: open a DEDICATED short-lived Redis client here. The shared segmentPublisher
+  // is null in the batch-WhisperX config (and redisPublisher is already quit earlier in
+  // this graceful-leave sequence), so relying on them silently dropped every event
+  // ("No SegmentPublisher available"). uid must equal the session uid the adapter filters
+  // on = connectionId; meeting_id is best-effort (adapter doesn't filter on it).
   if (speakerEvents.length > 0) {
-    const sp = getSegmentPublisher();
-    if (sp) {
+    const bridgeRedisUrl = currentRedisUrl || process.env.REDIS_URL || "redis://localhost:6379";
+    const bridgeUid = currentConnectionId || "";
+    const bridgeMeetingId = currentBotConfig?.meeting_id != null ? String(currentBotConfig.meeting_id) : "";
+    let bridgeClient: RedisClientType | null = null;
+    try {
+      bridgeClient = createClient({ url: bridgeRedisUrl }) as RedisClientType;
+      await bridgeClient.connect();
       let bridged = 0;
       for (const ev of speakerEvents) {
         const eventType = ev?.event_type;
@@ -815,13 +825,21 @@ async function performGracefulLeave(
           typeof name === "string" && name.length > 0 &&
           typeof relMs === "number"
         ) {
-          await sp.publishRelativeSpeakerEvent(eventType, name, relMs);
+          await bridgeClient.xAdd("speaker_events_relative", "*", {
+            uid: bridgeUid,
+            relative_client_timestamp_ms: String(Math.round(relMs)),
+            event_type: eventType,
+            participant_name: name,
+            meeting_id: bridgeMeetingId,
+          });
           bridged++;
         }
       }
-      log(`[Speaker Events] Bridged ${bridged}/${speakerEvents.length} events to speaker_events_relative`);
-    } else {
-      log(`[Speaker Events] No SegmentPublisher available; speaker events NOT bridged to Redis`);
+      log(`[Speaker Events] Bridged ${bridged}/${speakerEvents.length} events to speaker_events_relative (uid=${bridgeUid})`);
+    } catch (e: any) {
+      log(`[Speaker Events] Bridge to Redis FAILED: ${e?.message || e}`);
+    } finally {
+      try { if (bridgeClient && bridgeClient.isOpen) await bridgeClient.quit(); } catch {}
     }
   }
 

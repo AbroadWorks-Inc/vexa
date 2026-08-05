@@ -840,6 +840,13 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               // K8s hard deadline. The empty check uses the RAW tile count plus a presentation
               // guard, so an active screen-share (which hides tiles) can never false-finalize.
               let emptyTicks = 0;
+              let notStartedTicks = 0;
+              // The "everyone left" finalize must only arm AFTER the meeting has genuinely
+              // started (>=1 other participant, or someone presenting). Before that, the bot
+              // has joined early and is waiting alone: rawTiles<=1 means "not started yet",
+              // NOT "everyone left". Without this guard the 90s empty grace fired on an
+              // early-joining bot and completed the pod before the meeting ever started.
+              let meetingHasStarted = false;
               const EMPTY_GRACE_TICKS = 90; // 90 x 1s = 90s continuous empty before finalizing
               const checkInterval = setInterval(() => {
                 const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount
@@ -854,16 +861,31 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 // never false-triggers it. Grace period tolerates brief drops / a rejoin.
                 const rawTiles = countParticipantTiles();
                 const presenting = isPresentationActive();
+                // Arm the finalize only once the meeting is genuinely underway.
+                if (!meetingHasStarted && (rawTiles >= 2 || presenting)) {
+                  meetingHasStarted = true;
+                  (window as any).logBot(`Meeting has started (participants present) — empty-room finalize is now armed.`);
+                }
                 if (rawTiles <= 1 && !presenting) {
-                  emptyTicks++;
-                  if (emptyTicks >= EMPTY_GRACE_TICKS) {
-                    (window as any).logBot(`All participants left (empty ${emptyTicks}s, no presentation) — finalizing meeting.`);
-                    void stopWithFlush("everyone_left", () => resolve());
-                  } else if (emptyTicks % 15 === 0) {
-                    (window as any).logBot(`Room empty ${emptyTicks}s (will finalize at ${EMPTY_GRACE_TICKS}s if it stays empty)...`);
+                  if (!meetingHasStarted) {
+                    // Joined early; meeting not started. Keep waiting — do NOT finalize.
+                    emptyTicks = 0;
+                    notStartedTicks++;
+                    if (notStartedTicks % 30 === 0) {
+                      (window as any).logBot(`Waiting for the meeting to start — bot alone ${notStartedTicks}s (will not finalize until the meeting has begun).`);
+                    }
+                  } else {
+                    emptyTicks++;
+                    if (emptyTicks >= EMPTY_GRACE_TICKS) {
+                      (window as any).logBot(`All participants left (empty ${emptyTicks}s, no presentation) — finalizing meeting.`);
+                      void stopWithFlush("everyone_left", () => resolve());
+                    } else if (emptyTicks % 15 === 0) {
+                      (window as any).logBot(`Room empty ${emptyTicks}s (will finalize at ${EMPTY_GRACE_TICKS}s if it stays empty)...`);
+                    }
                   }
                 } else {
                   emptyTicks = 0;
+                  notStartedTicks = 0;
                 }
               }, 1000);
 
