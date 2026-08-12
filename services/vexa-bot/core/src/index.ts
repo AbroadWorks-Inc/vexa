@@ -27,6 +27,7 @@ import { TranscriptionClient } from './services/transcription-client';
 import { SegmentPublisher } from './services/segment-publisher';
 import { SpeakerStreamManager } from './services/speaker-streams';
 import { resolveSpeakerName, clearSpeakerNameCache, isTrackLocked, isNameTaken, reportTrackAudio, getLockedMapping } from './services/speaker-identity';
+import { createSpeakerBoundaryTracker, SpeakerBoundaryTracker } from './services/speaker-boundaries';
 import { SileroVAD } from './services/vad';
 import { isHallucination } from './services/hallucination-filter';
 import { SpeakerStreamHandle } from './services/audio';
@@ -1199,30 +1200,50 @@ async function initVoiceAgentServices(
 // ==================== Per-Speaker Transcription Pipeline ====================
 
 /**
- * Initialize the per-speaker transcription pipeline (Node.js side).
- * Creates TranscriptionClient, SegmentPublisher, and SpeakerStreamManager.
+ * Initialize the per-speaker pipeline (Node.js side).
+ *
+ * Two INDEPENDENT phases:
+ *
+ *  1. **Identity phase** (always runs, needs only a Redis URL) — creates
+ *     SegmentPublisher, SpeakerStreamManager, VAD and telemetry. This is what
+ *     produces the `speaker_events_relative` timeline that aw-integration turns
+ *     into `speaker_timeline.json`, so it MUST run for post-hoc (worker-side)
+ *     transcription where no live transcription service exists.
+ *  2. **Live-transcription phase** (optional) — creates TranscriptionClient only
+ *     when a transcription service URL is configured.
+ *
+ * Historically both phases were gated on `transcriptionServiceUrl`, which meant
+ * AW's post-hoc pipeline (orchestrator never sets `transcriptionServiceUrl`)
+ * silently disabled the whole speaker-identity subsystem and every Meet
+ * transcript fell back to `SPEAKER_NN`.
+ *
  * Must be called before `startPerSpeakerAudioCapture()`.
+ *
+ * @returns true when the identity phase came up (live transcription may still be off).
  */
 async function initPerSpeakerPipeline(botConfig: BotConfig): Promise<boolean> {
-  const transcriptionServiceUrl = botConfig.transcriptionServiceUrl || process.env.TRANSCRIPTION_SERVICE_URL;
-  if (!transcriptionServiceUrl) {
-    log('[PerSpeaker] WARNING: transcriptionServiceUrl not in config and TRANSCRIPTION_SERVICE_URL not set. Per-speaker transcription disabled.');
-    return false;
-  }
-
   const meetingId = botConfig.meeting_id;
+  const redisUrl = botConfig.redisUrl || process.env.REDIS_URL || 'redis://localhost:6379';
 
   try {
-    transcriptionClient = new TranscriptionClient({
-      serviceUrl: transcriptionServiceUrl,
-      apiToken: botConfig.transcriptionServiceToken || process.env.TRANSCRIPTION_SERVICE_TOKEN,
-      maxSpeechDurationSec: process.env.MAX_SPEECH_DURATION_SEC ? parseFloat(process.env.MAX_SPEECH_DURATION_SEC) : undefined,
-      minSilenceDurationMs: process.env.MIN_SILENCE_DURATION_MS ? parseInt(process.env.MIN_SILENCE_DURATION_MS) : 100,
-    });
-    log('[PerSpeaker] TranscriptionClient created');
+    // ── Live-transcription phase (OPTIONAL) ───────────────────────────────
+    const transcriptionServiceUrl = botConfig.transcriptionServiceUrl || process.env.TRANSCRIPTION_SERVICE_URL;
+    if (transcriptionServiceUrl) {
+      transcriptionClient = new TranscriptionClient({
+        serviceUrl: transcriptionServiceUrl,
+        apiToken: botConfig.transcriptionServiceToken || process.env.TRANSCRIPTION_SERVICE_TOKEN,
+        maxSpeechDurationSec: process.env.MAX_SPEECH_DURATION_SEC ? parseFloat(process.env.MAX_SPEECH_DURATION_SEC) : undefined,
+        minSilenceDurationMs: process.env.MIN_SILENCE_DURATION_MS ? parseInt(process.env.MIN_SILENCE_DURATION_MS) : 100,
+      });
+      log('[PerSpeaker] TranscriptionClient created (live transcription enabled)');
+    } else {
+      transcriptionClient = null;
+      log('[PerSpeaker] WARNING: transcriptionServiceUrl not in config and TRANSCRIPTION_SERVICE_URL not set. Live per-speaker transcription disabled — speaker-identity pipeline still runs.');
+    }
 
+    // ── Identity phase (ALWAYS — needs only Redis) ────────────────────────
     segmentPublisher = new SegmentPublisher({
-      redisUrl: botConfig.redisUrl || process.env.REDIS_URL || 'redis://localhost:6379',
+      redisUrl,
       meetingId: String(meetingId),
       token: botConfig.token,
       sessionUid: botConfig.connectionId || `bot-${Date.now()}`,
@@ -1485,6 +1506,67 @@ let lastParticipantCount = 0;
 /** Per-speaker last audio received timestamp (Node.js side) — for silence monitoring */
 const speakerLastAudioMs: Map<string, number> = new Map();
 
+// ─── Audio-derived speaker boundaries (CSS-INDEPENDENT) ──────────────────────
+// The state machine itself lives in services/speaker-boundaries.ts so it can be
+// unit-tested with no browser (this module imports playwright-extra at top level,
+// which makes it unloadable from a plain `tsx` run). Only the wiring lives here.
+//
+// Why the machine exists, and why the arming gate exists, is documented on the
+// module. Do not duplicate that reasoning here.
+
+/**
+ * The single production tracker. Its injected closures read `segmentPublisher` /
+ * `speakerManager` at CALL time, not construction time, so this can be built at
+ * module init even though both are late-bound by initPerSpeakerPipeline().
+ */
+const speakerBoundaries: SpeakerBoundaryTracker = createSpeakerBoundaryTracker({
+  log,
+  /**
+   * `timestampMs` is ABSOLUTE (Date.now() domain); SegmentPublisher subtracts
+   * `sessionStartMs`, which is already aligned to the recorded WAV zero for GMeet
+   * (reset post-admission in googlemeet/recording.ts:26 and re-aligned to
+   * MediaRecorder start via __vexaRecordingStarted at :116). Do not introduce a
+   * second time origin here.
+   */
+  publish: async (type, speaker, timestampMs) => {
+    if (!segmentPublisher) return;
+    // Clamp to the session origin. Audio can legitimately arrive before recording
+    // begins (capture is started from the admission callback, recording slightly
+    // later), and a negative relative offset would sort ahead of every transcript
+    // segment and corrupt the mapping.
+    const safeTs = Math.max(timestampMs, segmentPublisher.sessionStartMs);
+    await segmentPublisher.publishSpeakerEvent({ speaker, type, timestamp: safeTs });
+  },
+  resolveName: (trackIndex) => {
+    if (!speakerManager) return '';
+    return speakerManager.getSpeakerName(`speaker-${trackIndex}`) || '';
+  },
+});
+
+/**
+ * Signal that the session time origin is aligned to the recording, so buffered
+ * speaker boundaries may be published. Idempotent; safe to call more than once.
+ *
+ * Imported by platforms/googlemeet/recording.ts — keep this export.
+ */
+export function armSpeakerBoundaries(): void {
+  speakerBoundaries.arm();
+}
+
+/** Record audio activity for a track, opening a new utterance on a silent→speaking edge. */
+function markTrackAudioActivity(trackIndex: number, atMs: number): void {
+  speakerBoundaries.markTrackAudioActivity(trackIndex, atMs);
+}
+
+function startSpeakerBoundarySweep(): void {
+  speakerBoundaries.startSweep();
+}
+
+/** Stop the sweep and close every still-open utterance so no track is left unterminated. */
+async function stopSpeakerBoundarySweep(): Promise<void> {
+  await speakerBoundaries.stopSweep();
+}
+
 /** Check if a name is already assigned to a different speaker in the SpeakerStreamManager. */
 function isDuplicateSpeakerName(name: string, excludeSpeakerId: string): boolean {
   if (!speakerManager) return false;
@@ -1507,6 +1589,12 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
     : currentPlatform === 'teams' ? 'msteams'
     : currentPlatform || 'unknown';
 
+  // Hoisted: GMeet now derives its speaker timeline from audio-activity boundaries
+  // (markTrackAudioActivity + the sweep), so the legacy per-resolution `joined`
+  // events below are suppressed for GMeet only. Zoom/Teams keep their existing
+  // roster-announcement behaviour untouched.
+  const isGMeet = currentPlatform === 'google_meet';
+
   // ─── GMeet / Teams / Zoom: voting + locking ────────────────────────────────
   // All three platforms use the shared resolveSpeakerName() pipeline with
   // per-platform DOM resolvers (resolveGoogleMeetSpeakerName,
@@ -1526,7 +1614,9 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
     log(`[🎙️ SPEAKER ACTIVE] Track ${speakerIndex} → "${safeName || '(unmapped)'}" — streaming audio`);
     speakerManager.addSpeaker(speakerId, safeName);
     lastReResolveTime.set(speakerId, Date.now());
-    if (safeName) {
+    // GMeet: suppressed — a `joined` event maps to SPEAKER_START with no matching
+    // END, which corrupts the audio-derived timeline. Boundaries come from the sweep.
+    if (safeName && !isGMeet) {
       await segmentPublisher.publishSpeakerEvent({
         speaker: safeName,
         type: 'joined',
@@ -1548,7 +1638,7 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
       if (lockedName && lockedName !== currentName) {
         log(`[🔒 LOCK SYNC] Track ${speakerIndex}: "${currentName}" → "${lockedName}" (syncing locked name to buffer)`);
         speakerManager.updateSpeakerName(speakerId, lockedName);
-        if (!currentName) {
+        if (!currentName && !isGMeet) {
           await segmentPublisher.publishSpeakerEvent({
             speaker: lockedName,
             type: 'joined',
@@ -1592,12 +1682,14 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
       if (newName && newName !== currentName && !isDuplicateSpeakerName(newName, speakerId)) {
         log(`[🔄 SPEAKER MAPPED] Track ${speakerIndex}: "${currentName}" → "${newName}"`);
         speakerManager.updateSpeakerName(speakerId, newName);
-        await segmentPublisher.publishSpeakerEvent({
-          speaker: newName,
-          type: 'joined',
-          timestamp: Date.now(),
-        });
-        log(`[📡 SPEAKER EVENT] "${newName}" joined → Redis`);
+        if (!isGMeet) {
+          await segmentPublisher.publishSpeakerEvent({
+            speaker: newName,
+            type: 'joined',
+            timestamp: Date.now(),
+          });
+          log(`[📡 SPEAKER EVENT] "${newName}" joined → Redis`);
+        }
       }
 
       // Fallback: if unmapped for 15s+ and GMeet, assign by participant list order.
@@ -1622,11 +1714,13 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
               if (fallbackName && !isDuplicateSpeakerName(fallbackName, speakerId)) {
                 log(`[🔄 SPEAKER FALLBACK] Track ${speakerIndex}: assigning "${fallbackName}" by participant order (no votes after 15s)`);
                 speakerManager.updateSpeakerName(speakerId, fallbackName);
-                await segmentPublisher.publishSpeakerEvent({
-                  speaker: fallbackName,
-                  type: 'joined',
-                  timestamp: Date.now(),
-                });
+                if (!isGMeet) {
+                  await segmentPublisher.publishSpeakerEvent({
+                    speaker: fallbackName,
+                    type: 'joined',
+                    timestamp: Date.now(),
+                  });
+                }
               }
             }
           } catch {}
@@ -1639,7 +1733,7 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
   // Filters ambient noise BEFORE feedAudio() so lastAudioTimestamp only updates
   // on real speech. This lets the 15s idle timeout fire correctly when a speaker
   // stops talking but their mic still emits low-level room noise.
-  const isGMeet = currentPlatform === 'google_meet';
+  // (`isGMeet` is hoisted to the top of this function.)
   if (isGMeet && vadModel) {
     // Get or create per-speaker VAD state
     if (!vadSpeakerStates.has(speakerId)) {
@@ -1658,6 +1752,13 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
   // Track audio arrival for silence monitoring (only reached for real speech)
   const prevMs = speakerLastAudioMs.get(speakerId);
   const nowMs = Date.now();
+
+  // Audio-derived speaker boundaries (GMeet only). Deliberately placed AFTER the
+  // VAD gate so ambient room noise cannot open a spurious utterance. The sweep
+  // closes it once audio stops for `silenceHangoverMs`.
+  if (isGMeet) {
+    markTrackAudioActivity(speakerIndex, nowMs);
+  }
   if (prevMs && (nowMs - prevMs) > 30000) {
     const speakerName = speakerManager.getSpeakerName(speakerId) || speakerId;
     log(`[🔊 AUDIO RESUMED] ${speakerName} — audio arrived after ${((nowMs - prevMs) / 1000).toFixed(0)}s silence`);
@@ -1677,6 +1778,12 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
  * Tear down the per-speaker transcription pipeline and release resources.
  */
 async function cleanupPerSpeakerPipeline(): Promise<void> {
+  // Close any open speaker boundary FIRST — this still needs both `speakerManager`
+  // (to resolve names) and `segmentPublisher` (to publish), and both are torn down
+  // further below. Ordering matters: moving this later silently drops the final
+  // SPEAKER_END of every track that was still talking when the meeting ended.
+  await stopSpeakerBoundarySweep();
+
   // Clear telemetry interval
   if (pipelineTelemetryInterval) {
     clearInterval(pipelineTelemetryInterval);
@@ -1867,6 +1974,10 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
     }
   }
 
+  // Begin closing utterances that fall silent. Safe to call repeatedly (no-ops if
+  // already running). Stopped and flushed during per-speaker teardown.
+  startSpeakerBoundarySweep();
+
   // Set up per-speaker audio streams inside the browser using raw Web Audio API
   const handleCount = await pageToCaptureFrom.evaluate(async () => {
     const TARGET_SAMPLE_RATE = 16000;
@@ -1899,12 +2010,153 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
     const streamLastActive = new Map<number, number>();
     let nextStreamIndex = 0;
 
+    // ── Track → media element registry (for CSS-independent name resolution) ──
+    // Only this scope holds the live HTMLMediaElement per track, so the
+    // element→tile walk that backs __vexaGetTrackTileInfo must live here.
+    const trackElements = new Map<number, HTMLMediaElement>();
+    const tileMatchLogged = new Set<number>();
+
+    /** Read a participant name from STABLE SEMANTIC attributes only — never CSS classes. */
+    function readSemanticName(node: Element | null): string | null {
+      if (!node) return null;
+      try {
+        const el = node as HTMLElement;
+        const selfName = el.getAttribute('data-self-name');
+        if (selfName && selfName.trim()) return selfName.trim();
+        const aria = el.getAttribute('aria-label');
+        if (aria && aria.trim()) return aria.trim();
+        const tooltip = el.getAttribute('data-tooltip');
+        if (tooltip && tooltip.trim()) return tooltip.trim();
+        // Fall back to a descendant carrying one of those attributes.
+        const inner = el.querySelector('[data-self-name],[aria-label],[data-tooltip]');
+        if (inner && inner !== el) return readSemanticName(inner);
+        return null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Resolve a track index to its participant tile by walking UP from the bound
+     * media element. This is the durable path: it uses DOM structure + semantic
+     * attributes, so a Google Meet CSS class rotation cannot break it.
+     */
+    /**
+     * DIAGNOSTIC ONLY — no behaviour depends on this.
+     *
+     * The live run of 2026-08-12 logged `[TrackTile] Track N → name=null
+     * strategy=none participantId=null` for EVERY track: even
+     * `closest('[data-participant-id]')` matched nothing, so we do not actually
+     * know how Meet binds a media element to its participant tile. This dumps the
+     * real ancestor chain so the binding can be derived from facts.
+     *
+     * Attribute NAMES are always safe to log; VALUES are logged only for `data-*`
+     * and `aria-label` (the semantic surface we resolve names from), truncated.
+     * Strictly once per track index — never per audio chunk.
+     */
+    const tileDebugLogged = new Set<number>();
+    function dumpTileDebug(trackIndex: number, el: HTMLMediaElement): void {
+      if (tileDebugLogged.has(trackIndex)) return;
+      tileDebugLogged.add(trackIndex);
+      const emit = (window as any).logBot;
+      if (typeof emit !== 'function') return;
+      try {
+        const trunc = (v: string | null): string =>
+          v == null ? 'null' : (v.length > 80 ? `${v.slice(0, 80)}…` : v);
+        const describe = (node: Element, depth: number): string => {
+          const names: string[] = [];
+          const shown: string[] = [];
+          for (const attr of Array.from(node.attributes)) {
+            names.push(attr.name);
+            if (attr.name === 'aria-label' || attr.name.startsWith('data-')) {
+              shown.push(`${attr.name}="${trunc(attr.value)}"`);
+            }
+          }
+          const hasId = node.hasAttribute('id');
+          const hasClass = node.hasAttribute('class');
+          return `    [${depth}] <${node.tagName.toLowerCase()}> id=${hasId} class=${hasClass}`
+            + ` attrs=[${names.join(',')}]`
+            + (shown.length ? ` values={${shown.join(' ')}}` : '');
+        };
+
+        const lines: string[] = [`[TrackTileDebug] Track ${trackIndex} ancestor chain:`];
+        lines.push(describe(el, 0));
+        let node: Element | null = el.parentElement;
+        for (let depth = 1; node && depth <= 8; depth++) {
+          lines.push(describe(node, depth));
+          node = node.parentElement;
+        }
+        emit(lines.join('\n'));
+      } catch {
+        // Diagnostics must never break name resolution.
+      }
+    }
+
+    (window as any).__vexaGetTrackTileInfo = (trackIndex: number) => {
+      try {
+        const el = trackElements.get(trackIndex);
+        if (!el) return null;
+        dumpTileDebug(trackIndex, el);
+
+        // Strategy 1 — containment: nearest ancestor bound to a participant.
+        let container: Element | null = el.closest('[data-participant-id]');
+        let matched: string | null = container ? 'containment' : null;
+        if (!container) {
+          container = el.closest('[data-requested-participant-id],[data-self-name]');
+          if (container) matched = 'containment';
+        }
+
+        let participantId: string | null = container
+          ? (container.getAttribute('data-participant-id')
+            || container.getAttribute('data-requested-participant-id'))
+          : null;
+        let name = readSemanticName(container);
+
+        // Strategy 2 — participant-id cross-lookup: we know WHO but the enclosing
+        // node carries no name, so find the tile elsewhere in the DOM that does.
+        if (!name && participantId) {
+          const escaped = (window as any).CSS?.escape
+            ? (window as any).CSS.escape(participantId)
+            : participantId.replace(/["\\]/g, '\\$&');
+          const tile = document.querySelector(`[data-participant-id="${escaped}"]`);
+          const viaId = readSemanticName(tile);
+          if (viaId) {
+            name = viaId;
+            matched = 'participant-id';
+          }
+        }
+
+        if (!tileMatchLogged.has(trackIndex)) {
+          tileMatchLogged.add(trackIndex);
+          (window as any).logBot?.(
+            `[TrackTile] Track ${trackIndex} → name=${name ? `"${name}"` : 'null'} strategy=${matched || 'none'} participantId=${participantId ? 'present' : 'null'}`
+          );
+        }
+
+        return { participantId: participantId || null, name: name || null, matched };
+      } catch {
+        return null;
+      }
+    };
+
+    /** trackIndex → last-audio epoch ms. Feeds audio-derived speaking correlation. */
+    (window as any).__vexaGetTrackActivity = () => {
+      const out: Record<number, number> = {};
+      try {
+        streamLastActive.forEach((ts, idx) => { out[idx] = ts; });
+      } catch {}
+      return out;
+    };
+
     function connectElement(el: HTMLMediaElement, index: number): boolean {
       try {
         const stream: MediaStream = (el as any).srcObject;
         if (!stream || stream.getAudioTracks().length === 0) return false;
         const streamId = stream.id;
         if (connectedStreamIds.has(streamId)) return false;
+
+        // Register before wiring so tile lookup works from the first audio chunk.
+        trackElements.set(index, el);
 
         const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
         const source = ctx.createMediaStreamSource(stream);

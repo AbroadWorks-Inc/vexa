@@ -231,6 +231,45 @@ class TestBuildSpeakerTimeline:
         # fixture has 2 SPEAKER_START events (Alice and Bob)
         assert len(result.speaker_timeline) == 2
 
+    def test_speaker_timeline_is_sorted_when_events_are_published_late(
+        self, tmp_path: Path
+    ) -> None:
+        """Retroactively published SPEAKER_STARTs must not break timeline ordering.
+
+        The bot emits an utterance's START with its ORIGINAL onset even when the
+        speaker's name only resolves seconds later (vote/lock, or the 15s
+        roster-order fallback). Redis returns insertion order via xrange, so the
+        stream can carry an earlier onset AFTER a later one. Consumers attribute a
+        transcript segment to the last event with relative_sec <= segment.start,
+        which is only correct if the timeline is monotonic.
+        """
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), with_speaker_events=True
+        )
+        # Insertion order deliberately inverted vs. chronological order.
+        adapter._session.speaker_events = [
+            VexaSpeakerEvent(
+                uid="conn-abc123def456",
+                relative_ms=9000,
+                event_type="SPEAKER_START",
+                participant_name="Bob Müller",
+                meeting_id="42",
+            ),
+            VexaSpeakerEvent(
+                uid="conn-abc123def456",
+                relative_ms=1000,  # earlier onset, published later
+                event_type="SPEAKER_START",
+                participant_name="Alice Chen",
+                meeting_id="42",
+            ),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        relatives = [e.relative_sec for e in result.speaker_timeline]
+        assert relatives == sorted(relatives), f"timeline not monotonic: {relatives}"
+        assert result.speaker_timeline[0].speaker_name == "Alice Chen"
+
     def test_timestamp_ms_is_origin_plus_relative_ms(self, tmp_path: Path) -> None:
         adapter, _, _ = make_adapter(
             tmp_path, pcm_bytes=bytes(32000), with_speaker_events=True

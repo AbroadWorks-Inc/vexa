@@ -132,7 +132,21 @@ class VexaSessionAdapter:
         timeline_events: list[SpeakerEvent] = []
         if session.speaker_events:
             origin_ms = int(session.session_start_ts.timestamp() * 1000)
-            for ev in session.speaker_events:
+            # Sort by relative time, NOT Redis insertion order.
+            #
+            # The bot may publish a SPEAKER_START retroactively: an utterance whose
+            # onset is known immediately but whose speaker name only resolves later
+            # (vote/lock, or the 15s roster-order fallback) is emitted with its
+            # ORIGINAL onset, and therefore lands in the stream after events that
+            # started later. `xrange` returns insertion order, so iterating it
+            # directly yields a timeline that is non-monotonic in `relative_sec`.
+            #
+            # Consumers map a transcript segment to the last event with
+            # `relative_sec <= segment.start`, which assumes chronological order.
+            # The notetaker-worker does sort defensively, but this artifact must be
+            # correct on its own rather than depending on that.
+            ordered_events = sorted(session.speaker_events, key=lambda e: e.relative_ms)
+            for ev in ordered_events:
                 if ev.event_type != "SPEAKER_START":
                     continue
                 timeline_events.append(

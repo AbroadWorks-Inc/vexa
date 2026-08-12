@@ -16,6 +16,15 @@ import { log } from '../utils';
  * 3. Locked mappings are never re-evaluated (the mapping is static).
  * 4. If a name is already taken by another track (locked OR leading votes),
  *    don't return it — enforce one-name-per-track, one-track-per-name always.
+ *
+ * "Taken" deliberately includes LEADING VOTES, not just locks. Locks alone are
+ * not enough: `clearSpeakerNameCache()` fires on every participant-count change,
+ * and in the window after it nothing is locked yet, so a locks-only test lets two
+ * tracks resolve to the same person. That happened in production on 2026-08-12
+ * (tracks 0 and 2 both bound to one participant), which did not corrupt the names
+ * but badly skewed `speaker_timeline.json` and therefore misattributed speech.
+ * See `claimedNameForTrack` for the exact definition and `speaker-attribution.test.ts`
+ * for the regression guard.
  */
 
 // ─── Track→Speaker Mapping ───────────────────────────────────────────────────
@@ -36,12 +45,59 @@ const LOCK_RATIO = 0.7;
 const trackLastAudioMs = new Map<number, number>();
 
 /**
+ * `trackIndex:name` pairs already reported as refused, so a refusal is logged once
+ * and never per audio chunk. Bounded by tracks × roster size.
+ */
+const claimRefusalLogged = new Set<string>();
+
+/**
+ * The name a track currently believes itself to be: its locked name, or — if not
+ * yet locked — the top of its vote tally.
+ *
+ * The sort expression here is deliberately IDENTICAL to the one every resolver
+ * return path uses (`Array.from(votes.entries()).sort((a, b) => b[1] - a[1])`), so
+ * "the name this track would hand out" and "the name this track claims" can never
+ * disagree — including on ties, where V8's stable sort makes both pick the
+ * first-voted name. Each track therefore claims at most ONE name at a time, which
+ * is what keeps the guard from over-blocking.
+ *
+ * @param trackIndex Audio track index.
+ * @returns The claimed name, or null if the track has neither a lock nor any vote.
+ */
+function claimedNameForTrack(trackIndex: number): string | null {
+  const locked = lockedMappings.get(trackIndex);
+  if (locked) return locked;
+
+  const votes = trackVotes.get(trackIndex);
+  if (!votes || votes.size === 0) return null;
+
+  return Array.from(votes.entries()).sort((a, b) => b[1] - a[1])[0][0];
+}
+
+/**
  * Check if a name is already taken by another track.
- * "Taken" means locked to another track.
+ *
+ * "Taken" means another track has CLAIMED it — either locked to it permanently, or
+ * currently leading that track's vote tally. The leading-vote half is essential:
+ * `clearSpeakerNameCache()` wipes all locks on any participant-count change, so a
+ * locks-only test is blind precisely in the window where collisions happen.
+ *
+ * Because votes are wiped alongside locks, claims rebuild from scratch after a
+ * clear — which is what allows Google Meet's genuine track reassignment to take
+ * effect — but the FIRST vote a track casts re-establishes its claim immediately,
+ * so no second track can pile onto the same name inside that window.
+ *
+ * @param name Candidate display name.
+ * @param excludeTrackIndex Track asking the question; its own claim never blocks it.
  */
 export function isNameTaken(name: string, excludeTrackIndex?: number): boolean {
   for (const [idx, lockedName] of lockedMappings) {
     if (idx !== excludeTrackIndex && lockedName === name) return true;
+  }
+  for (const idx of trackVotes.keys()) {
+    if (idx === excludeTrackIndex) continue;
+    if (lockedMappings.has(idx)) continue; // its locked name was already checked above
+    if (claimedNameForTrack(idx) === name) return true;
   }
   return false;
 }
@@ -55,8 +111,17 @@ export function recordTrackVote(trackIndex: number, speakerName: string, weight:
   // Already locked — nothing to do
   if (lockedMappings.has(trackIndex)) return;
 
-  // Don't vote for a name already locked to another track
-  if (isNameTaken(speakerName, trackIndex)) return;
+  // Don't vote for a name another track has already claimed (locked OR leading).
+  // Logged once per track+name so a wrongly-held claim is diagnosable from the bot
+  // log without ever logging per audio chunk.
+  if (isNameTaken(speakerName, trackIndex)) {
+    const key = `${trackIndex}:${speakerName}`;
+    if (!claimRefusalLogged.has(key)) {
+      claimRefusalLogged.add(key);
+      log(`[SpeakerIdentity] Track ${trackIndex} vote for "${speakerName}" refused — claimed by another track`);
+    }
+    return;
+  }
 
   if (!trackVotes.has(trackIndex)) {
     trackVotes.set(trackIndex, new Map());
@@ -163,6 +228,57 @@ async function queryBrowserState(
   }
 }
 
+/** Which layer resolved each track — logged once per track, never per audio chunk. */
+const resolutionLogged = new Set<number>();
+/** Tracks whose full-cascade failure has been reported once. */
+const allLayersFailedLogged = new Set<number>();
+
+function logResolution(trackIndex: number, name: string, layer: string): void {
+  if (resolutionLogged.has(trackIndex)) return;
+  resolutionLogged.add(trackIndex);
+  log(`[NameResolve] Track ${trackIndex} → "${name}" via layer=${layer}`);
+}
+
+/**
+ * Layer 2 query: resolve a track to its participant tile name by walking UP from
+ * the bound media element (see __vexaGetTrackTileInfo in index.ts).
+ *
+ * Feature-detected: the in-page helper only exists in images carrying the
+ * audio-activity attribution change, so an older bundle simply yields null and
+ * the caller falls through to the remaining layers.
+ */
+async function queryTrackTileName(
+  page: Page,
+  trackIndex: number,
+  botName?: string,
+): Promise<string | null> {
+  try {
+    const info = await page.evaluate((idx: number) => {
+      const fn = (window as any).__vexaGetTrackTileInfo;
+      if (typeof fn !== 'function') return null;
+      try {
+        return fn(idx) as { participantId: string | null; name: string | null; matched: string | null } | null;
+      } catch {
+        return null;
+      }
+    }, trackIndex);
+
+    const name = info?.name?.trim();
+    if (!name) return null;
+    if (isJunkName(name)) return null;
+
+    // Never attribute a track to the bot itself.
+    const selfLower = (botName || 'Vexa Bot').toLowerCase();
+    const lower = name.toLowerCase();
+    if (lower.includes(selfLower) || selfLower.includes(lower)) return null;
+
+    return name;
+  } catch (err: any) {
+    log(`[SpeakerIdentity] Track-tile query failed: ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Main Resolution ─────────────────────────────────────────────────────────
 
 /**
@@ -177,21 +293,56 @@ async function resolveGoogleMeetSpeakerName(
   elementIndex: number,
   botName?: string,
 ): Promise<string | null> {
-  // Locked → permanent, instant return
+  // ── Layer 1: locked → permanent, instant return ───────────────────────────
   const locked = getLockedMapping(elementIndex);
   if (locked) return locked;
+
+  // ── Layer 2: direct tile containment (DURABLE — no CSS classes involved) ───
+  // Walks up from the actual HTMLMediaElement bound to this track to its
+  // participant tile and reads a semantic attribute. This is the only layer that
+  // survives a Google Meet CSS class rotation by construction, so it is tried
+  // before anything vote-based.
+  const tileName = await queryTrackTileName(page, elementIndex, botName);
+  if (tileName && !isNameTaken(tileName, elementIndex)) {
+    recordTrackVote(elementIndex, tileName, 1.0);
+    const lockedNow = getLockedMapping(elementIndex) || tileName;
+    logResolution(elementIndex, lockedNow, 'containment');
+    return lockedNow;
+  }
 
   // Query browser
   const state = await queryBrowserState(page, botName);
   if (!state) return null;
 
-  const { speaking } = state;
+  const { speaking, filteredNames } = state;
+
+  // ── Layer 3: audio-activity elimination (CSS-INDEPENDENT) ─────────────────
+  // The CSS `speaking[]` signal below is empty whenever Meet rotates its
+  // obfuscated class names, which is the recurring root cause of SPEAKER_NN.
+  // This layer needs no visual speaking indicator at all: if this track is the
+  // only one currently emitting audio, and exactly one roster name is not yet
+  // locked to another track, then by elimination that name is this track.
+  if (isMostRecentlyActiveTrack(elementIndex)) {
+    const unclaimed = filteredNames.filter(n => !isNameTaken(n, elementIndex));
+    if (unclaimed.length === 1) {
+      const candidate = unclaimed[0];
+      recordTrackVote(elementIndex, candidate, 1.0);
+      const lockedNow = getLockedMapping(elementIndex) || candidate;
+      logResolution(elementIndex, lockedNow, 'audio-elimination');
+      return lockedNow;
+    }
+  }
+
+  // ── Layer 4: legacy CSS speaking[] vote (DEMOTED, kept as a bonus signal) ──
+  // Non-functional while Meet's classes are rotated, but costs nothing and
+  // silently starts helping again if they ever match. No longer the only path.
 
   // Single speaker → full vote (high confidence)
   if (speaking.length === 1) {
     const candidate = speaking[0];
     if (!isNameTaken(candidate, elementIndex)) {
       recordTrackVote(elementIndex, candidate, 1.0);
+      logResolution(elementIndex, candidate, 'css-speaking');
       return getLockedMapping(elementIndex) || candidate;
     }
   }
@@ -205,19 +356,32 @@ async function resolveGoogleMeetSpeakerName(
     }
     // Return locked name if just locked, or top voted
     const justLocked = getLockedMapping(elementIndex);
-    if (justLocked) return justLocked;
+    if (justLocked) {
+      logResolution(elementIndex, justLocked, 'css-speaking-overlap');
+      return justLocked;
+    }
   }
 
+  // ── Layer 5: existing top-vote fallback ───────────────────────────────────
   // Zero or 3+ speaking — can't vote.
   // Return top voted name only if it's not taken by another track.
   const votes = trackVotes.get(elementIndex);
   if (votes && votes.size > 0) {
     const sorted = Array.from(votes.entries()).sort((a, b) => b[1] - a[1]);
     for (const [name] of sorted) {
-      if (!isNameTaken(name, elementIndex)) return name;
+      if (!isNameTaken(name, elementIndex)) {
+        logResolution(elementIndex, name, 'top-vote');
+        return name;
+      }
     }
   }
 
+  // All layers failed. index.ts has an independent 15s roster-order fallback that
+  // triggers off this null — do not duplicate it here.
+  if (!resolutionLogged.has(elementIndex) && !allLayersFailedLogged.has(elementIndex)) {
+    allLayersFailedLogged.add(elementIndex);
+    log(`[NameResolve] Track ${elementIndex} UNRESOLVED — all layers failed (tile=null, activity-elimination=no, css-speaking=${speaking.length}, votes=${votes?.size ?? 0}); roster-order fallback will apply after 15s`);
+  }
   return null;
 }
 
@@ -546,18 +710,49 @@ export async function resolveSpeakerName(
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
-/** Clear all mappings. Call only when meeting resets. */
+/**
+ * Clear all track→speaker mappings. Called on every participant-count change,
+ * because Google Meet genuinely reassigns audio tracks when someone joins or
+ * leaves, which can make an existing lock wrong.
+ *
+ * Votes and locks are both wiped — that is the point, and it is what lets a
+ * reassigned track acquire its new identity. The uniqueness invariant survives the
+ * wipe not by retaining state but because `isNameTaken` counts a track's LEADING
+ * VOTE as a claim: the first vote cast after the wipe re-establishes the claim
+ * before any other track can resolve to the same name.
+ *
+ * `trackLastAudioMs` is deliberately NOT cleared. It is audio telemetry, not
+ * identity, it is repopulated by the audio pipeline on the very next chunk, and
+ * wiping it makes `isMostRecentlyActiveTrack` — hence Layer 3's elimination — more
+ * trigger-happy at exactly the moment identity is least certain.
+ */
 export function clearSpeakerNameCache(): void {
   trackVotes.clear();
   lockedMappings.clear();
-  trackLastAudioMs.clear();
+  // Re-arm the once-per-track diagnostics so the post-invalidation re-resolution
+  // is visible in the logs — otherwise which-layer-won is silently lost after the
+  // first participant join/leave.
+  resolutionLogged.clear();
+  allLayersFailedLogged.clear();
+  claimRefusalLogged.clear();
   log('[SpeakerIdentity] All track mappings cleared.');
 }
 
-/** Remove mapping for a single track (participant left). */
+/**
+ * Remove mapping for a single track (participant left). Dropping this track's votes
+ * and lock also drops its name claim, so the name becomes available to whichever
+ * track the participant's audio moves to — that is what keeps the stricter
+ * `isNameTaken` from deadlocking a legitimate re-resolution.
+ */
 export function invalidateSpeakerName(platform: string, elementIndex: number): void {
   trackVotes.delete(elementIndex);
   lockedMappings.delete(elementIndex);
+  resolutionLogged.delete(elementIndex);
+  allLayersFailedLogged.delete(elementIndex);
+  // Re-arm refusal diagnostics for this track only.
+  for (const key of claimRefusalLogged) {
+    if (key.startsWith(`${elementIndex}:`)) claimRefusalLogged.delete(key);
+  }
   log(`[SpeakerIdentity] Track ${elementIndex} mapping invalidated.`);
 }
 
