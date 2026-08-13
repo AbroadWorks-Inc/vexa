@@ -45,18 +45,29 @@ def _resolve_min_dominant_utterance_ms() -> int:
     applies when a LONGER interval also covers the instant, so a standalone short
     utterance still owns its own span.
 
-    The default sits above the bot's 700ms silence hangover — an interval shorter
-    than that cannot represent a settled turn — and below the ~4s median real
-    utterance seen in production.
+    The plausible RANGE is bounded below by the bot's 700ms silence hangover (a
+    shorter interval cannot represent a settled turn) and above by the ~4s median
+    real utterance seen in production. Within that range the default is a judgement
+    call — nothing argues for 1500 over 900 or 2500. Treat it as a starting value to
+    tune from live data, not a derived constant.
 
-    KNOWN TRADE-OFF, quantified in review: a speaker whose turns are consistently
-    sub-threshold loses those turns to a colleague whose longer interval covers
-    them. A synthetic 200-turn model with 50% forced overlap retained only ~42% of
-    such a speaker's turns. Where turns do not overlap, attribution is unaffected.
-    Duration alone cannot separate a 0.5s real turn from a 0.5s cough, so the value
-    is a judgement call, not a derivation — hence the env override, so it can be
-    tuned from a deployment without rebuilding the image (mirrors
-    SPEAKER_SILENCE_HANGOVER_MS on the bot side).
+    KNOWN TRADE-OFF, quantified twice in review: a speaker whose turns are
+    consistently sub-threshold loses those turns to a colleague whose longer
+    interval covers them. A synthetic 200-turn model with 50% forced overlap
+    retained ~42% of such a speaker's turns; an adversarial construction where a
+    presenter's interval covers EVERY interjection retained 0% — 12 genuine short
+    replies, none of them noise, all erased. So the floor is total loss, not graceful
+    degradation. Where turns do not overlap, attribution is unaffected.
+
+    Duration alone cannot separate a 0.5s real word from a 0.5s cough, so no fixed
+    value removes this — it only moves where the failure lands. Hence the env
+    override (mirrors SPEAKER_SILENCE_HANGOVER_MS on the bot side), so it can be
+    lowered from a deployment without rebuilding the image.
+
+    Note for live validation: in the meeting that motivated this work, two of three
+    participants had a ~0.5s median burst. Watch specifically for their words
+    disappearing during cross-talk, and lower this before concluding the collapse
+    itself is at fault.
     """
     raw = os.environ.get("MIN_DOMINANT_UTTERANCE_MS")
     if not raw:
