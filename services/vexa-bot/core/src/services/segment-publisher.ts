@@ -29,6 +29,27 @@ export interface SpeakerEvent {
   speaker: string;
   type: 'joined' | 'left' | 'started_speaking' | 'stopped_speaking';
   timestamp: number;
+  /**
+   * Set ONLY by the audio-activity boundary tracker (services/speaker-boundaries.ts).
+   *
+   * It marks this event as one half of a GUARANTEED-PAIRED START/END, which is what
+   * licenses aw-integration to build a speaker INTERVAL from it. Every other caller
+   * of publishSpeakerEvent must leave this undefined, because they emit
+   * point-in-time claims with no matching close:
+   *
+   *   - feedZoomAudio / handleTeamsAudioData     -> 'joined', never 'left'
+   *   - handleTeamsCaptionData                   -> 'started_speaking' per caption
+   *                                                 line, never 'stopped_speaking'
+   *   - the !isGMeet roster-announcement paths   -> 'joined', never 'left'
+   *
+   * Tagging those as pairable would have aw-integration open an interval that only
+   * ever closes at the session boundary, so the longest such interval would win
+   * every span and erase the other speakers from the timeline entirely. Teams and
+   * Zoom never arm the boundary tracker, so ALL of their traffic has that shape —
+   * this is the normal case there, not an edge case. Leaving `source` undefined
+   * routes them to the point-based path, i.e. their existing behaviour.
+   */
+  source?: 'audio';
 }
 
 export interface SegmentPublisherConfig {
@@ -295,17 +316,19 @@ export class SegmentPublisher {
         event_type: eventTypeMap[event.type] || event.type,
         participant_name: event.speaker,
         meeting_id: this.meetingId,
-        // Provenance. Two independent producers write to this stream with an
-        // otherwise IDENTICAL field set, so a consumer cannot tell them apart
-        // without this. Events tagged 'audio' come from the per-track
-        // audio-activity state machine (services/speaker-boundaries.ts), whose
-        // START/END pairs are reliable — every START is named and eventually
-        // closed — so aw-integration pairs them into speaker INTERVALS.
-        // The DOM/CSS bridge tags itself 'dom' and is emitted as points only,
-        // because its pairing is not trustworthy (duplicate pairs from two
-        // state machines, no terminal flush, tiles vanishing mid-utterance).
-        source: 'audio',
       };
+
+      // Provenance. Multiple producers write to this stream with an otherwise
+      // IDENTICAL field set, so a consumer cannot tell them apart without this.
+      //
+      // Only tag what the CALLER declares pairable — never unconditionally. This
+      // method is shared with Zoom/Teams roster and caption paths that emit
+      // START-only claims (see the `source` field docs on SpeakerEvent), and
+      // marking those pairable makes aw-integration build never-closing intervals
+      // that erase other speakers. Untagged events route to the point-based path.
+      if (event.source) {
+        fields.source = event.source;
+      }
 
       await client.xAdd(this.speakerEventStreamKey, '*', fields);
     } catch (err: any) {

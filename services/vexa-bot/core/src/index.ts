@@ -1542,7 +1542,18 @@ const speakerBoundaries: SpeakerBoundaryTracker = createSpeakerBoundaryTracker({
     // later), and a negative relative offset would sort ahead of every transcript
     // segment and corrupt the mapping.
     const safeTs = Math.max(timestampMs, segmentPublisher.sessionStartMs);
-    await segmentPublisher.publishSpeakerEvent({ speaker, type, timestamp: safeTs });
+    // `source: 'audio'` is set HERE and nowhere else. This is the only producer
+    // whose START/END events are guaranteed paired (speaker-boundaries.ts closes
+    // every START it opens, including at teardown), which is what licenses
+    // aw-integration to build speaker intervals from them. Zoom/Teams roster and
+    // caption paths share publishSpeakerEvent but emit START-only claims, so they
+    // must stay untagged — see the `source` docs on SpeakerEvent.
+    await segmentPublisher.publishSpeakerEvent({
+      speaker,
+      type,
+      timestamp: safeTs,
+      source: 'audio',
+    });
   },
   resolveName: (trackIndex) => {
     if (!speakerManager) return '';

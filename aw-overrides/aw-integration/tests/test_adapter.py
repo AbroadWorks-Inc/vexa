@@ -330,6 +330,21 @@ def _audio(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
     )
 
 
+def _untagged(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
+    """A point-in-time claim with no provenance tag.
+
+    This is what Zoom and Teams emit for EVERY event (roster `joined` and caption
+    `started_speaking`), and also what an older bot image emits. Never pairable.
+    """
+    return VexaSpeakerEvent(
+        uid="conn-abc123def456",
+        relative_ms=relative_ms,
+        event_type=event_type,
+        participant_name=name,
+        meeting_id="42",
+    )
+
+
 def _dom(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
     """A DOM/CSS-derived event — must never be paired into an interval."""
     return VexaSpeakerEvent(
@@ -408,6 +423,105 @@ class TestDominantSpeakerCollapse:
         timeline = adapter.build_speaker_timeline().speaker_timeline
 
         assert _attribute(timeline, 148.0) == "Speaker B"
+
+    def test_real_utterance_nested_in_a_very_long_interval_is_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """A naive "longest interval wins" rule regressed this case.
+
+        Someone with a persistently open mic can produce one very long interval.
+        Under longest-wins they dominate every instant, so a genuine 5s utterance
+        nested inside it never becomes dominant, vanishes from the timeline
+        entirely, and their whole contribution is credited to the noisy
+        participant — far worse than the single-line bug this change fixes.
+
+        The rule therefore ignores sub-threshold intervals as noise and otherwise
+        prefers the SHORTEST covering interval, i.e. the most specific claim on
+        that instant.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),        # open mic, whole meeting
+            _audio("Speaker A", "SPEAKER_END", 55_000),
+            _audio("Speaker B", "SPEAKER_START", 20_000),   # a real 5s turn inside it
+            _audio("Speaker B", "SPEAKER_END", 25_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 22.0) == "Speaker B"
+        # And control returns to the long-running speaker afterwards.
+        assert _attribute(timeline, 30.0) == "Speaker A"
+
+    def test_sub_threshold_blip_still_loses_to_a_longer_interval(
+        self, tmp_path: Path
+    ) -> None:
+        """The other half of the rule: a brief interjection must NOT win.
+
+        Three-way case that defeats both naive rules — longest-wins gives the
+        open mic, shortest-wins gives the 0.4s blip, and only the
+        threshold-then-shortest rule gives the real turn.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),        # open mic
+            _audio("Speaker A", "SPEAKER_END", 55_000),
+            _audio("Speaker B", "SPEAKER_START", 20_000),   # real turn
+            _audio("Speaker B", "SPEAKER_END", 25_000),
+            _audio("Speaker C", "SPEAKER_START", 21_000),   # 0.4s cough
+            _audio("Speaker C", "SPEAKER_END", 21_400),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 21_200 / 1000.0) == "Speaker B"
+        assert all(e.speaker_name != "Speaker C" for e in timeline)
+
+    def test_competing_sub_threshold_claims_do_not_interrupt_the_incumbent(
+        self, tmp_path: Path
+    ) -> None:
+        """The fallback branch used to recreate the original bug below 1.5s.
+
+        When every interval covering a span is sub-threshold, the rule falls back
+        rather than dropping them all. That fallback used to pick the LONGEST,
+        which meant an 800ms blip overlapping the tail of a 600ms real turn stole
+        it mid-utterance — a transition at 10.2s instead of 10.6s. Exactly the
+        mechanism this change exists to kill, just at smaller scale.
+
+        The incumbent now keeps the floor: a later claim can only take over once
+        the turn in progress has actually ended. Found in review with a concrete
+        repro; this is its regression guard.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 10_000),
+            _audio("Speaker A", "SPEAKER_END", 10_600),   # 600ms real turn
+            _audio("Speaker B", "SPEAKER_START", 10_200),  # 800ms blip over its tail
+            _audio("Speaker B", "SPEAKER_END", 11_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # A keeps its whole turn; B only takes over after A ends.
+        assert _attribute(timeline, 10.4) == "Speaker A"
+        b_events = [e for e in timeline if e.speaker_name == "Speaker B"]
+        assert b_events, "B should still appear once A has finished"
+        assert b_events[0].relative_sec >= 10.6
+
+    def test_standalone_short_utterance_still_owns_its_span(
+        self, tmp_path: Path
+    ) -> None:
+        """The threshold must not silence short turns that face no competition."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 10_000),
+            _audio("Speaker A", "SPEAKER_END", 10_400),  # 0.4s, nothing overlaps
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Speaker A"]
+        assert _attribute(timeline, 10.2) == "Speaker A"
 
     def test_genuine_alternation_yields_one_transition_per_change(
         self, tmp_path: Path
@@ -542,6 +656,97 @@ class TestDominantSpeakerCollapse:
 
         assert _attribute(timeline, 106.0) == "Speaker B"
         assert all(e.speaker_name != "Speaker A" for e in timeline)
+
+    def test_teams_zoom_shape_is_not_paired_and_keeps_every_speaker(
+        self, tmp_path: Path
+    ) -> None:
+        """The normal shape of every Teams/Zoom meeting must not be mangled.
+
+        Teams and Zoom never arm the audio-activity boundary tracker, so 100% of
+        their `speaker_events_relative` traffic is START-only, point-in-time
+        claims — `joined` from the roster paths, `started_speaking` per caption
+        line — with no matching close, ever.
+
+        If those were treated as pairable, each would open an interval that only
+        closes at the session boundary, the longest such interval would win every
+        span, and every speaker after the first would VANISH from the timeline.
+        That is worse than the bug this change fixes, and it would affect every
+        multi-speaker Teams call rather than being an edge case.
+
+        Leaving `source` untagged routes them to the point path, i.e. exactly
+        their existing behaviour. Regression guard for a real defect found in
+        review.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        # Four speakers, one point-in-time claim each, no ENDs anywhere.
+        adapter._session.speaker_events = [
+            _untagged("Speaker A", "SPEAKER_START", 0),
+            _untagged("Speaker B", "SPEAKER_START", 10_000),
+            _untagged("Speaker C", "SPEAKER_START", 20_000),
+            _untagged("Speaker D", "SPEAKER_START", 30_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Every speaker survives, in order, as a point.
+        assert [e.speaker_name for e in timeline] == [
+            "Speaker A",
+            "Speaker B",
+            "Speaker C",
+            "Speaker D",
+        ]
+        # And each still owns the span following its own claim.
+        assert _attribute(timeline, 5.0) == "Speaker A"
+        assert _attribute(timeline, 15.0) == "Speaker B"
+        assert _attribute(timeline, 25.0) == "Speaker C"
+        assert _attribute(timeline, 35.0) == "Speaker D"
+
+    def test_audio_intervals_take_precedence_over_untagged_points(
+        self, tmp_path: Path
+    ) -> None:
+        """Trusted intervals win outright; untrusted points are excluded, not merged.
+
+        When any pairable audio interval exists, non-pairable claims — DOM/CSS
+        events and untagged ones alike — are dropped rather than merged in as
+        competing points. That exclusion IS the fix: a stray point surviving
+        alongside intervals could become "the last event before a segment" and
+        reintroduce the original misattribution.
+
+        Untagged claims are therefore only used when there is nothing pairable at
+        all, which is the Teams/Zoom case covered above.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 5_000),
+            _untagged("Speaker B", "SPEAKER_START", 1_000),  # excluded
+            _dom("Speaker C", "SPEAKER_START", 2_000),       # excluded
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Speaker A"]
+        assert _attribute(timeline, 2.0) == "Speaker A"
+
+    def test_two_partially_overlapping_real_turns(self, tmp_path: Path) -> None:
+        """Crosstalk between two genuine turns of different length.
+
+        Not nested — they overlap at the edges, which is the shape the suite
+        otherwise never covered. Each speaker must own the part of the span where
+        they are the only one active.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 20_000),
+            _audio("Speaker B", "SPEAKER_START", 15_000),  # cuts in at 15s
+            _audio("Speaker B", "SPEAKER_END", 40_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 5.0) == "Speaker A"    # A alone
+        assert _attribute(timeline, 30.0) == "Speaker B"   # B alone, after A stops
 
     def test_untagged_events_fall_back_to_legacy_points(
         self, tmp_path: Path
@@ -984,3 +1189,82 @@ async def test_run_from_redis_filters_by_session_uid(tmp_path: _Path) -> None:
 
     mock_s3.write_all.assert_called_once()
     mock_client.post_process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_parses_the_source_field_end_to_end(
+    tmp_path: _Path,
+) -> None:
+    """Guards the dict-parsing of `source`, which the collapse tests skip.
+
+    Every collapse test constructs `VexaSpeakerEvent(source=...)` directly, so none
+    of them exercise `run_from_redis`'s `fields.get("source")` read. A regression
+    there — e.g. `fields["source"]` instead of `.get()` — would raise KeyError,
+    which the surrounding `except (KeyError, ValueError)` swallows, SILENTLY
+    dropping every event and reverting transcripts to SPEAKER_NN with no error
+    anywhere. This asserts tagged events survive the parse and reach the timeline
+    as a collapsed interval, and that untagged ones still survive as points.
+    """
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    # A paired, audio-tagged utterance...
+    for fields in (
+        {
+            "uid": _SESSION_UID,
+            "relative_client_timestamp_ms": "2000",
+            "event_type": "SPEAKER_START",
+            "participant_name": "Speaker A",
+            "meeting_id": "42",
+            "source": "audio",
+        },
+        {
+            "uid": _SESSION_UID,
+            "relative_client_timestamp_ms": "9000",
+            "event_type": "SPEAKER_END",
+            "participant_name": "Speaker A",
+            "meeting_id": "42",
+            "source": "audio",
+        },
+        # ...and an untagged claim, as Teams/Zoom and older bot images emit.
+        {
+            "uid": _SESSION_UID,
+            "relative_client_timestamp_ms": "20000",
+            "event_type": "SPEAKER_START",
+            "participant_name": "Speaker B",
+            "meeting_id": "42",
+        },
+    ):
+        fake_r.xadd("speaker_events_relative", fields)
+
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(s3_key, wav, timeline, participants, metadata):  # noqa: ANN001
+        captured["timeline"] = timeline
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    timeline = captured["timeline"].speaker_timeline  # type: ignore[union-attr]
+    names = [e.speaker_name for e in timeline]
+
+    # The tagged pair collapsed to a transition at its true onset (2.0s), proving
+    # `source` survived the parse and licensed interval-building.
+    assert "Speaker A" in names
+    assert any(abs(e.relative_sec - 2.0) < 0.001 for e in timeline)
