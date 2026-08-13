@@ -441,9 +441,9 @@ class TestDominantSpeakerCollapse:
         """
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         adapter._session.speaker_events = [
-            _audio("Speaker A", "SPEAKER_START", 0),        # open mic, whole meeting
+            _audio("Speaker A", "SPEAKER_START", 0),  # open mic, whole meeting
             _audio("Speaker A", "SPEAKER_END", 55_000),
-            _audio("Speaker B", "SPEAKER_START", 20_000),   # a real 5s turn inside it
+            _audio("Speaker B", "SPEAKER_START", 20_000),  # a real 5s turn inside it
             _audio("Speaker B", "SPEAKER_END", 25_000),
         ]
 
@@ -464,11 +464,11 @@ class TestDominantSpeakerCollapse:
         """
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         adapter._session.speaker_events = [
-            _audio("Speaker A", "SPEAKER_START", 0),        # open mic
+            _audio("Speaker A", "SPEAKER_START", 0),  # open mic
             _audio("Speaker A", "SPEAKER_END", 55_000),
-            _audio("Speaker B", "SPEAKER_START", 20_000),   # real turn
+            _audio("Speaker B", "SPEAKER_START", 20_000),  # real turn
             _audio("Speaker B", "SPEAKER_END", 25_000),
-            _audio("Speaker C", "SPEAKER_START", 21_000),   # 0.4s cough
+            _audio("Speaker C", "SPEAKER_START", 21_000),  # 0.4s cough
             _audio("Speaker C", "SPEAKER_END", 21_400),
         ]
 
@@ -495,7 +495,7 @@ class TestDominantSpeakerCollapse:
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         adapter._session.speaker_events = [
             _audio("Speaker A", "SPEAKER_START", 10_000),
-            _audio("Speaker A", "SPEAKER_END", 10_600),   # 600ms real turn
+            _audio("Speaker A", "SPEAKER_END", 10_600),  # 600ms real turn
             _audio("Speaker B", "SPEAKER_START", 10_200),  # 800ms blip over its tail
             _audio("Speaker B", "SPEAKER_END", 11_000),
         ]
@@ -580,9 +580,7 @@ class TestDominantSpeakerCollapse:
             (e.relative_sec, e.speaker_name) for e in second
         ]
 
-    def test_unclosed_interval_is_closed_at_session_end(
-        self, tmp_path: Path
-    ) -> None:
+    def test_unclosed_interval_is_closed_at_session_end(self, tmp_path: Path) -> None:
         """Someone still talking when the meeting ends still gets an interval."""
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         adapter._session.speaker_events = [
@@ -635,9 +633,7 @@ class TestDominantSpeakerCollapse:
         # Derived from the fixture's two segments, not from the orphan END.
         assert {e.speaker_name for e in timeline} == {"Alice Chen", "Bob Müller"}
 
-    def test_dom_events_are_never_paired_into_intervals(
-        self, tmp_path: Path
-    ) -> None:
+    def test_dom_events_are_never_paired_into_intervals(self, tmp_path: Path) -> None:
         """The core of the fix: a stray DOM point must not steal a sentence.
 
         This is the exact shape that caused the live failures — but tagged
@@ -720,7 +716,7 @@ class TestDominantSpeakerCollapse:
             _audio("Speaker A", "SPEAKER_START", 0),
             _audio("Speaker A", "SPEAKER_END", 5_000),
             _untagged("Speaker B", "SPEAKER_START", 1_000),  # excluded
-            _dom("Speaker C", "SPEAKER_START", 2_000),       # excluded
+            _dom("Speaker C", "SPEAKER_START", 2_000),  # excluded
         ]
 
         timeline = adapter.build_speaker_timeline().speaker_timeline
@@ -745,12 +741,10 @@ class TestDominantSpeakerCollapse:
 
         timeline = adapter.build_speaker_timeline().speaker_timeline
 
-        assert _attribute(timeline, 5.0) == "Speaker A"    # A alone
-        assert _attribute(timeline, 30.0) == "Speaker B"   # B alone, after A stops
+        assert _attribute(timeline, 5.0) == "Speaker A"  # A alone
+        assert _attribute(timeline, 30.0) == "Speaker B"  # B alone, after A stops
 
-    def test_untagged_events_fall_back_to_legacy_points(
-        self, tmp_path: Path
-    ) -> None:
+    def test_untagged_events_fall_back_to_legacy_points(self, tmp_path: Path) -> None:
         """An older bot image publishes no `source`; must not crash or vanish."""
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         adapter._session.speaker_events = [
@@ -1240,7 +1234,9 @@ async def test_run_from_redis_parses_the_source_field_end_to_end(
 
     captured: dict[str, object] = {}
 
-    def _capture_write_all(s3_key, wav, timeline, participants, metadata):  # noqa: ANN001
+    def _capture_write_all(
+        s3_key, wav, timeline, participants, metadata
+    ):  # noqa: ANN001
         captured["timeline"] = timeline
 
     mock_s3 = _MagicMock()
