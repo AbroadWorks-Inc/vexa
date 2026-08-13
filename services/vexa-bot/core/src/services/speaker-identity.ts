@@ -182,12 +182,10 @@ function isMostRecentlyActiveTrack(trackIndex: number): boolean {
 
 // ─── Browser State Query ─────────────────────────────────────────────────────
 
-/** Helper: reject junk names */
-function isJunkName(name: string): boolean {
-  return /^Google Participant \(/.test(name) ||
-         /spaces\//.test(name) ||
-         /devices\//.test(name);
-}
+// (A module-level `isJunkName` lived here purely for the removed Layer 2. The
+// equivalent check that is still needed runs INSIDE the page context — see the
+// `isJunk` closure in queryBrowserState below — because it has to execute in the
+// browser, not in Node.)
 
 /**
  * Query browser for participant names and who's currently speaking.
@@ -239,45 +237,20 @@ function logResolution(trackIndex: number, name: string, layer: string): void {
   log(`[NameResolve] Track ${trackIndex} → "${name}" via layer=${layer}`);
 }
 
-/**
- * Layer 2 query: resolve a track to its participant tile name by walking UP from
- * the bound media element (see __vexaGetTrackTileInfo in index.ts).
- *
- * Feature-detected: the in-page helper only exists in images carrying the
- * audio-activity attribution change, so an older bundle simply yields null and
- * the caller falls through to the remaining layers.
- */
-async function queryTrackTileName(
-  page: Page,
-  trackIndex: number,
-  botName?: string,
-): Promise<string | null> {
-  try {
-    const info = await page.evaluate((idx: number) => {
-      const fn = (window as any).__vexaGetTrackTileInfo;
-      if (typeof fn !== 'function') return null;
-      try {
-        return fn(idx) as { participantId: string | null; name: string | null; matched: string | null } | null;
-      } catch {
-        return null;
-      }
-    }, trackIndex);
-
-    const name = info?.name?.trim();
-    if (!name) return null;
-    if (isJunkName(name)) return null;
-
-    // Never attribute a track to the bot itself.
-    const selfLower = (botName || 'Vexa Bot').toLowerCase();
-    const lower = name.toLowerCase();
-    if (lower.includes(selfLower) || selfLower.includes(lower)) return null;
-
-    return name;
-  } catch (err: any) {
-    log(`[SpeakerIdentity] Track-tile query failed: ${err.message}`);
-    return null;
-  }
-}
+// NOTE — the former "Layer 2" (tile containment) has been REMOVED.
+//
+// It walked up from a track's bound HTMLMediaElement looking for an enclosing
+// participant tile to read a name from. The live run of 2026-08-12 settled the
+// question: `[TrackTileDebug]` logged the identical ancestor chain for every
+// track — `<audio>` (zero attributes) -> `<body>` -> `<html>`. Google Meet
+// attaches its audio elements as direct children of `<body>`, nowhere near the
+// visual tile DOM, so there is nothing to walk up TO. The strategy was
+// architecturally impossible rather than merely broken by a selector change, and
+// it resolved 0 of 3 tracks in production while running on every resolution.
+//
+// Attribution is therefore correlation-based only: audio-activity elimination,
+// then the legacy CSS vote, then top-vote. Do not reintroduce a containment
+// layer without new DOM evidence — see docs-utpal/CHANGE_LEDGER.md (v8).
 
 // ─── Main Resolution ─────────────────────────────────────────────────────────
 
@@ -297,18 +270,7 @@ async function resolveGoogleMeetSpeakerName(
   const locked = getLockedMapping(elementIndex);
   if (locked) return locked;
 
-  // ── Layer 2: direct tile containment (DURABLE — no CSS classes involved) ───
-  // Walks up from the actual HTMLMediaElement bound to this track to its
-  // participant tile and reads a semantic attribute. This is the only layer that
-  // survives a Google Meet CSS class rotation by construction, so it is tried
-  // before anything vote-based.
-  const tileName = await queryTrackTileName(page, elementIndex, botName);
-  if (tileName && !isNameTaken(tileName, elementIndex)) {
-    recordTrackVote(elementIndex, tileName, 1.0);
-    const lockedNow = getLockedMapping(elementIndex) || tileName;
-    logResolution(elementIndex, lockedNow, 'containment');
-    return lockedNow;
-  }
+  // (Layer 2, tile containment, was removed — see the note above this function.)
 
   // Query browser
   const state = await queryBrowserState(page, botName);

@@ -52,30 +52,25 @@ function check(label: string, actual: unknown, expected: unknown): void {
 }
 
 interface FakeWindowOpts {
-  /** trackIndex → tile name returned by __vexaGetTrackTileInfo (Layer 2). */
-  tileNames?: Record<number, string | null>;
   /** Roster: participantId → display name. */
   names?: Record<string, string>;
-  /** CSS-derived speaking list. Deliberately [] in every test here. */
+  /** CSS-derived speaking list. Deliberately [] in most tests here. */
   speaking?: string[];
-  /** Omit __vexaGetTrackTileInfo entirely, simulating an older bot bundle. */
-  omitTileInfo?: boolean;
 }
 
 /**
  * Build a fake Playwright Page. `evaluate` executes the callback in-process with
  * a stubbed global `window`, which is the only browser surface these code paths
  * use (no `document`, no CSS).
+ *
+ * NOTE: this used to stub `__vexaGetTrackTileInfo` for the old Layer 2 (tile
+ * containment). That layer is gone — the 2026-08-12 live run proved Meet attaches
+ * <audio> directly to <body>, so there is no tile above a media element to walk
+ * up to. The cascade is now correlation-only, so the fake needs the roster and
+ * the CSS speaking list and nothing else.
  */
 function makeFakePage(opts: FakeWindowOpts): any {
   const win: Record<string, unknown> = {};
-
-  if (!opts.omitTileInfo) {
-    win.__vexaGetTrackTileInfo = (idx: number) => {
-      const name = opts.tileNames?.[idx] ?? null;
-      return { participantId: name ? `pid-${idx}` : null, name, matched: name ? 'containment' : null };
-    };
-  }
 
   win.__vexaGetAllParticipantNames = () => ({
     names: opts.names ?? {},
@@ -100,12 +95,15 @@ const BOT = 'AW Notetaker';
 async function run(): Promise<void> {
   console.log('\n=== Speaker attribution: CSS-independence ===\n');
 
-  // ── Layer 2: direct tile containment ──────────────────────────────────────
-  console.log('Layer 2 — tile containment (CSS signal dead):');
+  // ── Resolution with the CSS signal dead ───────────────────────────────────
+  // These used to exercise Layer 2 (tile containment). That layer is removed, so
+  // the same guarantees are now asserted through the correlation layers, which
+  // is what actually carries attribution in production.
+  console.log('Name resolution with a dead CSS signal:');
   {
     clearSpeakerNameCache();
+    reportTrackAudio(0); // this track is the one emitting audio
     const page = makeFakePage({
-      tileNames: { 0: 'Speaker B' },
       names: { p1: 'Speaker B', p2: BOT },
       speaking: [], // ← rotated classes: nothing detected
     });
@@ -115,9 +113,9 @@ async function run(): Promise<void> {
 
   {
     clearSpeakerNameCache();
+    reportTrackAudio(0);
     const page = makeFakePage({
-      tileNames: { 0: BOT }, // tile walk landed on the bot's own tile
-      names: { p1: BOT },
+      names: { p1: BOT }, // the bot is the only roster entry
       speaking: [],
     });
     const name = await resolveSpeakerName(page, 0, 'googlemeet', BOT);
@@ -131,22 +129,22 @@ async function run(): Promise<void> {
     recordTrackVote(0, 'Speaker C', 1.0);
     check('precondition: name is locked to track 0', isNameTaken('Speaker C', 1), true);
 
+    reportTrackAudio(1);
     const page = makeFakePage({
-      tileNames: { 1: 'Speaker C' }, // tile walk yields a name owned by another track
+      // Only the already-claimed name is unclaimed-looking to a naive resolver.
       names: { p1: 'Speaker C', p2: 'Speaker A' },
-      speaking: [],
+      speaking: ['Speaker C'], // CSS even points at the taken name
     });
     const name = await resolveSpeakerName(page, 1, 'googlemeet', BOT);
     check('upholds one-name-per-track (does not steal a locked name)', name !== 'Speaker C', true);
   }
 
   // ── Layer 3: audio-activity elimination ──────────────────────────────────
-  console.log('\nLayer 3 — audio-activity elimination (CSS signal dead, no tile match):');
+  console.log('\nLayer 3 — audio-activity elimination (CSS signal dead):');
   {
     clearSpeakerNameCache();
     reportTrackAudio(3); // only this track is emitting audio
     const page = makeFakePage({
-      tileNames: { 3: null }, // Layer 2 cannot resolve
       names: { p1: 'Speaker A', p2: BOT },
       speaking: [],
     });
@@ -158,7 +156,6 @@ async function run(): Promise<void> {
     clearSpeakerNameCache();
     reportTrackAudio(4);
     const page = makeFakePage({
-      tileNames: { 4: null },
       names: { p1: 'Alice', p2: 'Bob', p3: BOT }, // two candidates → ambiguous
       speaking: [],
     });
@@ -172,17 +169,16 @@ async function run(): Promise<void> {
     clearSpeakerNameCache();
     reportTrackAudio(5);
     const page = makeFakePage({
-      omitTileInfo: true, // older bot bundle without the in-page helper
       names: { p1: 'Solo Speaker', p2: BOT },
       speaking: [],
     });
     const name = await resolveSpeakerName(page, 5, 'googlemeet', BOT);
-    check('missing __vexaGetTrackTileInfo does not throw; later layers still work', name, 'Solo Speaker');
+    check('a sole active track with a sole unclaimed name still resolves', name, 'Solo Speaker');
   }
 
   {
     clearSpeakerNameCache();
-    const page = makeFakePage({ tileNames: {}, names: {}, speaking: [] });
+    const page = makeFakePage({ names: {}, speaking: [] });
     const name = await resolveSpeakerName(page, 9, 'googlemeet', BOT);
     check('empty roster + dead CSS yields "" rather than a wrong name', name, '');
   }
@@ -196,7 +192,6 @@ async function run(): Promise<void> {
     // genuinely the layer under test. Adding a reportTrackAudio call would make
     // Layer 3 resolve first and this test would silently stop covering the CSS path.
     const page = makeFakePage({
-      tileNames: { 7: null },
       names: { p1: 'Alice', p2: 'Bob', p3: BOT },
       speaking: ['Bob'], // classes DID match this time
     });
@@ -211,7 +206,6 @@ async function run(): Promise<void> {
   {
     clearSpeakerNameCache();
     const page = makeFakePage({
-      tileNames: { 0: null, 1: null }, // Layer 2 dead, as it is in production
       names: { p1: 'Speaker C', p2: BOT }, // exactly one real participant
       speaking: [],
     });
@@ -235,7 +229,6 @@ async function run(): Promise<void> {
     // would resolve first and this case would stop covering the CSS path.
     clearSpeakerNameCache();
     const page = makeFakePage({
-      tileNames: {},
       names: { p1: 'Speaker A', p2: 'Alice', p3: BOT },
       speaking: ['Speaker A'], // one highlighted name, several live tracks
     });
@@ -259,7 +252,6 @@ async function run(): Promise<void> {
   {
     clearSpeakerNameCache();
     const page = makeFakePage({
-      tileNames: { 0: 'Speaker B' },
       names: { p1: 'Speaker B', p2: BOT },
       speaking: [],
     });
@@ -280,17 +272,28 @@ async function run(): Promise<void> {
   // ── Happy path + no deadlock ─────────────────────────────────────────────
   console.log('\nNo deadlock — legitimate owners still get, and keep, their names:');
   {
+    // Two tracks, two people. With Layer 2 removed, one signal has to break the
+    // initial symmetry — either the CSS list or a lock. Here CSS names track 0's
+    // speaker; that claim then leaves exactly one unclaimed roster name, so
+    // Layer 3's elimination can resolve track 1 with NO CSS signal at all. This
+    // is the two layers cooperating, which is how production behaves.
     clearSpeakerNameCache();
-    const page = makeFakePage({
-      tileNames: { 0: 'Alice', 1: 'Bob' },
+    const withCss = makeFakePage({
+      names: { p1: 'Alice', p2: 'Bob', p3: BOT },
+      speaking: ['Alice'],
+    });
+    check('CSS names the first track', await resolveSpeakerName(withCss, 0, 'googlemeet', BOT), 'Alice');
+
+    const cssDead = makeFakePage({
       names: { p1: 'Alice', p2: 'Bob', p3: BOT },
       speaking: [],
     });
-    check('two tracks resolve to two different people (track 0)', await resolveSpeakerName(page, 0, 'googlemeet', BOT), 'Alice');
-    check('two tracks resolve to two different people (track 1)', await resolveSpeakerName(page, 1, 'googlemeet', BOT), 'Bob');
+    reportTrackAudio(1);
+    check('elimination then resolves the second, CSS dead', await resolveSpeakerName(cssDead, 1, 'googlemeet', BOT), 'Bob');
+
     // Re-resolving must be stable, not oscillate or fall back to "".
-    check('track 0 keeps its name on re-resolution', await resolveSpeakerName(page, 0, 'googlemeet', BOT), 'Alice');
-    check('track 1 keeps its name on re-resolution', await resolveSpeakerName(page, 1, 'googlemeet', BOT), 'Bob');
+    check('track 0 keeps its name on re-resolution', await resolveSpeakerName(cssDead, 0, 'googlemeet', BOT), 'Alice');
+    check('track 1 keeps its name on re-resolution', await resolveSpeakerName(cssDead, 1, 'googlemeet', BOT), 'Bob');
   }
 
   {
@@ -298,7 +301,6 @@ async function run(): Promise<void> {
     // away, the name is released and the remaining track can take it.
     clearSpeakerNameCache();
     const page = makeFakePage({
-      tileNames: { 10: null, 11: null },
       names: { p1: 'Solo Speaker', p2: BOT },
       speaking: [],
     });

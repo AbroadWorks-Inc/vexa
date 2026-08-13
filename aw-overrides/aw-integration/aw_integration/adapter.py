@@ -55,6 +55,12 @@ class VexaSpeakerEvent:
     event_type: str
     participant_name: str
     meeting_id: str
+    # Which bot producer emitted this. "audio" = the per-track audio-activity
+    # state machine, whose START/END pairs are reliable enough to form intervals.
+    # "dom" = the DOM/CSS speaking-indicator bridge, whose pairing is not.
+    # None = an older bot image that predates provenance tagging; treated as
+    # untrusted (point-only), never paired.
+    source: str | None = None
 
 
 @dataclass
@@ -146,7 +152,20 @@ class VexaSessionAdapter:
             # The notetaker-worker does sort defensively, but this artifact must be
             # correct on its own rather than depending on that.
             ordered_events = sorted(session.speaker_events, key=lambda e: e.relative_ms)
-            for ev in ordered_events:
+            timeline_events = self._build_dominant_speaker_timeline(
+                ordered_events, origin_ms, duration_sec
+            )
+
+        if not timeline_events and session.speaker_events:
+            # Safety valve. If the collapse produced nothing — e.g. a meeting where
+            # the audio-activity path never resolved a name, so there are no
+            # pairable events — emit the legacy one-point-per-START timeline from
+            # whatever events exist, DOM included. A noisy timeline still yields
+            # names; an EMPTY one makes notetaker-worker bail out
+            # ("Timeline has no speaker events, cannot map speakers") and the
+            # transcript reverts to raw SPEAKER_NN.
+            origin_ms = int(session.session_start_ts.timestamp() * 1000)
+            for ev in sorted(session.speaker_events, key=lambda e: e.relative_ms):
                 if ev.event_type != "SPEAKER_START":
                     continue
                 timeline_events.append(
@@ -157,7 +176,8 @@ class VexaSessionAdapter:
                         speaker_name=ev.participant_name,
                     )
                 )
-        else:
+
+        if not timeline_events:
             # Fallback: derive one event per unique speaker per segment start.
             seen: set[str] = set()
             for seg in session.segments:
@@ -186,6 +206,129 @@ class VexaSessionAdapter:
             participants=participants,
             speaker_timeline=timeline_events,
         )
+
+    def _build_dominant_speaker_timeline(
+        self,
+        ordered_events: list[VexaSpeakerEvent],
+        origin_ms: int,
+        duration_sec: float,
+    ) -> list[SpeakerEvent]:
+        """Collapse per-track audio bursts into dominant-speaker transitions.
+
+        WHY THIS EXISTS
+        ---------------
+        `speaker_timeline.json` is consumed by notetaker-worker, whose rule is
+        "attribute a transcript segment to the LAST event at or before the
+        segment's start". That rule is correct for the contract it was written
+        against: Prosody (Jitsi) emits *dominant-speaker transitions*, and it
+        deliberately discards silence and suppresses consecutive same-speaker
+        events, so each event means "the dominant speaker changed to X".
+
+        The bot, by contrast, emitted one event per audio burst per track, for
+        every participant simultaneously. Under a last-event-wins rule, a
+        half-second noise on someone else's microphone becomes "the most recent
+        speaker change" and captures the remainder of another person's sentence.
+        Observed live on 2026-08-12: a 0.5s burst at 105.700s stole a sentence
+        starting at 106s from a speaker who held the floor from 95.4s to 120.9s.
+
+        So this converts our raw bursts into the shape the contract expects,
+        rather than changing the consumer. Two steps:
+
+        1. PAIR trusted (`source == "audio"`) START/END events into intervals.
+           Only the audio-activity state machine is paired, because it
+           guarantees every START is named and eventually closed. DOM/CSS
+           events are excluded entirely — their pairing is unreliable
+           (two state machines can double-emit one utterance, there is no
+           terminal flush, and a tile removed mid-utterance never closes). They
+           must not be admitted even as points, or a stray DOM point
+           reintroduces exactly the bug above.
+        2. COLLAPSE overlaps so at most one speaker is dominant at any instant:
+           the longest interval covering a span wins, and a transition is
+           emitted only when the dominant speaker changes.
+
+        Returns [] when nothing pairable exists; the caller then falls back to
+        the legacy one-point-per-START timeline rather than emitting nothing.
+        """
+        # ── 1. Pair trusted events into intervals ────────────────────────────
+        open_starts: dict[str, int] = {}
+        intervals: list[tuple[str, int, int]] = []
+        # `relative_ms` is relative to session_start_ts (the caller's origin),
+        # so the session's own duration bounds any still-open interval.
+        session_end_ms = max(0, int(round(duration_sec * 1000)))
+
+        for ev in ordered_events:
+            if ev.source != "audio":
+                continue
+            name = ev.participant_name
+            if not name:
+                continue
+
+            if ev.event_type == "SPEAKER_START":
+                prior = open_starts.get(name)
+                if prior is not None and ev.relative_ms > prior:
+                    # A second START with no intervening END. Close the previous
+                    # utterance here rather than discarding it.
+                    intervals.append((name, prior, ev.relative_ms))
+                open_starts[name] = ev.relative_ms
+            elif ev.event_type == "SPEAKER_END":
+                prior = open_starts.pop(name, None)
+                if prior is not None and ev.relative_ms > prior:
+                    intervals.append((name, prior, ev.relative_ms))
+                # An END with no matching START is ignored. Never synthesise an
+                # interval from an orphan — that would invent speech.
+
+        # Anything still open when the meeting ended (e.g. someone talking
+        # through the final moment) closes at the session boundary.
+        for name, start in open_starts.items():
+            if session_end_ms > start:
+                intervals.append((name, start, session_end_ms))
+
+        if not intervals:
+            return []
+
+        # ── 2. Collapse to one dominant speaker per instant ──────────────────
+        # Every boundary is an interval endpoint, so within each consecutive
+        # pair an interval either fully covers the span or does not intersect it.
+        bounds = sorted({b for _, s, e in intervals for b in (s, e)})
+        events: list[SpeakerEvent] = []
+        last_name: str | None = None
+
+        for span_start, span_end in zip(bounds, bounds[1:]):
+            if span_end <= span_start:
+                continue
+
+            covering = [
+                iv for iv in intervals if iv[1] <= span_start and iv[2] >= span_end
+            ]
+            if not covering:
+                # Silence. Prosody records none, so neither do we; the previous
+                # transition simply remains in effect.
+                continue
+
+            # Longest interval wins. Tie-breaks are fully ordered (longest,
+            # then earliest start, then name) so the same input always yields a
+            # byte-identical artifact.
+            dominant = min(
+                covering, key=lambda iv: (-(iv[2] - iv[1]), iv[1], iv[0])
+            )
+            name = dominant[0]
+
+            if name == last_name:
+                # Match Prosody's consecutive-same-speaker suppression: the
+                # artifact carries transitions, not samples.
+                continue
+            last_name = name
+
+            events.append(
+                SpeakerEvent(
+                    timestamp_ms=origin_ms + span_start,
+                    relative_sec=span_start / 1000.0,
+                    speaker_id=self._slug(name),
+                    speaker_name=name,
+                )
+            )
+
+        return events
 
     def build_participants(self) -> ParticipantsFile:
         session = self._session
@@ -359,6 +502,11 @@ async def run_from_redis(
                     event_type=fields["event_type"],
                     participant_name=fields["participant_name"],
                     meeting_id=str(fields["meeting_id"]),
+                    # Deliberately `.get()`, not `fields[...]`: events published
+                    # by a bot image older than provenance tagging have no
+                    # `source`, and must degrade to point-only rather than being
+                    # dropped by the KeyError guard below.
+                    source=fields.get("source"),
                 )
             )
         except (KeyError, ValueError):

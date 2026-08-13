@@ -295,6 +295,16 @@ export class SegmentPublisher {
         event_type: eventTypeMap[event.type] || event.type,
         participant_name: event.speaker,
         meeting_id: this.meetingId,
+        // Provenance. Two independent producers write to this stream with an
+        // otherwise IDENTICAL field set, so a consumer cannot tell them apart
+        // without this. Events tagged 'audio' come from the per-track
+        // audio-activity state machine (services/speaker-boundaries.ts), whose
+        // START/END pairs are reliable — every START is named and eventually
+        // closed — so aw-integration pairs them into speaker INTERVALS.
+        // The DOM/CSS bridge tags itself 'dom' and is emitted as points only,
+        // because its pairing is not trustworthy (duplicate pairs from two
+        // state machines, no terminal flush, tiles vanishing mid-utterance).
+        source: 'audio',
       };
 
       await client.xAdd(this.speakerEventStreamKey, '*', fields);

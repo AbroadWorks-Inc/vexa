@@ -401,6 +401,51 @@ async function run(): Promise<void> {
     ]);
   }
 
+  // ── 8b. Teardown must not race an in-flight sweep ────────────────────────
+  // Regression guard. `stopSweep()` used to flush without checking `sweeping`,
+  // so teardown could run concurrently with a tick stuck inside publish. The
+  // caller (cleanupPerSpeakerPipeline) nulls `segmentPublisher` the moment
+  // stopSweep returns, so a still-in-flight publish was silently dropped.
+  // Previously harmless — aw-integration discarded every SPEAKER_END. Now that
+  // ENDs close speaker intervals, a dropped END runs that interval to the
+  // session boundary and hands the speaker the rest of the meeting.
+  console.log('\nTeardown vs in-flight sweep:');
+  {
+    const rig = makeRig();
+    rig.tracker.arm();
+    rig.setName(0, 'Judith');
+
+    const onset = rig.clock();
+    rig.tracker.markTrackAudioActivity(0, onset);
+
+    rig.blockPublish();
+    const inflightSweep = rig.tracker.sweep();   // parks inside publish
+    const teardown = rig.tracker.stopSweep();    // must WAIT, not barge in
+
+    let teardownFinishedEarly = false;
+    await Promise.race([
+      teardown.then(() => { teardownFinishedEarly = true; }),
+      new Promise((r) => setTimeout(r, 60)),
+    ]);
+    checkTrue('stopSweep waits while a sweep is in flight', !teardownFinishedEarly);
+
+    rig.releasePublish();
+    await inflightSweep;
+    await teardown;
+
+    // Exactly one START (from the parked sweep) and exactly one END (from the
+    // flush) — nothing duplicated, nothing lost.
+    check('teardown yields one clean START/END pair', rig.shape(), [
+      `started_speaking@${onset}`,
+      `stopped_speaking@${onset}`,
+    ]);
+    checkTrue(
+      'every START published by teardown has a matching END',
+      rig.events.filter((e) => e.type === 'started_speaking').length ===
+        rig.events.filter((e) => e.type === 'stopped_speaking').length,
+    );
+  }
+
   // ── 9. Multi-track independence (the live 3-speaker case) ────────────────
   console.log('\nMulti-track:');
   {

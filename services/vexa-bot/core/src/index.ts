@@ -832,6 +832,13 @@ async function performGracefulLeave(
             event_type: eventType,
             participant_name: name,
             meeting_id: bridgeMeetingId,
+            // Provenance — see the matching note in segment-publisher.ts.
+            // These DOM/CSS-derived events are deliberately marked 'dom' so
+            // aw-integration emits them as POINTS and never pairs them into
+            // intervals: two state machines here (mutation observer + 500ms
+            // poller) can double-emit a START/END for one utterance, there is no
+            // terminal flush, and a tile removed mid-utterance never closes.
+            source: "dom",
           });
           bridged++;
         }
@@ -2010,143 +2017,13 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
     const streamLastActive = new Map<number, number>();
     let nextStreamIndex = 0;
 
-    // ── Track → media element registry (for CSS-independent name resolution) ──
-    // Only this scope holds the live HTMLMediaElement per track, so the
-    // element→tile walk that backs __vexaGetTrackTileInfo must live here.
-    const trackElements = new Map<number, HTMLMediaElement>();
-    const tileMatchLogged = new Set<number>();
-
-    /** Read a participant name from STABLE SEMANTIC attributes only — never CSS classes. */
-    function readSemanticName(node: Element | null): string | null {
-      if (!node) return null;
-      try {
-        const el = node as HTMLElement;
-        const selfName = el.getAttribute('data-self-name');
-        if (selfName && selfName.trim()) return selfName.trim();
-        const aria = el.getAttribute('aria-label');
-        if (aria && aria.trim()) return aria.trim();
-        const tooltip = el.getAttribute('data-tooltip');
-        if (tooltip && tooltip.trim()) return tooltip.trim();
-        // Fall back to a descendant carrying one of those attributes.
-        const inner = el.querySelector('[data-self-name],[aria-label],[data-tooltip]');
-        if (inner && inner !== el) return readSemanticName(inner);
-        return null;
-      } catch {
-        return null;
-      }
-    }
-
-    /**
-     * Resolve a track index to its participant tile by walking UP from the bound
-     * media element. This is the durable path: it uses DOM structure + semantic
-     * attributes, so a Google Meet CSS class rotation cannot break it.
-     */
-    /**
-     * DIAGNOSTIC ONLY — no behaviour depends on this.
-     *
-     * The live run of 2026-08-12 logged `[TrackTile] Track N → name=null
-     * strategy=none participantId=null` for EVERY track: even
-     * `closest('[data-participant-id]')` matched nothing, so we do not actually
-     * know how Meet binds a media element to its participant tile. This dumps the
-     * real ancestor chain so the binding can be derived from facts.
-     *
-     * Attribute NAMES are always safe to log; VALUES are logged only for `data-*`
-     * and `aria-label` (the semantic surface we resolve names from), truncated.
-     * Strictly once per track index — never per audio chunk.
-     */
-    const tileDebugLogged = new Set<number>();
-    function dumpTileDebug(trackIndex: number, el: HTMLMediaElement): void {
-      if (tileDebugLogged.has(trackIndex)) return;
-      tileDebugLogged.add(trackIndex);
-      const emit = (window as any).logBot;
-      if (typeof emit !== 'function') return;
-      try {
-        const trunc = (v: string | null): string =>
-          v == null ? 'null' : (v.length > 80 ? `${v.slice(0, 80)}…` : v);
-        const describe = (node: Element, depth: number): string => {
-          const names: string[] = [];
-          const shown: string[] = [];
-          for (const attr of Array.from(node.attributes)) {
-            names.push(attr.name);
-            if (attr.name === 'aria-label' || attr.name.startsWith('data-')) {
-              shown.push(`${attr.name}="${trunc(attr.value)}"`);
-            }
-          }
-          const hasId = node.hasAttribute('id');
-          const hasClass = node.hasAttribute('class');
-          return `    [${depth}] <${node.tagName.toLowerCase()}> id=${hasId} class=${hasClass}`
-            + ` attrs=[${names.join(',')}]`
-            + (shown.length ? ` values={${shown.join(' ')}}` : '');
-        };
-
-        const lines: string[] = [`[TrackTileDebug] Track ${trackIndex} ancestor chain:`];
-        lines.push(describe(el, 0));
-        let node: Element | null = el.parentElement;
-        for (let depth = 1; node && depth <= 8; depth++) {
-          lines.push(describe(node, depth));
-          node = node.parentElement;
-        }
-        emit(lines.join('\n'));
-      } catch {
-        // Diagnostics must never break name resolution.
-      }
-    }
-
-    (window as any).__vexaGetTrackTileInfo = (trackIndex: number) => {
-      try {
-        const el = trackElements.get(trackIndex);
-        if (!el) return null;
-        dumpTileDebug(trackIndex, el);
-
-        // Strategy 1 — containment: nearest ancestor bound to a participant.
-        let container: Element | null = el.closest('[data-participant-id]');
-        let matched: string | null = container ? 'containment' : null;
-        if (!container) {
-          container = el.closest('[data-requested-participant-id],[data-self-name]');
-          if (container) matched = 'containment';
-        }
-
-        let participantId: string | null = container
-          ? (container.getAttribute('data-participant-id')
-            || container.getAttribute('data-requested-participant-id'))
-          : null;
-        let name = readSemanticName(container);
-
-        // Strategy 2 — participant-id cross-lookup: we know WHO but the enclosing
-        // node carries no name, so find the tile elsewhere in the DOM that does.
-        if (!name && participantId) {
-          const escaped = (window as any).CSS?.escape
-            ? (window as any).CSS.escape(participantId)
-            : participantId.replace(/["\\]/g, '\\$&');
-          const tile = document.querySelector(`[data-participant-id="${escaped}"]`);
-          const viaId = readSemanticName(tile);
-          if (viaId) {
-            name = viaId;
-            matched = 'participant-id';
-          }
-        }
-
-        if (!tileMatchLogged.has(trackIndex)) {
-          tileMatchLogged.add(trackIndex);
-          (window as any).logBot?.(
-            `[TrackTile] Track ${trackIndex} → name=${name ? `"${name}"` : 'null'} strategy=${matched || 'none'} participantId=${participantId ? 'present' : 'null'}`
-          );
-        }
-
-        return { participantId: participantId || null, name: name || null, matched };
-      } catch {
-        return null;
-      }
-    };
-
-    /** trackIndex → last-audio epoch ms. Feeds audio-derived speaking correlation. */
-    (window as any).__vexaGetTrackActivity = () => {
-      const out: Record<number, number> = {};
-      try {
-        streamLastActive.forEach((ts, idx) => { out[idx] = ts; });
-      } catch {}
-      return out;
-    };
+    // (The Layer-2 tile-containment helpers lived here: a trackIndex ->
+    // HTMLMediaElement registry, __vexaGetTrackTileInfo, its [TrackTileDebug]
+    // ancestor dump, and __vexaGetTrackActivity. All removed. The 2026-08-12
+    // live run proved Google Meet attaches <audio> as a direct child of <body>,
+    // so there is no participant tile above a media element to walk up to, and
+    // the strategy resolved 0 of 3 tracks. __vexaGetTrackActivity had no
+    // consumers at all. See docs-utpal/CHANGE_LEDGER.md (v8/v9).)
 
     function connectElement(el: HTMLMediaElement, index: number): boolean {
       try {
@@ -2154,9 +2031,6 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
         if (!stream || stream.getAudioTracks().length === 0) return false;
         const streamId = stream.id;
         if (connectedStreamIds.has(streamId)) return false;
-
-        // Register before wiring so tile lookup works from the first audio chunk.
-        trackElements.set(index, el);
 
         const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
         const source = ctx.createMediaStreamSource(stream);

@@ -29,6 +29,14 @@
 /** The two boundary kinds the publisher understands. */
 export type SpeakerBoundaryType = 'started_speaking' | 'stopped_speaking';
 
+/** Poll cadence while `stopSweep()` waits for an in-flight sweep to finish. */
+const STOP_SWEEP_DRAIN_POLL_MS = 20;
+/**
+ * Maximum polls before `stopSweep()` gives up waiting and flushes anyway
+ * (20ms x 100 = ~2s). Bounded so teardown can never hang on a wedged publish.
+ */
+const STOP_SWEEP_DRAIN_MAX_POLLS = 100;
+
 /** Sweep cadence for closing utterances that have gone silent. */
 export const SPEAKER_SWEEP_INTERVAL_MS = 200;
 /** Default silence gap before an utterance is considered ended. */
@@ -350,6 +358,37 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
+    }
+
+    // Wait out any sweep still in flight before flushing.
+    //
+    // `sweep()` holds `sweeping` for its whole async duration (decide + every
+    // publish await). Without this wait, teardown could run its own
+    // decide-and-flush pass concurrently with that tick, and the caller
+    // (cleanupPerSpeakerPipeline) nulls `segmentPublisher` immediately after we
+    // return — so an in-flight publish could be silently dropped by the
+    // `if (!segmentPublisher) return;` guard in the publish adapter.
+    //
+    // This was harmless while aw-integration discarded every SPEAKER_END. It is
+    // NOT harmless now: ENDs close speaker intervals, and a dropped END makes an
+    // interval run to the session boundary, handing that speaker the rest of the
+    // meeting in the dominant-speaker collapse.
+    // Counted, not clock-based: `this.now()` is the INJECTED clock, which tests
+    // hold static to drive the hangover deterministically, so a time-based loop
+    // here would spin forever under a fake clock.
+    for (
+      let waited = 0;
+      this.sweeping && waited < STOP_SWEEP_DRAIN_MAX_POLLS;
+      waited++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, STOP_SWEEP_DRAIN_POLL_MS));
+    }
+    if (this.sweeping) {
+      // Bounded, so teardown can never hang on a wedged publish. Proceeding is
+      // still the better option: `decide()` already drained the state the
+      // in-flight tick was working from, so the worst case is a duplicate
+      // boundary rather than a lost one.
+      this.log('[SpeakerBoundary] WARNING: a sweep was still in flight after waiting; flushing anyway');
     }
 
     // If recording never started the origin was never aligned, so anything published
