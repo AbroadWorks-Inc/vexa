@@ -2,7 +2,7 @@ import { Page } from "playwright";
 import { log } from "../../utils";
 import { BotConfig } from "../../types";
 import { RecordingService } from "../../services/recording";
-import { setActiveRecordingService, getSegmentPublisher } from "../../index";
+import { setActiveRecordingService, getSegmentPublisher, armSpeakerBoundaries } from "../../index";
 import { ensureBrowserUtils } from "../../utils/injection";
 import {
   googleParticipantSelectors,
@@ -25,6 +25,12 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
   if (publisher) {
     publisher.resetSessionStart();
     log(`[Recording] Session start reset to ${new Date(publisher.sessionStartMs).toISOString()}`);
+    // The origin is now recording-relative, so audio-derived speaker boundaries may
+    // publish. Any onset buffered during the admission wait is flushed by the next
+    // sweep against this corrected origin. __vexaRecordingStarted re-aligns again on
+    // real MediaRecorder start; residual error for the earliest events is the
+    // recording-start → MediaRecorder-start gap (sub-second), not the admission wait.
+    armSpeakerBoundaries();
   }
 
   const wantsAudioCapture =

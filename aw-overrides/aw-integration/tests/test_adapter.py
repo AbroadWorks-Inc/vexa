@@ -231,6 +231,45 @@ class TestBuildSpeakerTimeline:
         # fixture has 2 SPEAKER_START events (Alice and Bob)
         assert len(result.speaker_timeline) == 2
 
+    def test_speaker_timeline_is_sorted_when_events_are_published_late(
+        self, tmp_path: Path
+    ) -> None:
+        """Retroactively published SPEAKER_STARTs must not break timeline ordering.
+
+        The bot emits an utterance's START with its ORIGINAL onset even when the
+        speaker's name only resolves seconds later (vote/lock, or the 15s
+        roster-order fallback). Redis returns insertion order via xrange, so the
+        stream can carry an earlier onset AFTER a later one. Consumers attribute a
+        transcript segment to the last event with relative_sec <= segment.start,
+        which is only correct if the timeline is monotonic.
+        """
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), with_speaker_events=True
+        )
+        # Insertion order deliberately inverted vs. chronological order.
+        adapter._session.speaker_events = [
+            VexaSpeakerEvent(
+                uid="conn-abc123def456",
+                relative_ms=9000,
+                event_type="SPEAKER_START",
+                participant_name="Bob Müller",
+                meeting_id="42",
+            ),
+            VexaSpeakerEvent(
+                uid="conn-abc123def456",
+                relative_ms=1000,  # earlier onset, published later
+                event_type="SPEAKER_START",
+                participant_name="Alice Chen",
+                meeting_id="42",
+            ),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        relatives = [e.relative_sec for e in result.speaker_timeline]
+        assert relatives == sorted(relatives), f"timeline not monotonic: {relatives}"
+        assert result.speaker_timeline[0].speaker_name == "Alice Chen"
+
     def test_timestamp_ms_is_origin_plus_relative_ms(self, tmp_path: Path) -> None:
         adapter, _, _ = make_adapter(
             tmp_path, pcm_bytes=bytes(32000), with_speaker_events=True
@@ -272,6 +311,520 @@ class TestBuildSpeakerTimeline:
         speaker_ids = {e.speaker_id for e in result.speaker_timeline}
         assert "alice_chen" in speaker_ids
         assert "bob_müller" in speaker_ids
+
+
+# ---------------------------------------------------------------------------
+# Dominant-speaker collapse (audio-derived intervals)
+# ---------------------------------------------------------------------------
+
+
+def _audio(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
+    """A trusted, audio-activity-derived event (paired into intervals)."""
+    return VexaSpeakerEvent(
+        uid="conn-abc123def456",
+        relative_ms=relative_ms,
+        event_type=event_type,
+        participant_name=name,
+        meeting_id="42",
+        source="audio",
+    )
+
+
+def _untagged(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
+    """A point-in-time claim with no provenance tag.
+
+    This is what Zoom and Teams emit for EVERY event (roster `joined` and caption
+    `started_speaking`), and also what an older bot image emits. Never pairable.
+    """
+    return VexaSpeakerEvent(
+        uid="conn-abc123def456",
+        relative_ms=relative_ms,
+        event_type=event_type,
+        participant_name=name,
+        meeting_id="42",
+    )
+
+
+def _dom(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
+    """A DOM/CSS-derived event — must never be paired into an interval."""
+    return VexaSpeakerEvent(
+        uid="conn-abc123def456",
+        relative_ms=relative_ms,
+        event_type=event_type,
+        participant_name=name,
+        meeting_id="42",
+        source="dom",
+    )
+
+
+def _attribute(timeline: list, segment_start_sec: float) -> str | None:
+    """Replicate notetaker-worker's mapping rule EXACTLY, unchanged.
+
+    `map_segments_with_timeline` (talke, notetaker_worker.py:284-289) walks the
+    sorted events and keeps the last one whose `relative_sec` is at or before
+    the segment's start. These tests assert against that rule verbatim, because
+    the whole point of the collapse is to make the EXISTING consumer correct
+    rather than to change it.
+    """
+    current = None
+    for ev in sorted(timeline, key=lambda e: e.relative_sec):
+        if ev.relative_sec <= segment_start_sec:
+            current = ev.speaker_name
+        else:
+            break
+    return current
+
+
+class TestDominantSpeakerCollapse:
+    """Regression tests built from the two real misattributions of 2026-08-12.
+
+    Both were reported by the owner against the B8 transcript, and both are
+    reproduced here with the ACTUAL timestamps recovered from that meeting's
+    `speaker_timeline.json` in S3.
+    """
+
+    def test_short_burst_inside_a_long_run_does_not_steal_the_sentence(
+        self, tmp_path: Path
+    ) -> None:
+        """Live case 1: `[01:46]` was labelled Speaker A, truth was Speaker B.
+
+        B8 shipped these raw points: 104.928 Speaker B, 105.700 Speaker A,
+        107.928 Speaker B. The segment starts at 106.0s, so last-point-wins picked
+        Speaker A's 0.5s blip. Speaker B actually held the floor 95.4s -> 120.9s.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker B", "SPEAKER_START", 95_400),
+            _audio("Speaker A", "SPEAKER_START", 105_700),
+            _audio("Speaker A", "SPEAKER_END", 106_200),
+            _audio("Speaker B", "SPEAKER_END", 120_900),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 106.0) == "Speaker B"
+        # The nested blip must not produce a transition at all.
+        assert all(e.speaker_name != "Speaker A" for e in timeline)
+
+    def test_second_live_misattribution_is_fixed(self, tmp_path: Path) -> None:
+        """Live case 2: `[02:28]` was labelled Speaker C, truth was Speaker B.
+
+        B8 raw points: 146.428 Speaker B, 147.428 Speaker C, 149.428 Speaker B; segment
+        starts at 148.0s.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker B", "SPEAKER_START", 138_900),
+            _audio("Speaker C", "SPEAKER_START", 147_428),
+            _audio("Speaker C", "SPEAKER_END", 147_900),
+            _audio("Speaker B", "SPEAKER_END", 164_400),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 148.0) == "Speaker B"
+
+    def test_real_utterance_nested_in_a_very_long_interval_is_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """A naive "longest interval wins" rule regressed this case.
+
+        Someone with a persistently open mic can produce one very long interval.
+        Under longest-wins they dominate every instant, so a genuine 5s utterance
+        nested inside it never becomes dominant, vanishes from the timeline
+        entirely, and their whole contribution is credited to the noisy
+        participant — far worse than the single-line bug this change fixes.
+
+        The rule therefore ignores sub-threshold intervals as noise and otherwise
+        prefers the SHORTEST covering interval, i.e. the most specific claim on
+        that instant.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),        # open mic, whole meeting
+            _audio("Speaker A", "SPEAKER_END", 55_000),
+            _audio("Speaker B", "SPEAKER_START", 20_000),   # a real 5s turn inside it
+            _audio("Speaker B", "SPEAKER_END", 25_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 22.0) == "Speaker B"
+        # And control returns to the long-running speaker afterwards.
+        assert _attribute(timeline, 30.0) == "Speaker A"
+
+    def test_sub_threshold_blip_still_loses_to_a_longer_interval(
+        self, tmp_path: Path
+    ) -> None:
+        """The other half of the rule: a brief interjection must NOT win.
+
+        Three-way case that defeats both naive rules — longest-wins gives the
+        open mic, shortest-wins gives the 0.4s blip, and only the
+        threshold-then-shortest rule gives the real turn.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),        # open mic
+            _audio("Speaker A", "SPEAKER_END", 55_000),
+            _audio("Speaker B", "SPEAKER_START", 20_000),   # real turn
+            _audio("Speaker B", "SPEAKER_END", 25_000),
+            _audio("Speaker C", "SPEAKER_START", 21_000),   # 0.4s cough
+            _audio("Speaker C", "SPEAKER_END", 21_400),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 21_200 / 1000.0) == "Speaker B"
+        assert all(e.speaker_name != "Speaker C" for e in timeline)
+
+    def test_competing_sub_threshold_claims_do_not_interrupt_the_incumbent(
+        self, tmp_path: Path
+    ) -> None:
+        """The fallback branch used to recreate the original bug below 1.5s.
+
+        When every interval covering a span is sub-threshold, the rule falls back
+        rather than dropping them all. That fallback used to pick the LONGEST,
+        which meant an 800ms blip overlapping the tail of a 600ms real turn stole
+        it mid-utterance — a transition at 10.2s instead of 10.6s. Exactly the
+        mechanism this change exists to kill, just at smaller scale.
+
+        The incumbent now keeps the floor: a later claim can only take over once
+        the turn in progress has actually ended. Found in review with a concrete
+        repro; this is its regression guard.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 10_000),
+            _audio("Speaker A", "SPEAKER_END", 10_600),   # 600ms real turn
+            _audio("Speaker B", "SPEAKER_START", 10_200),  # 800ms blip over its tail
+            _audio("Speaker B", "SPEAKER_END", 11_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # A keeps its whole turn; B only takes over after A ends.
+        assert _attribute(timeline, 10.4) == "Speaker A"
+        b_events = [e for e in timeline if e.speaker_name == "Speaker B"]
+        assert b_events, "B should still appear once A has finished"
+        assert b_events[0].relative_sec >= 10.6
+
+    def test_standalone_short_utterance_still_owns_its_span(
+        self, tmp_path: Path
+    ) -> None:
+        """The threshold must not silence short turns that face no competition."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 10_000),
+            _audio("Speaker A", "SPEAKER_END", 10_400),  # 0.4s, nothing overlaps
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Speaker A"]
+        assert _attribute(timeline, 10.2) == "Speaker A"
+
+    def test_genuine_alternation_yields_one_transition_per_change(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 1_000),
+            _audio("Alice Chen", "SPEAKER_END", 5_000),
+            _audio("Bob Müller", "SPEAKER_START", 6_000),
+            _audio("Bob Müller", "SPEAKER_END", 9_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen", "Bob Müller"]
+        assert _attribute(timeline, 2.0) == "Alice Chen"
+        assert _attribute(timeline, 7.0) == "Bob Müller"
+
+    def test_consecutive_same_speaker_intervals_collapse_to_one_point(
+        self, tmp_path: Path
+    ) -> None:
+        """Prosody parity: it suppresses consecutive same-speaker events."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 1_000),
+            _audio("Alice Chen", "SPEAKER_END", 3_000),
+            _audio("Alice Chen", "SPEAKER_START", 4_000),
+            _audio("Alice Chen", "SPEAKER_END", 6_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert len(timeline) == 1
+        assert timeline[0].speaker_name == "Alice Chen"
+
+    def test_timeline_is_monotonic_and_deterministic(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        events = [
+            _audio("Alice Chen", "SPEAKER_START", 10_000),
+            _audio("Alice Chen", "SPEAKER_END", 20_000),
+            _audio("Bob Müller", "SPEAKER_START", 12_000),
+            _audio("Bob Müller", "SPEAKER_END", 13_000),
+            _audio("Alice Chen", "SPEAKER_START", 1_000),  # retroactive publish
+            _audio("Alice Chen", "SPEAKER_END", 2_000),
+        ]
+        adapter._session.speaker_events = list(events)
+        first = adapter.build_speaker_timeline().speaker_timeline
+
+        rel = [e.relative_sec for e in first]
+        assert rel == sorted(rel), f"not monotonic: {rel}"
+
+        # Same input -> byte-identical output (tie-breaks fully ordered).
+        adapter._session.speaker_events = list(events)
+        second = adapter.build_speaker_timeline().speaker_timeline
+        assert [(e.relative_sec, e.speaker_name) for e in first] == [
+            (e.relative_sec, e.speaker_name) for e in second
+        ]
+
+    def test_unclosed_interval_is_closed_at_session_end(
+        self, tmp_path: Path
+    ) -> None:
+        """Someone still talking when the meeting ends still gets an interval."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 5_000),  # no END
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        # The 60s fixture session bounds it, so a later segment still resolves.
+        assert _attribute(timeline, 50.0) == "Alice Chen"
+
+    def test_orphan_end_never_invents_an_interval(self, tmp_path: Path) -> None:
+        """An END with no START must not conjure speech for that speaker.
+
+        Producer A cannot emit one (the `hadStart && closingName` guard), but the
+        DOM path can, and a bot restart mid-meeting could too. Paired alongside a
+        real interval so this asserts the invariant directly rather than falling
+        through to the segment-derived fallback.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker B", "SPEAKER_START", 1_000),
+            _audio("Speaker C", "SPEAKER_END", 5_000),  # orphan: no START
+            _audio("Speaker B", "SPEAKER_END", 10_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Speaker B"]
+        assert all(e.speaker_name != "Speaker C" for e in timeline)
+
+    def test_no_usable_events_falls_through_to_segment_derived_timeline(
+        self, tmp_path: Path
+    ) -> None:
+        """Last line of defence, and it is pre-existing behaviour.
+
+        With nothing pairable AND no SPEAKER_START to fall back on, the timeline
+        is derived from the transcript segments themselves. Documented here
+        because the collapse makes this branch reachable in more situations than
+        before, and an empty timeline would cost us names entirely.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_END", 5_000),  # orphan END only
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Derived from the fixture's two segments, not from the orphan END.
+        assert {e.speaker_name for e in timeline} == {"Alice Chen", "Bob Müller"}
+
+    def test_dom_events_are_never_paired_into_intervals(
+        self, tmp_path: Path
+    ) -> None:
+        """The core of the fix: a stray DOM point must not steal a sentence.
+
+        This is the exact shape that caused the live failures — but tagged
+        'dom'. Because an audio interval covers the moment, the DOM blip must be
+        excluded entirely rather than admitted as a competing point.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker B", "SPEAKER_START", 95_400),
+            _audio("Speaker B", "SPEAKER_END", 120_900),
+            _dom("Speaker A", "SPEAKER_START", 105_700),
+            _dom("Speaker A", "SPEAKER_END", 106_200),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 106.0) == "Speaker B"
+        assert all(e.speaker_name != "Speaker A" for e in timeline)
+
+    def test_teams_zoom_shape_is_not_paired_and_keeps_every_speaker(
+        self, tmp_path: Path
+    ) -> None:
+        """The normal shape of every Teams/Zoom meeting must not be mangled.
+
+        Teams and Zoom never arm the audio-activity boundary tracker, so 100% of
+        their `speaker_events_relative` traffic is START-only, point-in-time
+        claims — `joined` from the roster paths, `started_speaking` per caption
+        line — with no matching close, ever.
+
+        If those were treated as pairable, each would open an interval that only
+        closes at the session boundary, the longest such interval would win every
+        span, and every speaker after the first would VANISH from the timeline.
+        That is worse than the bug this change fixes, and it would affect every
+        multi-speaker Teams call rather than being an edge case.
+
+        Leaving `source` untagged routes them to the point path, i.e. exactly
+        their existing behaviour. Regression guard for a real defect found in
+        review.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        # Four speakers, one point-in-time claim each, no ENDs anywhere.
+        adapter._session.speaker_events = [
+            _untagged("Speaker A", "SPEAKER_START", 0),
+            _untagged("Speaker B", "SPEAKER_START", 10_000),
+            _untagged("Speaker C", "SPEAKER_START", 20_000),
+            _untagged("Speaker D", "SPEAKER_START", 30_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Every speaker survives, in order, as a point.
+        assert [e.speaker_name for e in timeline] == [
+            "Speaker A",
+            "Speaker B",
+            "Speaker C",
+            "Speaker D",
+        ]
+        # And each still owns the span following its own claim.
+        assert _attribute(timeline, 5.0) == "Speaker A"
+        assert _attribute(timeline, 15.0) == "Speaker B"
+        assert _attribute(timeline, 25.0) == "Speaker C"
+        assert _attribute(timeline, 35.0) == "Speaker D"
+
+    def test_audio_intervals_take_precedence_over_untagged_points(
+        self, tmp_path: Path
+    ) -> None:
+        """Trusted intervals win outright; untrusted points are excluded, not merged.
+
+        When any pairable audio interval exists, non-pairable claims — DOM/CSS
+        events and untagged ones alike — are dropped rather than merged in as
+        competing points. That exclusion IS the fix: a stray point surviving
+        alongside intervals could become "the last event before a segment" and
+        reintroduce the original misattribution.
+
+        Untagged claims are therefore only used when there is nothing pairable at
+        all, which is the Teams/Zoom case covered above.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 5_000),
+            _untagged("Speaker B", "SPEAKER_START", 1_000),  # excluded
+            _dom("Speaker C", "SPEAKER_START", 2_000),       # excluded
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Speaker A"]
+        assert _attribute(timeline, 2.0) == "Speaker A"
+
+    def test_two_partially_overlapping_real_turns(self, tmp_path: Path) -> None:
+        """Crosstalk between two genuine turns of different length.
+
+        Not nested — they overlap at the edges, which is the shape the suite
+        otherwise never covered. Each speaker must own the part of the span where
+        they are the only one active.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 20_000),
+            _audio("Speaker B", "SPEAKER_START", 15_000),  # cuts in at 15s
+            _audio("Speaker B", "SPEAKER_END", 40_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert _attribute(timeline, 5.0) == "Speaker A"    # A alone
+        assert _attribute(timeline, 30.0) == "Speaker B"   # B alone, after A stops
+
+    def test_untagged_events_fall_back_to_legacy_points(
+        self, tmp_path: Path
+    ) -> None:
+        """An older bot image publishes no `source`; must not crash or vanish."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            VexaSpeakerEvent(
+                uid="conn-abc123def456",
+                relative_ms=4_500,
+                event_type="SPEAKER_START",
+                participant_name="Alice Chen",
+                meeting_id="42",
+            ),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        assert timeline[0].relative_sec == pytest.approx(4.5)
+
+    def test_dom_only_meeting_falls_back_rather_than_emitting_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """Safety valve.
+
+        An EMPTY timeline makes notetaker-worker bail ("Timeline has no speaker
+        events") and the transcript reverts to raw SPEAKER_NN. A noisy timeline
+        is strictly better than none, so DOM-only meetings keep legacy points.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _dom("Alice Chen", "SPEAKER_START", 1_000),
+            _dom("Alice Chen", "SPEAKER_END", 2_000),
+            _dom("Bob Müller", "SPEAKER_START", 3_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert len(timeline) == 2  # one per DOM SPEAKER_START
+        assert {e.speaker_name for e in timeline} == {"Alice Chen", "Bob Müller"}
+
+    def test_silence_gap_emits_no_event(self, tmp_path: Path) -> None:
+        """Prosody discards silence; so must we."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 1_000),
+            _audio("Alice Chen", "SPEAKER_END", 2_000),
+            _audio("Bob Müller", "SPEAKER_START", 30_000),
+            _audio("Bob Müller", "SPEAKER_END", 31_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.relative_sec for e in timeline] == [1.0, 30.0]
+        # Inside the gap the previous transition remains in effect — matching
+        # today's worker behaviour rather than inventing an "everyone silent".
+        assert _attribute(timeline, 15.0) == "Alice Chen"
+
+    def test_second_start_without_end_closes_the_previous_utterance(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 1_000),
+            _audio("Alice Chen", "SPEAKER_START", 5_000),  # no END between
+            _audio("Alice Chen", "SPEAKER_END", 9_000),
+            _audio("Bob Müller", "SPEAKER_START", 2_000),
+            _audio("Bob Müller", "SPEAKER_END", 3_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Alice's [1,5] and [5,9] both exist; Bob's 1s sits inside Alice's
+        # 4s interval, so Alice stays dominant throughout and there is exactly
+        # one transition.
+        assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        assert _attribute(timeline, 2.5) == "Alice Chen"
 
 
 # ---------------------------------------------------------------------------
@@ -636,3 +1189,82 @@ async def test_run_from_redis_filters_by_session_uid(tmp_path: _Path) -> None:
 
     mock_s3.write_all.assert_called_once()
     mock_client.post_process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_parses_the_source_field_end_to_end(
+    tmp_path: _Path,
+) -> None:
+    """Guards the dict-parsing of `source`, which the collapse tests skip.
+
+    Every collapse test constructs `VexaSpeakerEvent(source=...)` directly, so none
+    of them exercise `run_from_redis`'s `fields.get("source")` read. A regression
+    there — e.g. `fields["source"]` instead of `.get()` — would raise KeyError,
+    which the surrounding `except (KeyError, ValueError)` swallows, SILENTLY
+    dropping every event and reverting transcripts to SPEAKER_NN with no error
+    anywhere. This asserts tagged events survive the parse and reach the timeline
+    as a collapsed interval, and that untagged ones still survive as points.
+    """
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    # A paired, audio-tagged utterance...
+    for fields in (
+        {
+            "uid": _SESSION_UID,
+            "relative_client_timestamp_ms": "2000",
+            "event_type": "SPEAKER_START",
+            "participant_name": "Speaker A",
+            "meeting_id": "42",
+            "source": "audio",
+        },
+        {
+            "uid": _SESSION_UID,
+            "relative_client_timestamp_ms": "9000",
+            "event_type": "SPEAKER_END",
+            "participant_name": "Speaker A",
+            "meeting_id": "42",
+            "source": "audio",
+        },
+        # ...and an untagged claim, as Teams/Zoom and older bot images emit.
+        {
+            "uid": _SESSION_UID,
+            "relative_client_timestamp_ms": "20000",
+            "event_type": "SPEAKER_START",
+            "participant_name": "Speaker B",
+            "meeting_id": "42",
+        },
+    ):
+        fake_r.xadd("speaker_events_relative", fields)
+
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(s3_key, wav, timeline, participants, metadata):  # noqa: ANN001
+        captured["timeline"] = timeline
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    timeline = captured["timeline"].speaker_timeline  # type: ignore[union-attr]
+    names = [e.speaker_name for e in timeline]
+
+    # The tagged pair collapsed to a transition at its true onset (2.0s), proving
+    # `source` survived the parse and licensed interval-building.
+    assert "Speaker A" in names
+    assert any(abs(e.relative_sec - 2.0) < 0.001 for e in timeline)
