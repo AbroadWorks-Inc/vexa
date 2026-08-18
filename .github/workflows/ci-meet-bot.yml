@@ -42,15 +42,15 @@ jobs:
 
       - name: black — aw_output_hook
         working-directory: aw-overrides/services/meet-bot
-        run: black --check aw_output_hook.py tests/
+        run: black --check aw_output_hook.py knock_delay.py tests/
 
       - name: ruff — aw_output_hook
         working-directory: aw-overrides/services/meet-bot
-        run: ruff check aw_output_hook.py
+        run: ruff check aw_output_hook.py knock_delay.py
 
       - name: mypy — aw_output_hook
         working-directory: aw-overrides/services/meet-bot
-        run: mypy aw_output_hook.py --ignore-missing-imports
+        run: mypy aw_output_hook.py knock_delay.py --ignore-missing-imports
 
       - name: pytest — aw_output_hook
         working-directory: aw-overrides/services/meet-bot
