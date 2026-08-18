@@ -35,6 +35,41 @@ for i in $(seq 1 60); do
     sleep 0.5
 done
 
+# --- Knock at the door only when the meeting is nearly due ---
+# The pod is spawned ~10 min early so all of the above (Xvfb, PulseAudio, the
+# sidecar, and shortly the browser) is warm before the meeting starts. But in the
+# guest-join flow the bot is never invited, so Meet makes it "Ask to join" and a
+# human must admit it -- and knocking 10 min early means knocking on an EMPTY
+# room, burning the 15 min admission budget before anyone can let the bot in.
+# Observed live 2026-08-19: knocked 23:50, owner joined 00:00, gave up 00:05.
+#
+# So: wait here, then let the browser knock ~1 min before the start. Same budget,
+# aimed at the window where a human is actually present.
+#
+# knock_delay.py prints ONLY an integer on stdout and its reasoning on stderr, and
+# fails open (prints 0 = knock now, the pre-change behaviour) on every bad-input
+# path. Both guards below exist because `sleep` must never receive a non-integer:
+# `|| echo 0` covers the script failing to run at all, and the `case` covers it
+# printing something unexpected. `set -e` would otherwise abort the whole boot.
+# Only stdout is captured here; the module's stderr reasoning flows straight to
+# the pod log, which is where it is wanted.
+#
+# Bare `python`, not `python3`: it is what line 28 above already uses to launch the
+# sidecar, so it is the interpreter this image is PROVEN to resolve. Both exist in
+# the runtime image (verified: /usr/bin/python and /usr/bin/python3, both 3.12.3),
+# but if the invocation ever failed, `|| echo 0` would fail open and the bot would
+# silently knock early again -- the exact bug this block fixes. Matching the proven
+# convention removes that class of silent regression.
+KNOCK_SLEEP="$(python /app/knock_delay.py || echo 0)"
+case "$KNOCK_SLEEP" in
+    ''|*[!0-9]*) echo "[start.sh] knock delay unusable ('$KNOCK_SLEEP'); knocking now"; KNOCK_SLEEP=0 ;;
+esac
+if [ "$KNOCK_SLEEP" -gt 0 ]; then
+    echo "[start.sh] holding ${KNOCK_SLEEP}s before opening the meeting page"
+    sleep "$KNOCK_SLEEP"
+    echo "[start.sh] hold complete; launching bot"
+fi
+
 # --- Vexa Node bot core (foreground; its PID drives Job completion) ---
 # Capture the bot's exit code without letting `set -e` abort teardown.
 rm -f /tmp/pipeline_done 2>/dev/null || true

@@ -52,6 +52,7 @@ COPY vexa-fork/aw-overrides/services/meet-bot/aw_output_hook.py /app/aw_output_h
 # meet-bot-secrets Secret via the K8s REST API using httpx (already installed via
 # notetaker-common) — no kubernetes client dep (that is orchestrator-only, §10A.2).
 COPY vexa-fork/aw-overrides/services/meet-bot/refresh_storage_state.py /app/refresh_storage_state.py
+COPY vexa-fork/aw-overrides/services/meet-bot/knock_delay.py /app/knock_delay.py
 COPY vexa-fork/aw-overrides/services/meet-bot/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
