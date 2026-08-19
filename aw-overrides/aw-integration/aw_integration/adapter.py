@@ -123,6 +123,12 @@ class VexaSession:
     session_end_ts: datetime
     segments: list[VexaSegment] = field(default_factory=list)
     speaker_events: list[VexaSpeakerEvent] = field(default_factory=list)
+    # True = a remote participant's camera was observed on at some point
+    # (video). False = we could observe, and nobody ever did (audio-only).
+    # None = no usable observation opportunity, OR the bot's `media_state`
+    # message was never sent — only 3 of the bot's exit paths emit it, so
+    # absence must NOT be treated as "audio". See MetadataFile.media_kind.
+    saw_remote_camera: bool | None = None
 
 
 class VexaSessionAdapter:
@@ -468,6 +474,13 @@ class VexaSessionAdapter:
         duration_sec = (
             session.session_end_ts - session.session_start_ts
         ).total_seconds()
+        media_kind: Literal["audio", "video"] | None
+        if session.saw_remote_camera is True:
+            media_kind = "video"
+        elif session.saw_remote_camera is False:
+            media_kind = "audio"
+        else:
+            media_kind = None
         return MetadataFile(
             meeting_id=session.meeting_id,
             platform=self._platform,
@@ -483,6 +496,7 @@ class VexaSessionAdapter:
             bot_started_at=session.session_start_ts,
             bot_left_at=session.session_end_ts,
             bot_left_reason=bot_left_reason,
+            media_kind=media_kind,
         )
 
     async def run(
@@ -524,6 +538,7 @@ async def run_from_redis(
     )
     segments: list[VexaSegment] = []
     session_start_ts: datetime | None = None
+    saw_remote_camera: bool | None = None
 
     for _eid, fields in raw_ts:
         try:
@@ -540,6 +555,14 @@ async def run_from_redis(
                 session_start_ts = datetime.fromisoformat(
                     raw_ts_str.replace("Z", "+00:00")
                 )
+        elif msg_type == "media_state":
+            # Only 3 of the bot's exit paths emit this; a missing or
+            # non-boolean `sawRemoteCamera` (including explicit null) must
+            # land as None ("unknown"), never be coerced to "audio".
+            raw_saw_camera = payload.get("sawRemoteCamera")
+            saw_remote_camera = (
+                raw_saw_camera if isinstance(raw_saw_camera, bool) else None
+            )
         elif msg_type == "transcription":
             for seg_dict in payload.get("segments", []):
                 try:
@@ -618,6 +641,7 @@ async def run_from_redis(
         session_end_ts=session_end_wall_clock,
         segments=segments,
         speaker_events=speaker_events,
+        saw_remote_camera=saw_remote_camera,
     )
 
     adapter = VexaSessionAdapter(

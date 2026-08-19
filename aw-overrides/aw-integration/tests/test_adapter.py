@@ -67,6 +67,7 @@ def make_test_job() -> BotJob:
 
 def make_test_session(
     with_speaker_events: bool = True,
+    saw_remote_camera: bool | None = None,
 ) -> VexaSession:
     segments = [
         VexaSegment(
@@ -127,6 +128,7 @@ def make_test_session(
         session_end_ts=SESSION_END,
         segments=segments,
         speaker_events=speaker_events,
+        saw_remote_camera=saw_remote_camera,
     )
 
 
@@ -134,6 +136,7 @@ def make_adapter(
     tmp_path: Path,
     pcm_bytes: bytes | None = None,
     with_speaker_events: bool = True,
+    saw_remote_camera: bool | None = None,
 ) -> tuple[VexaSessionAdapter, MagicMock, MagicMock]:
     """Return (adapter, mock_s3_writer, mock_notetaker_client)."""
     raw_audio = tmp_path / "audio.raw"
@@ -145,7 +148,10 @@ def make_adapter(
     notetaker_client.post_process = AsyncMock(return_value={"status": "ok"})
 
     adapter = VexaSessionAdapter(
-        session=make_test_session(with_speaker_events=with_speaker_events),
+        session=make_test_session(
+            with_speaker_events=with_speaker_events,
+            saw_remote_camera=saw_remote_camera,
+        ),
         job=make_test_job(),
         audio_raw_path=raw_audio,
         s3_writer=s3_writer,
@@ -911,6 +917,27 @@ class TestBuildMetadata:
         result = adapter.build_metadata()
         assert result.meeting_id == "42"
 
+    def test_saw_remote_camera_true_maps_to_video(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), saw_remote_camera=True
+        )
+        result = adapter.build_metadata()
+        assert result.media_kind == "video"
+
+    def test_saw_remote_camera_false_maps_to_audio(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), saw_remote_camera=False
+        )
+        result = adapter.build_metadata()
+        assert result.media_kind == "audio"
+
+    def test_saw_remote_camera_none_maps_to_none(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), saw_remote_camera=None
+        )
+        result = adapter.build_metadata()
+        assert result.media_kind is None
+
 
 # ---------------------------------------------------------------------------
 # VexaSessionAdapter.run (integration of the full pipeline)
@@ -1264,3 +1291,255 @@ async def test_run_from_redis_parses_the_source_field_end_to_end(
     # `source` survived the parse and licensed interval-building.
     assert "Speaker A" in names
     assert any(abs(e.relative_sec - 2.0) < 0.001 for e in timeline)
+
+
+# ---------------------------------------------------------------------------
+# run_from_redis: `media_state` message -> MetadataFile.media_kind
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_media_state_true_maps_to_video(
+    tmp_path: _Path,
+) -> None:
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    fake_r.xadd(
+        "transcription_segments",
+        {
+            "payload": _json.dumps(
+                {
+                    "type": "media_state",
+                    "token": "jwt-irrelevant",
+                    "uid": _SESSION_UID,
+                    "meeting_id": "42",
+                    "sawRemoteCamera": True,
+                }
+            )
+        },
+    )
+
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(
+        s3_key, wav, timeline, participants, metadata
+    ):  # noqa: ANN001
+        captured["metadata"] = metadata
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    metadata = captured["metadata"]
+    assert metadata.media_kind == "video"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_media_state_false_maps_to_audio(
+    tmp_path: _Path,
+) -> None:
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    fake_r.xadd(
+        "transcription_segments",
+        {
+            "payload": _json.dumps(
+                {
+                    "type": "media_state",
+                    "token": "jwt-irrelevant",
+                    "uid": _SESSION_UID,
+                    "meeting_id": "42",
+                    "sawRemoteCamera": False,
+                }
+            )
+        },
+    )
+
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(
+        s3_key, wav, timeline, participants, metadata
+    ):  # noqa: ANN001
+        captured["metadata"] = metadata
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    metadata = captured["metadata"]
+    assert metadata.media_kind == "audio"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_media_state_absent_maps_to_none(
+    tmp_path: _Path,
+) -> None:
+    """No `media_state` message at all (hard-deadline / explicit-removal exit
+    paths never send one) must NOT be coerced to "audio"."""
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    _seed_fake_redis(fake_r)  # the base fixture has no media_state entry
+
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(
+        s3_key, wav, timeline, participants, metadata
+    ):  # noqa: ANN001
+        captured["metadata"] = metadata
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    metadata = captured["metadata"]
+    assert metadata.media_kind is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_media_state_malformed_does_not_raise(
+    tmp_path: _Path,
+) -> None:
+    """A non-boolean `sawRemoteCamera` (producer bug, truncated payload, etc.)
+    must degrade to `None` rather than raising or being coerced to "audio"."""
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    fake_r.xadd(
+        "transcription_segments",
+        {
+            "payload": _json.dumps(
+                {
+                    "type": "media_state",
+                    "token": "jwt-irrelevant",
+                    "uid": _SESSION_UID,
+                    "meeting_id": "42",
+                    "sawRemoteCamera": "not-a-bool",
+                }
+            )
+        },
+    )
+
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(
+        s3_key, wav, timeline, participants, metadata
+    ):  # noqa: ANN001
+        captured["metadata"] = metadata
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    metadata = captured["metadata"]
+    assert metadata.media_kind is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_media_state_ignores_other_session_uid(
+    tmp_path: _Path,
+) -> None:
+    """A `media_state` message for a different session must not leak in."""
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+    fake_r.xadd(
+        "transcription_segments",
+        {
+            "payload": _json.dumps(
+                {
+                    "type": "media_state",
+                    "token": "jwt-irrelevant",
+                    "uid": "OTHER_SESSION",
+                    "meeting_id": "99",
+                    "sawRemoteCamera": True,
+                }
+            )
+        },
+    )
+
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+    captured: dict[str, object] = {}
+
+    def _capture_write_all(
+        s3_key, wav, timeline, participants, metadata
+    ):  # noqa: ANN001
+        captured["metadata"] = metadata
+
+    mock_s3 = _MagicMock()
+    mock_s3.write_all.side_effect = _capture_write_all
+    mock_client = _AsyncMock()
+
+    from aw_integration.adapter import run_from_redis
+
+    with _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="host_ended",
+            s3_writer=mock_s3,
+            notetaker_client=mock_client,
+        )
+
+    metadata = captured["metadata"]
+    assert metadata.media_kind is None  # type: ignore[union-attr]

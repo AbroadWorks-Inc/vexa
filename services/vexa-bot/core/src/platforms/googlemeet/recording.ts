@@ -5,6 +5,12 @@ import { RecordingService } from "../../services/recording";
 import { setActiveRecordingService, getSegmentPublisher, armSpeakerBoundaries } from "../../index";
 import { ensureBrowserUtils } from "../../utils/injection";
 import {
+  evaluateRemoteCameraTick,
+  RemoteCameraLatch,
+  ObservedVideoElement,
+  createOnceGuard,
+} from "../../services/camera-detection";
+import {
   googleParticipantSelectors,
   googleSpeakingClassNames,
   googleSilenceClassNames,
@@ -32,6 +38,37 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
     // recording-start → MediaRecorder-start gap (sub-second), not the admission wait.
     armSpeakerBoundaries();
   }
+
+  // Remote-camera detection: a latched, meeting-lifetime verdict on whether any
+  // remote participant's camera was ever seen on. Independent of audio capture —
+  // media_state describes what participants showed, not whether we recorded audio.
+  // ALL decision logic (own-track exclusion, screen-share exclusion, unknown vs.
+  // audio vs. video) lives in services/camera-detection.ts and is unit-tested there;
+  // this file only ships raw per-tick DOM facts across the exposed function below.
+  const cameraLatch = new RemoteCameraLatch();
+
+  await page.exposeFunction(
+    "__vexaReportCameraTick",
+    (observedVideos: ObservedVideoElement[], isPresentationActive: boolean, hasRemoteParticipants: boolean) => {
+      cameraLatch.observe(evaluateRemoteCameraTick(observedVideos, isPresentationActive, hasRemoteParticipants));
+    },
+  );
+
+  // Called at meeting end, once the whole-meeting verdict is final. Every exit
+  // path that has a chance to reach the page (the in-page "everyone left"
+  // timer, beforeunload/visibilitychange, AND the Node-side graceful-leave
+  // path used by every other ending — admin removal, host-ended meetings,
+  // alone-timeouts, error paths, SIGTERM/SIGINT) calls this same function, so
+  // it is wrapped in a once-guard: the verdict is published at most once per
+  // meeting, no matter which caller(s) reach it or in what order.
+  const finalizeCameraDetectionOnce = createOnceGuard(async () => {
+    const verdict = cameraLatch.result();
+    log(`[Google Recording] Camera detection finalized: sawRemoteCamera=${verdict === null ? "unknown" : verdict}`);
+    if (publisher) {
+      await publisher.publishMediaState(verdict);
+    }
+  });
+  await page.exposeFunction("__vexaFinalizeCameraDetection", finalizeCameraDetectionOnce);
 
   const wantsAudioCapture =
     !!botConfig.recordingEnabled &&
@@ -810,6 +847,32 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               return /\bis presenting\b|you are presenting|presenting to everyone/i.test(bodyText);
             };
 
+            // Remote-camera detection (raw DOM facts only — see camera-detection.ts on the
+            // Node side for the actual decision logic). DOM-structural + track-identity checks
+            // only: NOT CSS class names, which Meet rotates (see selectors.ts history).
+            //
+            // "Own track" = the bot's own outbound virtual camera (services/screen-content.ts,
+            // window.__vexa_canvas_stream). We identify it by MediaStreamTrack id rather than
+            // any DOM position/class, since that survives Meet UI changes and correctly
+            // excludes the bot's own tile even if Meet ever renders a local self-view from it.
+            const collectObservedVideos = (): Array<{ videoWidth: number; isOwnTrack: boolean }> => {
+              const canvasStream = (window as any).__vexa_canvas_stream as MediaStream | undefined;
+              const ownTrackIds = new Set<string>(
+                canvasStream && typeof canvasStream.getVideoTracks === 'function'
+                  ? canvasStream.getVideoTracks().map((t) => t.id)
+                  : []
+              );
+              const videos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+              return videos.map((v) => {
+                let isOwnTrack = false;
+                const srcObject = v.srcObject as MediaStream | null;
+                if (srcObject && typeof srcObject.getVideoTracks === 'function') {
+                  isOwnTrack = srcObject.getVideoTracks().some((t) => ownTrackIds.has(t.id));
+                }
+                return { videoWidth: v.videoWidth || 0, isOwnTrack };
+              });
+            };
+
             // Setup Google Meet meeting monitoring (browser context)
             const setupGoogleMeetingMonitoring = (botConfigData: any, audioService: any, resolve: any) => {
               (window as any).logBot("Setting up Google Meet meeting monitoring...");
@@ -831,6 +894,15 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 } catch (flushErr: any) {
                   (window as any).logBot?.(
                     `[Google Recording] Flush error during shutdown (${reason}): ${flushErr?.message || flushErr}`
+                  );
+                }
+                try {
+                  if (typeof (window as any).__vexaFinalizeCameraDetection === "function") {
+                    await (window as any).__vexaFinalizeCameraDetection();
+                  }
+                } catch (camErr: any) {
+                  (window as any).logBot?.(
+                    `[CameraDetection] Finalize error during shutdown (${reason}): ${camErr?.message || camErr}`
                   );
                 }
                 audioService.disconnect();
@@ -867,6 +939,25 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 // never false-triggers it. Grace period tolerates brief drops / a rejoin.
                 const rawTiles = countParticipantTiles();
                 const presenting = isPresentationActive();
+
+                // Remote-camera detection tick — ships raw facts to Node, which owns all
+                // decision logic (own-track exclusion, screen-share exclusion, the latch).
+                // hasRemoteParticipants uses the same >=2-tiles threshold as meetingHasStarted
+                // below, so "opportunity to observe" tracks genuine occupancy, not the bot
+                // being alone in an empty or not-yet-started room.
+                try {
+                  const reportTick = (window as any).__vexaReportCameraTick;
+                  if (typeof reportTick === 'function') {
+                    Promise.resolve(reportTick(collectObservedVideos(), presenting, rawTiles >= 2)).catch(
+                      (camErr: any) => {
+                        (window as any).logBot?.(`[CameraDetection] Tick reporting rejected: ${camErr?.message || camErr}`);
+                      }
+                    );
+                  }
+                } catch (camErr: any) {
+                  (window as any).logBot?.(`[CameraDetection] Tick reporting failed: ${camErr?.message || camErr}`);
+                }
+
                 // Arm the finalize only once the meeting is genuinely underway.
                 if (!meetingHasStarted && (rawTiles >= 2 || presenting)) {
                   meetingHasStarted = true;

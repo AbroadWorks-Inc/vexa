@@ -192,6 +192,36 @@ export class SegmentPublisher {
   }
 
   /**
+   * Publish a media_state message: whether any remote participant's camera
+   * was ever seen on during the session. Emitted ONCE, at meeting end, once
+   * the whole-meeting verdict is known — unlike session_start/session_end
+   * this cannot be known earlier, so it must NOT be folded into either of
+   * those messages.
+   *
+   * `sawRemoteCamera` is `null` when the detection never had a usable
+   * opportunity to observe (e.g. the bot was alone the whole meeting) —
+   * callers MUST pass `null` in that case rather than guessing `false`.
+   */
+  async publishMediaState(sawRemoteCamera: boolean | null): Promise<void> {
+    try {
+      const client = await this.ensureConnected();
+
+      const payload = JSON.stringify({
+        type: 'media_state',
+        token: this.token,
+        uid: this.sessionUid,
+        meeting_id: this.meetingId,
+        sawRemoteCamera,
+      });
+
+      await client.xAdd(this.segmentStreamKey, '*', { payload });
+      log(`[SegmentPublisher] Published media_state for session ${this.sessionUid} (sawRemoteCamera=${sawRemoteCamera})`);
+    } catch (err: any) {
+      log(`[SegmentPublisher] Failed to publish media_state: ${err.message}`);
+    }
+  }
+
+  /**
    * Publish a transcription segment to Redis.
    * - XADD to transcription_segments stream (collector format: { payload: JSON })
    * - PUBLISH to meeting:{meetingId}:segments channel (flat JSON for gateway/dashboard)
