@@ -114,6 +114,31 @@ export async function leaveGoogleMeet(page: Page | null, botConfig?: BotConfig, 
     log(`[leaveGoogleMeet] Recording flush failed: ${flushError.message}`);
   }
 
+  // Finalize remote-camera detection before UI leave. This is the shared
+  // shutdown path used by every ending EXCEPT the three in-page endings
+  // (everyone_left / beforeunload / visibility_hidden), which already call
+  // it from stopWithFlush() in recording.ts. __vexaFinalizeCameraDetection
+  // is idempotent (see createOnceGuard in camera-detection.ts), so it is
+  // always safe to call here too — covers removed_by_admin, meeting_ended,
+  // left_alone_timeout, startup_alone_timeout, error paths, and
+  // SIGTERM/SIGINT (which route through this same function).
+  //
+  // Never fatal: an already-torn-down page/context is the NORMAL case for
+  // meeting_ended (host ended the call, page may already be navigating
+  // away or closed) — that degrades the verdict to unknown (null), which
+  // is the correct, safe outcome; it is logged as an expected condition,
+  // not a stack trace.
+  try {
+    await page.evaluate(async () => {
+      const finalizeFn = (window as any).__vexaFinalizeCameraDetection;
+      if (typeof finalizeFn === "function") {
+        await finalizeFn();
+      }
+    });
+  } catch (camErr: any) {
+    log(`[leaveGoogleMeet] Camera detection finalize skipped (page likely already gone): ${camErr.message}`);
+  }
+
   // Call leave callback first to notify meeting-api
   if (botConfig) {
     try {
