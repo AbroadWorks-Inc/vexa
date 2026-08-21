@@ -32,7 +32,11 @@ __all__ = [
     "run_from_redis",
 ]
 
-_PLATFORM_MAP: dict[str, str] = {"google_meet": "meet"}
+# Vexa's platform strings → our canonical schema/S3 platform slugs.
+# Meet needs remapping ("google_meet" → "meet"); Zoom's Vexa string is already
+# "zoom", so the entry is an identity mapping kept explicit for symmetry — a
+# future teams-bot ("teams" → "teams") slots in the same way (plan §5a).
+_PLATFORM_MAP: dict[str, str] = {"google_meet": "meet", "zoom": "zoom"}
 
 _MIN_DOMINANT_UTTERANCE_DEFAULT_MS = 1500
 

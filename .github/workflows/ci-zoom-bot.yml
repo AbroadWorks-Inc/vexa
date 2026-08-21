@@ -1,0 +1,73 @@
+name: CI — zoom-bot
+
+on:
+  push:
+    branches: [aw/main,aw-overrides, "aw/feat/**"]
+    paths:
+      - "aw-overrides/services/zoom-bot/**"
+      - "aw-overrides/aw-integration/**"
+      - ".github/workflows/ci-zoom-bot.yml"
+
+jobs:
+  test:
+    name: black · ruff · mypy · pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: AbroadWorks-Inc/vexa
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.7"
+
+      - name: Checkout aw-notetaker for notetaker-common
+        uses: actions/checkout@v5
+        with:
+          repository: AbroadWorks-Inc/aw-notetaker
+          path: aw-notetaker-repo
+          token: ${{ secrets.CROSS_REPO_PAT }}
+
+      - name: Install notetaker-common
+        run: pip install ./aw-notetaker-repo/notetaker-common
+
+      - name: Install aw-integration
+        run: pip install ./aw-overrides/aw-integration
+
+      - name: Install test deps
+        run: |
+          pip install "fastapi==0.109.0" "uvicorn[standard]==0.27.0" httpx \
+            python-multipart "prometheus-fastapi-instrumentator==6.1.0" \
+            pytest pytest-asyncio fakeredis "black==25.1.0" "ruff==0.15.3" "mypy==1.17.1"
+
+      - name: black — aw_output_hook
+        working-directory: aw-overrides/services/zoom-bot
+        run: black --check aw_output_hook.py knock_delay.py tests/
+
+      - name: ruff — aw_output_hook
+        working-directory: aw-overrides/services/zoom-bot
+        run: ruff check aw_output_hook.py knock_delay.py
+
+      - name: mypy — aw_output_hook
+        working-directory: aw-overrides/services/zoom-bot
+        run: mypy aw_output_hook.py knock_delay.py --ignore-missing-imports
+
+      - name: pytest — aw_output_hook
+        working-directory: aw-overrides/services/zoom-bot
+        run: pytest tests/ -v
+
+      - name: black — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: black --check aw_integration/ tests/
+
+      - name: ruff — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: ruff check aw_integration/
+
+      - name: mypy — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: mypy aw_integration/
+
+      - name: pytest — aw-integration
+        working-directory: aw-overrides/aw-integration
+        run: pytest tests/ -v

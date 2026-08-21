@@ -1543,3 +1543,42 @@ async def test_run_from_redis_media_state_ignores_other_session_uid(
 
     metadata = captured["metadata"]
     assert metadata.media_kind is None  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Zoom platform mapping (§13.8 zoom-bot) — _PLATFORM_MAP["zoom"] = "zoom"
+# ---------------------------------------------------------------------------
+
+
+class TestZoomPlatformMapping:
+    def test_platform_map_has_zoom_identity_entry(self) -> None:
+        from aw_integration.adapter import _PLATFORM_MAP
+
+        assert _PLATFORM_MAP["zoom"] == "zoom"
+        # Meet's remap is unchanged by the addition.
+        assert _PLATFORM_MAP["google_meet"] == "meet"
+
+    def test_zoom_session_reports_zoom_platform_in_artifacts(
+        self, tmp_path: Path
+    ) -> None:
+        raw_audio = tmp_path / "audio.raw"
+        raw_audio.write_bytes(bytes(32000))
+        session = VexaSession(
+            uid="conn-zoom-1",
+            platform="zoom",
+            meeting_id="99",
+            session_start_ts=SESSION_START,
+            session_end_ts=SESSION_END,
+            segments=[],
+            speaker_events=[],
+        )
+        adapter = VexaSessionAdapter(
+            session=session,
+            job=make_test_job(),
+            audio_raw_path=raw_audio,
+            s3_writer=MagicMock(spec=S3Writer),
+            notetaker_client=MagicMock(spec=NoteTakerClientWrapper),
+        )
+        assert adapter.build_speaker_timeline().platform == "zoom"
+        assert adapter.build_participants().platform == "zoom"
+        assert adapter.build_metadata().platform == "zoom"
