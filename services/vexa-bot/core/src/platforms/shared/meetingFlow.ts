@@ -55,7 +55,7 @@ export type PlatformStrategies = {
   checkAdmissionSilent: (page: Page | null) => Promise<boolean>; // Silent check without callbacks
   prepare: (page: Page | null, botConfig: BotConfig) => Promise<void>;
   startRecording: (page: Page | null, botConfig: BotConfig) => Promise<void>;
-  startRemovalMonitor: (page: Page | null, onRemoval?: () => void | Promise<void>) => () => void;
+  startRemovalMonitor: (page: Page | null, onRemoval?: (reasonToken?: string) => void | Promise<void>) => () => void;
   leave: (page: Page | null, botConfig?: BotConfig, reason?: LeaveReason) => Promise<boolean>;
   afterAdmission?: (page: Page | null, botConfig: BotConfig) => Promise<void>;
 };
@@ -210,11 +210,15 @@ export async function runMeetingFlow(
     startVideoRecordingIfNeeded();
 
     // Removal monitoring + recording race
-    let signalRemoval: (() => void) | null = null;
+    let signalRemoval: ((reasonToken?: string) => void) | null = null;
     const removalPromise = new Promise<never>((_, reject) => {
-      signalRemoval = () => reject(new Error(tokens.removedToken));
+      // A monitor may pass a specific token (e.g. left_alone / startup_alone);
+      // absent one, fall back to the generic removed-by-admin token.
+      signalRemoval = (reasonToken?: string) => reject(new Error(reasonToken || tokens.removedToken));
     });
-    const stopRemoval = strategies.startRemovalMonitor(page, () => { if (signalRemoval) signalRemoval(); });
+    const stopRemoval = strategies.startRemovalMonitor(page, (reasonToken?: string) => {
+      if (signalRemoval) signalRemoval(reasonToken);
+    });
 
     try {
       await Promise.race([
