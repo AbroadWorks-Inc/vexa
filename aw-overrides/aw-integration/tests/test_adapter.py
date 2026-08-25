@@ -285,6 +285,8 @@ class TestBuildSpeakerTimeline:
         alice_event = next(
             e for e in result.speaker_timeline if e.speaker_name == "Alice Chen"
         )
+        # Fixture is google_meet → Zoom-gated anchor does not fire → Alice keeps her
+        # 4.5s onset, so timestamp_ms is origin + 4500.
         assert alice_event.timestamp_ms == origin_ms + 4500
 
     def test_speaker_id_is_slug_of_participant_name(self, tmp_path: Path) -> None:
@@ -766,6 +768,9 @@ class TestDominantSpeakerCollapse:
         timeline = adapter.build_speaker_timeline().speaker_timeline
 
         assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        # Fixture is google_meet, so the Zoom-gated anchor does NOT fire — the sole
+        # event keeps its true 4.5s onset. (Anchor behaviour is covered by the
+        # Zoom-specific TestAnchorGate tests below.)
         assert timeline[0].relative_sec == pytest.approx(4.5)
 
     def test_dom_only_meeting_falls_back_rather_than_emitting_nothing(
@@ -801,6 +806,9 @@ class TestDominantSpeakerCollapse:
 
         timeline = adapter.build_speaker_timeline().speaker_timeline
 
+        # Mid-meeting silence is discarded — only two transitions, no event invented
+        # for the 2-30s gap. Fixture is google_meet so the Zoom-gated anchor does not
+        # fire; the earliest transition keeps its true 1.0s onset.
         assert [e.relative_sec for e in timeline] == [1.0, 30.0]
         # Inside the gap the previous transition remains in effect — matching
         # today's worker behaviour rather than inventing an "everyone silent".
@@ -825,6 +833,79 @@ class TestDominantSpeakerCollapse:
         # one transition.
         assert [e.speaker_name for e in timeline] == ["Alice Chen"]
         assert _attribute(timeline, 2.5) == "Alice Chen"
+
+
+# ---------------------------------------------------------------------------
+# VexaSessionAdapter.build_speaker_timeline — earliest-event anchor gate
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorGate:
+    """The earliest-event anchor (fixes leading SPEAKER_NN) is gated to
+    Zoom AND >= 2 distinct named speakers:
+      - Zoom-only keeps Meet/Teams byte-for-byte unchanged (meet-bot untouched).
+      - >= 2 speakers prevents the live failure (2026-08-25, session c90bfaad…)
+        where only one speaker resolved a name and anchoring it to t=0 funnelled
+        the whole meeting — including the unnamed speaker's words — onto the one
+        named speaker (everything clogged under the host).
+    """
+
+    def test_zoom_anchors_earliest_event_when_two_speakers(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "zoom"
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 2_900),
+            _audio("Alice Chen", "SPEAKER_END", 6_000),
+            _audio("Bob Müller", "SPEAKER_START", 10_000),
+            _audio("Bob Müller", "SPEAKER_END", 12_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Earliest transition pulled to t=0 with the first speaker's name...
+        assert timeline[0].relative_sec == pytest.approx(0.0)
+        assert timeline[0].speaker_name == "Alice Chen"
+        # ...so a segment at 2.0s (before Alice's true 2.9s onset) maps to Alice.
+        assert _attribute(timeline, 2.0) == "Alice Chen"
+        # Only the earliest is anchored; later transitions keep true onsets.
+        assert timeline[-1].speaker_name == "Bob Müller"
+        assert timeline[-1].relative_sec == pytest.approx(10.0)
+
+    def test_zoom_does_not_anchor_when_only_one_speaker(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "zoom"
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 2_900),
+            _audio("Alice Chen", "SPEAKER_END", 6_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        # NOT anchored — keeps the true 2.9s onset, so a segment at 2.0s stays
+        # unattributed (SPEAKER_NN) instead of being donated to Alice.
+        assert timeline[0].relative_sec == pytest.approx(2.9)
+        assert _attribute(timeline, 2.0) is None
+
+    def test_non_zoom_never_anchors_even_with_two_speakers(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "google_meet"
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 2_900),
+            _audio("Alice Chen", "SPEAKER_END", 6_000),
+            _audio("Bob Müller", "SPEAKER_START", 10_000),
+            _audio("Bob Müller", "SPEAKER_END", 12_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Meet is untouched by the Zoom-gated anchor — earliest keeps its onset.
+        assert timeline[0].relative_sec == pytest.approx(2.9)
+        assert timeline[0].speaker_name == "Alice Chen"
 
 
 # ---------------------------------------------------------------------------
@@ -1287,10 +1368,14 @@ async def test_run_from_redis_parses_the_source_field_end_to_end(
     timeline = captured["timeline"].speaker_timeline  # type: ignore[union-attr]
     names = [e.speaker_name for e in timeline]
 
-    # The tagged pair collapsed to a transition at its true onset (2.0s), proving
-    # `source` survived the parse and licensed interval-building.
+    # `source` survived the parse and licensed interval-building: the tagged pair
+    # collapsed into a Speaker A interval, so the UNTAGGED Speaker B claim was
+    # excluded (the safety valve only fires when interval-building yields nothing,
+    # and it did not). Had `source` been dropped, Speaker A would have fallen to the
+    # safety valve too and Speaker B would appear as a point. Asserted on membership
+    # rather than onset — this guards the source parse regardless of the anchor.
     assert "Speaker A" in names
-    assert any(abs(e.relative_sec - 2.0) < 0.001 for e in timeline)
+    assert "Speaker B" not in names
 
 
 # ---------------------------------------------------------------------------

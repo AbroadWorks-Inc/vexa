@@ -256,6 +256,33 @@ class VexaSessionAdapter:
                     )
                 )
 
+        # Anchor the earliest event to the recording origin (relative_sec 0) so a
+        # leading transcript segment (before the first DETECTED speech) attributes to
+        # the first speaker instead of a raw SPEAKER_NN — the recurring
+        # "SPEAKER_NN at the very start of the transcript".
+        #
+        # GATED to Zoom AND >= 2 distinct named speakers. Two reasons:
+        #  1. Zoom-only keeps every non-Zoom platform (Google Meet, Teams) BYTE-for-
+        #     byte unchanged — this anchor is a Zoom-track fix and must not alter the
+        #     stable meet-bot's timeline when that image is rebuilt.
+        #  2. The >= 2-speaker gate prevents the failure mode observed live
+        #     (2026-08-25, session c90bfaad…): when only ONE speaker resolves a name
+        #     (the other's tile is unreadable → 0 events), anchoring that lone speaker
+        #     to t=0 makes the worker's last-event-<=-start rule donate the WHOLE
+        #     meeting — including the unnamed speaker's words — to the one named
+        #     speaker (everything clogged under the host). With < 2 named speakers we
+        #     do NOT anchor: unattributed speech stays honest SPEAKER_NN rather than a
+        #     confident wrong name. (The real fix for the unresolved name is the Zoom
+        #     participant-roster fallback in the bot; this gate removes the amplifier.)
+        # Only the single earliest event is mutated; affects only the bot-produced
+        # speaker_timeline.json (Jitsi uses Prosody's separate timeline, untouched).
+        distinct_speakers = {ev.speaker_id for ev in timeline_events}
+        if self._platform == "zoom" and len(distinct_speakers) >= 2:
+            earliest = min(timeline_events, key=lambda ev: ev.relative_sec)
+            if earliest.relative_sec > 0:
+                earliest.relative_sec = 0.0
+                earliest.timestamp_ms = int(session.session_start_ts.timestamp() * 1000)
+
         return SpeakerTimelineFile(
             room_name=self._job.join.url,
             meeting_id=session.meeting_id,

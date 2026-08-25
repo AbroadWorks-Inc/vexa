@@ -1,10 +1,10 @@
 import { Page } from 'playwright';
 import { BotConfig } from '../../../types';
 import { RecordingService } from '../../../services/recording';
-import { setActiveRecordingService, getRawCaptureService } from '../../../index';
+import { setActiveRecordingService, getRawCaptureService, getSegmentPublisher, armSpeakerBoundaries } from '../../../index';
 import { log } from '../../../utils';
 import { spawn, ChildProcess } from 'child_process';
-import { zoomParticipantNameSelector } from './selectors';
+import { zoomParticipantNameSelector, zoomGallerySpeakingSelectors } from './selectors';
 import { dismissZoomPopups } from './prepare';
 import { startZoomRichObservation } from './observe';
 import { PcmChunker } from './pcm-chunker';
@@ -16,6 +16,22 @@ let speakerPollInterval: NodeJS.Timeout | null = null;
 let lastActiveSpeaker: string | null = null;
 let activeBotConfig: BotConfig | null = null;
 let popupDismissInterval: NodeJS.Timeout | null = null;
+
+// ---- Speaker-event bridging (Part C) ----
+// Accumulates every genuine speaker change AND periodic heartbeat detected by
+// startSpeakerPolling, so index.ts's graceful-leave bridge (isZoomWeb branch)
+// can push them into the speaker_events_relative Redis stream. Without this,
+// gallery/speaker-view DOM detections never leave this module — see
+// getZoomWebSpeakerEvents().
+let zoomWebSpeakerEvents: any[] = [];
+
+// A continuously-speaking participant only produces ONE change event (the
+// initial SPEAKER_START) — nothing re-affirms them until they stop. Re-emit a
+// SPEAKER_START on this cadence for the currently active speaker so a long
+// utterance doesn't silently vanish from speaker_timeline.json. Deliberately
+// NOT applied to SPEAKER_END (that is a genuine, one-shot transition).
+const ZOOM_SPEAKER_HEARTBEAT_MS = 15_000;
+let lastHeartbeatMs = 0;
 
 // ---- B1 audio crash-durability: incremental chunk upload ----
 // Upstream Vexa buffered the whole meeting into one local /tmp WAV and uploaded
@@ -77,10 +93,70 @@ export function getLastActiveSpeaker(): string | null {
   return lastActiveSpeaker;
 }
 
+/**
+ * Get accumulated Zoom Web speaker events for persistence via the bot exit
+ * callback. Read by index.ts's graceful-leave bridge (isZoomWeb branch) in
+ * place of the native-SDK `getZoomSpeakerEvents()`, which is always empty for
+ * the web bot.
+ */
+export function getZoomWebSpeakerEvents(): any[] {
+  return zoomWebSpeakerEvents;
+}
+
+/**
+ * Push a speaker event whose relative-time origin matches the local WAV/PCM
+ * capture's zero — `RecordingService.start()` (see services/recording.ts),
+ * the same start() call whose `this.startTime` seeds every PCM byte
+ * subsequently appended via appendPCMBuffer(). This mirrors the origin the
+ * native-Zoom path uses (`audioSessionStartTime`, set right after recording
+ * start) and the Google Meet path uses (`audioService.getSessionAudioStartTime()`)
+ * — the aw-integration timestamp-overlap mapper assumes events and audio
+ * share one zero, so reusing this exact clock (never inventing a new one) is
+ * what keeps names aligned to the transcript.
+ *
+ * No-ops (never throws) when recording isn't active — with no audio session
+ * there is no meaningful zero to measure against, and nothing downstream
+ * would consume the event anyway.
+ *
+ * Deliberately NOT `segmentPublisher.sessionStartMs`: in the batch-WhisperX
+ * config the transcript is produced by the worker running WhisperX on the
+ * uploaded `audio.wav` (whose sample-0 IS this RecordingService.start() zero),
+ * and aw-integration's `build_speaker_timeline` emits `relative_sec =
+ * relative_ms / 1000` as a PASS-THROUGH (session_start_ts only labels the output
+ * timestamp_ms, never the mapping key). So the worker's `map_segments_with_timeline`
+ * compares `segment.start` (seconds into the WAV) against `relative_sec`, and the
+ * only clock that aligns is the WAV's own. GMeet/Teams reach that same WAV zero
+ * indirectly via `SegmentPublisher.resetSessionStart()` (called when their audio
+ * capture begins); Zoom Web reaches it directly here.
+ *
+ * Do NOT "fix" this to `segmentPublisher.sessionStartMs`: that publisher is
+ * constructed at pipeline-init (before admission) and, unlike GMeet/Teams, is
+ * never `resetSessionStart()`'d for Zoom — so it holds a STALE pre-admission
+ * zero, off by the entire admission-wait. `recordingService.getStartTime()` is
+ * the only clock tied to the actual recorded WAV.
+ */
+function pushZoomWebSpeakerEvent(eventType: 'SPEAKER_START' | 'SPEAKER_END', participantName: string): void {
+  const sessionStartMs = recordingService?.getStartTime();
+  if (!sessionStartMs) return;
+  zoomWebSpeakerEvents.push({
+    event_type: eventType,
+    participant_name: participantName,
+    relative_timestamp_ms: Date.now() - sessionStartMs,
+  });
+}
+
 export async function startZoomWebRecording(page: Page | null, botConfig: BotConfig): Promise<void> {
   if (!page) throw new Error('[Zoom Web] Page required for recording');
 
   activeBotConfig = botConfig;
+
+  // Reset per-session speaker state up-front (defensive against any future
+  // process-reuse; today it is one meeting per pod). Deliberately reset HERE and
+  // NOT in stopZoomWebRecording(): stop runs (via leaveZoomWeb) BEFORE index.ts's
+  // graceful-leave bridge reads getZoomWebSpeakerEvents() (index.ts:654 then :794),
+  // so clearing on stop would drop every event before it is bridged.
+  zoomWebSpeakerEvents = [];
+  lastHeartbeatMs = 0;
 
   // Recording service
   const wantsAudioCapture =
@@ -93,6 +169,31 @@ export async function startZoomWebRecording(page: Page | null, botConfig: BotCon
     setActiveRecordingService(recordingService);
     recordingService.start();
     log('[Zoom Web] Recording service started');
+
+    // Align the per-speaker pipeline's clock to the recording start (mirror
+    // googlemeet/recording.ts + msteams/recording.ts). SegmentPublisher is
+    // constructed pre-admission, so its speaker events (speaker_events_relative,
+    // the stream the worker maps names from) would otherwise be offset by the
+    // ENTIRE admission wait — landing past the WhisperX transcript's time range
+    // and never mapping (observed live 2026-08-24: speaker events at 654s/767s vs
+    // a 0-416s transcript → all SPEAKER_NN despite names being captured). Reset
+    // here makes those events recording-relative — the same zero the
+    // WhisperX-on-audio.wav transcript uses — so names align and map.
+    const publisher = getSegmentPublisher();
+    if (publisher) {
+      publisher.resetSessionStart();
+      log('[Zoom Web] SegmentPublisher session start reset — speaker events now aligned to the recording clock');
+    }
+
+    // Arm the audio-activity speaker-boundary machine (mirror
+    // googlemeet/recording.ts). Without this, handlePerSpeakerAudioData's
+    // markTrackAudioActivity() calls warn "boundaries are NOT armed" and produce
+    // no paired source:'audio' START/END events — so the timeline degrades to the
+    // coarse one-point-per-`joined` safety valve and the transcript collapses to
+    // one block per participant. Arming here + the per-speaker sweep (already
+    // started in initPerSpeakerPipeline) yields a dense dominant-speaker timeline.
+    armSpeakerBoundaries();
+    log('[Zoom Web] Speaker-boundary machine armed — dense per-utterance timeline enabled');
 
     // B1: arm incremental durability. A wall-clock flush guarantees a checkpoint
     // every ZOOM_CHUNK_SECONDS even if the byte cap is never reached (quiet call).
@@ -287,26 +388,108 @@ function startSpeakerPolling(page: Page, botConfig: BotConfig): void {
   speakerPollInterval = setInterval(async () => {
     if (!page || page.isClosed()) return;
     try {
-      const speakerName = await page.evaluate((footerSelector: string) => {
-        function nameFromContainer(container: Element | null): string | null {
-          if (!container) return null;
-          const footer = container.querySelector(footerSelector);
-          if (!footer) return null;
-          const span = footer.querySelector('span');
-          return (span?.textContent?.trim() || (footer as HTMLElement).innerText?.trim()) || null;
-        }
+      const speakerName = await page.evaluate(
+        ({ footerSelector, gallerySelectors, botName }: { footerSelector: string; gallerySelectors: string[]; botName: string }) => {
+          const selfLower = (botName || '').toLowerCase();
 
-        // Layout 1: Normal view — active speaker has a dedicated full-size container
-        const name1 = nameFromContainer(document.querySelector('.speaker-active-container__video-frame'));
-        if (name1) return name1;
+          // Name-quality guards mirrored from services/speaker-identity.ts
+          // (traverseZoomDOM's accept()/looksLikeName()/isBotName()), applied
+          // to ALL layouts below: reject empty / >60 chars / chat-sentence-
+          // shaped (leading lowercase Latin letter) / the bot's own name
+          // (case-insensitive substring either direction).
+          function looksLikeName(text: string): boolean {
+            if (text.length === 0 || text.length > 60) return false;
+            const first = text[0];
+            if (first >= 'a' && first <= 'z') return false;
+            return true;
+          }
+          function isSelfName(text: string): boolean {
+            if (!selfLower) return false;
+            const t = text.toLowerCase();
+            return t.includes(selfLower) || selfLower.includes(t);
+          }
+          function accept(text: string | null | undefined): string | null {
+            if (!text) return null;
+            const trimmed = text.trim();
+            if (trimmed.length === 0) return null;
+            if (!looksLikeName(trimmed)) return null;
+            if (isSelfName(trimmed)) return null;
+            return trimmed;
+          }
 
-        // Layout 2: Screen-share view — active speaker tile has the --active modifier class
-        const name2 = nameFromContainer(document.querySelector('.speaker-bar-container__video-frame--active'));
-        if (name2) return name2;
+          function nameFromContainer(container: Element | null): string | null {
+            if (!container) return null;
+            const footer = container.querySelector(footerSelector);
+            if (!footer) return null;
+            const span = footer.querySelector('span');
+            const raw = (span?.textContent?.trim() || (footer as HTMLElement).innerText?.trim()) || null;
+            return accept(raw);
+          }
 
-        return null;
-      }, zoomParticipantNameSelector);
+          // Layout 1: Normal view — active speaker has a dedicated full-size container
+          const name1 = nameFromContainer(document.querySelector('.speaker-active-container__video-frame'));
+          if (name1) return name1;
 
+          // Layout 2: Screen-share view — active speaker tile has the --active modifier class
+          const name2 = nameFromContainer(document.querySelector('.speaker-bar-container__video-frame--active'));
+          if (name2) return name2;
+
+          // Layout 3: Gallery view — no dedicated "active speaker" container
+          // exists there, so scan CSS hooks that mark a tile as speaking.
+          // Resolve a name via: the tile's own footer span, the nearest
+          // enclosing avatar tile's footer span, or an aria-label of the form
+          // "X is speaking"/"X is talking". Accept a candidate selector ONLY
+          // if it resolves to exactly ONE distinct accepted name — more than
+          // one means that selector is too broad on this Zoom UI version.
+          function resolveGalleryName(el: Element): string | null {
+            const directFooter = el.querySelector?.('.video-avatar__avatar-footer');
+            if (directFooter) {
+              const span = directFooter.querySelector('span');
+              const raw = (span?.textContent?.trim() || (directFooter as HTMLElement).innerText?.trim()) || null;
+              if (raw) return raw;
+            }
+            const tile = el.closest?.('.video-avatar__avatar, [class*="video-avatar"]');
+            if (tile) {
+              const footer = tile.querySelector('.video-avatar__avatar-footer');
+              if (footer) {
+                const span = footer.querySelector('span');
+                const raw = (span?.textContent?.trim() || (footer as HTMLElement).innerText?.trim()) || null;
+                if (raw) return raw;
+              }
+            }
+            const aria = el.getAttribute?.('aria-label');
+            if (aria) {
+              const match = aria.match(/^(.*?)\s+is\s+(?:speaking|talking)$/i);
+              if (match?.[1]) return match[1].trim();
+            }
+            return null;
+          }
+
+          for (const selector of gallerySelectors) {
+            try {
+              const matches = Array.from(document.querySelectorAll(selector));
+              if (matches.length === 0) continue;
+              const names = new Set<string>();
+              for (const el of matches) {
+                const candidate = accept(resolveGalleryName(el));
+                if (candidate) names.add(candidate);
+              }
+              if (names.size === 1) {
+                return Array.from(names)[0];
+              }
+              // 0 or >1 distinct names: this selector is unusable here — try the next one.
+            } catch {
+              // Malformed selector on this Zoom Web version — skip it.
+              continue;
+            }
+          }
+
+          return null;
+        },
+        { footerSelector: zoomParticipantNameSelector, gallerySelectors: zoomGallerySpeakingSelectors, botName: botConfig.botName }
+      );
+
+      const now = Date.now();
       if (speakerName && speakerName !== lastActiveSpeaker) {
         // Speaker changed — log to raw capture if active
         const rawCapture = getRawCaptureService();
@@ -315,13 +498,24 @@ function startSpeakerPolling(page: Page, botConfig: BotConfig): void {
         }
         if (lastActiveSpeaker) {
           log(`🔇 [Zoom Web] SPEAKER_END: ${lastActiveSpeaker}`);
+          pushZoomWebSpeakerEvent('SPEAKER_END', lastActiveSpeaker);
         }
         lastActiveSpeaker = speakerName;
+        lastHeartbeatMs = now;
         log(`🎤 [Zoom Web] SPEAKER_START: ${speakerName}`);
+        pushZoomWebSpeakerEvent('SPEAKER_START', speakerName);
       } else if (!speakerName && lastActiveSpeaker) {
         // No active speaker
         log(`🔇 [Zoom Web] SPEAKER_END: ${lastActiveSpeaker}`);
+        pushZoomWebSpeakerEvent('SPEAKER_END', lastActiveSpeaker);
         lastActiveSpeaker = null;
+      } else if (speakerName && speakerName === lastActiveSpeaker && now - lastHeartbeatMs >= ZOOM_SPEAKER_HEARTBEAT_MS) {
+        // Same speaker still active for a long stretch — re-affirm so the
+        // utterance doesn't silently vanish from speaker_timeline.json
+        // (the branches above only fire on a transition). Never heartbeats
+        // SPEAKER_END — that stays a one-shot transition.
+        pushZoomWebSpeakerEvent('SPEAKER_START', speakerName);
+        lastHeartbeatMs = now;
       }
     } catch {
       // Page may be navigating — ignore

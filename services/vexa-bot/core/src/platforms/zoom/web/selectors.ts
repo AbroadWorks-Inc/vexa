@@ -97,6 +97,80 @@ export const zoomParticipantNameSelector = '.video-avatar__avatar-footer';
 // All video avatar containers
 export const zoomVideoAvatarSelector = '.video-avatar__avatar';
 
+// ---- View switching (Speaker View) ----
+// Zoom Web defaults to Gallery View. The active-speaker DOM signals used by
+// startSpeakerPolling's Layout 1/2 (zoomActiveSpeakerSelector /
+// zoomSpeakerBarSelector--active) only populate in Speaker View or during
+// screen-share — switchToZoomSpeakerView() (prepare.ts) uses the selectors
+// below to force it, once, before recording starts.
+
+// View/Layout footer control — tried in order; Zoom has renamed/reclassed
+// this control across versions, so no single selector is trusted alone.
+export const zoomViewButtonSelectors: string[] = [
+  'button[aria-label="View"]',                       // confirmed live 2026-08-24
+  'button.full-screen-widget__button',               // confirmed class of the View control
+  'button[aria-label*="View" i]',
+  'button[class*="view-toolbar" i], button[class*="footer-button"][class*="view" i]',
+  'footer button:has-text("View"), .footer-button-base__button:has-text("View")',
+];
+
+// The Speaker-View menu option carries this icon (confirmed live 2026-08-24:
+// <svg class="SvgSpeakerView">). It is a UNIQUE, unambiguous anchor — unlike the
+// bare word "Speaker" (which also appears in Zoom's audio-device menu) — so it is
+// safe to match page-wide and click its nearest clickable ancestor.
+export const zoomSpeakerViewIconSelector = 'svg.SvgSpeakerView';
+
+// Overflow "More meeting control" button — only tried if none of
+// zoomViewButtonSelectors are visible (some Zoom Web versions / narrow
+// viewports push the View control into this overflow menu).
+export const zoomMoreButtonSelector =
+  'button[aria-label="More"], button[aria-label*="More meeting control" i], button[class*="more-button" i]';
+
+// Container the View menu opens into after the View button is clicked. ALL
+// Speaker-View-option candidates below MUST be scoped inside this selector —
+// Zoom's separate audio-device menu also has a plain "Speaker (device)"
+// entry, so a page-wide has-text("Speaker") match would false-positive on it.
+export const zoomViewMenuScopeSelector = '[role="menu"], [class*="view-menu" i], .dropdown-menu';
+
+// Speaker-View menu-item candidates, tried in order, always scoped via
+// zoomViewMenuScopeSelector (never page-wide).
+export const zoomSpeakerViewOptionSelectors: string[] = [
+  '[role="menuitemradio"]:has-text("Speaker")',
+  'li:has-text("Speaker View")',
+  'button:has-text("Speaker View")',
+];
+
+// Last-resort exact-text match (case-insensitive), still scoped inside
+// zoomViewMenuScopeSelector, used only if none of the selectors above matched.
+export const zoomSpeakerViewExactTexts: string[] = ['Speaker View', 'Speaker Mode'];
+
+// ---- Gallery-view speaking indicators (view-independent) ----
+// startSpeakerPolling's Layout 3 fallback: CSS hooks Zoom Web uses to mark a
+// participant's Gallery-View tile as currently speaking. Multiple candidates
+// because Zoom has changed/renamed these classes across versions and none is
+// independently confirmed live — validate against ZOOM_OBSERVE output.
+export const zoomGallerySpeakingSelectors: string[] = [
+  '.video-avatar__avatar--active',
+  '.video-avatar__avatar--speaking',
+  '.video-avatar__avatar--talking',
+  '.video-avatar__avatar--audio-active',
+  '.video-avatar__avatar-border--active',
+  '[class*="speaker-active"]',
+  '[class*="active-speaker"]',
+  '[class*="avatar--active"]',
+  '[class*="avatar-active"]',
+  '[class*="is-talking"]',
+  '[class*="talking"]',
+  '[class*="voice-level"]',
+  '[class*="audio-animation"]',
+  '[class*="speaking-border"]',
+  '[class*="speaking-glow"]',
+  '[aria-label$="is speaking"]',
+  '[aria-label$="is talking"]',
+  '[data-speaking="true"]',
+  '[data-is-speaking="true"]',
+];
+
 // ---- Leave dialog (after clicking Leave button) ----
 // Verified from live DOM: the "Leave Meeting" button has class leave-meeting-options__btn--danger
 // aria-label is empty so text-based selectors are unreliable; use the CSS class directly

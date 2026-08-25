@@ -5,7 +5,7 @@ import { chromium } from "playwright-extra";
 import { handleGoogleMeet, leaveGoogleMeet } from "./platforms/googlemeet";
 import { handleMicrosoftTeams, leaveMicrosoftTeams } from "./platforms/msteams";
 import { handleZoom, leaveZoom, leaveZoomWeb } from "./platforms/zoom";
-import { reconfigureZoomWebRecording } from "./platforms/zoom/web/recording";
+import { reconfigureZoomWebRecording, getZoomWebSpeakerEvents } from "./platforms/zoom/web/recording";
 import { getZoomSpeakerEvents } from "./platforms/zoom/strategies/recording";
 import { browserArgs, getBrowserArgs, getAuthenticatedBrowserArgs, userAgent } from "./constans";
 import { BotConfig } from "./types";
@@ -786,8 +786,17 @@ async function performGracefulLeave(
   let speakerEvents: any[] = [];
   try {
     if (currentPlatform === "zoom") {
-      speakerEvents = getZoomSpeakerEvents();
-      log(`[Speaker Events] Read ${speakerEvents.length} speaker events from Zoom module`);
+      // Zoom Web is the default; isZoomWeb is true unless ZOOM_SDK=true
+      // explicitly opts into the native SDK path (same check used by the
+      // reconfigure-command handler above).
+      const isZoomWeb = process.env.ZOOM_WEB === 'true' || process.env.ZOOM_SDK !== 'true';
+      if (isZoomWeb) {
+        speakerEvents = getZoomWebSpeakerEvents();
+        log(`[Speaker Events] Read ${speakerEvents.length} speaker events from Zoom Web module`);
+      } else {
+        speakerEvents = getZoomSpeakerEvents();
+        log(`[Speaker Events] Read ${speakerEvents.length} speaker events from Zoom module`);
+      }
     } else if (page && !page.isClosed()) {
       speakerEvents = await page.evaluate(() => (window as any).__vexaSpeakerEvents || []);
       log(`[Speaker Events] Read ${speakerEvents.length} speaker events from browser context`);
@@ -1607,11 +1616,18 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
     : currentPlatform === 'teams' ? 'msteams'
     : currentPlatform || 'unknown';
 
-  // Hoisted: GMeet now derives its speaker timeline from audio-activity boundaries
-  // (markTrackAudioActivity + the sweep), so the legacy per-resolution `joined`
-  // events below are suppressed for GMeet only. Zoom/Teams keep their existing
-  // roster-announcement behaviour untouched.
+  // Hoisted: GMeet and Zoom Web derive their speaker timeline from audio-activity
+  // boundaries (markTrackAudioActivity + the sweep), so the legacy per-resolution
+  // `joined` events below are suppressed for both. A `joined` maps to a bare
+  // SPEAKER_START (no source, no matching END): the adapter rejects it for
+  // intervals and it only ever reaches the coarse safety valve — which is exactly
+  // what collapsed the Zoom transcript to 2 blocks before this path was enabled.
+  // Teams keeps its existing roster-announcement behaviour untouched.
   const isGMeet = currentPlatform === 'google_meet';
+  const isZoom = currentPlatform === 'zoom';
+  // Platforms whose speaker timeline comes from the audio-activity boundary
+  // machine rather than roster `joined` announcements.
+  const usesAudioBoundaries = isGMeet || isZoom;
 
   // ─── GMeet / Teams / Zoom: voting + locking ────────────────────────────────
   // All three platforms use the shared resolveSpeakerName() pipeline with
@@ -1632,9 +1648,10 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
     log(`[🎙️ SPEAKER ACTIVE] Track ${speakerIndex} → "${safeName || '(unmapped)'}" — streaming audio`);
     speakerManager.addSpeaker(speakerId, safeName);
     lastReResolveTime.set(speakerId, Date.now());
-    // GMeet: suppressed — a `joined` event maps to SPEAKER_START with no matching
-    // END, which corrupts the audio-derived timeline. Boundaries come from the sweep.
-    if (safeName && !isGMeet) {
+    // GMeet + Zoom: suppressed — a `joined` event maps to SPEAKER_START with no
+    // matching END, which corrupts the audio-derived timeline. Boundaries come
+    // from the sweep.
+    if (safeName && !usesAudioBoundaries) {
       await segmentPublisher.publishSpeakerEvent({
         speaker: safeName,
         type: 'joined',
@@ -1656,7 +1673,7 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
       if (lockedName && lockedName !== currentName) {
         log(`[🔒 LOCK SYNC] Track ${speakerIndex}: "${currentName}" → "${lockedName}" (syncing locked name to buffer)`);
         speakerManager.updateSpeakerName(speakerId, lockedName);
-        if (!currentName && !isGMeet) {
+        if (!currentName && !usesAudioBoundaries) {
           await segmentPublisher.publishSpeakerEvent({
             speaker: lockedName,
             type: 'joined',
@@ -1700,7 +1717,7 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
       if (newName && newName !== currentName && !isDuplicateSpeakerName(newName, speakerId)) {
         log(`[🔄 SPEAKER MAPPED] Track ${speakerIndex}: "${currentName}" → "${newName}"`);
         speakerManager.updateSpeakerName(speakerId, newName);
-        if (!isGMeet) {
+        if (!usesAudioBoundaries) {
           await segmentPublisher.publishSpeakerEvent({
             speaker: newName,
             type: 'joined',
@@ -1744,15 +1761,123 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
           } catch {}
         }
       }
+
+      // Fallback: Zoom, still unmapped after a long silence — assign from the
+      // participant ROSTER. Zoom resolves a track's name by walking up from its
+      // <audio> element to its video-tile name footer; when the tile isn't reachable
+      // from the element (observed live 2026-08-25: a speaker whose name appeared
+      // only in a chat message, never on a tile reachable from the audio element)
+      // the track never resolves. Because the timeline is name-gated, that speaker
+      // then emits ZERO events and the worker donates their speech to whoever DID
+      // resolve — "everything clogged under the host". This reads names directly
+      // from ALL tile footers AND the Participants panel (sources that list a
+      // participant regardless of per-track element association) and assigns ONLY
+      // when EXACTLY ONE roster name is still unclaimed — so the assignment is
+      // unambiguous and can never be a wrong/swapped name. FAIL-SAFE otherwise:
+      // with zero or ≥2 unclaimed names it assigns nothing and the track stays
+      // honest SPEAKER_NN. Residual (accepted): any of the speaker's utterances that
+      // fully opened AND closed before this fires (≤ the trigger window) stay
+      // misattributed; only utterances still open get a retroactive named START.
+      // Zoom-only — Meet/Teams keep their own paths untouched.
+      //
+      // NOTE on the trigger: speakerLastAudioMs is LAST-audio (rewritten every
+      // chunk), so this fires when the track resumes after a ≥15s silence — i.e.
+      // during turn-taking, exactly the 2-person case. A continuous monologue that
+      // never resolves via DOM won't trip it (acceptable; DOM usually resolves the
+      // dominant speaker).
+      if (!currentName && platformKey === 'zoom') {
+        const lastAudioMs = speakerLastAudioMs.get(speakerId) || Date.now();
+        // Re-read the live name: resolveSpeakerName may have assigned it earlier in
+        // THIS same call, leaving the captured `currentName` stale.
+        const stillUnmapped = !speakerManager.getSpeakerName(speakerId);
+        if (stillUnmapped && Date.now() - lastAudioMs > 15_000) {
+          try {
+            const roster: string[] = await page.evaluate((selfName: string) => {
+              const selfLower = (selfName || '').toLowerCase();
+              const UI_LABELS = new Set([
+                'mute all', 'unmute all', 'raise hand', 'lower hand', 'participants',
+                'invite', 'more', 'chat', 'share screen', 'record', 'leave',
+                'ask to unmute', 'reactions', 'view', 'you', 'me',
+              ]);
+              const looksLikeName = (t: string) => {
+                // Allow any case (roster reads tiles/panel, never chat) — just
+                // reject empty, over-long, multiline, and known UI labels.
+                if (t.length === 0 || t.length > 60) return false;
+                if (/[\n\t]/.test(t)) return false;
+                if (UI_LABELS.has(t.toLowerCase())) return false;
+                return true;
+              };
+              const isSelf = (t: string) => {
+                if (!selfLower) return false;
+                const l = t.toLowerCase();
+                return l.includes(selfLower) || selfLower.includes(l);
+              };
+              const out = new Set<string>();
+              const add = (raw: string | null | undefined) => {
+                if (!raw) return;
+                const t = raw.trim();
+                if (!looksLikeName(t) || isSelf(t)) return;
+                out.add(t);
+              };
+              // 1) All video-tile name footers (verified selector).
+              document.querySelectorAll('.video-avatar__avatar-footer').forEach((f) => {
+                const span = f.querySelector('span');
+                add(span?.textContent || (f as HTMLElement).innerText);
+              });
+              // 2) Participants panel rows (specific display-name selectors only).
+              const panelSels = [
+                '.participants-item__display-name',
+                '[class*="participants-item"] [class*="display-name"]',
+              ];
+              for (const sel of panelSels) {
+                document
+                  .querySelectorAll(sel)
+                  .forEach((el) => add((el as HTMLElement).textContent));
+              }
+              return Array.from(out);
+            }, currentBotConfig?.botName || 'Vexa Bot');
+
+            if (roster && roster.length) {
+              // Names already claimed by OTHER tracks — never double-assign.
+              const taken = new Set<string>();
+              for (const sid of speakerManager.getActiveSpeakers()) {
+                if (sid === speakerId) continue;
+                const nm = speakerManager.getSpeakerName(sid);
+                if (nm) taken.add(nm);
+              }
+              const unclaimed = roster.filter(
+                (n) => !taken.has(n) && !isDuplicateSpeakerName(n, speakerId),
+              );
+              // Assign ONLY when exactly one name is unclaimed → unambiguous, never
+              // a swapped/wrong name. With 0 or ≥2 unclaimed we stay SPEAKER_NN.
+              if (unclaimed.length === 1) {
+                const candidate = unclaimed[0];
+                log(
+                  `[🔄 SPEAKER FALLBACK] Track ${speakerIndex}: assigning "${candidate}" from Zoom participant roster (tile unresolved; roster=[${roster.join(', ')}])`,
+                );
+                speakerManager.updateSpeakerName(speakerId, candidate);
+                // usesAudioBoundaries is true for Zoom → the boundary machine emits
+                // named events once the name is set; no `joined` publish needed.
+              } else {
+                log(
+                  `[Zoom Web] Roster fallback: ${unclaimed.length} unclaimed names for Track ${speakerIndex} — not assigning (ambiguous; roster=[${roster.join(', ')}], taken=[${Array.from(taken).join(', ')}])`,
+                );
+              }
+            }
+          } catch {}
+        }
+      }
     }
   }
 
-  // Per-speaker streaming VAD gate (GMeet only).
+  // Per-speaker streaming VAD gate (GMeet + Zoom — the audio-boundary platforms).
   // Filters ambient noise BEFORE feedAudio() so lastAudioTimestamp only updates
   // on real speech. This lets the 15s idle timeout fire correctly when a speaker
-  // stops talking but their mic still emits low-level room noise.
-  // (`isGMeet` is hoisted to the top of this function.)
-  if (isGMeet && vadModel) {
+  // stops talking but their mic still emits low-level room noise, and — critically
+  // for the boundary machine below — keeps mic noise from opening a spurious
+  // utterance. `vadModel` is loaded for every per-speaker session, so Zoom gets
+  // the same gating GMeet does. (`usesAudioBoundaries` is hoisted above.)
+  if (usesAudioBoundaries && vadModel) {
     // Get or create per-speaker VAD state
     if (!vadSpeakerStates.has(speakerId)) {
       vadSpeakerStates.set(speakerId, vadModel.createSpeakerState());
@@ -1771,10 +1896,12 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
   const prevMs = speakerLastAudioMs.get(speakerId);
   const nowMs = Date.now();
 
-  // Audio-derived speaker boundaries (GMeet only). Deliberately placed AFTER the
+  // Audio-derived speaker boundaries (GMeet + Zoom). Deliberately placed AFTER the
   // VAD gate so ambient room noise cannot open a spurious utterance. The sweep
-  // closes it once audio stops for `silenceHangoverMs`.
-  if (isGMeet) {
+  // closes it once audio stops for `silenceHangoverMs`. Requires the platform's
+  // recording path to have called armSpeakerBoundaries() first (googlemeet and
+  // zoom/web recording.ts both do), else the machine warns and stays empty.
+  if (usesAudioBoundaries) {
     markTrackAudioActivity(speakerIndex, nowMs);
   }
   if (prevMs && (nowMs - prevMs) > 30000) {
@@ -2014,12 +2141,22 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
       (window as any).logBot?.(`[PerSpeaker] No media elements yet, retry ${attempt + 1}/10...`);
     }
 
+    // Do NOT bail when the initial enumeration is empty. The bot can enter a room
+    // that has no audio yet — no waiting room (it joins before/at the same moment
+    // as the first human), it joins first, or everyone is still muted — and the
+    // audio elements attach seconds later. Returning here would skip installing the
+    // periodic re-scan below, so those late streams would never be captured and the
+    // whole meeting yields an empty speaker timeline (all SPEAKER_NN) — the
+    // no-waiting-room failure observed live 2026-08-24. Continue with an empty set:
+    // the connect loop no-ops on 0 elements and the re-scan connects streams as
+    // they appear (deduped by MediaStream id via connectedStreamIds).
     if (mediaElements.length === 0) {
-      (window as any).logBot?.('[PerSpeaker] No active media elements with audio found');
-      return 0;
+      (window as any).logBot?.(
+        '[PerSpeaker] No active media elements with audio at startup — installing re-scan to catch late-attaching streams',
+      );
+    } else {
+      (window as any).logBot?.(`[PerSpeaker] Found ${mediaElements.length} media elements with audio`);
     }
-
-    (window as any).logBot?.(`[PerSpeaker] Found ${mediaElements.length} media elements with audio`);
 
     // Track connected streams by MediaStream ID to avoid double-binding
     const connectedStreamIds = new Set<string>();

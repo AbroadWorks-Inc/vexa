@@ -8,7 +8,10 @@ import {
   zoomMeetingAppSelector,
   zoomWaitingRoomTexts,
   zoomRemovalTexts,
+  zoomInvalidMeetingText,
+  zoomInvalidMeetingTitle,
 } from './selectors';
+import { revealZoomFooter } from './prepare';
 
 /**
  * Check if the bot is confirmed inside the meeting.
@@ -55,27 +58,20 @@ async function isAdmitted(page: Page): Promise<boolean> {
     const meetingApp = page.locator(zoomMeetingAppSelector).first();
     if (await meetingApp.isVisible({ timeout: 500 })) return true;
 
-    // Fallback 2: live <audio> elements AND no pre-join indicators.
+    // Fallback 2: live <audio> elements AND not on a pre-join page.
     // Distinguishes "in meeting, audio routing" from "pre-join page with
-    // mic preview audio".
-    const state = await page.evaluate(() => {
-      const liveAudioCount = Array.from(document.querySelectorAll('audio'))
+    // mic preview audio". Pre-join detection is shared via isOnPreJoinPage()
+    // so it stays in sync with the post-admission silent check.
+    const liveAudioCount = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('audio'))
         .filter((el: any) =>
           !el.paused &&
           el.srcObject instanceof MediaStream &&
           el.srcObject.getAudioTracks().length > 0 &&
           el.srcObject.getAudioTracks()[0].readyState === 'live')
         .length;
-      const preJoinPresent = !!(
-        document.querySelector('#input-for-name') ||
-        document.querySelector('button.preview-join-button') ||
-        document.querySelector('input[placeholder*="passcode" i], input[placeholder*="password" i]')
-      );
-      const bodyText = (document.body?.innerText || '').toLowerCase();
-      const preJoinTextHints = ['enter meeting info', 'meeting passcode'].some(t => bodyText.includes(t));
-      return { liveAudioCount, preJoinPresent, preJoinTextHints };
-    }).catch(() => ({ liveAudioCount: 0, preJoinPresent: true, preJoinTextHints: true }));
-    return state.liveAudioCount > 0 && !state.preJoinPresent && !state.preJoinTextHints;
+    }).catch(() => 0);
+    return liveAudioCount > 0 && !(await isOnPreJoinPage(page));
   } catch {
     return false;
   }
@@ -185,14 +181,101 @@ export async function waitForZoomWebAdmission(
   throw new Error(`[Zoom Web] Bot not admitted within ${effectiveTimeout()}ms timeout`);
 }
 
+/**
+ * True if the page is showing Zoom's pre-join / passcode-entry screen (bot not
+ * yet in the meeting). Combines DOM-selector detection with body-text hints —
+ * the text hints matter because selectors alone missed a real pre-join screen
+ * once (see isAdmitted() history, meeting_id=31). Shared by isAdmitted()'s audio
+ * fallback and checkZoomWebAdmissionSilent() so the two can't drift apart.
+ * Fails safe to `true` (assume pre-join / NOT admitted) on error.
+ */
+async function isOnPreJoinPage(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const domPresent = !!(
+      document.querySelector('#input-for-name') ||
+      document.querySelector('button.preview-join-button') ||
+      document.querySelector('input[placeholder*="passcode" i], input[placeholder*="password" i]')
+    );
+    const bodyText = (document.body?.innerText || '').toLowerCase();
+    const textHint = ['enter meeting info', 'meeting passcode'].some(t => bodyText.includes(t));
+    return domPresent || textHint;
+  }).catch(() => true);
+}
+
+/**
+ * POSITIVE-liveness gate: the page is still a live Zoom meeting-client page.
+ * Guards the silent check's negative-confirmation path so a torn-down /
+ * about:blank / error / network-interstitial page (where the waiting-room /
+ * removal / pre-join text checks can all legitimately return false) is never
+ * mistaken for "still admitted" (which would silently record nothing). Fails
+ * safe to `false` (NOT a live meeting) on error.
+ *
+ * URL check accepts every legitimate meeting-client URL — `/wc/`, `/wc/{id}/join`
+ * AND `/wc-loading/` — because Zoom sits on `/wc-loading/` for 10-15s during the
+ * post-admission audio-init handshake; a narrower `/wc/` match wrongly evicted a
+ * genuinely-live bot during that window. Excludes, semantically: Chromium's
+ * network-error interstitial (`#main-frame-error`, which keeps the target URL)
+ * and Zoom's "host hasn't started / invalid link" error screen.
+ */
+async function hasMeetingLiveness(page: Page): Promise<boolean> {
+  if (page.isClosed()) return false;
+  if (!page.url().includes('zoom.us/wc')) return false;
+  return page.evaluate(
+    ({ invalidText, invalidTitle }: { invalidText: string; invalidTitle: string }) => {
+      if (document.readyState !== 'complete') return false;
+      // Chromium net-error interstitial keeps the target URL but is not a Zoom page.
+      if (document.querySelector('#main-frame-error')) return false;
+      const bodyText = document.body?.innerText || '';
+      if (bodyText.trim().length <= 20) return false;
+      // Zoom "Error - Zoom" / "This meeting link is invalid" screen is not a live meeting.
+      if (document.title.includes(invalidTitle)) return false;
+      if (bodyText.toLowerCase().includes(invalidText.toLowerCase())) return false;
+      return true;
+    },
+    { invalidText: zoomInvalidMeetingText, invalidTitle: zoomInvalidMeetingTitle }
+  ).catch(() => false);
+}
+
+/**
+ * Post-admission "is the bot STILL in the meeting?" check, used by the shared
+ * meeting flow to catch genuine false positives (bot bounced back to pre-join /
+ * waiting room / was removed) right after a confirmed admission.
+ *
+ * Two Zoom-Web races made the old naive re-check wrongly EVICT a genuinely
+ * admitted bot (observed live 2026-08-21 on the waiting-room admit path — the
+ * bot was admitted, then self-declared `admission_false_positive` and left
+ * without recording):
+ *   1. The in-meeting footer auto-hides within seconds, so the Leave button that
+ *      isAdmitted() keys off vanishes.
+ *   2. Audio-join (prepare) runs AFTER this check, so the live-<audio> fallback
+ *      is always 0 here.
+ * So: reveal the footer first; and if no positive control is visible yet, accept
+ * "still admitted" ONLY when a coarse positive-liveness signal holds AND none of
+ * the negative states (waiting room / removed / pre-join) do. The liveness gate
+ * (hasMeetingLiveness) is what makes this safe — without it, a blank/errored/
+ * torn-down page would slip through all three negative checks and be misread as
+ * admitted, silently recording nothing for the whole meeting. A real bounce
+ * still returns false. Bounded to 3 attempts so a genuine eviction is still
+ * detected within a few seconds.
+ */
 export async function checkZoomWebAdmissionSilent(page: Page | null): Promise<boolean> {
   if (!page) return false;
-  // Retry up to 3 times with 1s delay — Zoom UI may briefly hide elements
-  // during popup dismissals, tooltips, or layout transitions after admission.
   for (let attempt = 0; attempt < 3; attempt++) {
+    await revealZoomFooter(page);
     if (await isAdmitted(page)) return true;
+
+    const [waiting, gone, preJoin, live] = await Promise.all([
+      isInWaitingRoom(page).catch(() => false),
+      isRejectedOrEnded(page).catch(() => false),
+      isOnPreJoinPage(page),
+      hasMeetingLiveness(page).catch(() => false),
+    ]);
+    if (live && !waiting && !gone && !preJoin) {
+      log('[Zoom Web] Silent admission check: controls momentarily hidden but page is a live meeting (not waiting room / removed / pre-join) — treating as still admitted');
+      return true;
+    }
     if (attempt < 2) {
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(1500);
     }
   }
   return false;

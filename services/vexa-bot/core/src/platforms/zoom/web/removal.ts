@@ -1,6 +1,8 @@
 import { Page } from 'playwright';
 import { log } from '../../../utils';
-import { zoomLeaveButtonSelector, zoomMeetingEndedModalSelector, zoomRemovalTexts } from './selectors';
+import { BotConfig } from '../../../types';
+import { zoomLeaveButtonSelector, zoomMeetingEndedModalSelector, zoomRemovalTexts, zoomParticipantsButtonSelector } from './selectors';
+import { AloneTimerState, stepAloneTimer } from './alone-timer';
 
 /**
  * Starts polling for removal/end-of-meeting events.
@@ -24,17 +26,48 @@ function isZoomAudioInitUrl(url: string): boolean {
 
 export function startZoomWebRemovalMonitor(
   page: Page | null,
-  onRemoval?: () => void | Promise<void>
+  onRemoval?: (reasonToken?: string) => void | Promise<void>,
+  botConfig?: BotConfig
 ): () => void {
   if (!page) return () => {};
 
   let stopped = false;
   let consecutiveLeaveButtonMisses = 0;
   const LEAVE_BUTTON_MISS_THRESHOLD = 3; // Require 3 consecutive misses (9s) before acting
+  // A /wc/{id}/join redirect after presence is usually meeting-end, but Zoom can
+  // also bounce there for a mid-meeting audio reconnect that recovers in ~10-15s
+  // (see GRACE_PERIOD_MS note). Require a longer miss streak (~18s) for that URL
+  // shape specifically, so a reconnect can recover before we declare the meeting
+  // ended. Unambiguous end states (error/blank/post-meeting title) keep the fast 3.
+  const WC_REDIRECT_MISS_THRESHOLD = 6;
   const joinedAtMs = Date.now();
   const GRACE_PERIOD_MS = 20_000; // 20s grace — Zoom audio init can take 10-15s with slow networks
+  const POLL_INTERVAL_MS = 3000;
 
-  const triggerRemoval = async (reason: string) => {
+  // Left-alone / empty-room auto-leave. Zoom Web (unlike meet-bot) has no
+  // built-in "everyone left" exit, so an admitted bot in a meeting that is never
+  // formally Ended lingers until the 4h Job hard-deadline. Mirror meet-bot's two
+  // timeouts: noOneJoined (admitted but nobody else ever joined) and everyoneLeft
+  // (others were present, then all left). Timers only run once the bot is
+  // confirmed in the meeting (Leave button visible) and past the join grace.
+  // Real system defaults are asymmetric (docker.ts / meeting-api SYSTEM_DEFAULTS):
+  // noOneJoined 10min, everyoneLeft 2min. The `??` only applies if botConfig is
+  // absent (index.ts always injects it). Floor at 60s so a mis-set 0/tiny value
+  // can't evict a slightly-late participant on the first post-grace poll.
+  const everyoneLeftMs = Math.max(60_000, botConfig?.automaticLeave?.everyoneLeftTimeout ?? 120_000);
+  const noOneJoinedMs = Math.max(60_000, botConfig?.automaticLeave?.noOneJoinedTimeout ?? 600_000);
+  let aloneState: AloneTimerState = { aloneMs: 0, sawOthers: false };
+  let warnedUnreadable = false;
+
+  // Once the bot has confirmed it is actually in the meeting (Leave button seen
+  // at least once), a later redirect to /wc/{id}/join is NOT the audio-init
+  // handshake — it is Zoom bouncing the bot back to the pre-join page because the
+  // meeting ENDED. So the audio-init URL exemption must apply ONLY before presence
+  // is confirmed; afterwards such a redirect is treated as end-of-meeting (still
+  // gated by the consecutive-miss threshold, so a transient reconnect can recover).
+  let confirmedPresence = false;
+
+  const triggerRemoval = async (reason: string, signalToken?: string) => {
     if (stopped) return;
     stopped = true;
     const elapsed = ((Date.now() - joinedAtMs) / 1000).toFixed(1);
@@ -42,7 +75,9 @@ export function startZoomWebRemovalMonitor(
     log(`[Zoom Web] Current URL at removal: ${page.url()}`);
     const title = await page.title().catch(() => '<unknown>');
     log(`[Zoom Web] Current title at removal: "${title}"`);
-    onRemoval && await onRemoval();
+    // signalToken lets the alone-timer report left_alone_timeout /
+    // startup_alone_timeout instead of the generic removed_by_admin.
+    onRemoval && await onRemoval(signalToken);
   };
 
   // Fast path: detect navigation away from the meeting page immediately via framenavigated.
@@ -60,9 +95,11 @@ export function startZoomWebRemovalMonitor(
       return;
     }
 
-    // Always ignore known audio-init redirect URLs regardless of grace period.
-    // These patterns appear during Zoom's audio handshake which can extend beyond the grace window.
-    if (isZoomAudioInitUrl(url)) {
+    // Ignore known audio-init redirect URLs (they can extend beyond the grace
+    // window) — but ONLY before the bot has confirmed presence. After the bot has
+    // been in the meeting, the same /wc/{id}/join redirect means the meeting ended;
+    // fall through so the /wc/ handling below defers it to the polling loop.
+    if (isZoomAudioInitUrl(url) && !confirmedPresence) {
       log(`[Zoom Web] Ignoring audio-init redirect URL (${elapsed}s after join): ${url}`);
       return;
     }
@@ -125,8 +162,12 @@ export function startZoomWebRemovalMonitor(
 
         // During grace period or on audio-init URLs, don't act on Leave button absence.
         // Zoom's UI hasn't fully loaded yet — Leave button simply doesn't exist.
-        if (Date.now() - joinedAtMs < GRACE_PERIOD_MS || isZoomAudioInitUrl(url)) {
-          log(`[Zoom Web] Suppressing Leave button miss — still in grace/audio-init phase`);
+        // But once presence was confirmed, an audio-init URL is really the meeting
+        // ending (Zoom bounced us to the pre-join page), so stop suppressing then —
+        // the consecutive-miss threshold below still guards against a transient blip.
+        if (Date.now() - joinedAtMs < GRACE_PERIOD_MS || (isZoomAudioInitUrl(url) && !confirmedPresence)) {
+          const why = Date.now() - joinedAtMs < GRACE_PERIOD_MS ? 'grace period' : 'pre-presence audio-init URL';
+          log(`[Zoom Web] Suppressing Leave button miss — ${why}`);
         } else {
           // Navigated off Zoom entirely — immediate exit (no counter needed)
           if (url && !url.startsWith('about:') && !/zoom\.(us|com|eu|com\.cn|com\.br|com\.au|de|fr|jp|ca|co\.uk)\b/.test(url)) {
@@ -140,28 +181,93 @@ export function startZoomWebRemovalMonitor(
           }
           // For other conditions, only act after consecutive misses
           if (consecutiveLeaveButtonMisses >= LEAVE_BUTTON_MISS_THRESHOLD) {
-            // Redirected away from meeting page within Zoom
+            // Redirected away from meeting page within Zoom (e.g. /wc/{id}/join).
+            // Handle this URL shape EXCLUSIVELY on the longer reconnect-tolerant
+            // threshold — and skip the title branches for it, since the pre-join
+            // page's own title ("Join Meeting - Zoom") would otherwise trip the
+            // post-meeting-title branch at the fast 3 and defeat the longer window.
             if (url.includes('/wc/') && !url.includes('/meeting')) {
-              await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and URL is non-meeting: ${url}`);
-              return;
-            }
+              if (consecutiveLeaveButtonMisses >= WC_REDIRECT_MISS_THRESHOLD) {
+                await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and URL is non-meeting: ${url}`);
+                return;
+              }
             // Error page or blank
-            if (title === 'Error - Zoom' || title === '') {
+            } else if (title === 'Error - Zoom' || title === '') {
               await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and page shows error (title="${title}")`);
               return;
-            }
             // Generic post-meeting title
-            if (zoomPostMeetingTitles.includes(title)) {
+            } else if (zoomPostMeetingTitles.includes(title)) {
               await triggerRemoval(`Leave button gone ${consecutiveLeaveButtonMisses}x and post-meeting title: "${title}"`);
               return;
             }
           }
         }
       } else {
+        if (!confirmedPresence) {
+          confirmedPresence = true;
+          log('[Zoom Web] Presence confirmed (Leave button visible) — audio-init URL exemption now disabled; a later /wc/join redirect will be treated as meeting end');
+        }
         if (consecutiveLeaveButtonMisses > 0) {
           log(`[Zoom Web] Leave button recovered after ${consecutiveLeaveButtonMisses} miss(es)`);
         }
         consecutiveLeaveButtonMisses = 0;
+
+        // Left-alone / empty-room check. The bot is confirmed in the meeting
+        // (Leave button visible); only run past the join grace.
+        if (Date.now() - joinedAtMs >= GRACE_PERIOD_MS) {
+          // Zoom's OWN participant count (includes the bot) from the Participants
+          // toolbar button — the one count source that is view-mode-independent
+          // (survives Speaker View, which the bot is forced into, AND screen
+          // share). Deliberately NO DOM-tile fallback: `.video-avatar__*` is the
+          // Gallery-View family, so in Speaker View it would see only the bot's
+          // self-view and report a false "alone". If the button can't be parsed
+          // we return 0 = "unreadable" → hold (never leave), so a selector drift
+          // degrades to "bot lingers" (safe), never "bot evicts a live meeting".
+          const info = await page
+            .evaluate((btnSel: string) => {
+              const btn = document.querySelector(btnSel);
+              if (btn) {
+                const s = (btn.getAttribute('aria-label') || '') + ' ' + (btn.textContent || '');
+                // Prefer the number anchored to "participant(s)" (live label:
+                // "…pane,3 particpants" — note Zoom's own misspelling) so an
+                // unrelated badge/count elsewhere in the label can't be misread;
+                // fall back to the first digit-run.
+                const m = s.match(/(\d+)\s*partic/i) || s.match(/(\d+)/);
+                if (m) return { count: parseInt(m[1], 10), source: 'button' };
+              }
+              return { count: 0, source: 'unreadable' };
+            }, zoomParticipantsButtonSelector)
+            .catch(() => ({ count: 0, source: 'unreadable' }));
+
+          // Observability breadcrumb: if the count is unreadable, the alone-timer
+          // HOLDS (never leaves) — surface it once so a Participants-button
+          // selector drift is visible in logs instead of silently reverting to
+          // the pre-fix "bot lingers up to 4h" behavior.
+          if (info.source === 'unreadable' && !warnedUnreadable) {
+            warnedUnreadable = true;
+            log('[Zoom Web] WARNING: participant count unreadable (Participants button not matched) — left-alone timer HOLDING; verify zoomParticipantsButtonSelector against live DOM.');
+          }
+
+          const hadSeenOthers = aloneState.sawOthers;
+          const res = stepAloneTimer(aloneState, info.count, POLL_INTERVAL_MS, everyoneLeftMs, noOneJoinedMs);
+          aloneState = res.state;
+
+          if (info.count >= 2 && !hadSeenOthers) {
+            log('[Zoom Web] Other participant(s) present — alone-timer armed for "everyone left"');
+          } else if (info.count === 1) {
+            const threshold = aloneState.sawOthers ? everyoneLeftMs : noOneJoinedMs;
+            log(`[Zoom Web] Bot alone (${res.label}) ${(aloneState.aloneMs / 1000).toFixed(0)}s / ${(threshold / 1000).toFixed(0)}s [count source=${info.source}]`);
+          }
+
+          if (res.shouldLeave) {
+            const token = aloneState.sawOthers ? 'ZOOM_BOT_LEFT_ALONE_TIMEOUT' : 'ZOOM_BOT_STARTUP_ALONE_TIMEOUT';
+            await triggerRemoval(
+              `Alone in meeting (${res.label}) for ${(aloneState.aloneMs / 1000).toFixed(0)}s`,
+              token
+            );
+            return;
+          }
+        }
       }
     } catch {
       // Page navigated away or context destroyed
@@ -170,7 +276,7 @@ export function startZoomWebRemovalMonitor(
     }
 
     if (!stopped) {
-      setTimeout(poll, 3000);
+      setTimeout(poll, POLL_INTERVAL_MS);
     }
   };
 
