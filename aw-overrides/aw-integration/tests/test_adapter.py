@@ -6,7 +6,7 @@ Run with:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta as _timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,6 +30,19 @@ from notetaker_common.schemas import (
     ProcessRequest,
     RetryConfig,
     SpeakerTimelineFile,
+)
+
+# Stale-install guard. `speaker_intervals` is an ADDITIVE, defaulted field on
+# `SpeakerTimelineFile`. Pydantic's default `extra='ignore'` means passing
+# `speaker_intervals=` to a model built from a stale (pre-field) install of
+# notetaker-common silently DROPS the kwarg — every assertion below about
+# `speaker_intervals` would then pass vacuously against an empty default list
+# rather than testing anything. Fail loudly, at collection time, instead.
+assert "speaker_intervals" in SpeakerTimelineFile.model_fields, (
+    "notetaker_common.schemas.SpeakerTimelineFile has no `speaker_intervals` "
+    "field — the installed notetaker-common is stale. Reinstall from "
+    "/var/www/html/aw-notetaker/notetaker-common before trusting any test "
+    "in this file that touches speaker_intervals."
 )
 
 # ---------------------------------------------------------------------------
@@ -836,6 +849,224 @@ class TestDominantSpeakerCollapse:
 
 
 # ---------------------------------------------------------------------------
+# VexaSessionAdapter.build_speaker_timeline — speaker_intervals (additive)
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerIntervals:
+    """`speaker_intervals` carries the RAW paired audio intervals — overlap and
+    all — alongside the collapsed `speaker_timeline`. It must never change
+    `speaker_timeline`'s output; that invariant is the regression test that
+    matters most here.
+    """
+
+    def test_overlapping_intervals_are_both_emitted_with_overlap_intact(
+        self, tmp_path: Path
+    ) -> None:
+        """The whole reason the type exists: overlap must survive, unmerged."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 20_000),
+            _audio("Speaker B", "SPEAKER_START", 15_000),  # overlaps A's tail
+            _audio("Speaker B", "SPEAKER_END", 40_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        assert [
+            (iv.speaker_name, iv.start_sec, iv.end_sec)
+            for iv in result.speaker_intervals
+        ] == [
+            ("Speaker A", 0.0, 20.0),
+            ("Speaker B", 15.0, 40.0),
+        ]
+        # The overlap itself: both cover [15, 20).
+        a, b = result.speaker_intervals
+        assert a.start_sec < b.start_sec < a.end_sec < b.end_sec
+
+    def test_intervals_are_sorted_by_start_sec(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        # Constructed out of chronological order to prove the output is sorted
+        # rather than merely reflecting input order.
+        adapter._session.speaker_events = [
+            _audio("Speaker C", "SPEAKER_START", 20_000),
+            _audio("Speaker C", "SPEAKER_END", 21_000),
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 1_000),
+            _audio("Speaker B", "SPEAKER_START", 10_000),
+            _audio("Speaker B", "SPEAKER_END", 11_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        starts = [iv.start_sec for iv in result.speaker_intervals]
+        assert starts == sorted(starts)
+        assert [iv.speaker_name for iv in result.speaker_intervals] == [
+            "Speaker A",
+            "Speaker B",
+            "Speaker C",
+        ]
+
+    def test_collapsed_speaker_timeline_is_byte_identical_to_pre_change_output(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression guard: emitting speaker_intervals must not alter
+        `speaker_timeline` at all.
+
+        Expected values below were captured by running this exact fixture
+        against the adapter BEFORE this change (git stash of the
+        `speaker_intervals=` addition), i.e. the collapse logic untouched.
+        The fixture deliberately mixes overlap (A/B), a nested sub-threshold
+        interval (C, 1s < MIN_DOMINANT_UTTERANCE_MS), an excluded DOM point
+        (D), and an excluded untagged point (E) — the same shape exercised by
+        `TestDominantSpeakerCollapse` and `TestSpeakerIntervals` elsewhere in
+        this file.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 20_000),
+            _audio("Speaker B", "SPEAKER_START", 15_000),
+            _audio("Speaker B", "SPEAKER_END", 40_000),
+            _audio("Speaker C", "SPEAKER_START", 5_000),
+            _audio("Speaker C", "SPEAKER_END", 6_000),
+            _dom("Speaker D", "SPEAKER_START", 1_000),
+            _untagged("Speaker E", "SPEAKER_START", 2_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        origin_ms = int(SESSION_START.timestamp() * 1000)
+        assert [
+            (e.timestamp_ms, e.relative_sec, e.speaker_id, e.speaker_name)
+            for e in result.speaker_timeline
+        ] == [
+            (origin_ms + 0, 0.0, "speaker_a", "Speaker A"),
+            (origin_ms + 20_000, 20.0, "speaker_b", "Speaker B"),
+        ]
+        # And, additively, the raw intervals are all still there.
+        assert [
+            (iv.speaker_name, iv.start_sec, iv.end_sec)
+            for iv in result.speaker_intervals
+        ] == [
+            ("Speaker A", 0.0, 20.0),
+            ("Speaker C", 5.0, 6.0),
+            ("Speaker B", 15.0, 40.0),
+        ]
+
+    def test_dom_sourced_events_are_not_turned_into_intervals(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _dom("Alice Chen", "SPEAKER_START", 1_000),
+            _dom("Alice Chen", "SPEAKER_END", 2_000),
+            _dom("Bob Müller", "SPEAKER_START", 3_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        # Safety-valve path: speaker_timeline still gets legacy points...
+        assert len(result.speaker_timeline) == 2
+        # ...but nothing was pairable, so no intervals.
+        assert result.speaker_intervals == []
+
+    def test_segment_derived_fallback_emits_no_intervals(self, tmp_path: Path) -> None:
+        """No speaker_events at all -> segment-derived fallback -> no intervals."""
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), with_speaker_events=False
+        )
+
+        result = adapter.build_speaker_timeline()
+
+        assert len(result.speaker_timeline) == 2  # unchanged fallback behaviour
+        assert result.speaker_intervals == []
+
+    def test_unpaired_start_is_bounded_by_session_end(self, tmp_path: Path) -> None:
+        """Mirrors the collapse's own handling of an unclosed interval."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 5_000),  # no END
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        duration_sec = (SESSION_END - SESSION_START).total_seconds()
+        assert len(result.speaker_intervals) == 1
+        iv = result.speaker_intervals[0]
+        assert iv.speaker_name == "Alice Chen"
+        assert iv.start_sec == pytest.approx(5.0)
+        assert iv.end_sec == pytest.approx(duration_sec)
+
+    def test_second_start_without_end_produces_two_intervals(
+        self, tmp_path: Path
+    ) -> None:
+        """The collapse closes a re-opened START at the new START's time; the
+        same two intervals must appear in speaker_intervals, unmerged."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Alice Chen", "SPEAKER_START", 1_000),
+            _audio("Alice Chen", "SPEAKER_START", 5_000),  # no END between
+            _audio("Alice Chen", "SPEAKER_END", 9_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        assert [(iv.start_sec, iv.end_sec) for iv in result.speaker_intervals] == [
+            (1.0, 5.0),
+            (5.0, 9.0),
+        ]
+
+    def test_untagged_events_yield_no_intervals(self, tmp_path: Path) -> None:
+        """The Teams/Zoom point-only shape has nothing pairable."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _untagged("Speaker A", "SPEAKER_START", 0),
+            _untagged("Speaker B", "SPEAKER_START", 10_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        assert result.speaker_intervals == []
+
+    def test_audio_intervals_present_excludes_untrusted_points_from_intervals(
+        self, tmp_path: Path
+    ) -> None:
+        """When any pairable audio interval exists, untrusted points are
+        dropped from the timeline (existing behaviour) and were never eligible
+        for intervals in the first place."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.speaker_events = [
+            _audio("Speaker A", "SPEAKER_START", 0),
+            _audio("Speaker A", "SPEAKER_END", 5_000),
+            _untagged("Speaker B", "SPEAKER_START", 1_000),
+            _dom("Speaker C", "SPEAKER_START", 2_000),
+        ]
+
+        result = adapter.build_speaker_timeline()
+
+        assert [
+            (iv.speaker_name, iv.start_sec, iv.end_sec)
+            for iv in result.speaker_intervals
+        ] == [("Speaker A", 0.0, 5.0)]
+
+    def test_no_speaker_events_object_yields_no_intervals(self, tmp_path: Path) -> None:
+        """Belt-and-braces: an empty speaker_events list never populates
+        speaker_intervals — the `if session.speaker_events:` guard is never
+        entered, so `paired_intervals` stays its initial `[]`."""
+        adapter, _, _ = make_adapter(
+            tmp_path, pcm_bytes=bytes(32000), with_speaker_events=False
+        )
+        adapter._session.segments = []  # also empty segments -> nothing at all
+
+        result = adapter.build_speaker_timeline()
+
+        assert result.speaker_timeline == []
+        assert result.speaker_intervals == []
+
+
+# ---------------------------------------------------------------------------
 # VexaSessionAdapter.build_speaker_timeline — earliest-event anchor gate
 # ---------------------------------------------------------------------------
 
@@ -1185,6 +1416,7 @@ class TestNoteTakerClientWrapper:
 # ── Tests for run_from_redis() ─────────────────────────────────────────────
 
 import json as _json  # noqa: E402
+import os as _os  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 from unittest.mock import (
     AsyncMock as _AsyncMock,
@@ -1667,3 +1899,298 @@ class TestZoomPlatformMapping:
         assert adapter.build_speaker_timeline().platform == "zoom"
         assert adapter.build_participants().platform == "zoom"
         assert adapter.build_metadata().platform == "zoom"
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_reads_newest_not_oldest_when_stream_exceeds_count(
+    tmp_path: _Path,
+) -> None:
+    """A session at the END of an over-long global stream must still be read.
+
+    This is the regression test for the 2026-08-27 incident. `transcription_segments`
+    and `speaker_events_relative` are global streams shared by every bot ever run,
+    and nothing trims them; `speaker_events_relative` measured 64,135 entries. The
+    original code read them with `xrange(count=50000)`, which returns the OLDEST N
+    entries — so once a stream passed 50,000, the current session's events fell
+    outside the window, zero events were read, `speaker_timeline.json` was written
+    empty, and every transcript silently reverted to SPEAKER_00/01/02. No exception,
+    no log line, no failing test.
+
+    `_STREAM_READ_COUNT` is monkeypatched small so the shape can be exercised
+    without seeding 50,000 entries. Under `xrange` this test fails; the assertions
+    below pin the ordering too, so a well-meaning revert to xrange cannot pass.
+    """
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+
+    # OLDER traffic from OTHER sessions — the entries that would fill the window.
+    for i in range(12):
+        fake_r.xadd(
+            "speaker_events_relative",
+            {
+                "uid": f"someone-elses-session-{i}",
+                "relative_client_timestamp_ms": str(1000 + i),
+                "event_type": "SPEAKER_START",
+                "participant_name": "Somebody Else",
+                "meeting_id": "999",
+                "source": "audio",
+            },
+        )
+
+    # THEN this session's events, newest in the stream — as in production, where
+    # the bridge writes them seconds before run_from_redis reads.
+    for ms, etype, name in (
+        (1000, "SPEAKER_START", "Alice"),
+        (4000, "SPEAKER_END", "Alice"),
+        (4200, "SPEAKER_START", "Bob"),
+        (7000, "SPEAKER_END", "Bob"),
+    ):
+        fake_r.xadd(
+            "speaker_events_relative",
+            {
+                "uid": _SESSION_UID,
+                "relative_client_timestamp_ms": str(ms),
+                "event_type": etype,
+                "participant_name": name,
+                "meeting_id": "123",
+                "source": "audio",
+            },
+        )
+
+    import aw_integration.adapter as _adapter_mod
+    from aw_integration.adapter import run_from_redis
+
+    captured: dict[str, object] = {}
+    real_init = _adapter_mod.VexaSessionAdapter.__init__
+
+    def _spy_init(self: object, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)  # type: ignore[arg-type]
+        captured["session"] = kwargs.get("session")
+
+    with (
+        _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r),
+        _patch("aw_integration.adapter._STREAM_READ_COUNT", 5),
+        _patch.object(_adapter_mod.VexaSessionAdapter, "__init__", _spy_init),
+        _patch.object(_adapter_mod.VexaSessionAdapter, "run", _AsyncMock()),
+    ):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="last_participant",
+            s3_writer=_MagicMock(),
+            notetaker_client=_AsyncMock(),
+        )
+
+    session = captured["session"]
+    assert session is not None
+    events = session.speaker_events  # type: ignore[union-attr]
+
+    # The bug: this was 0, and nothing anywhere reported it.
+    assert len(events) == 4, (
+        f"expected this session's 4 events, got {len(events)} — the read window is "
+        "anchored to the OLDEST entries again, so a long global stream hides the "
+        "current session and every transcript silently becomes SPEAKER_NN"
+    )
+    assert all(e.uid == _SESSION_UID for e in events)
+    # Ascending insertion order must survive the newest-first read; the dominant
+    # collapse and the interval pairing both depend on it.
+    assert [e.relative_ms for e in events] == [1000, 4000, 4200, 7000]
+    assert [e.participant_name for e in events] == ["Alice", "Alice", "Bob", "Bob"]
+
+
+@pytest.mark.asyncio
+async def test_run_from_redis_reads_newest_segments_and_keeps_first_last_wins_order(
+    tmp_path: _Path,
+) -> None:
+    """The `transcription_segments` half of the newest-first read, and its ordering.
+
+    Companion to the speaker-event test above. That one left this half completely
+    uncovered: reverting only the `transcription_segments` read (and deleting its
+    `.reverse()`) kept the whole suite green, because nothing padded that stream.
+
+    This half fails worse than missing speaker names. An empty `segments` list
+    also means `session_start_ts` falls through to
+    `session_end_wall_clock - expected_duration_min` — a FABRICATED recording
+    origin that shifts every timestamp in the artifact.
+
+    The `.reverse()` is asserted directly, because the two consumers of `raw_ts`
+    are order-dependent in OPPOSITE directions: `session_start_ts` is first-wins
+    (guarded by `is None`), `saw_remote_camera` is last-wins (unguarded). Drop the
+    reverse and both silently invert with nothing else failing.
+    """
+    audio_path = tmp_path / "audio.raw"
+    audio_path.write_bytes(b"\x00\x01" * 1600)
+
+    fake_r = _fakeredis.FakeRedis(decode_responses=True)
+
+    # OLDER traffic from OTHER sessions, enough to fill a small read window.
+    for i in range(12):
+        fake_r.xadd(
+            "transcription_segments",
+            {
+                "payload": _json.dumps(
+                    {
+                        "uid": f"someone-elses-session-{i}",
+                        "type": "transcription",
+                        "segments": [
+                            {
+                                "speaker": "Somebody Else",
+                                "text": "not ours",
+                                "start": 0.0,
+                                "end": 1.0,
+                            }
+                        ],
+                    }
+                )
+            },
+        )
+
+    # THEN this session's traffic, newest in the stream.
+    real_origin = "2026-08-27T11:46:20.733000+00:00"
+    for payload in (
+        {"uid": _SESSION_UID, "type": "session_start", "start_timestamp": real_origin},
+        # Two media_state messages: LAST one must win.
+        {"uid": _SESSION_UID, "type": "media_state", "sawRemoteCamera": False},
+        {"uid": _SESSION_UID, "type": "media_state", "sawRemoteCamera": True},
+        {
+            "uid": _SESSION_UID,
+            "type": "transcription",
+            "segments": [
+                {"speaker": "Alice", "text": "ours one", "start": 0.5, "end": 2.0},
+                {"speaker": "Bob", "text": "ours two", "start": 2.1, "end": 4.0},
+            ],
+        },
+    ):
+        fake_r.xadd("transcription_segments", {"payload": _json.dumps(payload)})
+
+    import aw_integration.adapter as _adapter_mod
+    from aw_integration.adapter import run_from_redis
+
+    captured: dict[str, object] = {}
+    real_init = _adapter_mod.VexaSessionAdapter.__init__
+
+    def _spy_init(self: object, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)  # type: ignore[arg-type]
+        captured["session"] = kwargs.get("session")
+
+    with (
+        _patch("aw_integration.adapter.redis.Redis.from_url", return_value=fake_r),
+        _patch("aw_integration.adapter._STREAM_READ_COUNT", 5),
+        _patch.object(_adapter_mod.VexaSessionAdapter, "__init__", _spy_init),
+        _patch.object(_adapter_mod.VexaSessionAdapter, "run", _AsyncMock()),
+    ):
+        await run_from_redis(
+            session_uid=_SESSION_UID,
+            job=_JOB,
+            audio_raw_path=audio_path,
+            session_end_wall_clock=SESSION_END,
+            redis_url="redis://localhost:6379",
+            bot_left_reason="last_participant",
+            s3_writer=_MagicMock(),
+            notetaker_client=_AsyncMock(),
+        )
+
+    session = captured["session"]
+    assert session is not None
+
+    # The bug: this was 0, and the transcript came out empty.
+    segs = session.segments  # type: ignore[union-attr]
+    assert len(segs) == 2, (
+        f"expected this session's 2 segments, got {len(segs)} — the read window is "
+        "anchored to the OLDEST entries again, so a long global stream hides the "
+        "current session's transcript entirely"
+    )
+    assert [s.text for s in segs] == ["ours one", "ours two"]
+
+    # The real origin must be used, NOT the duration-guess fallback.
+    fabricated = SESSION_END - _timedelta(minutes=_JOB.expected_duration_min)
+    start_ts = session.session_start_ts  # type: ignore[union-attr]
+    assert start_ts == datetime.fromisoformat(real_origin), (
+        f"session_start_ts is {start_ts}; the published session_start was lost and "
+        "the origin was fabricated from expected_duration_min"
+    )
+    assert start_ts != fabricated
+
+    # last-wins on media_state must survive the newest-first read + reverse.
+    assert session.saw_remote_camera is True, (  # type: ignore[union-attr]
+        "saw_remote_camera is not the LAST published media_state — iteration order "
+        "is inverted, which also inverts first-wins on session_start_ts"
+    )
+
+
+def test_stream_read_count_covers_writer_cap() -> None:
+    """The read window must be at least the writer-side MAXLEN, in BOTH languages.
+
+    This closes the blind spot that the two regression tests above do not: they
+    monkeypatch `_STREAM_READ_COUNT`, so the value that actually SHIPS is never
+    exercised by them. Six independent mutations of the shipped width — including
+    restoring the literal `50000` that caused the 2026-08-27 incident — passed the
+    entire suite before this test existed.
+
+    The invariant: everything Redis still retains for `speaker_events_relative`
+    must be readable. If the writer's MAXLEN exceeds the reader's window, entries
+    are retained but structurally invisible — the same silent failure as the
+    original bug, entering from the other end, with no error anywhere.
+
+    The cap is declared in TypeScript and the window in Python, so the TS value is
+    parsed out of the source here. Prose in two files across a language boundary
+    cannot stop the two drifting; only an assertion can.
+    """
+    import re
+
+    import aw_integration.adapter as _adapter
+
+    assert _adapter._STREAM_READ_COUNT >= _adapter._SPEAKER_EVENT_STREAM_MAXLEN, (
+        f"read window {_adapter._STREAM_READ_COUNT} is below the writer cap "
+        f"{_adapter._SPEAKER_EVENT_STREAM_MAXLEN}: Redis would retain entries that "
+        "this reader can never see, silently losing speaker names again"
+    )
+
+    # A floor-clamp, not advice: an operator typo must not be able to reintroduce
+    # the incident. (`_resolve_stream_read_count` has no ceiling — widening is safe.)
+    _os_environ_backup = _os.environ.get("AW_STREAM_READ_COUNT")
+    try:
+        _os.environ["AW_STREAM_READ_COUNT"] = "2000"  # typo for 200000
+        assert (
+            _adapter._resolve_stream_read_count()
+            >= _adapter._SPEAKER_EVENT_STREAM_MAXLEN
+        ), "a too-small override was accepted; the floor clamp is gone"
+        _os.environ["AW_STREAM_READ_COUNT"] = "not-a-number"
+        assert (
+            _adapter._resolve_stream_read_count() == _adapter._STREAM_READ_COUNT_DEFAULT
+        ), "a non-numeric override must fall back, not raise"
+    finally:
+        if _os_environ_backup is None:
+            _os.environ.pop("AW_STREAM_READ_COUNT", None)
+        else:
+            _os.environ["AW_STREAM_READ_COUNT"] = _os_environ_backup
+
+    # Cross-language: parse the TypeScript constant the Python mirror claims to track.
+    ts = (
+        _Path(__file__).resolve().parents[3]
+        / "services"
+        / "vexa-bot"
+        / "core"
+        / "src"
+        / "services"
+        / "segment-publisher.ts"
+    )
+    if ts.is_file():
+        m = re.search(
+            r"SPEAKER_EVENT_STREAM_MAXLEN\s*=\s*(\d+)", ts.read_text(encoding="utf-8")
+        )
+        assert m, f"SPEAKER_EVENT_STREAM_MAXLEN not found in {ts}"
+        ts_cap = int(m.group(1))
+        assert ts_cap == _adapter._SPEAKER_EVENT_STREAM_MAXLEN, (
+            f"TypeScript cap {ts_cap} != Python mirror "
+            f"{_adapter._SPEAKER_EVENT_STREAM_MAXLEN} — the two have drifted"
+        )
+        assert _adapter._STREAM_READ_COUNT >= ts_cap, (
+            f"read window {_adapter._STREAM_READ_COUNT} < TypeScript writer cap "
+            f"{ts_cap}: Redis retains what this reader cannot see"
+        )
