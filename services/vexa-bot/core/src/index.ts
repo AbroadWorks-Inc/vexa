@@ -3,6 +3,7 @@ import { log } from "./utils";
 import { callStatusChangeCallback, mapExitReasonToStatus } from "./services/unified-callback";
 import { chromium } from "playwright-extra";
 import { handleGoogleMeet, leaveGoogleMeet } from "./platforms/googlemeet";
+import { stopMeetAudioCapture } from "./platforms/googlemeet/recording";
 import { handleMicrosoftTeams, leaveMicrosoftTeams } from "./platforms/msteams";
 import { handleZoom, leaveZoom, leaveZoomWeb } from "./platforms/zoom";
 import { reconfigureZoomWebRecording, getZoomWebSpeakerEvents } from "./platforms/zoom/web/recording";
@@ -24,7 +25,7 @@ import { ensureBrowserDataDir, syncBrowserDataFromS3, syncBrowserDataToS3, clean
 
 // Per-speaker transcription pipeline
 import { TranscriptionClient } from './services/transcription-client';
-import { SegmentPublisher } from './services/segment-publisher';
+import { SegmentPublisher, SPEAKER_EVENT_STREAM_MAXLEN } from './services/segment-publisher';
 import { SpeakerStreamManager } from './services/speaker-streams';
 import { resolveSpeakerName, clearSpeakerNameCache, isTrackLocked, isNameTaken, reportTrackAudio, getLockedMapping } from './services/speaker-identity';
 import { createSpeakerBoundaryTracker, SpeakerBoundaryTracker } from './services/speaker-boundaries';
@@ -711,6 +712,22 @@ async function performGracefulLeave(
     log(`[Graceful Leave] Per-speaker pipeline cleanup error: ${pipelineCleanupErr.message}`);
   }
 
+  // Google Meet: stop the Node-side PulseAudio capture and finalize the WAV.
+  // Must happen HERE, and before both the video-mux block and the audio upload
+  // below read the file. It cannot live in leaveGoogleMeet(): every ending other
+  // than a bot-initiated leave arrives with the page already destroyed (the host
+  // ended the call) or without startGoogleRecording ever returning (the removal
+  // monitor wins the Promise.race in meetingFlow.ts; SIGTERM/SIGINT), and
+  // performGracefulLeave is the one path all of them share. Idempotent + never
+  // throws for "capture was never started".
+  if (currentPlatform === "google_meet") {
+    try {
+      await stopMeetAudioCapture();
+    } catch (captureErr: any) {
+      log(`[Graceful Leave] Google Meet audio capture stop error: ${captureErr.message}`);
+    }
+  }
+
   // Clean up per-bot PulseAudio sink if one was created
   if (botPaSinkModuleId) {
     try {
@@ -848,6 +865,14 @@ async function performGracefulLeave(
             // poller) can double-emit a START/END for one utterance, there is no
             // terminal flush, and a tile removed mid-utterance never closes.
             source: "dom",
+          }, {
+            TRIM: {
+              strategy: 'MAXLEN',
+              strategyModifier: '~',
+              // Same cap as the audio path — this bridge writes to the same
+              // global stream, so the two must not be able to drift.
+              threshold: SPEAKER_EVENT_STREAM_MAXLEN,
+            },
           });
           bridged++;
         }

@@ -76,6 +76,38 @@ export interface SegmentPublisherConfig {
  * Segments: XADD with { payload: JSON } to stream, PUBLISH flat JSON to pub/sub.
  * Speaker events: XADD flat fields to speaker_events_relative stream.
  */
+/**
+ * Cap on the shared `speaker_events_relative` stream.
+ *
+ * This stream is GLOBAL — every bot that has ever run appends to it — and until
+ * 2026-08-27 nothing trimmed it. It reached 64,135 entries, which is how a
+ * latent reader bug in aw-integration became a live incident: the reader took
+ * the OLDEST 50,000 entries, so once the stream passed that, a finished
+ * session's own events were outside the window and every transcript silently
+ * reverted to SPEAKER_00/01/02. The reader now takes the NEWEST entries, so
+ * this cap is belt-and-braces — it bounds Redis memory and keeps the whole
+ * failure mode structurally impossible. Measured growth: 64,135 entries over
+ * 22.0 days is ~2,900/day on average, but the two days before the incident ran
+ * ~16,000/day. Size headroom against the peak, not the mean.
+ *
+ * `~` lets Redis trim at node boundaries, which is O(1) amortised.
+ *
+ * Safe for OUR deployment, with a caveat a maintainer needs: nothing we deploy
+ * consumes this stream as history — aw-integration reads it newest-first at
+ * session end and filters on `uid`. Upstream Vexa's own collector DOES hold a
+ * consumer group on it (`services/meeting-api/.../collector/consumer.py`,
+ * group `collector_speaker_group`), and we do not deploy meeting-api. If that
+ * service is ever brought up, revisit this cap first: MAXLEN deletes entry data
+ * while pending IDs remain in the group's PEL, so a reclaim returns nil and
+ * events vanish with no error.
+ *
+ * Keep this cap BELOW aw-integration's `_STREAM_READ_COUNT` (250,000). If Redis
+ * retains more than the reader reads, the entries in between are retained but
+ * structurally unreadable — which is the same silent-clipping failure this whole
+ * change exists to remove, just entering from the other end.
+ */
+export const SPEAKER_EVENT_STREAM_MAXLEN = 200000;
+
 export class SegmentPublisher {
   private redisUrl: string;
   private meetingId: string;
@@ -360,7 +392,13 @@ export class SegmentPublisher {
         fields.source = event.source;
       }
 
-      await client.xAdd(this.speakerEventStreamKey, '*', fields);
+      await client.xAdd(this.speakerEventStreamKey, '*', fields, {
+        TRIM: {
+          strategy: 'MAXLEN',
+          strategyModifier: '~',
+          threshold: SPEAKER_EVENT_STREAM_MAXLEN,
+        },
+      });
     } catch (err: any) {
       log(`[SegmentPublisher] Failed to publish speaker event: ${err.message}`);
     }
@@ -397,7 +435,13 @@ export class SegmentPublisher {
         meeting_id: this.meetingId,
       };
 
-      await client.xAdd(this.speakerEventStreamKey, '*', fields);
+      await client.xAdd(this.speakerEventStreamKey, '*', fields, {
+        TRIM: {
+          strategy: 'MAXLEN',
+          strategyModifier: '~',
+          threshold: SPEAKER_EVENT_STREAM_MAXLEN,
+        },
+      });
     } catch (err: any) {
       log(`[SegmentPublisher] Failed to publish relative speaker event: ${err.message}`);
     }

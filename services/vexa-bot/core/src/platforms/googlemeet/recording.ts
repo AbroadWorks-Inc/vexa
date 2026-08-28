@@ -1,4 +1,5 @@
 import { Page } from "playwright";
+import { spawn, ChildProcess } from "child_process";
 import { log } from "../../utils";
 import { BotConfig } from "../../types";
 import { RecordingService } from "../../services/recording";
@@ -20,9 +21,199 @@ import {
   googlePeopleButtonSelectors
 } from "./selectors";
 
+// ---- Node-side continuous audio capture (parecord) ----
+//
+// The full-session recording is captured in the POD, not in the page: `parecord`
+// is a child_process and RecordingService writes with fs.createWriteStream, so
+// neither dies with the renderer. This matters because when the HOST ends a Meet
+// call the page context is destroyed instantly — the in-page MediaRecorder flush
+// never runs and, before this, no full recording was produced at all.
+//
+// It also removes the audio-duplication bug: MediaRecorder used to BOTH upload
+// 30 s chunks and accumulate every chunk into `__vexaRecordedChunks`, whose
+// combined blob was then saved on top of those chunks — the meeting twice. The
+// 30 s chunk uploads are KEPT (they are the S3 backup and are unchanged); only
+// the combined-blob path is gone, and the primary audio is now this WAV.
+//
+// Deliberately mirrors platforms/zoom/web/recording.ts (the proven production
+// implementation) — read the two side by side when changing either.
+let meetRecordingService: RecordingService | null = null;
+let meetParecordProcess: ChildProcess | null = null;
+let meetCaptureStarted = false;
+let meetCaptureStopped = false;
+
+// Bound the wait for parecord to drain after SIGTERM before finalizing the WAV.
+const MEET_PARECORD_DRAIN_MS = 2000;
+
+/**
+ * The PulseAudio monitor source parecord reads from.
+ *
+ * `meet-bot/start.sh` creates `module-null-sink sink_name=meet_sink` and makes it
+ * the default sink, so Chromium's output lands there and `meet_sink.monitor`
+ * carries the meeting audio. PULSE_SINK is exported by that same script; the
+ * fallback keeps a hand-run bot working if it is unset.
+ */
+function meetPulseMonitorDevice(): string {
+  return `${process.env.PULSE_SINK || "meet_sink"}.monitor`;
+}
+
+/**
+ * Wait for a killed parecord child to actually drain before finalizing.
+ *
+ * SIGTERM is asynchronous: parecord can emit one last stdout `data` event AFTER
+ * `kill()` returns. Finalizing immediately would drop that tail slice from the
+ * WAV. All `data` events precede stdout `end`, so awaiting `end`/`exit`/`close`
+ * guarantees the tail has reached appendPCMBuffer first. Bounded by a timeout so
+ * teardown can never hang.
+ */
+function drainMeetParecord(proc: ChildProcess, timeoutMs: number): Promise<void> {
+  // Already exited → nothing to wait for.
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    if (proc.stdout) proc.stdout.once("end", finish);
+    proc.once("exit", finish);
+    proc.once("close", finish);
+  });
+}
+
+/**
+ * Open the WAV and start streaming `meet_sink.monitor` into it.
+ *
+ * Called from the `__vexaRecordingStarted` bridge — i.e. at the exact moment the
+ * in-page MediaRecorder starts, which is also where `publisher.resetSessionStart()`
+ * runs. That shared instant is the point: the transcript is produced by WhisperX
+ * over this WAV, and aw-integration maps speaker names by comparing segment
+ * offsets into the WAV against `relative_ms` measured from `sessionStartMs`. Both
+ * clocks must have the same zero or every name lands on the wrong utterance.
+ * Starting capture earlier (e.g. at startGoogleRecording) would offset the WAV
+ * from the speaker timeline by the media-element wait — 2 s at best, up to 30 s
+ * when findMediaElements has to retry.
+ *
+ * Idempotent: the bridge can fire more than once (recorder restart), and a second
+ * `RecordingService.start()` would truncate the file already being written.
+ */
+async function startMeetAudioCapture(): Promise<void> {
+  if (meetCaptureStarted) return;
+  const svc = meetRecordingService;
+  if (!svc) {
+    log("[Google Recording] No recording service — Node-side audio capture skipped.");
+    return;
+  }
+  meetCaptureStarted = true;
+
+  svc.start();
+  log("[Google Recording] Recording service started (Node-side WAV)");
+
+  const device = meetPulseMonitorDevice();
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn("parecord", [
+      "--raw",
+      "--format=s16le",
+      "--rate=16000",
+      "--channels=1",
+      `--device=${device}`,
+    ]);
+    meetParecordProcess = proc;
+
+    if (!proc.stdout) {
+      reject(new Error("[Google Recording] Failed to start parecord"));
+      return;
+    }
+
+    let started = false;
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      if (!started) {
+        log(`[Google Recording] PulseAudio capture receiving audio from ${device}`);
+        started = true;
+        resolve();
+      }
+      // Audio recording only — transcription is handled by the per-speaker
+      // pipeline in index.ts (browser ScriptProcessor → handlePerSpeakerAudioData).
+      svc.appendPCMBuffer(chunk);
+    });
+
+    proc.stderr?.on("data", (data: Buffer) => {
+      log(`[Google Recording] parecord stderr: ${data.toString().trim()}`);
+    });
+
+    proc.on("error", (err: Error) => {
+      log(`[Google Recording] parecord error: ${err.message}`);
+      if (!started) reject(err);
+    });
+
+    proc.on("exit", (code, signal) => {
+      log(`[Google Recording] parecord exited: code=${code}, signal=${signal}`);
+      if (meetParecordProcess === proc) meetParecordProcess = null;
+    });
+
+    // Optimistic resolve after 1s even with no data yet — a silent meeting must
+    // not block the recording chain.
+    setTimeout(() => {
+      if (!started) {
+        log("[Google Recording] PulseAudio capture started (waiting for data)");
+        resolve();
+      }
+    }, 1000);
+  });
+}
+
+/**
+ * Stop parecord, drain its tail, and finalize the WAV header.
+ *
+ * Called from performGracefulLeave in index.ts rather than from
+ * leaveGoogleMeet(): every ending except a bot-initiated leave arrives either
+ * with the page already destroyed (host ended the call) or without
+ * startGoogleRecording ever returning (the removal monitor wins the
+ * Promise.race in meetingFlow.ts; SIGTERM/SIGINT). performGracefulLeave is the
+ * one path all of them share, and it runs before anything reads the file.
+ *
+ * Idempotent and never throws for "not started" — finalize() is a no-op once the
+ * service is already finalized, and RecordingService.upload() finalizes lazily
+ * anyway, so a double call cannot corrupt the header.
+ */
+export async function stopMeetAudioCapture(): Promise<void> {
+  if (meetCaptureStopped) return;
+  meetCaptureStopped = true;
+
+  const drainingProc = meetParecordProcess;
+  meetParecordProcess = null;
+  if (drainingProc) {
+    log("[Google Recording] Stopping PulseAudio capture");
+    drainingProc.kill("SIGTERM");
+    await drainMeetParecord(drainingProc, MEET_PARECORD_DRAIN_MS);
+  }
+
+  const svc = meetRecordingService;
+  meetRecordingService = null;
+  if (svc && meetCaptureStarted) {
+    try {
+      await svc.finalize();
+      log("[Google Recording] Recording finalized");
+    } catch (err: any) {
+      log(`[Google Recording] Error finalizing recording: ${err?.message || err}`);
+    }
+  }
+}
+
 // Modified to use new services - Google Meet recording functionality
 export async function startGoogleRecording(page: Page, botConfig: BotConfig): Promise<void> {
   log("Starting Google Meet recording");
+
+  // Reset per-session capture state up-front (defensive against future process
+  // reuse; today it is one meeting per pod).
+  meetRecordingService = null;
+  meetParecordProcess = null;
+  meetCaptureStarted = false;
+  meetCaptureStopped = false;
 
   // Reset segment publisher session start to align with recording start.
   // SegmentPublisher was created pre-admission; recording starts post-admission.
@@ -79,34 +270,17 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
   if (wantsAudioCapture) {
     recordingService = new RecordingService(botConfig.meeting_id, sessionUid);
     setActiveRecordingService(recordingService);
+    // Hand the same service to the Node-side capture path; startMeetAudioCapture()
+    // opens the WAV on it when the in-page MediaRecorder starts.
+    meetRecordingService = recordingService;
 
-    await page.exposeFunction("__vexaSaveRecordingBlob", async (payload: { base64: string; mimeType?: string }) => {
-      try {
-        if (!recordingService) {
-          log("[Google Recording] Recording service not initialized; dropping blob.");
-          return false;
-        }
-
-        const mimeType = (payload?.mimeType || "").toLowerCase();
-        let format = "webm";
-        if (mimeType.includes("wav")) format = "wav";
-        else if (mimeType.includes("ogg")) format = "ogg";
-        else if (mimeType.includes("mp4") || mimeType.includes("m4a")) format = "m4a";
-
-        const blobBuffer = Buffer.from(payload.base64 || "", "base64");
-        if (!blobBuffer.length) {
-          log("[Google Recording] Received empty audio blob.");
-          return false;
-        }
-
-        await recordingService.writeBlob(blobBuffer, format);
-        log(`[Google Recording] Saved browser audio blob (${blobBuffer.length} bytes, ${format}).`);
-        return true;
-      } catch (error: any) {
-        log(`[Google Recording] Failed to persist browser blob: ${error?.message || String(error)}`);
-        return false;
-      }
-    });
+    // NOTE: `__vexaSaveRecordingBlob` is deliberately NOT exposed any more.
+    // It called RecordingService.writeBlob(), which (a) landed a full-session
+    // combined blob in the sidecar's chunk store ON TOP of the 30 s chunks that
+    // had already been uploaded — every Meet transcript contained the meeting
+    // twice — and (b) repointed RecordingService.filePath at a `.webm`, which
+    // would now clobber the WAV that is the primary audio. The in-page half of
+    // that path is gone too (see flushBrowserRecordingBlob below).
 
     // Pack B (issue #218): incremental chunk upload — each MediaRecorder
     // chunk uploads immediately, so ungraceful exits leave already-uploaded
@@ -154,10 +328,22 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
 
   // Expose callback so the browser can signal when MediaRecorder actually starts.
   // This re-aligns sessionStartMs with the recording, fixing click-to-seek offset.
-  await page.exposeFunction("__vexaRecordingStarted", () => {
+  //
+  // It is also where Node-side PulseAudio capture begins, so the WAV's sample 0
+  // and the speaker timeline's zero are the same instant — see
+  // startMeetAudioCapture() for why that shared origin is load-bearing.
+  await page.exposeFunction("__vexaRecordingStarted", async () => {
     if (publisher) {
       publisher.resetSessionStart();
       log(`[Recording] Session start re-aligned to MediaRecorder start: ${new Date(publisher.sessionStartMs).toISOString()}`);
+    }
+    if (wantsAudioCapture) {
+      try {
+        await startMeetAudioCapture();
+      } catch (err: any) {
+        // Non-fatal: the 30 s chunk uploads are unaffected and remain the backup.
+        log(`[Google Recording] Node-side audio capture failed to start: ${err?.message || err}`);
+      }
     }
   });
 
@@ -193,8 +379,12 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
       (window as any).__vexaAudioService = audioService;
       (window as any).__vexaBotConfig = botConfigData;
       (window as any).__vexaMediaRecorder = null;
-      (window as any).__vexaRecordedChunks = [];
       (window as any).__vexaRecordingFlushed = false;
+      // NOTE: `__vexaRecordedChunks` is gone. Each MediaRecorder blob is uploaded
+      // as a 30 s backup chunk and then dropped; nothing re-reads them. Keeping
+      // them was what produced the doubled audio (the combined blob was saved on
+      // top of the same chunks), and it also held the whole meeting in renderer
+      // heap — ~200 MB on a 1-hour call.
 
       const isAudioRecordingEnabled =
         !!(botConfigData as any)?.recordingEnabled &&
@@ -224,27 +414,36 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
 
         try {
           const recorder: MediaRecorder | null = (window as any).__vexaMediaRecorder;
-          const chunks: Blob[] = (window as any).__vexaRecordedChunks || [];
+          // Number of backup chunks emitted so far. Replaces the old
+          // `__vexaRecordedChunks.length` check below: `__vexaChunkSeq` is
+          // incremented by exactly the same `ondataavailable` events that used to
+          // push into that array, so `> 0` is the identical condition without
+          // retaining the blobs.
+          const emittedChunks: number = ((window as any).__vexaChunkSeq as number) ?? 0;
 
           const finalizeAndSend = async () => {
             if ((window as any).__vexaRecordingFlushed) return;
             (window as any).__vexaRecordingFlushed = true;
 
             try {
-              // Pack B (issue #218): with incremental chunk upload in the
-              // ondataavailable handler, the preferred shutdown path is a
-              // single final-chunk POST with is_final=true. The `recorder.stop()`
-              // call just before this flush triggers one last dataavailable
-              // event that already uploaded as is_final=false; now we send
-              // an empty-body "finalizer" with the next chunk_seq so
-              // meeting-api flips the Recording to COMPLETED and fires the
-              // webhook. If that fails (or chunk sink absent), fall back to
-              // the legacy full-blob save for durable local copy.
+              // Pack B (issue #218): the shutdown path is a single final-chunk
+              // POST with is_final=true. The `recorder.stop()` call just before
+              // this flush triggers one last dataavailable event that already
+              // uploaded as is_final=false; now we send an empty-body "finalizer"
+              // with the next chunk_seq so the sidecar sees a clean end of the
+              // backup-chunk stream.
+              //
+              // The legacy full-blob fallback that used to follow is GONE: it
+              // combined every retained chunk into one blob and posted it through
+              // `__vexaSaveRecordingBlob`, landing the whole meeting a second time
+              // on top of the chunks already uploaded. The primary full-session
+              // audio is now the Node-side WAV (startMeetAudioCapture), which also
+              // survives the page being destroyed when the host ends the call —
+              // something this in-page path never could.
               const mimeType =
                 (window as any).__vexaMediaRecorder?.mimeType || "audio/webm";
               const chunkSeq = ((window as any).__vexaChunkSeq as number) ?? 0;
 
-              let chunkFinalized = false;
               if (typeof (window as any).__vexaSaveRecordingChunk === "function") {
                 try {
                   await (window as any).__vexaSaveRecordingChunk({
@@ -256,48 +455,20 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                   (window as any).logBot?.(
                     `[Google Recording] Finalized recording (chunk_seq=${chunkSeq}, ${reason}).`
                   );
-                  chunkFinalized = true;
                 } catch (err: any) {
                   (window as any).logBot?.(
                     `[Google Recording] Chunk finalizer failed: ${err?.message || err}`
                   );
                 }
-              }
-
-              // Legacy full-blob path (kept as defense-in-depth for local
-              // disk copy + for cases where chunk upload is unreachable).
-              const recorded = (window as any).__vexaRecordedChunks || [];
-              if (recorded.length) {
-                const blob = new Blob(recorded, { type: mimeType });
-                const buffer = await blob.arrayBuffer();
-                const bytes = new Uint8Array(buffer);
-                let binary = "";
-                const chunkSize = 0x8000;
-                for (let i = 0; i < bytes.length; i += chunkSize) {
-                  binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-                }
-                const base64 = btoa(binary);
-
-                if (typeof (window as any).__vexaSaveRecordingBlob === "function") {
-                  await (window as any).__vexaSaveRecordingBlob({
-                    base64,
-                    mimeType: blob.type || mimeType,
-                  });
-                  (window as any).logBot?.(
-                    `[Google Recording] Flushed ${bytes.length} bytes (${blob.type || mimeType}) on ${reason}${chunkFinalized ? " (chunk upload already final)" : ""}.`
-                  );
-                } else if (!chunkFinalized) {
-                  (window as any).logBot?.("[Google Recording] Node blob sink is not available.");
-                }
-              } else if (!chunkFinalized) {
-                (window as any).logBot?.(`[Google Recording] No media chunks to flush (${reason}).`);
+              } else {
+                (window as any).logBot?.(
+                  `[Google Recording] Chunk sink not available — nothing to finalize in-page (${reason}).`
+                );
               }
             } catch (err: any) {
               (window as any).logBot?.(
                 `[Google Recording] Failed to flush blob: ${err?.message || err}`
               );
-            } finally {
-              (window as any).__vexaRecordedChunks = [];
             }
           };
 
@@ -319,7 +490,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 }, 200);
               }
             });
-          } else if (chunks.length > 0) {
+          } else if (emittedChunks > 0) {
             await finalizeAndSend();
           }
         } catch (err: any) {
@@ -374,22 +545,21 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                   : new MediaRecorder(combinedStream);
 
                 (window as any).__vexaMediaRecorder = recorder;
-                (window as any).__vexaRecordedChunks = [];
                 (window as any).__vexaRecordingFlushed = false;
                 (window as any).__vexaChunkSeq = 0;
 
                 // Pack B (issue #218): upload each chunk immediately to MinIO
                 // via meeting-api, rather than buffering the whole WebM until
                 // shutdown. On ungraceful exit, already-uploaded chunks are
-                // durable. The buffer is still populated as a fallback for
-                // the shutdown-flush path — the server-side `chunk_seq`
-                // contract is idempotent across duplicate arrivals.
+                // durable. These 30 s webm chunks are the S3 backup copy; the
+                // primary full-session audio is the Node-side WAV. The chunk is
+                // NOT retained after upload — retaining it was half of the
+                // audio-duplication bug (see flushBrowserRecordingBlob).
                 recorder.ondataavailable = async (event: BlobEvent) => {
                   if (!(event.data && event.data.size > 0)) {
                     (window as any).logBot?.("[Google Recording] dataavailable fired with empty data (skipping)");
                     return;
                   }
-                  (window as any).__vexaRecordedChunks.push(event.data);
 
                   // Best-effort immediate upload; do NOT block the recorder.
                   const chunkSeq = (window as any).__vexaChunkSeq as number;
@@ -424,7 +594,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                       }
                     } else {
                       (window as any).logBot?.(
-                        `[Google Recording] __vexaSaveRecordingChunk not exposed — chunk ${chunkSeq} will rely on the legacy full-blob shutdown path`
+                        `[Google Recording] __vexaSaveRecordingChunk not exposed — backup chunk ${chunkSeq} dropped (the Node-side WAV is unaffected)`
                       );
                     }
                   } catch (err: any) {

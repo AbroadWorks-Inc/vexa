@@ -14,15 +14,19 @@ Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
 XVFB_PID=$!
 
 # --- Audio: PulseAudio user daemon + a default null sink for the browser.
-# Non-fatal: Meet audio is captured in-browser (MediaRecorder); PulseAudio is
-# for Chromium's audio subsystem / getUserMedia and Vexa parity. ---
+# The full-session recording is captured Node-side by parecord reading
+# `${PULSE_SINK}.monitor` (platforms/googlemeet/recording.ts), so the sink name
+# here and PULSE_SINK must agree — same arrangement as zoom-bot/start.sh. The
+# in-browser MediaRecorder still runs, but only to produce the 30s backup chunks.
+# Making this sink the default is what routes Chromium's output into it. ---
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/pulse-$(id -u)}"
+export PULSE_SINK="${PULSE_SINK:-meet_sink}"
 mkdir -p "$XDG_RUNTIME_DIR"
 pulseaudio --start --exit-idle-time=-1 || true
 sleep 1
-pactl load-module module-null-sink sink_name=meet_sink \
-    sink_properties=device.description=meet_sink || true
-pactl set-default-sink meet_sink || true
+pactl load-module module-null-sink sink_name="$PULSE_SINK" \
+    sink_properties=device.description="$PULSE_SINK" || true
+pactl set-default-sink "$PULSE_SINK" || true
 
 # --- Our output-hook sidecar ---
 python /app/aw_output_hook.py &
