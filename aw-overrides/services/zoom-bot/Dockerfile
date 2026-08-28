@@ -12,7 +12,25 @@
 FROM node:20-slim AS ts-build
 WORKDIR /build
 COPY vexa-fork/services/vexa-bot/core/ ./
-RUN npm install --omit=dev
+RUN npm install
+# ^ deliberately NOT `--omit=dev`, for two reasons -- neither of which is "the
+# build would otherwise fail". Verified on a clean tree 2026-08-27: `npm install
+# --omit=dev` DOES produce a working build, because `typescript` arrives as a
+# production transitive (puppeteer -> cosmiconfig -> typescript).
+#
+#   1. That availability is an accident of someone else's dependency tree. With
+#      dev deps installed, `tsc` comes from OUR declared devDependency instead,
+#      and the build survives cosmiconfig ever dropping typescript.
+#   2. It keeps this stage's node_modules a superset of what previously-shipped
+#      images contained. Those were built with the host's node_modules copied in
+#      (dev deps included, since --omit=dev does not prune an existing tree), so
+#      installing dev deps here means adding the repo-root .dockerignore cannot
+#      silently remove a package from the runtime image.
+#
+# Not pinned: `core/` has no package-lock.json, so the resolved tsc version
+# floats (host has 5.8.2; a clean install picked 5.9.3). Committing a lockfile is
+# the actual fix for build reproducibility and is deliberately left out of an
+# incident fix.
 RUN npm run build
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────

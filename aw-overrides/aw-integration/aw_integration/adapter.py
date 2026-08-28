@@ -17,6 +17,7 @@ from notetaker_common.schemas import (
     ParticipantInfo,
     ParticipantsFile,
     SpeakerEvent,
+    SpeakerInterval,
     SpeakerTimelineFile,
     TimelineParticipant,
 )
@@ -39,6 +40,82 @@ __all__ = [
 _PLATFORM_MAP: dict[str, str] = {"google_meet": "meet", "zoom": "zoom"}
 
 _MIN_DOMINANT_UTTERANCE_DEFAULT_MS = 1500
+
+# Writer-side cap on `speaker_events_relative`, mirrored from
+# `SPEAKER_EVENT_STREAM_MAXLEN` in services/vexa-bot/core/src/services/
+# segment-publisher.ts. Duplicated across a language boundary, so it is pinned by
+# `test_stream_read_count_covers_writer_cap` — prose in two files could not stop
+# the two drifting, and the failure when they do is silent.
+_SPEAKER_EVENT_STREAM_MAXLEN = 200000
+
+# How many entries `run_from_redis` reads from a stream, NEWEST-FIRST.
+#
+# READ THE NEWEST ENTRIES, NEVER THE OLDEST. `transcription_segments` and
+# `speaker_events_relative` are GLOBAL streams shared by every bot that has ever
+# run. `speaker_events_relative` measured 64,135 entries on 2026-08-27.
+#
+# `xrange(name, count=N)` returns the OLDEST N entries. So the moment a stream
+# grows past N, a session's own events sit *outside* the read window, this
+# function reads ZERO events for its own uid, the speaker timeline is written
+# empty, and every transcript silently reverts to SPEAKER_00/01/02 — with no
+# error, no exception and no log line anywhere. That is a live incident, not a
+# hypothetical: the 50,000th entry was written 2026-08-26 12:02 UTC, the meeting
+# that day had 3,365 of its 4,373 events inside the window (77% — a silently
+# PARTIAL misattribution, which is worse than a clean failure), and the next
+# day's meeting had 0 of 1,258 inside and lost speaker names entirely.
+#
+# The default deliberately EXCEEDS the writer-side cap above, so that everything
+# Redis still retains for `speaker_events_relative` is readable. Inverting that
+# inequality re-creates the same silent clipping from the other end: entries
+# retained, structurally invisible, no error. That is why the floor below is a
+# hard clamp rather than advice, and why a test pins it.
+#
+# Scope note: the "retained implies readable" guarantee applies to
+# `speaker_events_relative` only. `transcription_segments` has NO writer cap
+# (deliberately — measured at 120 entries in 22 days because live streaming is
+# off). Capping it is a PREREQUISITE of enabling `BotJob.live_streaming`, not a
+# follow-up: at that point its rate jumps to the speaker-event order and the
+# original bug returns verbatim on the segments half.
+#
+# Growth rate, measured rather than eyeballed: 64,135 entries over 22.0 days is
+# ~2,900/day on average, but the two days before the incident ran ~16,000/day.
+# Size the headroom against the peak, not the mean.
+_STREAM_READ_COUNT_DEFAULT = 250000
+
+
+def _resolve_stream_read_count() -> int:
+    """Read window size, overridable but never below the writer-side cap.
+
+    Follows `_resolve_min_dominant_utterance_ms` in this file: parse defensively,
+    fall back to the default rather than raising, and clamp to the range where
+    the value is meaningful.
+
+    The clamp has only a FLOOR, and it is the point of this function. A value
+    below `_SPEAKER_EVENT_STREAM_MAXLEN` reintroduces the exact incident
+    described above, so a typo (`2000` for `200000`) must not be able to do it
+    quietly. Raising the window is always safe — it costs one larger read at
+    session end — so there is no ceiling.
+
+    HOW TO ACTUALLY SET THIS, because the obvious route does not work:
+    `bot-orchestrator/.../job_launcher.py` forwards EXACTLY four env vars to a bot
+    pod plus one explicitly-wired passthrough; it does not forward arbitrary
+    environment. So exporting this on the orchestrator, or on the deployment, has
+    NO effect on the sidecar that runs this code. The only live route today is the
+    bot Secret consumed via `envFrom`. Widening this in an incident therefore
+    means either that Secret or a rebuild — do not assume a plain env var reaches
+    here.
+    """
+    raw = os.environ.get("AW_STREAM_READ_COUNT")
+    if not raw:
+        return _STREAM_READ_COUNT_DEFAULT
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return _STREAM_READ_COUNT_DEFAULT
+    return max(parsed, _SPEAKER_EVENT_STREAM_MAXLEN)
+
+
+_STREAM_READ_COUNT = _resolve_stream_read_count()
 
 
 def _resolve_min_dominant_utterance_ms() -> int:
@@ -197,6 +274,14 @@ class VexaSessionAdapter:
         ]
 
         timeline_events: list[SpeakerEvent] = []
+        # Raw (pre-collapse) paired intervals from the audio-activity state
+        # machine, kept alongside the collapsed `timeline_events`. Only the
+        # branch below (the paired-interval path) can populate this; every
+        # other branch — the safety valve and the segment-derived fallback —
+        # has nothing pairable, so it stays `[]`. See the docstring on
+        # `_build_dominant_speaker_timeline` for why `[]` is the right answer
+        # there rather than synthesising something.
+        paired_intervals: list[tuple[str, int, int]] = []
         if session.speaker_events:
             origin_ms = int(session.session_start_ts.timestamp() * 1000)
             # Sort by relative time, NOT Redis insertion order.
@@ -205,15 +290,16 @@ class VexaSessionAdapter:
             # onset is known immediately but whose speaker name only resolves later
             # (vote/lock, or the 15s roster-order fallback) is emitted with its
             # ORIGINAL onset, and therefore lands in the stream after events that
-            # started later. `xrange` returns insertion order, so iterating it
-            # directly yields a timeline that is non-monotonic in `relative_sec`.
+            # started later. The stream read yields insertion order (see
+            # `_STREAM_READ_COUNT`), so iterating it directly yields a timeline
+            # that is non-monotonic in `relative_sec`.
             #
             # Consumers map a transcript segment to the last event with
             # `relative_sec <= segment.start`, which assumes chronological order.
             # The notetaker-worker does sort defensively, but this artifact must be
             # correct on its own rather than depending on that.
             ordered_events = sorted(session.speaker_events, key=lambda e: e.relative_ms)
-            timeline_events = self._build_dominant_speaker_timeline(
+            timeline_events, paired_intervals = self._build_dominant_speaker_timeline(
                 ordered_events, origin_ms, duration_sec
             )
 
@@ -283,6 +369,23 @@ class VexaSessionAdapter:
                 earliest.relative_sec = 0.0
                 earliest.timestamp_ms = int(session.session_start_ts.timestamp() * 1000)
 
+        # Convert the raw paired intervals to the schema type, preserving
+        # overlap as-is — no merging, clipping, or de-overlapping. Sorted by
+        # start (then end, then speaker) for a deterministic, byte-identical
+        # artifact given identical input, matching the tie-break discipline
+        # already used for `timeline_events`.
+        speaker_intervals = [
+            SpeakerInterval(
+                speaker_id=self._slug(name),
+                speaker_name=name,
+                start_sec=start_ms / 1000.0,
+                end_sec=end_ms / 1000.0,
+            )
+            for name, start_ms, end_ms in sorted(
+                paired_intervals, key=lambda iv: (iv[1], iv[2], iv[0])
+            )
+        ]
+
         return SpeakerTimelineFile(
             room_name=self._job.join.url,
             meeting_id=session.meeting_id,
@@ -293,6 +396,7 @@ class VexaSessionAdapter:
             start_time=session.session_start_ts.timestamp(),
             participants=participants,
             speaker_timeline=timeline_events,
+            speaker_intervals=speaker_intervals,
         )
 
     def _build_dominant_speaker_timeline(
@@ -300,7 +404,7 @@ class VexaSessionAdapter:
         ordered_events: list[VexaSpeakerEvent],
         origin_ms: int,
         duration_sec: float,
-    ) -> list[SpeakerEvent]:
+    ) -> tuple[list[SpeakerEvent], list[tuple[str, int, int]]]:
         """Collapse per-track audio bursts into dominant-speaker transitions.
 
         WHY THIS EXISTS
@@ -334,8 +438,17 @@ class VexaSessionAdapter:
            the longest interval covering a span wins, and a transition is
            emitted only when the dominant speaker changes.
 
-        Returns [] when nothing pairable exists; the caller then falls back to
-        the legacy one-point-per-START timeline rather than emitting nothing.
+        Returns a `(timeline_events, intervals)` pair. `timeline_events` is the
+        collapsed dominant-speaker transitions described above — unchanged by
+        the addition of the second element. `intervals` is the RAW paired
+        intervals from step 1, before the collapse — overlap and all — so the
+        caller can additionally emit them as `SpeakerTimelineFile.speaker_intervals`
+        for word-level attribution downstream, without the collapse having to
+        change or duplicate the pairing logic.
+
+        Returns `([], [])` when nothing pairable exists; the caller then falls
+        back to the legacy one-point-per-START timeline rather than emitting
+        nothing, and correctly has no intervals to offer either.
         """
         # ── 1. Pair trusted events into intervals ────────────────────────────
         open_starts: dict[str, int] = {}
@@ -372,7 +485,7 @@ class VexaSessionAdapter:
                 intervals.append((name, start, session_end_ms))
 
         if not intervals:
-            return []
+            return [], []
 
         # ── 2. Collapse to one dominant speaker per instant ──────────────────
         # Every boundary is an interval endpoint, so within each consecutive
@@ -450,7 +563,7 @@ class VexaSessionAdapter:
                 )
             )
 
-        return events
+        return events, intervals
 
     def build_participants(self) -> ParticipantsFile:
         session = self._session
@@ -565,8 +678,13 @@ async def run_from_redis(
 
     raw_ts = cast(
         list[tuple[str, dict[str, str]]],
-        r.xrange("transcription_segments", count=50000),
+        r.xrevrange("transcription_segments", count=_STREAM_READ_COUNT),
     )
+    # Newest-first from xrevrange -> restore ascending insertion order. This is
+    # load-bearing, not cosmetic: below, `session_start_ts` is FIRST-wins (its
+    # `is None` guard) while `saw_remote_camera` is LAST-wins (no guard), so the
+    # iteration order decides which value of each survives. Reversed, both invert.
+    raw_ts.reverse()
     segments: list[VexaSegment] = []
     session_start_ts: datetime | None = None
     saw_remote_camera: bool | None = None
@@ -627,8 +745,14 @@ async def run_from_redis(
 
     raw_se = cast(
         list[tuple[str, dict[str, str]]],
-        r.xrange("speaker_events_relative", count=50000),
+        r.xrevrange("speaker_events_relative", count=_STREAM_READ_COUNT),
     )
+    # Newest-first from xrevrange -> restore ascending insertion order. The
+    # dominant-speaker collapse re-sorts by `relative_ms` on its own, so it does
+    # not depend on this; what depends on it is tie determinism — Python's sort
+    # is stable, so equal-timestamp events keep insertion order, and without the
+    # reverse two identical inputs could yield different artifacts.
+    raw_se.reverse()
     speaker_events: list[VexaSpeakerEvent] = []
     for _eid, fields in raw_se:
         if fields.get("uid") != session_uid:
