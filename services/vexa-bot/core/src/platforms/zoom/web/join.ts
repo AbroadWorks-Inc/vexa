@@ -1,6 +1,7 @@
 import { Page } from 'playwright';
 import { BotConfig } from '../../../types';
 import { log, callJoiningCallback } from '../../../utils';
+import { installOutboundAudioLockInPage, isZoomAudioSealEnabled, readZoomMicState } from './prepare';
 import {
   zoomNameInputSelector,
   zoomJoinButtonSelector,
@@ -58,6 +59,39 @@ export async function joinZoomWebMeeting(page: Page | null, botConfig: BotConfig
   const rawUrl = botConfig.meetingUrl!;
   const webClientUrl = buildZoomWebClientUrl(rawUrl);
   log(`[Zoom Web] Navigating to web client: ${webClientUrl}`);
+
+  // Arm the outbound-audio lock BEFORE the first navigation, so the patches are
+  // in place before any Zoom script runs.
+  //
+  // WHY HERE and not at afterAdmission: the bot joins audio during preview/join,
+  // i.e. BEFORE admission, so by the time afterAdmission fires the real mic track
+  // ALREADY EXISTS. An existing track can only be found by enumerating peer
+  // connections, and the registry that made that possible
+  // (`__vexa_peer_connections`) is written only by Meet's virtual-camera init
+  // script, which is installed solely when `cameraEnabled` is true — false for a
+  // recorder bot. Net effect of the old placement: in the default configuration
+  // the bot's actual microphone track was never sealed at all.
+  //
+  // Installing at page load dissolves that: no outbound audio track can pre-exist
+  // the patches, so the mic track is caught at birth by the getUserMedia patch —
+  // the only way a real microphone track can come into being — regardless of any
+  // registry. The afterAdmission install remains, as a re-assert.
+  //
+  // Zoom-only by construction: this runs from platforms/zoom/web/, so Meet and
+  // Teams init paths are untouched.
+  if (botConfig.voiceAgentEnabled) {
+    log('[Zoom Web] Outbound audio lock NOT armed at page load — voice agent must transmit TTS');
+  } else {
+    try {
+      await page.addInitScript(installOutboundAudioLockInPage, {
+        voiceAgentEnabled: false,
+        sealEnabled: isZoomAudioSealEnabled(),
+      });
+      log('[Zoom Web] Outbound audio lock armed at page load (before any Zoom script runs)');
+    } catch (e: any) {
+      log(`[Zoom Web] WARNING: could not arm the page-load audio lock (${e?.message ?? e}) — falling back to the post-admission install, which cannot seal a pre-existing mic track`);
+    }
+  }
 
   // Retry loop: if host hasn't started the meeting yet, page title = "Error - Zoom"
   // and body contains "This meeting link is invalid". Poll until the pre-join page appears.
@@ -195,14 +229,50 @@ export async function joinZoomWebMeeting(page: Page | null, botConfig: BotConfig
   if (!isVoiceAgent) {
     try {
       const muteBtn = page.locator(zoomPreviewMuteSelector);
-      const muteAriaLabel = await muteBtn.getAttribute('aria-label');
-      // "Mute" means currently unmuted → click to mute. "Unmute" means already muted → skip.
-      if (muteAriaLabel === 'Mute') {
+      const probe = {
+        ariaLabel: await muteBtn.getAttribute('aria-label').catch(() => null),
+        ariaPressed: await muteBtn.getAttribute('aria-pressed').catch(() => null),
+        className: await muteBtn.getAttribute('class').catch(() => null),
+        descendantClassNames: [] as string[],
+      };
+      const reading = readZoomMicState(probe);
+
+      // WHY this is no longer `ariaLabel === 'Mute'`:
+      //
+      // Two independent problems with that test. First, it is the same brittle
+      // exact-match that shipped the in-meeting bug — the live DOM there returned
+      // aria-label="audio", matching neither spelling. Second, and new: the
+      // outbound-audio seal is now armed PRE-NAVIGATION, so it covers this preview
+      // page and the mic track is already `enabled = false` when this runs. If
+      // Zoom renders this label from the track's `enabled` state, the label reads
+      // "Unmute" (already muted), the click is skipped, and Zoom's own mute state
+      // is never set — leaving the bot silent but MORE likely to APPEAR unmuted,
+      // which is the user's original complaint.
+      //
+      // What is NOT done here, and why: we do not click when the control reads
+      // muted. Clicking a control that is already muted UNMUTES it — the exact
+      // toggle hazard the in-meeting one-shot latch exists to prevent — and it
+      // would turn a cosmetic uncertainty into a real unmute. Nor is the seal
+      // deferred until after this step: that would let the mic track pre-exist the
+      // patches and reopen the defect the pre-navigation arming fixed.
+      //
+      // So the reading is logged either way. A live run resolves whether Zoom's
+      // preview label tracks `enabled` (reads muted before we ever click) or its
+      // own internal state (reads unmuted, and we click as before). If it is the
+      // former, the corrective is post-admission: ensureZoomMutedInMeeting and the
+      // persistent mute watcher both re-read the real control and re-mute on a
+      // confident unmuted reading. Those cosmetic layers are LOAD-BEARING for the
+      // visual half now, not nice-to-have.
+      if (reading.kind === 'unmuted') {
         await muteBtn.click();
-        log('[Zoom Web] Muted microphone in preview (recorder bot — receive-only audio)');
+        log(`[Zoom Web] Muted microphone in preview (recorder bot — receive-only audio) [${reading.evidence}]`);
+      } else if (reading.kind === 'muted') {
+        log(`[Zoom Web] Preview mic already reads muted — NOT clicking (a click here would unmute) [${reading.evidence}]. If the seal is armed this may be the track state rather than Zoom's own; the in-meeting mute watcher is the corrective.`);
+      } else {
+        log(`[Zoom Web] Preview mic state unreadable (${reading.kind}) — NOT clicking [${reading.evidence}]; relying on the in-meeting mute path`);
       }
     } catch {
-      log('[Zoom Web] Could not toggle preview mic (may already be muted)');
+      log('[Zoom Web] Could not read/toggle preview mic — relying on the in-meeting mute path');
     }
   } else {
     log('[Zoom Web] Voice agent: keeping mic enabled in preview for TTS');

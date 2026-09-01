@@ -70,6 +70,30 @@ export interface SpeakerBoundaryDeps {
   hangoverMs?: number;
   /** Override the sweep cadence used by `startSweep()`. Defaults to `SPEAKER_SWEEP_INTERVAL_MS`. */
   sweepIntervalMs?: number;
+  /**
+   * Opt in to publishing an unresolved utterance under a synthetic per-track
+   * identity (`syntheticSpeakerLabel`) instead of DROPPING it.
+   *
+   * ── Defaults to OFF, deliberately ──────────────────────────────────────────
+   * Google Meet and Microsoft Teams run through this same tracker — there is one
+   * module-level instance (`index.ts`) and BOTH `platforms/googlemeet/recording.ts`
+   * and `platforms/zoom/web/recording.ts` call `armSpeakerBoundaries()`. Google
+   * Meet and the transcription pipeline are tested and in production, so any
+   * caller that does not explicitly opt in must keep the pre-existing behaviour
+   * byte for byte: no boundary, and the original
+   * "utterance dropped — no name resolved before it ended" log line.
+   *
+   * Default-OFF rather than default-on-with-an-opt-out is the point: a future
+   * caller inherits the SAFE behaviour, not the new one. That is the same drift
+   * trap as a hand-copied predicate, and it is worth a little verbosity to avoid.
+   *
+   * ── Why a predicate, not a boolean ─────────────────────────────────────────
+   * The production tracker is constructed at MODULE INIT, before any bot config
+   * exists, so a boolean evaluated there could only ever be `false` and Zoom
+   * would silently never get the behaviour. This is read at CALL time, exactly
+   * like the `publish` / `resolveName` closures above.
+   */
+  synthesizeUnresolvedSpeakers?: () => boolean;
 }
 
 /** Public surface of the boundary state machine. */
@@ -133,6 +157,35 @@ export function resolveSilenceHangoverMs(log?: (message: string) => void): numbe
 }
 
 /**
+ * Stable placeholder identity for a track whose utterance ended with no name
+ * ever resolved (see the `decide()` fallback below).
+ *
+ * Derived purely from the track index — never from a running counter — so the
+ * SAME track keeps the SAME placeholder for the whole session, which is what
+ * makes two unresolved humans two DISTINCT speakers downstream instead of one.
+ * 1-based only for readability in `transcript.txt`.
+ *
+ * The "(unresolved)" qualifier is load-bearing, not decorative. Every platform
+ * resolver in `speaker-identity.ts` (Meet, Teams, Zoom) hands back a
+ * participant's own display name verbatim; none of them appends or strips a
+ * parenthetical, so even a participant literally named "Unknown Speaker 3"
+ * would still lack the " (unresolved)" suffix. Someone who typed their own display
+ * name as "Unknown Speaker 3 (unresolved)" WOULD collide — nothing prevents that;
+ * it is simply not worth defending against. A reader of the transcript can therefore
+ * always tell a placeholder from a real identity — which is the whole point: an
+ * unknown speaker rendered as a KNOWN one is a lie, and a lie is worse than a
+ * gap.
+ *
+ * Note this label is NOT routed through `isNameTaken` in `speaker-identity.ts`
+ * (this file must not import that module — see the file header); uniqueness comes
+ * from the label being a pure function of the track index, so two tracks can
+ * never receive the same one.
+ */
+export function syntheticSpeakerLabel(trackIndex: number): string {
+  return `Unknown Speaker ${trackIndex + 1} (unresolved)`;
+}
+
+/**
  * Reject a resolved name that is really the string form of a nullish value.
  *
  * Defensive: a boundary naming `"null"` is indistinguishable downstream from a
@@ -149,7 +202,7 @@ export function sanitizeResolvedName(raw: string | null | undefined): string {
 
 class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
   private readonly trackSpeech: Map<number, TrackSpeechState> = new Map();
-  /** Tracks whose utterance was dropped for lack of a name — logged once each. */
+  /** Tracks that fell back to a synthetic identity — logged once each. */
   private readonly unnamedUtteranceLogged: Set<number> = new Set();
   /** Tracks whose resolver returned a stringified-nullish name — logged once each. */
   private readonly junkNameLogged: Set<number> = new Set();
@@ -184,12 +237,15 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
   private readonly sweepIntervalMs: number;
   private readonly now: () => number;
   private readonly log: (message: string) => void;
+  /** See `SpeakerBoundaryDeps.synthesizeUnresolvedSpeakers`. Defaults to OFF. */
+  private readonly synthesizeUnresolved: () => boolean;
 
   constructor(private readonly deps: SpeakerBoundaryDeps) {
     this.now = deps.now ?? Date.now;
     this.log = deps.log ?? (() => {});
     this.hangover = deps.hangoverMs ?? resolveSilenceHangoverMs(this.log);
     this.sweepIntervalMs = deps.sweepIntervalMs ?? SPEAKER_SWEEP_INTERVAL_MS;
+    this.synthesizeUnresolved = deps.synthesizeUnresolvedSpeakers ?? (() => false);
   }
 
   arm(): void {
@@ -336,9 +392,53 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
             timestampMs: closingAtMs,
             logLine: `[SpeakerBoundary] Track ${idx} END "${closingName}" @${closingAtMs}`,
           });
-        } else if (!this.unnamedUtteranceLogged.has(idx)) {
-          this.unnamedUtteranceLogged.add(idx);
-          this.log(`[SpeakerBoundary] Track ${idx} utterance dropped — no name resolved before it ended`);
+        } else if (hadStart) {
+          // A published START with no name to close it against. `startEmitted`
+          // and `emittedName` are only ever written together, so this is
+          // unreachable — but the alternative to guarding it is emitting a
+          // SECOND START (below) for an utterance that already has one, leaving
+          // an orphan in the timeline. Report it instead of guessing.
+          this.log(`[SpeakerBoundary] BUG: Track ${idx} had a published START with no name at close — emitting nothing rather than a duplicate START`);
+        } else if (!this.synthesizeUnresolved()) {
+          // NOT opted in (Google Meet, Teams, any future caller): the pre-existing
+          // behaviour, unchanged — no boundary, and the original log line, verbatim.
+          if (!this.unnamedUtteranceLogged.has(idx)) {
+            this.unnamedUtteranceLogged.add(idx);
+            this.log(`[SpeakerBoundary] Track ${idx} utterance dropped — no name resolved before it ended`);
+          }
+        } else {
+          // No name ever resolved before this utterance ended. This used to be
+          // DISCARDED entirely — no boundary at all — which silently handed every
+          // word of it to whichever OTHER track's name the downstream mapper last
+          // saw (see the module header: a roster collapses onto the last-known
+          // name). That is worse than an unknown label: it asserts a falsehood.
+          // Emit it honestly instead, under a stable per-track synthetic identity,
+          // so the timeline always carries a DISTINCT speaker for a distinct human
+          // even when nothing ever names them. No START was published for this
+          // utterance (the retroactive-START block above never had a name to work
+          // with), so both boundaries are emitted here together, using the
+          // utterance's true onset and true last-audio time — the same shape as a
+          // normal START+END pair, just under a placeholder name instead of a
+          // resolved one. Exactly one START/END pair either way — never both this
+          // branch and the retroactive one for the same utterance.
+          const onsetSnapshot = st.onsetMs;
+          const synthetic = syntheticSpeakerLabel(idx);
+          pending.push({
+            type: 'started_speaking',
+            speaker: synthetic,
+            timestampMs: onsetSnapshot,
+            logLine: `[SpeakerBoundary] Track ${idx} START "${synthetic}" @onset=${onsetSnapshot} (synthetic identity)`,
+          });
+          pending.push({
+            type: 'stopped_speaking',
+            speaker: synthetic,
+            timestampMs: closingAtMs,
+            logLine: `[SpeakerBoundary] Track ${idx} END "${synthetic}" @${closingAtMs} (synthetic identity)`,
+          });
+          if (!this.unnamedUtteranceLogged.has(idx)) {
+            this.unnamedUtteranceLogged.add(idx);
+            this.log(`[SpeakerBoundary] Track ${idx} NEVER RESOLVED a name — its speech is published as "${synthetic}" rather than dropped (dropping donated it to another track)`);
+          }
         }
       }
     }
@@ -423,6 +523,25 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
           speaker: st.emittedName,
           timestampMs: st.lastAudioMs,
           logLine: `[SpeakerBoundary] Track ${idx} END "${st.emittedName}" @${st.lastAudioMs} (finalize flush)`,
+        });
+      } else if (st.speaking && this.synthesizeUnresolved()) {
+        // Still speaking at teardown and STILL nameless — the meeting's final
+        // utterance for this track. The sweep fallback below `decide()` would
+        // have caught it, but the sweep never runs again, so without this the
+        // last utterance is dropped and donated to whoever else resolved. Same
+        // rule, same synthetic identity, so the two paths cannot disagree.
+        const synthetic = syntheticSpeakerLabel(idx);
+        pending.push({
+          type: 'started_speaking',
+          speaker: synthetic,
+          timestampMs: st.onsetMs,
+          logLine: `[SpeakerBoundary] Track ${idx} START "${synthetic}" @onset=${st.onsetMs} (finalize flush, no name resolved)`,
+        });
+        pending.push({
+          type: 'stopped_speaking',
+          speaker: synthetic,
+          timestampMs: st.lastAudioMs,
+          logLine: `[SpeakerBoundary] Track ${idx} END "${synthetic}" @${st.lastAudioMs} (finalize flush, no name resolved)`,
         });
       }
       st.speaking = false;

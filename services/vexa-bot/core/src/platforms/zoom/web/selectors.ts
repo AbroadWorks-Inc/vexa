@@ -176,3 +176,89 @@ export const zoomGallerySpeakingSelectors: string[] = [
 // aria-label is empty so text-based selectors are unreliable; use the CSS class directly
 export const zoomLeaveConfirmSelector = 'button.leave-meeting-options__btn--danger';
 export const zoomEndForAllSelector = 'button:has-text("End for All")';
+
+// ---- In-meeting mic toggle (mute guarantee) ----
+// WHY a list and not `zoomAudioButtonSelector` alone: on 2026-09-01 a live bot
+// read aria-label="audio" off `button.join-audio-container__btn` (.first()) for
+// the whole meeting while audio WAS flowing — so that first match is not always
+// the mute toggle, and its label does not always carry mute vocabulary. Exact
+// string equality against 'Mute'/'Unmute' therefore matched nothing and the bot
+// sat unmuted in front of other participants. Candidates are tried in order and
+// EVERY match of each is probed (not just the first) — the first one that yields
+// a confident muted/unmuted reading wins.
+//
+// Zoom renames CSS classes and changes markup between releases, so NOTHING in
+// this list is a contract — every selector here may vanish without notice. That
+// is precisely why the mute guarantee does not rest on it: this layer only makes
+// the participant list SHOW the bot as muted. The actual guarantee that no audio
+// leaves the bot is silenceOutboundAudioTracks() in prepare.ts, which reads no
+// DOM at all. If you are here because the bot appeared unmuted, fix these
+// selectors; if you are here because the bot was HEARD, the track-level guard is
+// what failed and these selectors are not the bug.
+//
+// Pure CSS only: these are fed to document.querySelectorAll inside page.evaluate,
+// so Playwright-only pseudo-classes (:has-text) must NOT appear here. The CSS
+// Level 4 case-insensitive attribute flag ([attr*="x" i]) IS supported by Chrome.
+// EVERY candidate is scoped to the meeting footer/toolbar, and the live-confirmed
+// control comes FIRST. Page-wide mute-vocabulary selectors were removed: Zoom
+// renders OTHER buttons whose labels contain mute vocabulary — "Ask to unmute",
+// "Unmute All", "Mute All", and per-participant "Mute" rows in the participants
+// panel. Because candidates are probed in order and the first confident reading
+// wins, a page-wide match could impersonate the mic control. Two distinct
+// failures came out of that: "Ask to unmute" reads as MUTED, so the bot reports
+// success without ever clicking (a silent failure in the safe-looking
+// direction); and "Mute All" reads as UNMUTED, so the watcher would CLICK it and
+// mute everyone else in the meeting. zoomNonMicLabelSubstrings below is the
+// semantic half of the same defence — scoping alone is not trusted.
+//
+// One selector per entry (no comma lists): candidates are addressed again as
+// page.locator(selector).nth(index) after being probed with querySelectorAll, and
+// a comma list makes that index depend on both engines ordering a union
+// identically.
+export const zoomMicToggleSelectors: string[] = [
+  'button.join-audio-container__btn',                                 // confirmed live 2026-09-01 (aria-label="audio")
+  'button[class*="join-audio-container" i]',
+  'button[class*="footer-button" i][aria-label*="unmute" i]',         // footer-button-base__button, confirmed live
+  'button[class*="footer-button" i][aria-label*="mute" i]',
+  'footer button[aria-label*="unmute" i]',
+  'footer button[aria-label*="mute" i]',
+  'footer button[aria-label*="audio" i]',
+];
+
+// Labels that belong to a DIFFERENT control which merely CONTAINS mute
+// vocabulary. Checked before the mute/unmute branches and returned on
+// immediately — never falling through to class hints or aria-pressed, because a
+// "Mute All" button may well carry a muted-looking icon class of its own.
+// Substring match on the normalised label.
+export const zoomNonMicLabelSubstrings: string[] = [
+  'mute all',
+  'unmute all',
+  'ask to unmute',
+  'ask all to',
+  'mute everyone',
+  'unmute everyone',
+  'mute participant',
+  'unmute participant',
+];
+
+// Normalised (lowercased, whitespace-collapsed) aria-labels that identify an
+// audio control carrying NO mute/unmute state — either audio is not joined yet
+// ("join audio") or Zoom rendered the generic label observed live ("audio").
+// Matched as whole-label equality first, then as substrings; 'audio' MUST only
+// ever match exactly, because "unmute my audio" contains it.
+export const zoomMicNonToggleExactLabels: string[] = ['audio', 'audio settings', 'mic', 'microphone'];
+export const zoomMicNonToggleSubstrings: string[] = ['join audio', 'connect audio', 'audio settings'];
+
+// Secondary, UNVERIFIED-LIVE evidence: class hooks Zoom has used to mark the mic
+// control's state, read off the button and its icon descendants when neither
+// aria-label mute vocabulary nor aria-pressed settled the state. These rank
+// BELOW aria-pressed: a real ARIA state attribute beats a guessed class name.
+//
+// The last entry in each list is the bare word, which is what lets this fallback
+// survive Zoom renaming its classes again (the specific spellings above it are
+// guesses; 'unmuted'/'muted' will appear in almost any state class Zoom picks).
+// It is ALSO what makes the test ORDER load-bearing: 'svgaudiounmuted' contains
+// 'muted', so the unmuted list MUST be tested first, or every unmuted control
+// reads as muted and the bot never mutes itself. Proven by mutation M3.
+export const zoomMicUnmutedClassHints: string[] = ['svgaudiounmuted', 'audio-unmuted', 'is-unmuted', 'mic-unmuted', 'unmuted'];
+export const zoomMicMutedClassHints: string[] = ['svgaudiomuted', 'audio-muted', 'is-muted', 'mic-muted', 'muted'];

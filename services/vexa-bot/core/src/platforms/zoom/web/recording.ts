@@ -5,6 +5,7 @@ import { setActiveRecordingService, getRawCaptureService, getSegmentPublisher, a
 import { log } from '../../../utils';
 import { spawn, ChildProcess } from 'child_process';
 import { zoomParticipantNameSelector, zoomGallerySpeakingSelectors } from './selectors';
+import { pickZoomActiveSpeaker, type ZoomActiveSpeakerRead, type ZoomActiveSpeakerSource } from '../../../services/zoom-roster';
 import { dismissZoomPopups } from './prepare';
 import { startZoomRichObservation } from './observe';
 import { PcmChunker } from './pcm-chunker';
@@ -14,6 +15,8 @@ let recordingStopResolver: (() => void) | null = null;
 let parecordProcess: ChildProcess | null = null;
 let speakerPollInterval: NodeJS.Timeout | null = null;
 let lastActiveSpeaker: string | null = null;
+/** Which DOM layout last produced a name — logged on change, not per poll. */
+let lastActiveSpeakerSource: ZoomActiveSpeakerSource | null = null;
 let activeBotConfig: BotConfig | null = null;
 let popupDismissInterval: NodeJS.Timeout | null = null;
 
@@ -157,6 +160,7 @@ export async function startZoomWebRecording(page: Page | null, botConfig: BotCon
   // so clearing on stop would drop every event before it is bridged.
   zoomWebSpeakerEvents = [];
   lastHeartbeatMs = 0;
+  lastActiveSpeakerSource = null;
 
   // Recording service
   const wantsAudioCapture =
@@ -388,60 +392,34 @@ function startSpeakerPolling(page: Page, botConfig: BotConfig): void {
   speakerPollInterval = setInterval(async () => {
     if (!page || page.isClosed()) return;
     try {
-      const speakerName = await page.evaluate(
-        ({ footerSelector, gallerySelectors, botName }: { footerSelector: string; gallerySelectors: string[]; botName: string }) => {
-          const selfLower = (botName || '').toLowerCase();
-
-          // Name-quality guards mirrored from services/speaker-identity.ts
-          // (traverseZoomDOM's accept()/looksLikeName()/isBotName()), applied
-          // to ALL layouts below: reject empty / >60 chars / chat-sentence-
-          // shaped (leading lowercase Latin letter) / the bot's own name
-          // (case-insensitive substring either direction).
-          function looksLikeName(text: string): boolean {
-            if (text.length === 0 || text.length > 60) return false;
-            const first = text[0];
-            if (first >= 'a' && first <= 'z') return false;
-            return true;
-          }
-          function isSelfName(text: string): boolean {
-            if (!selfLower) return false;
-            const t = text.toLowerCase();
-            return t.includes(selfLower) || selfLower.includes(t);
-          }
-          function accept(text: string | null | undefined): string | null {
-            if (!text) return null;
-            const trimmed = text.trim();
-            if (trimmed.length === 0) return null;
-            if (!looksLikeName(trimmed)) return null;
-            if (isSelfName(trimmed)) return null;
-            return trimmed;
-          }
-
-          function nameFromContainer(container: Element | null): string | null {
+      // The browser side is DELIBERATELY DUMB: it returns raw candidate strings
+      // and nothing else. Every judgement — length, junk, UI labels, the bot's own
+      // name, and which layout wins — happens in Node, in `pickZoomActiveSpeaker`,
+      // against the SAME predicate `services/speaker-identity.ts` uses.
+      //
+      // This replaces a hand-copied `looksLikeName()/isSelfName()/accept()` trio
+      // whose own comment said it was "mirrored from services/speaker-identity.ts".
+      // The mirror drifted: when the leading-lowercase reject was deleted from the
+      // source (it made a real participant named "sujoy sarkar" unreturnable), the
+      // copy kept it. A predicate passed to `page.evaluate` is serialised into the
+      // page and cannot close over an import, so an inline copy is also untestable
+      // without a real browser — which is exactly how the drift went unnoticed.
+      // Returning raw strings fixes both problems at once.
+      const read: ZoomActiveSpeakerRead = await page.evaluate(
+        ({ footerSelector, gallerySelectors }: { footerSelector: string; gallerySelectors: string[] }) => {
+          function rawFromContainer(container: Element | null): string | null {
             if (!container) return null;
             const footer = container.querySelector(footerSelector);
             if (!footer) return null;
             const span = footer.querySelector('span');
-            const raw = (span?.textContent?.trim() || (footer as HTMLElement).innerText?.trim()) || null;
-            return accept(raw);
+            return (span?.textContent?.trim() || (footer as HTMLElement).innerText?.trim()) || null;
           }
 
-          // Layout 1: Normal view — active speaker has a dedicated full-size container
-          const name1 = nameFromContainer(document.querySelector('.speaker-active-container__video-frame'));
-          if (name1) return name1;
-
-          // Layout 2: Screen-share view — active speaker tile has the --active modifier class
-          const name2 = nameFromContainer(document.querySelector('.speaker-bar-container__video-frame--active'));
-          if (name2) return name2;
-
-          // Layout 3: Gallery view — no dedicated "active speaker" container
-          // exists there, so scan CSS hooks that mark a tile as speaking.
-          // Resolve a name via: the tile's own footer span, the nearest
-          // enclosing avatar tile's footer span, or an aria-label of the form
-          // "X is speaking"/"X is talking". Accept a candidate selector ONLY
-          // if it resolves to exactly ONE distinct accepted name — more than
-          // one means that selector is too broad on this Zoom UI version.
-          function resolveGalleryName(el: Element): string | null {
+          // Gallery view has no dedicated active-speaker container, so scan the CSS
+          // hooks Zoom uses to mark a tile as speaking. A name may sit on the tile's
+          // own footer span, on the nearest enclosing avatar tile's footer span, or
+          // in an aria-label of the form "X is speaking" / "X is talking".
+          function rawFromGalleryElement(el: Element): string | null {
             const directFooter = el.querySelector?.('.video-avatar__avatar-footer');
             if (directFooter) {
               const span = directFooter.querySelector('span');
@@ -465,29 +443,38 @@ function startSpeakerPolling(page: Page, botConfig: BotConfig): void {
             return null;
           }
 
+          const gallery: Array<{ selector: string; raw: Array<string | null> }> = [];
           for (const selector of gallerySelectors) {
             try {
               const matches = Array.from(document.querySelectorAll(selector));
               if (matches.length === 0) continue;
-              const names = new Set<string>();
-              for (const el of matches) {
-                const candidate = accept(resolveGalleryName(el));
-                if (candidate) names.add(candidate);
-              }
-              if (names.size === 1) {
-                return Array.from(names)[0];
-              }
-              // 0 or >1 distinct names: this selector is unusable here — try the next one.
+              gallery.push({ selector, raw: matches.map((el) => rawFromGalleryElement(el)) });
             } catch {
               // Malformed selector on this Zoom Web version — skip it.
               continue;
             }
           }
 
-          return null;
+          return {
+            // Layout 1: normal view — the active speaker has a full-size container.
+            layout1: rawFromContainer(document.querySelector('.speaker-active-container__video-frame')),
+            // Layout 2: screen-share view — the active tile carries --active.
+            layout2: rawFromContainer(document.querySelector('.speaker-bar-container__video-frame--active')),
+            gallery,
+          };
         },
-        { footerSelector: zoomParticipantNameSelector, gallerySelectors: zoomGallerySpeakingSelectors, botName: botConfig.botName }
+        { footerSelector: zoomParticipantNameSelector, gallerySelectors: zoomGallerySpeakingSelectors }
       );
+
+      const picked = pickZoomActiveSpeaker(read, botConfig.botName);
+      const speakerName = picked?.name ?? null;
+      // Log WHICH layout won, once per change of source. Live, this poll accepted
+      // no name for a whole meeting and said nothing about why; the bridge reported
+      // "Read 0 speaker events from Zoom Web module" and that was the only clue.
+      if (picked && picked.source !== lastActiveSpeakerSource) {
+        lastActiveSpeakerSource = picked.source;
+        log(`[Zoom Web] Active-speaker source is now ${picked.source}`);
+      }
 
       const now = Date.now();
       if (speakerName && speakerName !== lastActiveSpeaker) {

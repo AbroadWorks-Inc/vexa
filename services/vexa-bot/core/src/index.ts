@@ -1593,6 +1593,16 @@ const speakerBoundaries: SpeakerBoundaryTracker = createSpeakerBoundaryTracker({
     if (!speakerManager) return '';
     return speakerManager.getSpeakerName(`speaker-${trackIndex}`) || '';
   },
+  /**
+   * Zoom ONLY. A predicate, not a boolean: this options object is built at module
+   * init, before any bot config exists, so a value read here would always be the
+   * pre-join `undefined` and Zoom would silently never get the behaviour.
+   *
+   * Google Meet and Teams fall through to the tracker's default (OFF) and keep the
+   * `aw/main` drop path byte-for-byte, log line included — Meet's attribution is
+   * proven in production and is deliberately not changed here.
+   */
+  synthesizeUnresolvedSpeakers: () => currentPlatform === 'zoom',
 });
 
 /**
