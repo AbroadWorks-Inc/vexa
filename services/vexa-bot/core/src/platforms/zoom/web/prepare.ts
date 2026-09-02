@@ -1,6 +1,11 @@
 import { Page, Locator } from 'playwright';
 import { BotConfig } from '../../../types';
 import { log } from '../../../utils';
+// Read-only reuse of the shared repeat collapser. It is imported, never
+// modified: this file must not change behaviour for Google Meet or Teams (see
+// the ZOOM-LOCAL note above installOutboundAudioLockInPage), and log-throttle
+// is a pure, platform-agnostic utility with its own suite.
+import { createRepeatCollapser } from '../../../services/log-throttle';
 import {
   zoomAudioButtonSelector,
   zoomChatButtonSelector,
@@ -17,6 +22,12 @@ import {
   zoomMicUnmutedClassHints,
   zoomMicMutedClassHints,
   zoomNonMicLabelSubstrings,
+  zoomMicLabelNodeSelector,
+  zoomMicNotJoinedTextSubstrings,
+  zoomMicCaretSelectors,
+  zoomMicIconMutedClasses,
+  zoomMicIconUnmutedClasses,
+  zoomMicIconNotJoinedClasses,
 } from './selectors';
 
 /**
@@ -310,6 +321,41 @@ export function normaliseZoomMicText(raw: string | null | undefined): string {
   return (raw ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * Classify mute vocabulary in a normalised string, distinguishing a STATE word
+ * from an ACTION-OFFERED word.
+ *
+ * WHY THIS EXISTS — the dangerous defect it fixes: the text tier matched `mute`
+ * as a bare substring and read it as "the action offered is mute, therefore the
+ * mic is UNMUTED". But visible text is not always an action: Zoom and its
+ * relatives also render STATE words. "Muted" and "You are muted" contain
+ * `mute`, so they read as `unmuted` -> the watcher clicks -> **a muted bot
+ * becomes unmuted**. That is the one direction that actively makes the reported
+ * bug worse, and it came from the text tier itself.
+ *
+ * Order is load-bearing and is the reverse of specificity:
+ *   'unmuted' (STATE: mic is live)   -- must precede 'unmute', which it contains
+ *   'unmute'  (ACTION offered => currently MUTED)
+ *   'muted'   (STATE: mic is muted)  -- must precede 'mute', which it contains
+ *   'mute'    (ACTION offered => currently UNMUTED)
+ *
+ * Every ambiguity therefore resolves toward `muted`, which is the SAFE
+ * direction: a wrong `muted` merely declines to click, while a wrong `unmuted`
+ * triggers a click that can unmute an already-muted bot.
+ *
+ * Pure. Input must already be normalised by normaliseZoomMicText.
+ */
+export function readZoomMuteVocabulary(
+  normalised: string,
+): { kind: 'muted' | 'unmuted'; word: string; sense: 'state' | 'action' } | null {
+  if (!normalised) return null;
+  if (normalised.includes('unmuted')) return { kind: 'unmuted', word: 'unmuted', sense: 'state' };
+  if (normalised.includes('unmute')) return { kind: 'muted', word: 'unmute', sense: 'action' };
+  if (normalised.includes('muted')) return { kind: 'muted', word: 'muted', sense: 'state' };
+  if (normalised.includes('mute')) return { kind: 'unmuted', word: 'mute', sense: 'action' };
+  return null;
+}
+
 /** Attributes read off one candidate mic-control element. */
 export interface ZoomMicProbe {
   ariaLabel: string | null;
@@ -317,6 +363,84 @@ export interface ZoomMicProbe {
   className: string | null;
   /** class attributes of icon/span descendants — Zoom encodes state in the icon. */
   descendantClassNames: string[];
+  /**
+   * ELEMENT IDENTITY: the `id` when Zoom provides one, else a tag/child-index
+   * path up to `body`. Prefixed `#` or `path:` so a reader can tell which.
+   *
+   * HONEST LIMIT — this is NOT "stable identity, independent of state", which is
+   * what this comment used to claim. It is independent of `class` and
+   * `aria-label` (both change with the mute state), and that is the property
+   * retirement depends on. It is NOT immune to a SIBLING INSERTION within the 12
+   * ancestors it walks: an inserted sibling shifts every later child index, so a
+   * path can be INHERITED by a different element. selectors.ts records that
+   * Zoom's split-button caret "grows only once audio is joined" — exactly such
+   * an insertion. Inheritance is the dangerous direction: a fresh element could
+   * occupy a retired path and never be selectable.
+   *
+   * What bounds that: retirement requires TWO proven failures on the same key
+   * (so an inherited path must fail twice), and is cleared wholesale if it ever
+   * retires every readable control. An `#id` key does not have this weakness at
+   * all, which is why it is preferred.
+   *
+   * WHY identity and not `selector[index]`: several entries in
+   * zoomMicToggleSelectors match the SAME button (`button.join-audio-container__btn`
+   * and `button[class*="join-audio-container" i]` both do). Rejecting a
+   * selector name would leave the identical element selectable under the next
+   * name and the discovery loop would click it again forever. It also must not
+   * contain the class attribute, because that CHANGES when the mic state
+   * changes and a rejection keyed on it would silently stop applying.
+   */
+  elementKey: string;
+  /** the element's own id attribute, if any (also folded into elementKey). */
+  id: string | null;
+  /**
+   * Text of the button's label node — the state WORD a human in the room
+   * actually reads off the toolbar. Harvested because in the 2026-09-02 failure
+   * aria-label carried no mute vocabulary at all.
+   */
+  labelText: string | null;
+  /** Whole-element textContent, truncated. Fallback for labelText. */
+  text: string | null;
+  /**
+   * class attributes of VISIBLY RENDERED descendants only. A hidden state icon
+   * is not what the room sees, so the precise icon-whitelist tier reads this
+   * rather than descendantClassNames.
+   */
+  visibleDescendantClassNames: string[];
+  /**
+   * Whether a split-button caret was found in the same container — a structural
+   * marker of "audio joined". null when it was not probed.
+   *
+   * REPORTED, NEVER GATED ON: zoomMicCaretSelectors is an unverified guess, and
+   * a veto keyed on a selector that never matches would make the watcher
+   * permanently blind. It is in the evidence and the digest so one live run can
+   * settle it.
+   */
+  caretNearby: boolean | null;
+}
+
+/**
+ * Build a complete probe from whatever fields a caller actually has.
+ *
+ * WHY a factory: ZoomMicProbe grew from 4 fields to 10, and two callers build
+ * probes by hand (join.ts's preview read, and the unit tests). Every default is
+ * "absent", so a caller that cannot supply a field can never accidentally
+ * assert a state through it — and adding a field later cannot silently change
+ * an existing caller's reading.
+ */
+export function makeZoomMicProbe(p: Partial<ZoomMicProbe> = {}): ZoomMicProbe {
+  return {
+    ariaLabel: p.ariaLabel ?? null,
+    ariaPressed: p.ariaPressed ?? null,
+    className: p.className ?? null,
+    descendantClassNames: p.descendantClassNames ?? [],
+    elementKey: p.elementKey ?? '',
+    id: p.id ?? null,
+    labelText: p.labelText ?? null,
+    text: p.text ?? null,
+    visibleDescendantClassNames: p.visibleDescendantClassNames ?? [],
+    caretNearby: p.caretNearby ?? null,
+  };
 }
 
 /**
@@ -338,79 +462,199 @@ export type ZoomMicReading =
 /**
  * Interpret one candidate control's attributes into a mic reading.
  *
- * Evidence is weighed in descending order of trust:
- *   1. aria-label mute vocabulary — 'unmute' BEFORE 'mute', because the string
- *      "Unmute" contains "mute" and a naive substring test inverts the reading.
- *      This ranks first because it needs NO polarity assumption: the label names
- *      the action OFFERED, which fixes the current state unambiguously.
- *   2. aria-pressed="true" -> muted. A real ARIA state attribute, so it
- *      outranks the guessed CSS class names below it.
- *      aria-pressed="false" is deliberately NOT read as unmuted. ARIA convention
- *      says a toggle button's pressed state is its engaged state, but for a mic
- *      control "engaged" is genuinely ambiguous — it can mean "mute is applied"
- *      or "microphone is on", and real apps ship both. Zoom's polarity is
- *      unconfirmed (see below), and the two possible mistakes do NOT cost the
- *      same: a wrong 'unmuted' read triggers a CLICK that unmutes a
- *      already-muted bot — making the user-visible complaint worse — whereas a
- *      wrong 'muted' read merely declines to click and leaves layer 2
- *      (track-level silence) in charge. Asymmetric cost, asymmetric rule.
- *      NOTE: aria-pressed has never been OBSERVED on Zoom's control. The live
- *      2026-09-01 run logged aria-label only, so this branch is untested against
- *      the real DOM; describeZoomMicCandidates now prints aria-pressed so a
- *      single live run settles whether Zoom sets it (and with which polarity).
- *   3. class hints on the button and its icon descendants (unverified live) —
- *      again unmuted-before-muted, since 'audio-unmuted' contains 'muted'.
- *   4. Only THEN is a label classified as known-non-state vocabulary ("audio",
+ * Evidence is weighed in descending order of trust. The list below is the
+ * ACTUAL order of the branches; it was previously wrong in two ways — it listed
+ * aria-pressed twice, and it claimed aria-pressed "outranks the guessed CSS
+ * class names below it" while the text tier had been inserted above it.
+ *
+ *   1. NON-MIC guard over aria-label AND visible text ("Mute All",
+ *      "Ask to Unmute"). Returns immediately: clicking one of these would mute
+ *      every human in the meeting.
+ *   2. aria-label vocabulary, via readZoomMuteVocabulary (state words before
+ *      action words). First because aria-label is an explicit accessibility
+ *      contract and is the one signal live-confirmed on this control
+ *      ("Muted microphone in preview [aria-label \"mute\" offers mute]").
+ *   3. VISIBLE-TEXT vocabulary — the label node under the button, else the
+ *      element's own rendered text. This is the word a human in the room
+ *      actually reads off the toolbar, and in the 2026-09-02 failure aria-label
+ *      carried NO mute vocabulary while the weakest tier was left to decide a
+ *      state it cannot establish.
+ *   4. aria-pressed="true" -> muted. DELIBERATELY BELOW TEXT, not above:
+ *      aria-pressed has never been OBSERVED on Zoom's control (the live runs
+ *      logged aria-label only), and its polarity for a mic toggle is genuinely
+ *      ambiguous — "engaged" can mean "mute is applied" or "microphone is on",
+ *      and real apps ship both. A signal that has never been seen and whose
+ *      polarity is unconfirmed does not outrank a word rendered on screen.
+ *      aria-pressed="false" is NOT read as unmuted, for the same asymmetric
+ *      reason throughout this file: a wrong 'unmuted' triggers a CLICK that can
+ *      unmute an already-muted bot, a wrong 'muted' merely declines to click.
+ *      describeZoomMicCandidates prints aria-pressed so one live run can settle
+ *      whether Zoom sets it at all, and with which polarity.
+ *   5. FULL icon class name matched against a whitelist, over VISIBLY RENDERED
+ *      descendants only. Precise, and it can positively identify the unjoined
+ *      control's glyph.
+ *   6. legacy class-hint SUBSTRINGS over all descendants — the lowest-confidence
+ *      tier, and the one that decided the 2026-09-02 reading on its own. Kept
+ *      below the whitelist rather than deleted: its bare-word entries are what
+ *      let the reader survive Zoom renaming a glyph (mutation M3), and deleting
+ *      them trades a false positive for permanent blindness. The evidence string
+ *      names which tier fired, so a substring-only reading is identifiable in
+ *      the log as the weak reading it is.
+ *   7. Only THEN is a label classified as known-non-state vocabulary ("audio",
  *      "join audio"). This check ranks LAST on purpose: it used to return early,
  *      which meant the live aria-label="audio" element was written off before
  *      aria-pressed or the class hints were ever consulted. An uninformative
  *      LABEL is not an uninformative ELEMENT.
+ *
+ * NOTE on `caretNearby`: it is folded into the evidence string but never
+ * decides a reading. See ZoomMicProbe.caretNearby for why.
  */
 export function readZoomMicState(probe: ZoomMicProbe): ZoomMicReading {
   const label = normaliseZoomMicText(probe.ariaLabel);
+  // Prefer the dedicated label node; fall back to the element's own text.
+  const labelText = normaliseZoomMicText(probe.labelText);
+  const text = normaliseZoomMicText(probe.text);
+  const visibleText = labelText || text;
+  const visibleTextSource = labelText ? 'label node' : 'text';
+  // Appended to every evidence string so the joined/unjoined structural marker
+  // is always in the log, without ever deciding the reading.
+  const caret =
+    probe.caretNearby === null ? '' : probe.caretNearby ? ' [caret: yes]' : ' [caret: no]';
 
   // FIRST, and returning immediately: a control that merely CONTAINS mute
   // vocabulary but is not the mic toggle. Must precede the mute branches below
   // (otherwise "Ask to unmute" reads as muted and "Mute All" as unmuted) AND
   // must not fall through to the class hints (a "Mute All" button can carry its
-  // own muted-looking icon class).
-  const nonMic = zoomNonMicLabelSubstrings.find((s) => label.includes(s));
-  if (nonMic) {
-    return { kind: 'not-mic-control', evidence: `aria-label "${label}" matches non-mic control "${nonMic}"` };
+  // own muted-looking icon class). Checked against the VISIBLE text as well as
+  // aria-label — "Mute All" is a text label on some Zoom builds, and a wrapper
+  // that swallows several buttons' text is correctly rejected here too.
+  for (const [field, value] of [['aria-label', label], [visibleTextSource, visibleText]] as const) {
+    if (!value) continue;
+    const nonMic = zoomNonMicLabelSubstrings.find((s) => value.includes(s));
+    if (nonMic) {
+      return { kind: 'not-mic-control', evidence: `${field} "${value}" matches non-mic control "${nonMic}"${caret}` };
+    }
   }
 
-  if (label.includes('unmute')) {
-    // "Unmute" == the action offered == currently MUTED.
-    return { kind: 'muted', evidence: `aria-label "${label}" offers unmute` };
+  // aria-label, through the shared polarity-correct reader. A label of "Muted"
+  // is a STATE, not an action offered, and used to read as unmuted here too.
+  const labelVocab = readZoomMuteVocabulary(label);
+  if (labelVocab) {
+    return {
+      kind: labelVocab.kind,
+      evidence: `aria-label "${label}" ${labelVocab.sense === 'action' ? `offers ${labelVocab.word}` : `states "${labelVocab.word}"`}${caret}`,
+    };
   }
-  if (label.includes('mute')) {
-    // "Mute" == the action offered == currently UNMUTED.
-    return { kind: 'unmuted', evidence: `aria-label "${label}" offers mute` };
+
+  // VISIBLE TEXT. "Join Audio" identifies the UNJOINED control positively —
+  // returned as not-mute-toggle so the watcher never clicks it, and named
+  // explicitly rather than lumped in with an unreadable element.
+  if (visibleText) {
+    const notJoined = zoomMicNotJoinedTextSubstrings.find((s) => visibleText.includes(s));
+    if (notJoined) {
+      return {
+        kind: 'not-mute-toggle',
+        evidence: `${visibleTextSource} "${visibleText}" is the UNJOINED audio control ("${notJoined}") — not a mute toggle${caret}`,
+      };
+    }
+    const textVocab = readZoomMuteVocabulary(visibleText);
+    if (textVocab) {
+      return {
+        kind: textVocab.kind,
+        evidence: `${visibleTextSource} "${visibleText}" ${textVocab.sense === 'action' ? `offers ${textVocab.word}` : `states "${textVocab.word}"`}${caret}`,
+      };
+    }
   }
+
   // A real ARIA state attribute outranks the guessed class names below.
   if (probe.ariaPressed === 'true') {
-    return { kind: 'muted', evidence: 'aria-pressed="true"' };
+    return { kind: 'muted', evidence: `aria-pressed="true"${caret}` };
   }
 
+  // PRECISE ICON TIER: full class-name tokens off VISIBLY RENDERED descendants,
+  // matched against a whitelist. Unmuted before muted for the same reason the
+  // substring tier is ordered that way, and 'not joined' before both because a
+  // headset glyph is not a mic state at all.
+  const visibleTokens = new Set(
+    probe.visibleDescendantClassNames
+      .concat(probe.className ? [probe.className] : [])
+      .flatMap((c) => normaliseZoomMicText(c).split(' '))
+      .filter((t) => t.length > 0),
+  );
+  const notJoinedIcon = zoomMicIconNotJoinedClasses.find((c) => visibleTokens.has(c));
+  if (notJoinedIcon) {
+    return {
+      kind: 'not-mute-toggle',
+      evidence: `visible icon class "${notJoinedIcon}" is the UNJOINED audio control — not a mute toggle${caret}`,
+    };
+  }
+  // BOTH lookups happen BEFORE either return, so the ORDER OF THESE TWO LINES
+  // CANNOT AFFECT THE RESULT. That is deliberate: with exact-token matching
+  // there is no containment problem to order around, so swapping the lookups
+  // was a behaviour-preserving edit for every single-glyph fixture and left the
+  // suite green — while, with both glyphs rendered, the order alone decided
+  // whether a MUTED bot read `unmuted` and got clicked. Removing the ordering
+  // dependency kills that whole mutation class instead of pinning one order.
+  const unmutedIcon = zoomMicIconUnmutedClasses.find((c) => visibleTokens.has(c));
+  const mutedIcon = zoomMicIconMutedClasses.find((c) => visibleTokens.has(c));
+  if (unmutedIcon && mutedIcon) {
+    // Genuinely ambiguous: two contradicting state glyphs are both RENDERED.
+    // Resolve toward `muted`, on the asymmetric-cost rule used throughout this
+    // file — a wrong `unmuted` triggers a click that can unmute an
+    // already-muted bot, a wrong `muted` merely declines to click.
+    return {
+      kind: 'muted',
+      evidence: `CONFLICTING visible icon classes "${mutedIcon}" and "${unmutedIcon}" — resolving to muted, the safe direction (a wrong unmuted would trigger a click)${caret}`,
+    };
+  }
+  if (unmutedIcon) {
+    return { kind: 'unmuted', evidence: `visible icon class "${unmutedIcon}"${caret}` };
+  }
+  if (mutedIcon) {
+    return { kind: 'muted', evidence: `visible icon class "${mutedIcon}"${caret}` };
+  }
+
+  // WEAKEST TIER, kept for rename resilience: substring hints over ALL
+  // descendants, visible or not. The evidence says "class hint", which is how a
+  // reader tells this apart from the whitelist tier above.
   const classes = normaliseZoomMicText([probe.className, ...probe.descendantClassNames].join(' '));
   const unmutedHint = zoomMicUnmutedClassHints.find((h) => classes.includes(h));
-  if (unmutedHint) {
-    return { kind: 'unmuted', evidence: `class hint "${unmutedHint}"` };
-  }
   const mutedHint = zoomMicMutedClassHints.find((h) => classes.includes(h));
+  // CONFLICT DETECTION, PER TOKEN — and this tier CANNOT be reordered the way
+  // the whitelist above can. 'svgaudiounmuted' CONTAINS 'muted', so a blob-level
+  // "both matched" test is true for every unmuted-only control and would make
+  // the bot never mute itself (the M3 trap). So a token counts as muted only if
+  // that same token is not itself an unmuted token; two DIFFERENT glyph tokens
+  // are then a real conflict, resolved toward muted like the tier above.
+  const classTokens = classes.split(' ').filter((t) => t.length > 0);
+  const unmutedToken = classTokens.find((t) => zoomMicUnmutedClassHints.some((h) => t.includes(h)));
+  const mutedToken = classTokens.find(
+    (t) => zoomMicMutedClassHints.some((h) => t.includes(h)) && !zoomMicUnmutedClassHints.some((h) => t.includes(h)),
+  );
+  if (unmutedToken && mutedToken) {
+    return {
+      kind: 'muted',
+      evidence: `CONFLICTING class hints "${mutedToken}" and "${unmutedToken}" — resolving to muted, the safe direction${caret}`,
+    };
+  }
+  if (unmutedHint) {
+    return { kind: 'unmuted', evidence: `class hint "${unmutedHint}"${caret}` };
+  }
   if (mutedHint) {
-    return { kind: 'muted', evidence: `class hint "${mutedHint}"` };
+    return { kind: 'muted', evidence: `class hint "${mutedHint}"${caret}` };
   }
 
   // LAST, not first: an uninformative label is not an uninformative element.
-  if (label && (zoomMicNonToggleExactLabels.includes(label)
-    || zoomMicNonToggleSubstrings.some((s) => label.includes(s)))) {
-    return { kind: 'not-mute-toggle', evidence: `aria-label "${label}" carries no mute state` };
+  for (const [field, value] of [['aria-label', label], [visibleTextSource, visibleText]] as const) {
+    if (!value) continue;
+    if (zoomMicNonToggleExactLabels.includes(value) || zoomMicNonToggleSubstrings.some((s) => value.includes(s))) {
+      return { kind: 'not-mute-toggle', evidence: `${field} "${value}" carries no mute state${caret}` };
+    }
   }
 
-  return label
-    ? { kind: 'not-mute-toggle', evidence: `aria-label "${label}" unrecognised` }
-    : { kind: 'unknown', evidence: 'no aria-label, no class hint, no aria-pressed' };
+  if (label) return { kind: 'not-mute-toggle', evidence: `aria-label "${label}" unrecognised${caret}` };
+  if (visibleText) return { kind: 'not-mute-toggle', evidence: `${visibleTextSource} "${visibleText}" unrecognised${caret}` };
+  return { kind: 'unknown', evidence: `no aria-label, no text, no icon class, no aria-pressed${caret}` };
 }
 
 /** One probed DOM candidate, addressable again via selector + nth index. */
@@ -426,13 +670,26 @@ export interface ZoomMicSelection {
 }
 
 /**
- * Pick the first candidate that yields a CONFIDENT reading (muted / unmuted).
+ * Pick the first candidate that yields a CONFIDENT reading (muted / unmuted),
+ * skipping any element the caller has REJECTED.
+ *
  * Candidates that read `not-mute-toggle` or `unknown` are skipped rather than
  * acted on — this is what stops the bot from clicking a control it has not
  * actually identified (the aria-label="audio" element observed live).
+ *
+ * @param rejected `elementKey`s proven not to be mute toggles — a click landed
+ *   on them and the state did not move. This is the CANDIDATE-DISCOVERY half of
+ *   the fix: without it the watcher re-clicks the same wrong element forever
+ *   (twice in 30s on 2026-09-02, and it would have continued for the whole
+ *   call). Keyed on `elementKey`, not `selector[index]`, because several
+ *   selectors match the same button — see ZoomMicProbe.elementKey.
  */
-export function selectZoomMicToggle(candidates: ZoomMicCandidate[]): ZoomMicSelection | null {
+export function selectZoomMicToggle(
+  candidates: ZoomMicCandidate[],
+  rejected: ReadonlySet<string> = new Set(),
+): ZoomMicSelection | null {
   for (const candidate of candidates) {
+    if (candidate.probe.elementKey && rejected.has(candidate.probe.elementKey)) continue;
     const reading = readZoomMicState(candidate.probe);
     if (reading.kind === 'muted' || reading.kind === 'unmuted') {
       return { candidate, reading };
@@ -441,11 +698,69 @@ export function selectZoomMicToggle(candidates: ZoomMicCandidate[]): ZoomMicSele
   return null;
 }
 
-/** One-line digest of everything probed — the diagnostic missing from the failed run. */
-export function describeZoomMicCandidates(candidates: ZoomMicCandidate[]): string {
+/**
+ * Read ONE SPECIFIC element out of a probe set, by its stable identity.
+ *
+ * WHY THIS EXISTS — the defect it fixes: the post-click re-read used
+ * selectZoomMicToggle, which returns THE FIRST CANDIDATE THAT READS
+ * CONFIDENTLY, not the element that was clicked. probeZoomMicCandidates walks
+ * seven selectors and pushes up to four matches each, so the re-probe is a
+ * fresh, re-ordered set of up to 28 entries, and the verdict was computed from
+ * whichever element happened to sort first and then ATTRIBUTED TO THE CLICK.
+ * Two concrete failures followed:
+ *
+ *   - FALSE 'muted': the click lands on A and does nothing; on re-probe A's
+ *     class has changed enough that it no longer reads confidently, and an
+ *     earlier-ranked B reads muted. The log then said "CONFIRMED the bot muted
+ *     after clicking" — the exact class of untrue claim this change set exists
+ *     to delete, now with the word CONFIRMED attached — and A was never
+ *     retired, so the loop would repeat forever.
+ *   - FALSE 'still-unmuted': the mirror case. The click WORKS on A, but some
+ *     other element reads unmuted first, so a WORKING control gets retired.
+ *     That is the worse direction: retirement lasts the whole session and could
+ *     discard the only candidate that works.
+ *
+ * Returns the matched candidate with WHATEVER it reads — confident or not — so
+ * the caller can report an honest "unreadable" rather than silently
+ * substituting a different element. Returns null when the key is empty or the
+ * element is absent from the probe set; both are unknowns, never verdicts.
+ *
+ * Identity is `probe.elementKey`, which excludes `class` and `aria-label`
+ * precisely because both CHANGE when the mute state changes — so a successful
+ * mute (the common case, and the one that flips the icon class) still matches.
+ *
+ * Pure — no DOM, no clock, no I/O.
+ */
+export function readZoomMicCandidateByKey(
+  candidates: ZoomMicCandidate[],
+  elementKey: string,
+): ZoomMicSelection | null {
+  if (!elementKey) return null;
+  for (const candidate of candidates) {
+    if (candidate.probe.elementKey !== elementKey) continue;
+    return { candidate, reading: readZoomMicState(candidate.probe) };
+  }
+  return null;
+}
+
+/**
+ * One-line digest of everything probed — the diagnostic missing from the failed
+ * run. Carries each candidate's EVIDENCE as well as its kind: on 2026-09-02 the
+ * live reading came from a descendant class hint ("svgaudiounmuted") rather than
+ * from aria-label, and the log did not say so, which left the reading's basis
+ * unknowable after the fact.
+ */
+export function describeZoomMicCandidates(
+  candidates: ZoomMicCandidate[],
+  rejected: ReadonlySet<string> = new Set(),
+): string {
   if (candidates.length === 0) return 'no mic-control candidates matched any selector';
   return candidates
-    .map((c) => `${c.selector}[${c.index}] aria-label="${c.probe.ariaLabel ?? ''}" aria-pressed=${c.probe.ariaPressed ?? 'absent'} -> ${readZoomMicState(c.probe).kind}`)
+    .map((c) => {
+      const reading = readZoomMicState(c.probe);
+      const skipped = c.probe.elementKey && rejected.has(c.probe.elementKey) ? ' REJECTED' : '';
+      return `${c.selector}[${c.index}]${skipped} key=${c.probe.elementKey || 'none'} aria-label="${c.probe.ariaLabel ?? ''}" label="${c.probe.labelText ?? ''}" aria-pressed=${c.probe.ariaPressed ?? 'absent'} -> ${reading.kind} (${reading.evidence})`;
+    })
     .join('; ');
 }
 
@@ -458,37 +773,160 @@ export function describeZoomMicCandidates(candidates: ZoomMicCandidate[]): strin
  * `page.locator(selector).nth(index)` addresses the same element.
  */
 async function probeZoomMicCandidates(page: Page, selectors: string[]): Promise<ZoomMicCandidate[]> {
-  return page.evaluate((sels: string[]) => {
-    const MAX_PER_SELECTOR = 4;
-    const MAX_DESCENDANTS = 8;
-    const out: ZoomMicCandidate[] = [];
-    for (const selector of sels) {
-      let nodes: Element[] = [];
-      try {
-        nodes = Array.from(document.querySelectorAll(selector));
-      } catch {
-        continue; // selector not supported by this browser — try the next
-      }
-      nodes.slice(0, MAX_PER_SELECTOR).forEach((el, index) => {
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return; // hidden — not clickable
-        const descendantClassNames = Array.from(el.querySelectorAll('[class]'))
-          .slice(0, MAX_DESCENDANTS)
-          .map((d) => d.getAttribute('class') ?? '');
-        out.push({
-          selector,
-          index,
-          probe: {
-            ariaLabel: el.getAttribute('aria-label'),
-            ariaPressed: el.getAttribute('aria-pressed'),
-            className: el.getAttribute('class'),
-            descendantClassNames,
-          },
+  return page.evaluate(
+    (args: { sels: string[]; labelSel: string; caretSels: string[] }) => {
+      const { sels, labelSel, caretSels } = args;
+      const MAX_PER_SELECTOR = 4;
+      const MAX_DESCENDANTS = 8;
+      // Scan more than we keep, so the RENDERED filter has something to choose
+      // from. Slicing to 8 BEFORE filtering starved the precise whitelist tier
+      // whenever a button's first eight [class] descendants were hidden, while
+      // the demoted substring tier still saw them — the weaker signal winning
+      // by accident of DOM order.
+      const MAX_DESCENDANT_SCAN = 40;
+      const MAX_TEXT = 120;
+      // KNOWN DEBT, recorded deliberately rather than fixed now: 12 ancestors is
+      // not necessarily enough to reach `body` for a real Zoom footer button, so
+      // two different elements can produce the SAME path key and retiring one
+      // control could retire an unrelated one. What bounds the damage: a
+      // retirement needs TWO proven failures on that key, and the set is cleared
+      // wholesale if it ever retires every readable control — so a collision
+      // costs extra cycles, not a permanently blind watcher. An `#id` key has no
+      // such weakness, which is why it is preferred. Raising the depth or
+      // asserting the path is rooted at body is the real fix.
+      const MAX_PATH_DEPTH = 12;
+
+      /**
+       * State-INDEPENDENT element identity. The class attribute is deliberately
+       * excluded: it changes when the mic state changes, and a rejection keyed
+       * on it would silently stop applying to the element it was meant for.
+       */
+      const identify = (el: Element): string => {
+        const id = el.getAttribute('id');
+        // Prefixed so the log shows WHICH kind of identity backs a retirement:
+        // an id is immune to sibling insertion, a path is not.
+        if (id) return `#${id}`;
+        const parts: string[] = [];
+        let node: Element | null = el;
+        let depth = 0;
+        while (node && node !== document.body && depth < MAX_PATH_DEPTH) {
+          const parent: Element | null = node.parentElement;
+          if (!parent) break;
+          parts.unshift(`${node.tagName.toLowerCase()}:${Array.from(parent.children).indexOf(node)}`);
+          node = parent;
+          depth++;
+        }
+        return parts.length > 0 ? `path:${parts.join('/')}` : '';
+      };
+
+      const isRendered = (el: Element): boolean => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 || r.height > 0;
+      };
+
+      /**
+       * Text of an element EXCLUDING descendants that are not rendered.
+       *
+       * `el.textContent` includes `display:none` subtrees, so a button carrying
+       * a hidden "Unmute" span alongside a visible "Mute" one would feed both
+       * words to the text tier — which outranks the icon whitelist and feeds the
+       * non-mic guard. "Hidden is not what the room sees" was already applied to
+       * icon classes; it has to apply to the HIGHER-ranked signal too.
+       *
+       * HONEST LIMIT: this uses layout boxes, so `visibility:hidden` and
+       * `opacity:0` text still counts (both keep a box). Only display:none /
+       * zero-area subtrees are excluded.
+       */
+      const renderedTextOf = (root: Element): string => {
+        if (!isRendered(root)) return '';
+        let out = '';
+        const walk = (node: Node): void => {
+          const children = Array.from(node.childNodes);
+          for (const child of children) {
+            if (out.length >= MAX_TEXT) return;
+            if (child.nodeType === 3) {
+              out += child.nodeValue ?? '';
+              continue;
+            }
+            if (child.nodeType !== 1) continue;
+            const el = child as Element;
+            if (!isRendered(el)) continue; // display:none / zero-area subtree
+            walk(el);
+          }
+        };
+        walk(root);
+        return out.slice(0, MAX_TEXT);
+      };
+
+      const out: ZoomMicCandidate[] = [];
+      for (const selector of sels) {
+        let nodes: Element[] = [];
+        try {
+          nodes = Array.from(document.querySelectorAll(selector));
+        } catch {
+          continue; // selector not supported by this browser — try the next
+        }
+        nodes.slice(0, MAX_PER_SELECTOR).forEach((el, index) => {
+          if (!isRendered(el)) return; // hidden — not clickable
+          const scanned = Array.from(el.querySelectorAll('[class]')).slice(0, MAX_DESCENDANT_SCAN);
+          const descendantClassNames = scanned.slice(0, MAX_DESCENDANTS).map((d) => d.getAttribute('class') ?? '');
+          // Visible-only, for the precise icon-whitelist tier: a hidden state
+          // icon is not what the room sees. FILTER THEN SLICE (see
+          // MAX_DESCENDANT_SCAN) — the reverse order starved this tier.
+          const visibleDescendantClassNames = scanned
+            .filter(isRendered)
+            .slice(0, MAX_DESCENDANTS)
+            .map((d) => d.getAttribute('class') ?? '');
+
+          let labelText: string | null = null;
+          try {
+            const labelNode = el.querySelector(labelSel);
+            if (labelNode) labelText = renderedTextOf(labelNode);
+          } catch {
+            /* unsupported selector — fall back to the element's own text */
+          }
+
+          // Split-button caret in the SAME container. Harvested only; nothing
+          // in readZoomMicState gates on it (the selectors are unverified).
+          let caretNearby: boolean | null = null;
+          const container = el.parentElement;
+          if (container) {
+            caretNearby = false;
+            for (const cs of caretSels) {
+              try {
+                const hit = container.querySelector(cs);
+                if (hit && isRendered(hit)) {
+                  caretNearby = true;
+                  break;
+                }
+              } catch {
+                /* unsupported selector — try the next */
+              }
+            }
+          }
+
+          out.push({
+            selector,
+            index,
+            probe: {
+              ariaLabel: el.getAttribute('aria-label'),
+              ariaPressed: el.getAttribute('aria-pressed'),
+              className: el.getAttribute('class'),
+              descendantClassNames,
+              elementKey: identify(el),
+              id: el.getAttribute('id'),
+              labelText,
+              text: renderedTextOf(el),
+              visibleDescendantClassNames,
+              caretNearby,
+            },
+          });
         });
-      });
-    }
-    return out;
-  }, selectors);
+      }
+      return out;
+    },
+    { sels: selectors, labelSel: zoomMicLabelNodeSelector, caretSels: zoomMicCaretSelectors },
+  );
 }
 
 export interface ZoomMuteOutcome {
@@ -515,9 +953,11 @@ export interface ZoomMuteOutcome {
  * vocabulary-tolerant (readZoomMicState) and probes EVERY match of several
  * selectors rather than `.first()` of one.
  *
- * This is best-effort by nature — it depends on Zoom's DOM. The deterministic
- * guarantee that no audio leaves the bot is startZoomOutboundAudioGuard
- * (layer 2), which does not read the DOM at all. Never throws.
+ * This is best-effort by nature — it depends on Zoom's DOM. What keeps the bot
+ * silent is installOutboundAudioLockInPage, armed at PAGE LOAD from join.ts and
+ * re-asserted by startZoomOutboundAudioGuard (layer 2); neither reads the DOM.
+ * The guard is the backstop, not the primary mechanism — the earlier wording
+ * here credited it with the whole guarantee, which is wrong. Never throws.
  *
  * Recorder bots only; voice-agent bots must transmit TTS and are gated out by
  * the caller.
@@ -558,12 +998,17 @@ export async function ensureZoomMutedInMeeting(page: Page): Promise<ZoomMuteOutc
         clickedMute = true;
         await page.waitForTimeout(500);
 
-        const after = selectZoomMicToggle(await probeZoomMicCandidates(page, zoomMicToggleSelectors));
+        // SAME DEFECT, SAME FIX. This re-read also used selectZoomMicToggle
+        // over a fresh probe, so it could report "Muted microphone in meeting"
+        // and return muted:true on the strength of a DIFFERENT element than the
+        // one it clicked. Pin it to the clicked element's identity.
+        const afterProbe = await probeZoomMicCandidates(page, zoomMicToggleSelectors);
+        const after = readZoomMicCandidateByKey(afterProbe, selection.candidate.probe.elementKey);
         if (after && after.reading.kind === 'muted') {
-          log(`[Zoom Web] Muted microphone in meeting (recorder bot — receive-only) [${after.reading.evidence}]`);
+          log(`[Zoom Web] Muted microphone in meeting (recorder bot — receive-only) [same element key=${selection.candidate.probe.elementKey}: ${after.reading.evidence}]`);
           return { muted: true, clicked: true, attempts: attempt + 1, detail: after.reading.evidence };
         }
-        log(`[Zoom Web] Mute click not yet confirmed (${after ? after.reading.kind : 'unreadable'}) — re-checking`);
+        log(`[Zoom Web] Mute click not yet confirmed — the CLICKED element (key=${selection.candidate.probe.elementKey || 'none'}) reads ${after ? after.reading.kind : 'absent from the re-probe'} — re-checking`);
       }
     } catch (e: any) {
       log(`[Zoom Web] ensureZoomMutedInMeeting attempt ${attempt + 1} error: ${e?.message ?? e}`);
@@ -571,7 +1016,7 @@ export async function ensureZoomMutedInMeeting(page: Page): Promise<ZoomMuteOutc
     await page.waitForTimeout(5000);
   }
 
-  log(`[Zoom Web] WARNING: could not confirm in-meeting mute after retries — the participant list may show this bot as unmuted. Outbound audio is still silenced at track level by the outbound-audio guard. Last probe: [${lastDetail}]`);
+  log(`[Zoom Web] WARNING: could not confirm in-meeting mute after retries — the participant list may show this bot as unmuted. The track-level seal is unaffected by this; read the outbound-audio guard heartbeat for its actual state. Last probe: [${lastDetail}]`);
   return { muted: false, clicked: clickedMute, attempts: 6, detail: lastDetail };
 }
 
@@ -609,8 +1054,10 @@ interface VexaAudioWindow {
  * LAYER 2 — the deterministic guarantee, executed IN THE PAGE.
  *
  * A recorder bot is receive-only: it never legitimately transmits. So rather
- * than trusting Zoom's DOM, disable every OUTBOUND audio track directly. Even
- * if every selector in this file rots, no audio leaves the bot.
+ * than trusting Zoom's DOM, disable every OUTBOUND audio track directly — so a
+ * rotted selector in this file cannot make the bot audible. The honest limit:
+ * this sweep can only act on peers it can SEE, so a false `registryPresent` is
+ * reported rather than treated as "nothing to do", and the caller must read it.
  *
  * Mirrors the in-repo precedent in services/screen-content.ts (~line 1228),
  * which disables incoming VIDEO tracks with `track.enabled = false` — and
@@ -716,6 +1163,183 @@ export function describeOutboundAudioSweep(result: OutboundAudioSweepResult): st
   return `pcs=${result.peerConnections} audioSenders=${result.audioSendersFound} disabled=${result.tracksDisabled} alreadyDisabled=${result.alreadyDisabled} errors=${result.errors}`;
 }
 
+/** What Chromium is actually offered on the SEND side. */
+export interface ZoomSendSideProbe {
+  /** number of audioinput devices enumerateDevices() reports. */
+  audioInputDevices: number;
+  /** enumerateDevices threw / was unavailable. */
+  error: string | null;
+}
+
+/**
+ * Report whether Chromium was offered a MICROPHONE at all.
+ *
+ * WHY THIS EXISTS: `AUDIO JOIN OK` counts `document.querySelectorAll('audio')`
+ * elements with live MediaStreams — those are INBOUND. It printed identically on
+ * the run that failed and will print identically whether or not the capture
+ * device exists, so it is a canary for the RECORDING and for nothing else. The
+ * start.sh microphone fix has no observable signal without this.
+ *
+ * Runs as a plain page.evaluate: no patches, no track access, nothing installed.
+ * That is deliberate — it must work in mode 'none' too, and it must not be the
+ * thing an operator is trying to rule out.
+ *
+ * Never throws.
+ */
+export async function probeZoomSendSide(page: Page): Promise<ZoomSendSideProbe | null> {
+  if (page.isClosed()) return null;
+  try {
+    return await page.evaluate(async () => {
+      try {
+        const md = navigator.mediaDevices;
+        if (!md || typeof md.enumerateDevices !== 'function') {
+          return { audioInputDevices: 0, error: 'navigator.mediaDevices.enumerateDevices unavailable' };
+        }
+        const devices = await md.enumerateDevices();
+        return {
+          audioInputDevices: devices.filter((d) => d.kind === 'audioinput').length,
+          error: null,
+        };
+      } catch (e) {
+        return { audioInputDevices: 0, error: String((e as Error)?.message ?? e) };
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Format the send-side probe. Pure, so it is unit-testable.
+ *
+ * States plainly which counters are and are not meaningful in the current mode,
+ * because two of them are STRUCTURALLY ZERO in mode 'off' — the mode the first
+ * live run uses — and an operator staring at a zero that can never be anything
+ * else is worse off than one told it is unavailable.
+ */
+export function describeZoomSendSide(probe: ZoomSendSideProbe | null, mode: ZoomAudioLockMode): string {
+  const modeNote =
+    mode === 'on'
+      ? 'mode=on (tracksLocked, audioSenders and blockedUnmutes are all meaningful)'
+      : mode === 'off'
+        // WAS FACTUALLY WRONG, and this file contradicted itself: the old text
+        // claimed "the peer registry is not installed, so audioSenders reads
+        // unreadable". The RTCPeerConnection ctor patch sits ABOVE the
+        // kill-switch boundary and is deliberately NOT gated (see the KILL
+        // SWITCH BOUNDARY comment), so in mode off the registry IS populated,
+        // registryPresent is true, and audioSenders is a live number. The note
+        // therefore told the operator to discard the informative signal and
+        // rely on the weaker one — worse than an uninformative line, because it
+        // sat in the same sentence as a true statement about tracksLocked.
+        ? 'mode=off — NOTE: tracksLocked is STRUCTURALLY 0 here (lockTrack returns before the counter), but the peer registry IS installed (the ctor patch sits above the kill-switch boundary), so audioSenders and sweepDisabled are LIVE and meaningful — they are what shows Zoom ATTACHED the mic to a sender, as against merely being offered a device'
+        : 'mode=none — NOTE: the guard is not armed, so there is NO heartbeat at all; this one-shot line is the only send-side evidence you will get';
+  if (!probe) return `audioInputDevices=unreadable (probe could not run) | ${modeNote}`;
+  if (probe.error) return `audioInputDevices=unreadable (${probe.error}) | ${modeNote}`;
+  return probe.audioInputDevices > 0
+    ? `audioInputDevices=${probe.audioInputDevices} — a CAPTURE DEVICE IS OFFERED to Chromium (the start.sh microphone fix is in force) | ${modeNote}`
+    : `audioInputDevices=0 — NO CAPTURE DEVICE: Chromium has no microphone, so Zoom cannot join audio for SENDING and will have no mute state to describe. This is the 2026-09-02 root cause; check the start.sh remap-source block | ${modeNote}`;
+}
+
+/** One guard tick reduced to a loggable line. Pure, so it is unit-testable. */
+export interface ZoomAudioGuardTickReport {
+  /**
+   * Fingerprint of the situation. The collapser emits IMMEDIATELY when this
+   * changes, so a state transition is never delayed by the heartbeat.
+   */
+  signature: string;
+  /** The line to log, with no platform prefix and no repeat accounting. */
+  message: string;
+  /** true when the tick found something that should not be happening. */
+  warn: boolean;
+}
+
+/**
+ * Reduce one guard tick (a lock re-assert plus an observability sweep) to the
+ * line the log should carry.
+ *
+ * WHY this exists: the previous tick logged only when `tracksLocked` or
+ * `blockedUnmutes` had grown, so a tick where nothing changed was completely
+ * SILENT. Over the live 5-minute meeting of 2026-09-02 the guard therefore
+ * logged exactly once — the install at 06:45:19 — and nothing whatsoever could
+ * be said about the ~30 ticks that followed. A silent mechanism on a
+ * privacy-critical path cannot be trusted or debugged, so every tick now
+ * produces a line, which `createRepeatCollapser` throttles to a heartbeat while
+ * the situation is unchanged and emits at once when it moves.
+ *
+ * `audioSenders` comes from the sweep because `OutboundAudioLockResult` does not
+ * carry it, and it is the single most load-bearing number here: on 2026-09-02 it
+ * was 0 for the whole meeting. This function reports that count as a FACT and
+ * deliberately does NOT classify it — whether a bot with no outbound audio
+ * sender at all can be muted via Zoom's toolbar is under separate investigation,
+ * and prejudging it here is exactly the kind of claim this change exists to stop.
+ *
+ * Pure — no clock, no DOM, no I/O.
+ */
+export function reportZoomAudioGuardTick(
+  lock: OutboundAudioLockResult | null,
+  sweep: OutboundAudioSweepResult | null,
+): ZoomAudioGuardTickReport {
+  if (!lock) {
+    return {
+      signature: 'lock-unavailable',
+      message: 'Outbound audio guard tick could not read the lock (page closed or execution context destroyed)',
+      warn: true,
+    };
+  }
+  if (lock.skippedVoiceAgent) {
+    // Not reachable from the armed guard (it returns early for a voice agent),
+    // but reported honestly rather than mislabelled if it ever is.
+    return {
+      signature: 'voice-agent',
+      message: `Outbound audio guard tick — ${describeOutboundAudioLock(lock)}`,
+      warn: false,
+    };
+  }
+
+  // Sweep detail. A sweep that DISABLED something means a live outbound audio
+  // track existed which the lock had not sealed — the one case this backstop
+  // exists for, and never silent again.
+  const sweepDetail = !sweep
+    ? 'audioSenders=unreadable (sweep could not run)'
+    : !sweep.registryPresent
+      ? 'audioSenders=unreadable (peer-connection registry ABSENT)'
+      : `audioSenders=${sweep.audioSendersFound} sweepDisabled=${sweep.tracksDisabled} sweepAlreadyDisabled=${sweep.alreadyDisabled} sweepErrors=${sweep.errors}`;
+
+  const warn =
+    !lock.sealEnabled ||
+    !lock.registryPresent ||
+    lock.errors > 0 ||
+    !sweep ||
+    !sweep.registryPresent ||
+    sweep.tracksDisabled > 0 ||
+    sweep.errors > 0;
+
+  return {
+    // Every counter that can move is in the signature, so any real change emits
+    // on the very next tick instead of waiting up to a heartbeat.
+    signature: [
+      lock.sealEnabled,
+      lock.registryPresent,
+      lock.tracksLocked,
+      lock.tracksVerified,
+      lock.tracksResealed,
+      lock.blockedUnmutes,
+      lock.errors,
+      lock.patchedConstructor,
+      lock.patchedAddTrack,
+      lock.patchedAddTransceiver,
+      lock.patchedReplaceTrack,
+      lock.patchedGetUserMedia,
+      sweep ? sweep.registryPresent : 'no-sweep',
+      sweep ? sweep.audioSendersFound : -1,
+      sweep ? sweep.tracksDisabled : -1,
+      sweep ? sweep.errors : -1,
+    ].join('|'),
+    message: `Outbound audio guard heartbeat — ${describeOutboundAudioLock(lock)} ${sweepDetail}`,
+    warn,
+  };
+}
+
 /**
  * BACKSTOP for the outbound-audio lock — not the primary mechanism.
  *
@@ -730,8 +1354,13 @@ export function describeOutboundAudioSweep(result: OutboundAudioSweepResult): st
  * the page-load init script, so the patches come back on their own. This tick is
  * not what recovers them, and the previous claim that it was has been removed.
  *
- * Logs the first pass, then only passes that actually locked something or
- * refused an unmute — a 10s heartbeat would bury everything else in the log.
+ * OBSERVABILITY (fixed 2026-09-02): every tick now produces a line via
+ * reportZoomAudioGuardTick, throttled by a repeat collapser to roughly one
+ * heartbeat per `heartbeatMs` while the counters are unchanged and emitted
+ * immediately when they move. The previous "only log a change" rule made a
+ * healthy guard indistinguishable from a dead one — across a real 5-minute
+ * meeting it logged once. `stop()` flushes the collapser so the final suppressed
+ * run is accounted for rather than lost.
  *
  * The interval is unref()'d and self-clears when the page closes, so it can
  * never hold the Node event loop open and delay bot shutdown.
@@ -742,15 +1371,31 @@ export function startZoomOutboundAudioGuard(
   page: Page,
   voiceAgentEnabled: boolean,
   intervalMs = 10_000,
+  heartbeatMs = 60_000,
 ): () => void {
   if (voiceAgentEnabled) {
     log('[Zoom Web] Outbound audio guard NOT armed — voice agent must transmit TTS');
     return () => { /* nothing armed */ };
   }
+  // Hands-off mode: the guard re-installs the lock and sweeps tracks, both of
+  // which touch tracks, so it must not run. Checked HERE as well as at the call
+  // site — 'none' has to be a property of the machinery, not of one caller.
+  if (!isZoomAudioTouchAllowed()) {
+    log('[Zoom Web] Outbound audio guard NOT armed — ZOOM_AUDIO_LOCK hands-off mode (no track is touched; no heartbeat will be emitted)');
+    return () => { /* nothing armed */ };
+  }
 
   let stopped = false;
-  let lastLockedCount = -1;
-  let lastBlockedCount = 0;
+  // One stream, keyed below; the collapser turns "every tick" into "a heartbeat
+  // plus every transition", which is what makes a healthy guard visible.
+  const heartbeat = createRepeatCollapser(heartbeatMs);
+  const emit = (line: string, warn: boolean): void =>
+    log(warn ? `[Zoom Web] WARNING: ${line}` : `[Zoom Web] ${line}`);
+
+  // The warn level of the most recent tick, so the shutdown flush does not
+  // downgrade a suppressed WARNING to informational on the very last line
+  // before teardown — which is the line most likely to be read.
+  let lastWarn = false;
   const timer = setInterval(() => {
     void (async () => {
       if (stopped) return;
@@ -761,22 +1406,15 @@ export function startZoomOutboundAudioGuard(
       // Re-install rather than merely sweep: this re-seals new tracks AND
       // re-applies the patches if a navigation dropped them.
       const lock = await installZoomOutboundAudioLock(page, voiceAgentEnabled);
-      if (!lock) return;
-      const newlyLocked = lastLockedCount >= 0 && lock.tracksLocked > lastLockedCount;
-      const newlyBlocked = lock.blockedUnmutes > lastBlockedCount;
-      if (newlyLocked || newlyBlocked) {
-        log(`[Zoom Web] Outbound audio lock refreshed — ${describeOutboundAudioLock(lock)}`);
-      }
-      lastLockedCount = lock.tracksLocked;
-      lastBlockedCount = lock.blockedUnmutes;
-      // Belt and braces: if any track could not be sealed, at least keep it
-      // disabled with the least invasive primitive.
-      if (lock.errors > 0) {
-        const sweep = await sweepZoomOutboundAudio(page, voiceAgentEnabled);
-        if (sweep && sweep.tracksDisabled > 0) {
-          log(`[Zoom Web] Unsealed track re-silenced by sweep — ${describeOutboundAudioSweep(sweep)}`);
-        }
-      }
+      // Sweep EVERY tick, not just when lock.errors > 0. Two reasons: it is the
+      // belt-and-braces disable for a track that could not be sealed, and it is
+      // the only source of audioSenders — the number that was missing from the
+      // 2026-09-02 log and the one a reader most needs.
+      const sweep = await sweepZoomOutboundAudio(page, voiceAgentEnabled);
+      const report = reportZoomAudioGuardTick(lock, sweep);
+      lastWarn = report.warn;
+      const line = heartbeat.consider('zoom-audio-guard', report.signature, report.message, Date.now());
+      if (line) emit(line, report.warn);
     })();
   }, intervalMs);
 
@@ -787,6 +1425,10 @@ export function startZoomOutboundAudioGuard(
     if (stopped) return;
     stopped = true;
     clearInterval(timer);
+    // Account for whatever the heartbeat was still suppressing, so the last run
+    // of ticks before shutdown is not silently discarded.
+    const tail = heartbeat.flush('zoom-audio-guard', Date.now());
+    if (tail) emit(tail, lastWarn);
   };
 
   page.once('close', stop);
@@ -998,8 +1640,42 @@ export function parseZoomAudioLockEnv(raw: string | undefined): boolean {
   return !(v === 'off' || v === '0' || v === 'false' || v === 'no' || v === 'disabled');
 }
 
+/**
+ * The three operating modes of the outbound-audio machinery.
+ *
+ *   'on'   — default. Tracks are disabled AND sealed; the at-birth patches are
+ *            installed; the guard is armed.
+ *   'off'  — the original kill switch, behaviour UNCHANGED: no seal, no
+ *            at-birth patches, but tracks are still written `enabled = false`
+ *            (lockTrack does that write BEFORE consulting the switch) and the
+ *            guard still runs. An unmute CAN succeed.
+ *   'none' — HANDS OFF. Nothing is installed and no track is ever touched, in
+ *            the page or from Node. Only the DOM mute path remains.
+ */
+export type ZoomAudioLockMode = 'on' | 'off' | 'none';
+
+/** Spellings that select hands-off mode. Normalised (trimmed, lowercased). */
+const zoomAudioLockNoneValues = ['none', 'hands-off', 'handsoff', 'no-touch', 'notouch'];
+
+/**
+ * Parse the env var into a MODE.
+ *
+ * WHY this is separate from parseZoomAudioLockEnv rather than replacing it:
+ * that function's boolean contract is depended on by the seal itself and is
+ * pinned by mutations M37/M37b/M37c, and 'off' must keep behaving EXACTLY as it
+ * does today. So hands-off is recognised FIRST and everything else delegates —
+ * which also means `parseZoomAudioLockEnv('none')` still returns true on its
+ * own. That is a trap: read the MODE, never the boolean, when deciding whether
+ * to touch a track.
+ */
+export function parseZoomAudioLockMode(raw: string | undefined): ZoomAudioLockMode {
+  const v = (raw ?? '').trim().toLowerCase();
+  if (zoomAudioLockNoneValues.includes(v)) return 'none';
+  return parseZoomAudioLockEnv(raw) ? 'on' : 'off';
+}
+
 /** Memoised so the decision is read once per process and logged exactly once. */
-let zoomAudioSealDecision: boolean | null = null;
+let zoomAudioSealDecision: ZoomAudioLockMode | null = null;
 
 /**
  * THE OPERATIONAL ESCAPE HATCH — read this before deleting the env var.
@@ -1015,20 +1691,54 @@ let zoomAudioSealDecision: boolean | null = null;
  * So an operator who sees audio-join breakage in a live meeting can set
  * ZOOM_AUDIO_LOCK=off and keep recording, with no rebuild and no revert.
  *
+ * WHY 'none' EXISTS AS WELL: 'off' removes the lying getter and the at-birth
+ * patches, but lockTrack writes `track.enabled = false` BEFORE it consults the
+ * switch — so 'off' still MUTATES the track. If Zoom's audio join turns out to
+ * be upset by the write rather than by the unreadable getter, 'off' cannot
+ * isolate that, and `voiceAgentEnabled` is far too blunt a substitute (it also
+ * changes preview mute and arms neither guard nor watcher). 'none' is the
+ * genuine touch-nothing configuration that makes a live incident isolable
+ * instead of guessable. It leaves the bot's silence resting on the start.sh
+ * microphone topology — the mic is fed by a null sink nothing ever plays into,
+ * so it is silent BY CONSTRUCTION, with the source mute as defence in depth.
+ *
+ * LIVE-RUN ORDER: 'off' FIRST, then 'on'. NOT 'none' — 'none' refuses to arm the
+ * outbound-audio guard, so it emits no heartbeat at all and blinds the very
+ * instrument added to observe this. What 'none' gives up, explicitly: the guard
+ * heartbeat, audioSenders, blockedUnmutes, and every at-birth patch. Use it only
+ * to answer "does OUR code break Zoom's audio join?", and read the one-shot
+ * send-side line (describeZoomSendSide) for evidence in that mode.
+ *
  * Defaults to ON. Logged once, plainly, at arm time: a silent kill switch is
  * worse than none — if anyone later asks "was the lock on during that meeting?",
  * the log has to answer.
  */
-export function isZoomAudioSealEnabled(): boolean {
+export function zoomAudioLockMode(): ZoomAudioLockMode {
   if (zoomAudioSealDecision !== null) return zoomAudioSealDecision;
   const raw = process.env.ZOOM_AUDIO_LOCK;
-  zoomAudioSealDecision = parseZoomAudioLockEnv(raw);
+  zoomAudioSealDecision = parseZoomAudioLockMode(raw);
   log(
-    zoomAudioSealDecision
+    zoomAudioSealDecision === 'on'
       ? `[Zoom Web] Outbound audio SEAL: ENABLED (default) [ZOOM_AUDIO_LOCK=${raw ?? '<unset>'}]`
-      : `[Zoom Web] Outbound audio SEAL: DISABLED by operator [ZOOM_AUDIO_LOCK=${raw ?? '<unset>'}] — tracks are still set enabled=false and the DOM mute path is unchanged, but an unmute CAN succeed`,
+      : zoomAudioSealDecision === 'off'
+        ? `[Zoom Web] Outbound audio SEAL: DISABLED by operator [ZOOM_AUDIO_LOCK=${raw ?? '<unset>'}] — tracks are still set enabled=false and the DOM mute path is unchanged, but an unmute CAN succeed`
+        : `[Zoom Web] Outbound audio SEAL: HANDS OFF by operator [ZOOM_AUDIO_LOCK=${raw ?? '<unset>'}] — NOTHING is installed and no track is touched; silence rests on the start.sh mic topology (a null sink nothing plays into, plus its source mute), and an unmute CAN succeed. GIVES UP: the guard is not armed, so there is NO heartbeat, no audioSenders and no blockedUnmutes. For a first live run prefer ZOOM_AUDIO_LOCK=off, which keeps the heartbeat`,
   );
   return zoomAudioSealDecision;
+}
+
+/** True only in mode 'on'. This is what the in-page seal is gated on. */
+export function isZoomAudioSealEnabled(): boolean {
+  return zoomAudioLockMode() === 'on';
+}
+
+/**
+ * False ONLY in hands-off mode. Every site that installs a patch or writes to a
+ * track must consult this first, so 'none' is a property of the whole machinery
+ * rather than of one function that could be bypassed.
+ */
+export function isZoomAudioTouchAllowed(): boolean {
+  return zoomAudioLockMode() !== 'none';
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,7 +2221,11 @@ export async function installZoomOutboundAudioLock(
 export function describeOutboundAudioLock(result: OutboundAudioLockResult): string {
   if (result.skippedVoiceAgent) return 'voice agent enabled — outbound audio intentionally left live and UNLOCKED';
   if (!result.sealEnabled) {
-    return `SEAL DISABLED by ZOOM_AUDIO_LOCK — tracksDisabled=${result.tracksLocked} registry=${result.registryPresent ? 'present' : 'ABSENT'} errors=${result.errors} (an unmute CAN succeed)`;
+    // `tracksLocked` is STRUCTURALLY 0 in this mode: lockTrack returns before
+    // the counter increments, even though it has already written
+    // enabled = false. Labelling it "tracksDisabled" was simply wrong — it
+    // reported 0 for tracks that WERE disabled.
+    return `SEAL DISABLED by ZOOM_AUDIO_LOCK — tracksLocked=${result.tracksLocked} (STRUCTURALLY 0 in this mode; tracks ARE still written enabled=false, the counter just never runs) registry=${result.registryPresent ? 'present' : 'ABSENT'} errors=${result.errors} (an unmute CAN succeed)`;
   }
   const patches = [
     result.patchedConstructor ? 'ctor' : null,
@@ -1548,6 +2262,26 @@ export const zoomMuteWatcherInitialState: ZoomMuteWatcherState = {
   consecutiveUnmuted: 0,
   lastClickAtMs: null,
   clicks: 0,
+};
+
+/**
+ * THE SHIPPED watcher config. Named and exported so the values that actually
+ * run can be asserted.
+ *
+ * WHY: stepZoomMuteWatcher is tested exhaustively with INJECTED configs, so
+ * every anti-oscillator property was proven — for configs that never ship.
+ * Replacing this default with `{ confirmations: 1, cooldownMs: 0 }` survived
+ * the whole suite while restoring the toggle oscillator the state machine
+ * exists to prevent.
+ *
+ * It also carries a load-bearing relationship: ZOOM_RETIREMENT_REQUIRED_STRIKES
+ * is justified by "each strike costs a full watcher cycle (~15s poll +
+ * cooldown)". That rationale rests on `cooldownMs` being large, so a pinned
+ * constant was resting on an unpinned one. Both are pinned now.
+ */
+export const zoomMuteWatcherDefaultConfig: ZoomMuteWatcherConfig = {
+  confirmations: 2,
+  cooldownMs: 30_000,
 };
 
 /**
@@ -1613,13 +2347,333 @@ export function stepZoomMuteWatcher(
   };
 }
 
+/** Timing for the post-click settle poll. All injected, so it is testable. */
+export interface ZoomMutePollConfig {
+  /** wait before the FIRST re-read (Zoom needs a beat to repaint). */
+  firstDelayMs: number;
+  /** gap between subsequent re-reads. */
+  intervalMs: number;
+  /** total budget from the click; a reading still unmuted at this point is a proven failure. */
+  deadlineMs: number;
+}
+
+export const zoomMutePollDefaults: ZoomMutePollConfig = {
+  firstDelayMs: 500,
+  intervalMs: 500,
+  deadlineMs: 4_000,
+};
+
+export interface ZoomMutePollResult {
+  /** the CLICKED element's reading, or null if it was never readable. */
+  after: ZoomMicSelection | null;
+  /** how many re-probes were performed. */
+  polls: number;
+  /** ms after the click at which `muted` was first observed, else null. */
+  settledAtMs: number | null;
+  /** true when the budget ran out without ever reading `muted`. */
+  timedOut: boolean;
+  /** the candidate set from the LAST probe, for the diagnostic digest. */
+  lastCandidates: ZoomMicCandidate[];
+}
+
 /**
- * Keep the bot LOOKING muted for the whole call: poll the mic control and
+ * Poll for the mute to SETTLE, instead of sampling once and calling it.
+ *
+ * WHY THIS EXISTS — the defect it fixes: verification took ONE reading at a
+ * fixed +750ms after the click, and a reading of `unmuted` there was treated as
+ * a proven failure that RETIRED the candidate permanently. But Zoom's mute is an
+ * audio-session operation acknowledged by the server, not a local CSS toggle; on
+ * a loaded pod or a busy meeting the toolbar reflects it later than 750ms. The
+ * re-read then sampled the PRE-CLICK state and the only control that actually
+ * mutes the bot was retired for the whole call. Before retirement existed that
+ * same timing produced a useless-but-harmless re-click loop; with retirement it
+ * became terminal. A state that has not arrived is not a state that will not
+ * arrive.
+ *
+ * So: re-probe until the clicked element reads `muted` (return at once), or the
+ * budget expires. Only a reading still `unmuted` AT THE DEADLINE is a proven
+ * failure — and even then it is only ONE strike (see stepZoomRetirement).
+ *
+ * The prober, the clock and the sleep are all INJECTED, which is what makes the
+ * timing behaviour unit-testable rather than a source assertion. `probeOnce`
+ * must never throw; the caller wraps the Playwright call.
+ */
+export async function pollZoomMuteSettled(
+  probeOnce: () => Promise<ZoomMicCandidate[]>,
+  clickedKey: string,
+  config: ZoomMutePollConfig,
+  now: () => number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<ZoomMutePollResult> {
+  const startedAt = now();
+  let polls = 0;
+  let after: ZoomMicSelection | null = null;
+  let lastCandidates: ZoomMicCandidate[] = [];
+  // HARD ITERATION CAP, independent of the clock. The deadline check is the
+  // normal exit; this is the backstop for the case where it cannot fire — a
+  // clock that does not advance, or a future edit that breaks the comparison.
+  // This loop runs inside a setInterval callback in a live bot, so "loops
+  // forever" is not an acceptable failure mode for any edit to reach.
+  const maxPolls = Math.max(1, Math.ceil(config.deadlineMs / Math.max(1, config.intervalMs)) + 2);
+
+  await sleep(config.firstDelayMs);
+  for (;;) {
+    lastCandidates = await probeOnce();
+    polls++;
+    const reading = readZoomMicCandidateByKey(lastCandidates, clickedKey);
+    // Keep the most informative reading seen: a later "absent" must not erase
+    // an earlier confident one.
+    if (reading) after = reading;
+    if (reading && reading.reading.kind === 'muted') {
+      return { after: reading, polls, settledAtMs: now() - startedAt, timedOut: false, lastCandidates };
+    }
+    if (now() - startedAt >= config.deadlineMs || polls >= maxPolls) {
+      return { after, polls, settledAtMs: null, timedOut: true, lastCandidates };
+    }
+    await sleep(config.intervalMs);
+  }
+}
+
+/** What a post-click re-read actually established. */
+export type ZoomMuteClickVerdict = 'muted' | 'still-unmuted' | 'unreadable';
+
+export interface ZoomMuteClickReport {
+  verdict: ZoomMuteClickVerdict;
+  /** true for every verdict except a confirmed mute. */
+  warn: boolean;
+  /** The line to log, with no platform prefix. */
+  message: string;
+  /**
+   * `elementKey` to stop selecting for the rest of the session, or null.
+   *
+   * Set ONLY for a `still-unmuted` verdict — a click that landed and provably
+   * did not change the state. `unreadable` is unknown, not a proven failure,
+   * and must never blacklist a candidate that might be the right one. Null when
+   * the probe could not produce an identity, since rejecting an empty key would
+   * match every unidentified element.
+   */
+  rejectKey: string | null;
+}
+
+/** Everything the post-click report needs. `after` is the RE-READ, not the trigger. */
+export interface ZoomMuteClickInput {
+  /** stepZoomMuteWatcher's reason for clicking (carries the click number). */
+  reason: string;
+  /** The candidate + reading that triggered the click. */
+  before: ZoomMicSelection;
+  /** The confident reading taken AFTER the click, or null if none was available. */
+  after: ZoomMicSelection | null;
+  /** Full probe digest of the post-click pass — only used when something is wrong. */
+  afterDetail: string;
+  /** Clicks already proven ineffective before this one. */
+  priorIneffectiveClicks: number;
+}
+
+/**
+ * Turn a click plus its re-read into an HONEST log line.
+ *
+ * WHY this exists: the watcher used to log `Mute watcher re-muted the bot` from
+ * the line immediately after `.click()`, with no re-read at all. That string is
+ * a claim about the meeting, not an observation of it, and on 2026-09-02 it was
+ * emitted twice (06:49:35 and 06:50:05) while the control kept reading
+ * `svgaudiounmuted` and the user ended up muting the bot by hand from the
+ * participant list. Click #1 demonstrably did not mute, and nothing in the
+ * system noticed — the log asserted the opposite.
+ *
+ * The clicked candidate's selector and index are now in the line too. Previously
+ * only `reading.evidence` was logged, so which of the seven candidate selectors
+ * was actually clicked could not be recovered from the log.
+ *
+ * Pure — no DOM, no clock, no I/O.
+ */
+export function reportZoomMuteClick(input: ZoomMuteClickInput): ZoomMuteClickReport {
+  const target = `${input.before.candidate.selector}[${input.before.candidate.index}]`;
+  const clickedKey = input.before.candidate.probe.elementKey || 'none';
+  const trigger = `${input.reason}; clicked ${target} key=${clickedKey} on [${input.before.reading.evidence}]`;
+  // Every verdict says WHICH element the after-reading describes. Without this a
+  // reader cannot tell whether the verdict refers to the clicked element at all
+  // — which is exactly how a reading taken from a different element was able to
+  // masquerade as a confirmed mute.
+  const sameElement = `re-read of the SAME element (key=${clickedKey})`;
+
+  if (input.after && input.after.reading.kind === 'muted') {
+    return {
+      verdict: 'muted',
+      warn: false,
+      rejectKey: null,
+      message: `Mute watcher CONFIRMED the bot muted after clicking — ${trigger}; ${sameElement} [${input.after.reading.evidence}]`,
+    };
+  }
+
+  if (input.after && input.after.reading.kind === 'unmuted') {
+    const ineffective = input.priorIneffectiveClicks + 1;
+    const key = input.before.candidate.probe.elementKey;
+    // CANDIDATE DISCOVERY. A click landed and the state did not move, so this
+    // element is not the mute toggle in this state. Rejecting it converts the
+    // futile re-click loop (twice in 30s on 2026-09-02, and it would have run
+    // for the whole call) into a fall-through to the NEXT candidate.
+    return {
+      verdict: 'still-unmuted',
+      warn: true,
+      rejectKey: key || null,
+      message:
+        `Mute watcher clicked mute and the control STILL reads unmuted — the click had NO EFFECT ` +
+        `(${ineffective} ineffective click(s) so far) — ${trigger}; ${sameElement} [${input.after.reading.evidence}]; ` +
+        (key
+          ? `this element is now REJECTED for the session (key=${key}) — the next pass falls through to the next candidate; `
+          : `it could NOT be rejected (the probe produced no element identity), so the next pass may pick it again; `) +
+        `post-click probe [${input.afterDetail}]`,
+    };
+  }
+
+  // UNREADABLE. Two distinct causes, and a reader needs to know which:
+  //   - `after` is null: the clicked element was ABSENT from the re-probe (or
+  //     the verification itself failed, which afterDetail spells out).
+  //   - `after` is present but reads neither muted nor unmuted: the element WAS
+  //     found and says nothing useful.
+  // Both are honest unknowns. Neither may retire a candidate — the clicked
+  // element might well be the only one that works.
+  const why = input.after
+    ? `the clicked element re-read as "${input.after.reading.kind}" [${input.after.reading.evidence}]`
+    : `the clicked element (key=${clickedKey}) was NOT FOUND in the post-click probe`;
+  return {
+    verdict: 'unreadable',
+    warn: true,
+    rejectKey: null,
+    message:
+      `Mute watcher clicked mute but could NOT verify the result — ${why}, ` +
+      `so whether the bot is muted is UNKNOWN and the candidate is NOT rejected — ${trigger}; ` +
+      `post-click probe [${input.afterDetail}]`,
+  };
+}
+
+/** Retirement bookkeeping. Pure data, stepped by stepZoomRetirement. */
+export interface ZoomRetirementState {
+  /** proven-ineffective clicks per element key, since the last reset. */
+  strikes: Record<string, number>;
+  /** keys currently retired from selection. */
+  retired: string[];
+  /** how many times the whole set has been cleared (an absorbing state broken). */
+  resets: number;
+}
+
+export const zoomRetirementInitialState: ZoomRetirementState = { strikes: {}, retired: [], resets: 0 };
+
+export interface ZoomRetirementStep {
+  state: ZoomRetirementState;
+  action: 'none' | 'strike' | 'retire';
+  reason: string;
+}
+
+/**
+ * Default corroboration. TWO proven-ineffective clicks on the SAME element
+ * before it is retired.
+ *
+ * WHY 2 and not 1: retirement is the only irreversible-ish decision in this
+ * file, and a single proven failure can still be a timing artefact that the
+ * settle poll did not outlast (a pod paused long enough for a 4s budget to
+ * expire, a mid-meeting re-render). One flake must not be terminal. WHY not
+ * higher: each strike costs a full watcher cycle (~15s poll + cooldown 30s), so
+ * 3 strikes would leave a genuinely wrong candidate in play for well over a
+ * minute of a call that is often only a few minutes long.
+ */
+export const ZOOM_RETIREMENT_REQUIRED_STRIKES = 2;
+
+/**
+ * Record a PROVEN-ineffective click and decide whether to retire the element.
+ *
+ * Fail-safes, both deliberate and both previously present:
+ *   - an EMPTY key is never recorded and never retired: '' is the ambient
+ *     elementKey, so putting it in the set would match every unidentified
+ *     element and silence the watcher wholesale.
+ *   - only a PROVEN failure reaches here. `unreadable` is an unknown and the
+ *     caller must not call this for it.
+ *
+ * Pure.
+ */
+export function stepZoomRetirement(
+  state: ZoomRetirementState,
+  key: string,
+  requiredStrikes: number = ZOOM_RETIREMENT_REQUIRED_STRIKES,
+): ZoomRetirementStep {
+  if (!key) {
+    return { state, action: 'none', reason: 'no element identity — nothing can be recorded or retired' };
+  }
+  if (state.retired.includes(key)) {
+    return { state, action: 'none', reason: `already retired (key=${key})` };
+  }
+  const strikes = (state.strikes[key] ?? 0) + 1;
+  const next: ZoomRetirementState = { ...state, strikes: { ...state.strikes, [key]: strikes } };
+  if (strikes < requiredStrikes) {
+    return {
+      state: next,
+      action: 'strike',
+      reason: `strike ${strikes}/${requiredStrikes} on key=${key} — NOT retired yet (one proven failure can still be a timing artefact)`,
+    };
+  }
+  return {
+    state: { ...next, retired: [...state.retired, key] },
+    action: 'retire',
+    reason: `strike ${strikes}/${requiredStrikes} on key=${key} — RETIRED for the session; the next pass falls through to the next candidate`,
+  };
+}
+
+/**
+ * Is retirement now an ABSORBING state — i.e. does the DOM still offer a
+ * confidently-readable control, but every such control has been retired?
+ *
+ * "Every readable control retired" must never be terminal. Without this the
+ * watcher logs `N candidate(s) rejected` for the rest of the call with nothing
+ * left to try, which is strictly worse than the re-click loop it replaced.
+ *
+ * Deliberately NOT time-based expiry as well: two mechanisms (corroboration +
+ * this reset) already cover both the single-flake case and the
+ * everything-retired case, and a third tuning knob with its own clock would add
+ * surface without covering a case these two miss.
+ *
+ * Pure.
+ */
+export function zoomRetirementIsAbsorbing(
+  candidates: ZoomMicCandidate[],
+  retired: ReadonlySet<string>,
+): boolean {
+  if (retired.size === 0) return false;
+  let anyConfident = false;
+  for (const candidate of candidates) {
+    const kind = readZoomMicState(candidate.probe).kind;
+    if (kind !== 'muted' && kind !== 'unmuted') continue;
+    anyConfident = true;
+    // A confidently-readable candidate that is NOT retired: still have options.
+    if (!candidate.probe.elementKey || !retired.has(candidate.probe.elementKey)) return false;
+  }
+  return anyConfident;
+}
+
+/** Clear every retirement and every strike, keeping a count of how often. */
+export function resetZoomRetirement(state: ZoomRetirementState): ZoomRetirementState {
+  return { strikes: {}, retired: [], resets: state.resets + 1 };
+}
+
+/**
+ * Try to keep the bot LOOKING muted for the whole call: poll the mic control and
  * re-click mute if it is confidently unmuted (a host-requested unmute, say).
  *
- * This maintains only the VISUAL half. Silence is already guaranteed
- * irrevocably by installOutboundAudioLockInPage, which is why this watcher can
- * afford to be conservative and slow rather than aggressive.
+ * Best-effort, and known to be capable of failing: on 2026-09-02 two clicks
+ * landed (Playwright reported no actionability error) and the control still read
+ * unmuted afterwards. Every click is therefore re-read and reported through
+ * reportZoomMuteClick — a click is never logged as a mute.
+ *
+ * CANDIDATE DISCOVERY is what makes that verification worth having. A click that
+ * provably did not move the state retires that ELEMENT for the rest of the
+ * session, so the next pass falls through to the next candidate. The failure it
+ * fixes was not a missing selector: the element clicked was visible, enabled and
+ * hit-testable, and simply is not a mute toggle in that state. Walking the
+ * candidate list on evidence therefore survives whatever Zoom renames next,
+ * which no amount of selector guessing does.
+ *
+ * This maintains only the VISUAL half. Silence is guaranteed independently by
+ * installOutboundAudioLockInPage, which is why this watcher can afford to be
+ * conservative and slow rather than aggressive.
  *
  * Unref'd and self-clearing on page close, so it can never delay bot shutdown.
  * Never throws. @returns a stop function (idempotent).
@@ -1628,7 +2682,8 @@ export function startZoomMuteWatcher(
   page: Page,
   voiceAgentEnabled: boolean,
   intervalMs = 15_000,
-  config: ZoomMuteWatcherConfig = { confirmations: 2, cooldownMs: 30_000 },
+  config: ZoomMuteWatcherConfig = zoomMuteWatcherDefaultConfig,
+  pollConfig: ZoomMutePollConfig = zoomMutePollDefaults,
 ): () => void {
   if (voiceAgentEnabled) {
     log('[Zoom Web] Mute watcher NOT armed — voice agent must be able to transmit');
@@ -1640,6 +2695,25 @@ export function startZoomMuteWatcher(
   // Consecutive passes that found NO readable candidate. An invisible no-op is
   // the worst outcome for a watcher, so this is logged rather than swallowed.
   let noCandidatePasses = 0;
+  // Clicks that were re-read afterwards and PROVEN not to have muted the bot.
+  // Reported in the warning so a repeat failure reads as a pattern, not as a
+  // fresh surprise each time. With rejection in place this also counts DISTINCT
+  // wrong candidates, since each can only fail once.
+  let ineffectiveClicks = 0;
+  // Candidate-discovery memory. `retirement` holds the strikes and the retired
+  // keys; `rejected` is the Set the selection consults, kept in step with it.
+  //
+  // Retirement is CORROBORATED (two proven failures on the same key) and
+  // REVERSIBLE (cleared wholesale if it ever becomes absorbing). It used to be
+  // one timing-sensitive observation, permanently — which turned a
+  // useless-but-harmless re-click loop into a terminal failure whenever Zoom's
+  // toolbar reflected the mute later than the single re-read.
+  let retirement = zoomRetirementInitialState;
+  const rejected = new Set<string>();
+  const syncRejected = (): void => {
+    rejected.clear();
+    for (const key of retirement.retired) rejected.add(key);
+  };
 
   const stop = (): void => {
     if (stopped) return;
@@ -1660,13 +2734,26 @@ export function startZoomMuteWatcher(
         // watcher finds nothing on every pass and silently never fires.
         await revealZoomFooter(page);
         const candidates = await probeZoomMicCandidates(page, zoomMicToggleSelectors);
-        const selection = selectZoomMicToggle(candidates);
+        // "Every readable control retired" must never be an absorbing state:
+        // without this the watcher would log `N candidate(s) rejected` for the
+        // rest of the call with nothing left to try — strictly worse than the
+        // re-click loop retirement replaced.
+        if (zoomRetirementIsAbsorbing(candidates, rejected)) {
+          const cleared = retirement.retired.length;
+          retirement = resetZoomRetirement(retirement);
+          syncRejected();
+          log(`[Zoom Web] WARNING: Mute watcher had retired EVERY readable mic control (${cleared}) — clearing the retirement set and starting discovery over (reset #${retirement.resets}). Retirement is corroborated and reversible precisely so this is not terminal`);
+        }
+        const selection = selectZoomMicToggle(candidates, rejected);
         if (!selection) {
           noCandidatePasses++;
           // Log the first occurrence, then every 8th pass (~2 min), so a
           // permanently blind watcher is visible without flooding the log.
+          // The rejected count is named: "no readable control" and "every
+          // readable control has been proven wrong" are different situations
+          // and only one of them means the selector list needs work.
           if (noCandidatePasses === 1 || noCandidatePasses % 8 === 0) {
-            log(`[Zoom Web] Mute watcher found no readable mic control (pass ${noCandidatePasses}) — visual re-mute is INACTIVE; track-level silence unaffected [${describeZoomMicCandidates(candidates)}]`);
+            log(`[Zoom Web] Mute watcher found no selectable mic control (pass ${noCandidatePasses}, ${rejected.size} candidate(s) rejected so far) — visual re-mute is INACTIVE; track-level silence unaffected [${describeZoomMicCandidates(candidates, rejected)}]`);
           }
         } else if (noCandidatePasses > 0) {
           log(`[Zoom Web] Mute watcher recovered a readable mic control after ${noCandidatePasses} blind pass(es)`);
@@ -1679,7 +2766,69 @@ export function startZoomMuteWatcher(
             .locator(selection.candidate.selector)
             .nth(selection.candidate.index)
             .click({ timeout: 3000 });
-          log(`[Zoom Web] Mute watcher re-muted the bot — ${step.reason} [${selection.reading.evidence}]`);
+          // VERIFY. The click is not the outcome: re-reveal the footer (the
+          // click may have moved focus or the toolbar may have auto-hidden
+          // again) and re-probe before saying anything about the mute state.
+          //
+          // Its OWN try/catch, so a click is reported even when the
+          // verification itself dies (a navigation destroys the execution
+          // context). Falling through to the outer catch would log a generic
+          // "pass failed" and leave the click entirely unaccounted for — which
+          // is the same invisibility this change exists to remove.
+          let poll: ZoomMutePollResult | null = null;
+          let verifyError: string | null = null;
+          try {
+            // POLL, do not sample once. Every probe re-reveals the footer first
+            // (the click can move focus and the toolbar auto-hides), and the
+            // reading is always taken from the CLICKED element by key.
+            poll = await pollZoomMuteSettled(
+              async () => {
+                await revealZoomFooter(page);
+                return probeZoomMicCandidates(page, zoomMicToggleSelectors);
+              },
+              selection.candidate.probe.elementKey,
+              pollConfig,
+              () => Date.now(),
+              (ms) => page.waitForTimeout(ms),
+            );
+          } catch (ve: any) {
+            verifyError = ve?.message ?? String(ve);
+          }
+          const settled = poll && poll.settledAtMs !== null ? ` settled after ${poll.settledAtMs}ms in ${poll.polls} poll(s)` : '';
+          const timing = poll
+            ? `polls=${poll.polls} budget=${pollConfig.deadlineMs}ms${poll.timedOut ? ' TIMED OUT' : settled}`
+            : 'poll did not run';
+          const report = reportZoomMuteClick({
+            reason: `${step.reason}; ${timing}`,
+            before: selection,
+            // PINNED TO THE CLICKED ELEMENT, never a fresh selection: see
+            // readZoomMicCandidateByKey for the false-muted / false-retirement
+            // failures a fresh selectZoomMicToggle produced here.
+            //
+            // `rejected` is deliberately NOT threaded here, and that asymmetry
+            // with describeZoomMicCandidates below is intentional: this read is
+            // keyed to ONE element, so filtering the set it is drawn from cannot
+            // change the answer. Threading it would be dead weight that implied
+            // the read is a selection.
+            after: verifyError || !poll ? null : poll.after,
+            afterDetail: verifyError
+              ? `post-click verification failed: ${verifyError}`
+              : describeZoomMicCandidates(poll ? poll.lastCandidates : [], rejected),
+            priorIneffectiveClicks: ineffectiveClicks,
+          });
+          // Only a PROVEN-ineffective click counts; an unverifiable one is
+          // unknown, not a failure, and must not be tallied as one.
+          if (report.verdict === 'still-unmuted') ineffectiveClicks++;
+          log(report.warn ? `[Zoom Web] WARNING: ${report.message}` : `[Zoom Web] ${report.message}`);
+          // CORROBORATION. A proven failure is a STRIKE; only the second strike
+          // on the same element retires it. One proven failure can still be a
+          // timing artefact the settle poll did not outlast.
+          if (report.rejectKey) {
+            const rs = stepZoomRetirement(retirement, report.rejectKey);
+            retirement = rs.state;
+            syncRejected();
+            log(`[Zoom Web] ${rs.action === 'retire' ? 'WARNING: ' : ''}Mute watcher candidate discovery — ${rs.reason}`);
+          }
         }
       } catch (e: any) {
         log(`[Zoom Web] Mute watcher pass failed: ${e?.message ?? e}`);

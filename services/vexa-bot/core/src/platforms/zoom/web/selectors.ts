@@ -262,3 +262,59 @@ export const zoomMicNonToggleSubstrings: string[] = ['join audio', 'connect audi
 // reads as muted and the bot never mutes itself. Proven by mutation M3.
 export const zoomMicUnmutedClassHints: string[] = ['svgaudiounmuted', 'audio-unmuted', 'is-unmuted', 'mic-unmuted', 'unmuted'];
 export const zoomMicMutedClassHints: string[] = ['svgaudiomuted', 'audio-muted', 'is-muted', 'mic-muted', 'muted'];
+
+// ---- Structural discriminators for the mic control (added 2026-09-02) ----
+// WHY these exist: on 2026-09-02 the in-meeting control gave NO mute vocabulary
+// on aria-label and no aria-pressed, so only the rank-3 class-hint substring
+// fired — a PRESENCE TEST over substrings, read as if it were state. Two clicks
+// landed on that element (visible, enabled, hit-testable, no interception, no
+// Playwright actionability error) and the reading did not move on the next 15s
+// poll. So the element is real and clickable and simply was not a mute toggle in
+// that state. These give the reader signals that do not depend on Zoom keeping
+// its aria vocabulary.
+
+// The label node under a footer button. Zoom renders the state WORD here, which
+// is what a human in the room actually reads off the toolbar — and unlike
+// aria-label it was NOT missing from the failed run's DOM.
+export const zoomMicLabelNodeSelector = '.footer-button-base__button-label, [class*="button-label" i]';
+
+// Text vocabulary that identifies the control as the UNJOINED audio button
+// rather than a mute toggle. Substring match on the normalised label/text.
+export const zoomMicNotJoinedTextSubstrings: string[] = ['join audio', 'connect audio', 'connect to audio'];
+
+// Split-button caret. Zoom's mic control grows an audio-options chevron beside
+// the toggle ONLY once audio is joined, so a caret in the same container is a
+// structural marker of the joined state and its absence marks the unjoined one.
+//
+// UNVERIFIED LIVE — this list is a GUESS. Nothing in readZoomMicState GATES on
+// it: it is harvested and reported so one live run can establish whether these
+// selectors match the real caret. Promoting it to a discriminator before that
+// would risk exactly the failure M30 fixed — a watcher made permanently blind by
+// a veto keyed on a selector that never matches.
+export const zoomMicCaretSelectors: string[] = [
+  '[class*="caret" i]',
+  '[class*="chevron" i]',
+  '[class*="arrow" i]',
+  '[class*="dropdown" i]',
+  '[aria-label*="audio option" i]',
+  '[aria-label*="audio setting" i]',
+  '[aria-label*="mute option" i]',
+];
+
+// FULL icon class-name whitelists, matched token-by-token against the class
+// attributes of VISIBLY RENDERED descendants. This is the precise tier that
+// ranks ABOVE the legacy substring hints above.
+//
+// WHY a whitelist AND the substrings, rather than replacing them: an exact
+// whitelist is precise but goes blind the moment Zoom renames a glyph, and the
+// bare-word substring entries in zoomMicUnmutedClassHints exist specifically to
+// survive that rename (see the note there, and mutation M3). So the whitelist
+// runs FIRST and reports an exact token as its evidence; the substrings stay as
+// the lower-confidence fallback, and the evidence string says which tier fired.
+// Tokens are compared after normaliseZoomMicText, so list them lowercased.
+export const zoomMicIconMutedClasses: string[] = ['svgaudiomuted', 'svgmicmuted', 'svgaudiomutedsmall'];
+export const zoomMicIconUnmutedClasses: string[] = ['svgaudiounmuted', 'svgmicunmuted', 'svgaudiounmutedsmall'];
+// A headset/join-audio-shaped glyph belongs to the UNJOINED control, which is
+// not a mute toggle at all — distinguishing it from a joined mic is the whole
+// point of matching full names instead of substrings.
+export const zoomMicIconNotJoinedClasses: string[] = ['svgjoinaudio', 'svgheadset', 'svgaudioheadset', 'svgphonecall'];
