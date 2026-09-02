@@ -28,6 +28,7 @@ import {
   zoomMicIconMutedClasses,
   zoomMicIconUnmutedClasses,
   zoomMicIconNotJoinedClasses,
+  zoomAudioOptionsExactLabels,
 } from './selectors';
 
 /**
@@ -411,10 +412,13 @@ export interface ZoomMicProbe {
    * Whether a split-button caret was found in the same container — a structural
    * marker of "audio joined". null when it was not probed.
    *
-   * REPORTED, NEVER GATED ON: zoomMicCaretSelectors is an unverified guess, and
-   * a veto keyed on a selector that never matches would make the watcher
-   * permanently blind. It is in the evidence and the digest so one live run can
-   * settle it.
+   * REPORTED IN EVERY EVIDENCE STRING, and — since the 2026-09-02 live run
+   * settled that zoomMicCaretSelectors do match the real caret — GATED ON IN
+   * EXACTLY ONE PLACE: isZoomAudioOptionsControl requires caret PRESENCE as one
+   * of five conditions. Nothing reads caret ABSENCE, and nothing must: a veto
+   * keyed on absence goes permanently blind the moment Zoom renames the caret
+   * (the M30 failure). It never decides a muted/unmuted reading in either
+   * direction.
    */
   caretNearby: boolean | null;
 }
@@ -454,10 +458,110 @@ export function makeZoomMicProbe(p: Partial<ZoomMicProbe> = {}): ZoomMicProbe {
 export type ZoomMicReading =
   | { kind: 'muted'; evidence: string }
   | { kind: 'unmuted'; evidence: string }
+  /**
+   * The WEAKEST tier (a class-hint substring, hidden descendants included)
+   * pointed at `unmuted`, and nothing corroborated it. NON-ACTIONABLE.
+   *
+   * Added 2026-09-02, because this reading was observed WRONG in production: on
+   * a real Zoom DOM the class hint `svgaudiounmuted` sat on an element whose
+   * aria-label was "audio" and whose visible label was "Audio", the reader
+   * called it `unmuted` for a whole meeting, and the bot was in fact MUTED (the
+   * participant list showed it muted; the container-level capture check
+   * agreed). `unmuted` is the direction that TRIGGERS A CLICK, so the weakest
+   * evidence must not be able to produce it.
+   *
+   * Distinct from `unknown` on purpose: the direction the weak evidence pointed
+   * is diagnostically useful in the log, and a distinct kind lets a test assert
+   * the DISPATCH rather than the presence of a phrase in an evidence string.
+   * A class-hint `muted` still stands as `muted` — that is the safe direction,
+   * and it merely declines to act.
+   */
+  | { kind: 'unmuted-unconfirmed'; evidence: string }
   /** a DIFFERENT control that merely contains mute vocabulary ("Mute All"). */
   | { kind: 'not-mic-control'; evidence: string }
   | { kind: 'not-mute-toggle'; evidence: string }
   | { kind: 'unknown'; evidence: string };
+
+/**
+ * The class-name tokens of an element's VISIBLY RENDERED parts, plus its own
+ * class attribute. Shared by the precise icon-whitelist tier and by
+ * isZoomAudioOptionsControl, so the two cannot drift apart — the guard's whole
+ * safety argument is that it defers to exactly the tokens that tier reads.
+ */
+function zoomVisibleClassTokens(probe: ZoomMicProbe): Set<string> {
+  return new Set(
+    probe.visibleDescendantClassNames
+      .concat(probe.className ? [probe.className] : [])
+      .flatMap((c) => normaliseZoomMicText(c).split(' '))
+      .filter((t) => t.length > 0),
+  );
+}
+
+/**
+ * Is this candidate Zoom's audio OPTIONS control (the split-button half /
+ * dropdown beside the mute toggle) rather than a mute toggle?
+ *
+ * WHY — the 2026-09-02 live failure. The clicked element carried
+ * aria-label="audio", visible label "Audio", a caret in its own container, and
+ * a sibling button labelled "More audio controls". It is visible, enabled and
+ * hit-testable, so nothing in the click path objected; it simply is not a mute
+ * toggle, and every ~30s the watcher clicked it — plausibly opening and closing
+ * an audio-options menu — for the whole meeting.
+ *
+ * FIVE conditions, and every one of them is load-bearing:
+ *
+ *  1. A caret in the same container. Live-verified 2026-09-02. PRESENCE only:
+ *     a rule keyed on caret ABSENCE is the M30 blindness failure, since a
+ *     selector that stops matching would then veto every reading. Keyed on
+ *     presence, a stale selector stops REJECTING, which is a safe degradation.
+ *  2. At least one of aria-label / visible text is positively a generic audio
+ *     label, by WHOLE-LABEL EQUALITY. Never a substring: "audio" occurs inside
+ *     "unmute my audio" and "mute audio", which are real state labels. Without
+ *     this, every unlabelled caret-adjacent button would be rejected.
+ *  3. NEITHER field says anything else. An empty field claims nothing and is
+ *     allowed (the live "More audio controls" button rendered no visible text),
+ *     but a field carrying any other words — mute vocabulary above all — is a
+ *     signal this guard has no business overriding.
+ *  4. No aria-pressed="true".
+ *  5. No whitelisted state glyph among the VISIBLY RENDERED class tokens.
+ *
+ * Conditions 3–5 are what make this guard's POSITION in readZoomMicState
+ * irrelevant: it cannot reach a different verdict than the tiers it precedes,
+ * because it refuses to fire whenever any of them could speak. That is the same
+ * technique the icon whitelist uses (both lookups before either return) and it
+ * kills the whole "someone reorders the branches" mutation class rather than
+ * pinning one order. It deliberately does NOT defer to the class-hint substring
+ * tier: that tier is what lied here, and deferring to it would reinstate the
+ * bug.
+ *
+ * Pure.
+ */
+export function isZoomAudioOptionsControl(probe: ZoomMicProbe): boolean {
+  // 1. Structural corroboration. `null` means "not probed" and is not a yes.
+  if (probe.caretNearby !== true) return false;
+
+  const label = normaliseZoomMicText(probe.ariaLabel);
+  const visibleText = normaliseZoomMicText(probe.labelText) || normaliseZoomMicText(probe.text);
+  const generic = (v: string): boolean => zoomAudioOptionsExactLabels.includes(v);
+
+  // 2. + 3. Whole-label equality; at least one field positive, neither field
+  // saying anything else.
+  if (label !== '' && !generic(label)) return false;
+  if (visibleText !== '' && !generic(visibleText)) return false;
+  if (label === '' && visibleText === '') return false;
+
+  // 4. A real ARIA state attribute outranks this guess.
+  if (probe.ariaPressed === 'true') return false;
+
+  // 5. Any precisely-identified glyph outranks it too — including the
+  // unjoined-control glyph, whose own branch gives a more specific evidence
+  // string for the same non-actionable verdict.
+  const visibleTokens = zoomVisibleClassTokens(probe);
+  const precise = [...zoomMicIconMutedClasses, ...zoomMicIconUnmutedClasses, ...zoomMicIconNotJoinedClasses];
+  if (precise.some((c) => visibleTokens.has(c))) return false;
+
+  return true;
+}
 
 /**
  * Interpret one candidate control's attributes into a mic reading.
@@ -470,6 +574,12 @@ export type ZoomMicReading =
  *   1. NON-MIC guard over aria-label AND visible text ("Mute All",
  *      "Ask to Unmute"). Returns immediately: clicking one of these would mute
  *      every human in the meeting.
+ *   1b. AUDIO-OPTIONS guard, via isZoomAudioOptionsControl — the split-button
+ *      half / dropdown beside the toggle, which the watcher clicked every ~30s
+ *      for the whole 2026-09-02 meeting. It runs here, before every state tier,
+ *      but it is written so its position cannot change any verdict: it refuses
+ *      to fire whenever aria-label, visible text, aria-pressed or a whitelisted
+ *      glyph could speak. See that function for the five conditions.
  *   2. aria-label vocabulary, via readZoomMuteVocabulary (state words before
  *      action words). First because aria-label is an explicit accessibility
  *      contract and is the one signal live-confirmed on this control
@@ -500,6 +610,11 @@ export type ZoomMicReading =
  *      them trades a false positive for permanent blindness. The evidence string
  *      names which tier fired, so a substring-only reading is identifiable in
  *      the log as the weak reading it is.
+ *      ASYMMETRIC SINCE 2026-09-02: this tier may still conclude `muted`, but it
+ *      may NOT conclude `unmuted` — it returns `unmuted-unconfirmed`, which is
+ *      non-actionable. `unmuted` is the direction that triggers a click, and
+ *      this tier's `unmuted` has now been observed WRONG against a bot that was
+ *      really muted. A wrong `muted` merely declines to act.
  *   7. Only THEN is a label classified as known-non-state vocabulary ("audio",
  *      "join audio"). This check ranks LAST on purpose: it used to return early,
  *      which meant the live aria-label="audio" element was written off before
@@ -534,6 +649,20 @@ export function readZoomMicState(probe: ZoomMicProbe): ZoomMicReading {
     if (nonMic) {
       return { kind: 'not-mic-control', evidence: `${field} "${value}" matches non-mic control "${nonMic}"${caret}` };
     }
+  }
+
+  // Zoom's audio OPTIONS control — a caret-bearing element whose only label is
+  // a generic audio word, with no state signal of any kind on it. Positively
+  // identified rather than left to fall through as "unrecognised", because
+  // naming it is what tells a reader of the log that the DOM offered no mute
+  // toggle at all — as opposed to offering one the reader could not parse.
+  if (isZoomAudioOptionsControl(probe)) {
+    return {
+      kind: 'not-mute-toggle',
+      evidence:
+        `AUDIO OPTIONS control — generic label (aria-label "${label}", ${visibleTextSource} "${visibleText}") ` +
+        `beside a split-button caret, with no aria-pressed and no state glyph: not a mute toggle${caret}`,
+    };
   }
 
   // aria-label, through the shared polarity-correct reader. A label of "Muted"
@@ -575,12 +704,9 @@ export function readZoomMicState(probe: ZoomMicProbe): ZoomMicReading {
   // matched against a whitelist. Unmuted before muted for the same reason the
   // substring tier is ordered that way, and 'not joined' before both because a
   // headset glyph is not a mic state at all.
-  const visibleTokens = new Set(
-    probe.visibleDescendantClassNames
-      .concat(probe.className ? [probe.className] : [])
-      .flatMap((c) => normaliseZoomMicText(c).split(' '))
-      .filter((t) => t.length > 0),
-  );
+  // SHARED with isZoomAudioOptionsControl, so the guard's "I defer to any
+  // precisely-identified glyph" promise cannot drift from what this tier reads.
+  const visibleTokens = zoomVisibleClassTokens(probe);
   const notJoinedIcon = zoomMicIconNotJoinedClasses.find((c) => visibleTokens.has(c));
   if (notJoinedIcon) {
     return {
@@ -638,7 +764,27 @@ export function readZoomMicState(probe: ZoomMicProbe): ZoomMicReading {
     };
   }
   if (unmutedHint) {
-    return { kind: 'unmuted', evidence: `class hint "${unmutedHint}"${caret}` };
+    // DEMOTED 2026-09-02, and this is the whole point of that change. This tier
+    // is a PRESENCE TEST over substrings, run against hidden descendants as
+    // well as visible ones — and `unmuted` is the one reading that causes an
+    // ACTION. On 2026-09-02 it produced `unmuted` off `svgaudiounmuted` for an
+    // entire meeting while the bot was really muted, and the watcher clicked
+    // the wrong control four times as a direct result.
+    //
+    // WHY DEMOTION AND NOT CORROBORATION: there is nothing left to corroborate
+    // with. Mute vocabulary on aria-label or on the rendered label would have
+    // returned at tier 2 or 3; a whitelisted visible glyph at tier 5;
+    // aria-pressed="false" is deliberately not read as unmuted (never observed
+    // on this control, polarity unconfirmed). A "require corroboration" branch
+    // here would be unsatisfiable in practice — dead code shaped like a check.
+    //
+    // The `muted` direction below is NOT demoted: it merely declines to act.
+    return {
+      kind: 'unmuted-unconfirmed',
+      evidence:
+        `class hint "${unmutedHint}" — the WEAKEST tier (substring presence, hidden descendants included) ` +
+        `cannot establish unmuted, so this is NON-ACTIONABLE and no click follows${caret}`,
+    };
   }
   if (mutedHint) {
     return { kind: 'muted', evidence: `class hint "${mutedHint}"${caret}` };
@@ -980,7 +1126,7 @@ export async function ensureZoomMutedInMeeting(page: Page): Promise<ZoomMuteOutc
       if (!selection) {
         // Log EVERY candidate seen. The 2026-09-01 failure logged only one
         // label and repeated it 6 times, which hid that other matches existed.
-        log(`[Zoom Web] No readable mic toggle — retry ${attempt + 1}/6 [${lastDetail}]`);
+        log(`[Zoom Web] No ACTIONABLE mic toggle — retry ${attempt + 1}/6 (an unreadable or non-toggle control is deliberately never clicked) [${lastDetail}]`);
       } else if (selection.reading.kind === 'muted') {
         log(
           clickedMute
@@ -1016,7 +1162,12 @@ export async function ensureZoomMutedInMeeting(page: Page): Promise<ZoomMuteOutc
     await page.waitForTimeout(5000);
   }
 
-  log(`[Zoom Web] WARNING: could not confirm in-meeting mute after retries — the participant list may show this bot as unmuted. The track-level seal is unaffected by this; read the outbound-audio guard heartbeat for its actual state. Last probe: [${lastDetail}]`);
+  // WHAT THIS LINE MAY AND MAY NOT CLAIM (rewritten 2026-09-02). It used to say
+  // "the participant list may show this bot as unmuted". It cannot: on
+  // 2026-09-02 this exact path fired for a whole meeting while the participant
+  // list showed the bot MUTED (user-confirmed) and the container-level capture
+  // check agreed. An unreadable DOM is a fact about the DOM, not about the room.
+  log(`[Zoom Web] WARNING: could not read the in-meeting mute STATE from the DOM after retries — this says the DOM was unreadable, NOT that the bot appears unmuted (on 2026-09-02 this fired for a whole meeting while the participant list showed the bot MUTED). The authority on APPEARANCE is the participant list; the authority on SILENCE is the outbound-audio guard heartbeat, which this does not affect. Last probe: [${lastDetail}]`);
   return { muted: false, clicked: clickedMute, attempts: 6, detail: lastDetail };
 }
 
@@ -2753,7 +2904,13 @@ export function startZoomMuteWatcher(
           // readable control has been proven wrong" are different situations
           // and only one of them means the selector list needs work.
           if (noCandidatePasses === 1 || noCandidatePasses % 8 === 0) {
-            log(`[Zoom Web] Mute watcher found no selectable mic control (pass ${noCandidatePasses}, ${rejected.size} candidate(s) rejected so far) — visual re-mute is INACTIVE; track-level silence unaffected [${describeZoomMicCandidates(candidates, rejected)}]`);
+            // NOT a warning, and deliberately not phrased as one. Since
+            // 2026-09-02 this is the EXPECTED steady state on a DOM that only
+            // exposes the audio-options control: nothing is actionable, so
+            // nothing is clicked, which is the correct behaviour rather than a
+            // fault. It says nothing about how the bot APPEARS — that is the
+            // participant list's business (see the rewritten layer-1 warning).
+            log(`[Zoom Web] Mute watcher found no ACTIONABLE mute control (pass ${noCandidatePasses}, ${rejected.size} candidate(s) retired so far) — nothing was clicked, which is correct: an unreadable or non-toggle control must never be clicked. Visual re-mute is INACTIVE and this is NOT evidence the bot appears unmuted; track-level silence unaffected [${describeZoomMicCandidates(candidates, rejected)}]`);
           }
         } else if (noCandidatePasses > 0) {
           log(`[Zoom Web] Mute watcher recovered a readable mic control after ${noCandidatePasses} blind pass(es)`);

@@ -711,8 +711,16 @@ import {
   OutboundAudioLockResult,
   OutboundAudioSweepResult,
   ZoomMicSelection,
+  isZoomAudioOptionsControl,
 } from './prepare';
-import { zoomMicToggleSelectors, zoomNonMicLabelSubstrings } from './selectors';
+import {
+  zoomMicToggleSelectors,
+  zoomNonMicLabelSubstrings,
+  zoomAudioOptionsExactLabels,
+  zoomMicUnmutedClassHints,
+  zoomMicIconUnmutedClasses,
+  zoomMicIconMutedClasses,
+} from './selectors';
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -794,10 +802,16 @@ console.log('\n=== LAYER 1: class-hint fallback (unmuted-before-muted trap) ==='
 // 8. Every unmuted hint contains the substring 'muted' ('svgaudiounmuted', and
 //    the bare-word 'unmuted' fallback). Checking the muted list first inverts
 //    the reading and the bot never mutes itself. Load-bearing per mutation M3.
+//
+//    UPDATED 2026-09-02 (W11): the DIRECTION is still what this pins, but the
+//    tier no longer produces the actionable `unmuted` — it produces
+//    `unmuted-unconfirmed`. M3 is still killed: swapping the two hint lists
+//    makes this read `muted`, which is a different kind, so this assertion goes
+//    red exactly as before.
 assertEqual(
   readZoomMicState(probe({ ariaLabel: null, descendantClassNames: ['zm-icon SvgAudioUnmuted'] })).kind,
-  'unmuted',
-  'icon class "SvgAudioUnmuted" => unmuted (NOT muted — it contains "muted")',
+  'unmuted-unconfirmed',
+  'icon class "SvgAudioUnmuted" => unmuted-unconfirmed (NOT muted — it contains "muted")',
 );
 assertEqual(
   readZoomMicState(probe({ ariaLabel: null, descendantClassNames: ['zm-icon SvgAudioMuted'] })).kind,
@@ -809,11 +823,12 @@ assertEqual(
   'muted',
   'button class "is-muted" => muted',
 );
-// 8b. The bare-word fallback: an unseen future Zoom class name still resolves.
+// 8b. The bare-word fallback: an unseen future Zoom class name still resolves —
+//     to a DIRECTION that is reported, not to a click.
 assertEqual(
   readZoomMicState(probe({ descendantClassNames: ['zm-btn__icon--unmuted-state'] })).kind,
-  'unmuted',
-  'unseen class "...--unmuted-state" => unmuted via the bare-word fallback',
+  'unmuted-unconfirmed',
+  'unseen class "...--unmuted-state" => unmuted-unconfirmed via the bare-word fallback',
 );
 assertEqual(
   readZoomMicState(probe({ descendantClassNames: ['zm-btn__icon--muted-state'] })).kind,
@@ -843,10 +858,20 @@ assertEqual(
   'muted',
   'LIVE SHAPE aria-label="audio" + muted icon class => muted',
 );
+// UPDATED 2026-09-02 (W11). This case is EXACTLY the live failure, and it is no
+// longer clickable: a HIDDEN-inclusive class-hint substring is the weakest
+// evidence there is and it produced this reading against a bot that was really
+// muted. The actionable version of the same shape needs the glyph to be
+// RENDERED (the case immediately below).
 assertEqual(
   readZoomMicState(probe({ ariaLabel: 'audio', descendantClassNames: ['SvgAudioUnmuted'] })).kind,
+  'unmuted-unconfirmed',
+  'LIVE SHAPE aria-label="audio" + unmuted class HINT => unmuted-unconfirmed (NOT clickable)',
+);
+assertEqual(
+  readZoomMicState(probe({ ariaLabel: 'audio', visibleDescendantClassNames: ['SvgAudioUnmuted'] })).kind,
   'unmuted',
-  'LIVE SHAPE aria-label="audio" + unmuted icon class => unmuted (now clickable)',
+  'LIVE SHAPE aria-label="audio" + a RENDERED unmuted glyph => unmuted (clickable, on the precise tier)',
 );
 // ...but a weak/absent signal still must NOT make it clickable.
 assertEqual(
@@ -1963,9 +1988,22 @@ console.log('\n=== W4: source guards for the watcher driver (not unit-testable) 
   );
   assertEqual(fn.includes('noCandidatePasses'), true, '[M30] a no-candidate pass is tracked, not swallowed');
   assertEqual(
-    fn.includes('visual re-mute is INACTIVE'),
+    fn.includes('Visual re-mute is INACTIVE'),
     true,
     '[M30] and it is LOGGED — an invisible no-op is the worst outcome for a watcher',
+  );
+  // W11: the same line must NOT overstate. "No actionable control" is a fact
+  // about the DOM; the bot's appearance is the participant list's business, and
+  // on 2026-09-02 the two disagreed for a whole meeting.
+  assertEqual(
+    fn.includes('NOT evidence the bot appears unmuted'),
+    true,
+    '[W11] and it explicitly declines to claim the bot appears unmuted',
+  );
+  assertEqual(
+    fn.includes('no ACTIONABLE mute control'),
+    true,
+    '[W11] and says "no ACTIONABLE control", not "no control" — the live DOM had four',
   );
 }
 
@@ -2414,6 +2452,19 @@ const liveProbeFields = {
   elementKey: 'div:2/div:0/button:0',
 };
 
+// W11: since the class-hint `unmuted` was demoted, `liveProbeFields` no longer
+// yields an ACTIONABLE reading — which is the fix, and is asserted directly in
+// the W11 section below. The candidate-discovery mechanism tests still need a
+// first candidate the watcher would really click, so they use this variant: the
+// same element with its unmuted glyph actually RENDERED, which reads `unmuted`
+// on the precise whitelist tier. Keeping the two apart is deliberate — folding
+// them together would have quietly turned every M59/M60 assertion into a test
+// of a state the producer no longer emits.
+const clickableProbeFields = {
+  ...liveProbeFields,
+  visibleDescendantClassNames: ['SvgAudioUnmuted'],
+};
+
 // 71. [M59] Two entries in zoomMicToggleSelectors match the SAME button, so a
 //     rejection keyed on `selector[index]` would leave the identical element
 //     selectable under the next selector name and the loop would re-click it
@@ -2421,8 +2472,8 @@ const liveProbeFields = {
 //     this is the assertion that fails if it goes back to a selector key.
 {
   const sameElementTwice: ZoomMicCandidate[] = [
-    { selector: 'button.join-audio-container__btn', index: 0, probe: probe(liveProbeFields) },
-    { selector: 'button[class*="join-audio-container" i]', index: 0, probe: probe(liveProbeFields) },
+    { selector: 'button.join-audio-container__btn', index: 0, probe: probe(clickableProbeFields) },
+    { selector: 'button[class*="join-audio-container" i]', index: 0, probe: probe(clickableProbeFields) },
   ];
   const first = selectZoomMicToggle(sameElementTwice);
   assertEqual(first !== null && first.candidate.selector, 'button.join-audio-container__btn', '[M59] with nothing rejected the first selector wins');
@@ -2440,7 +2491,7 @@ const liveProbeFields = {
 //     rejected. Without this, "rejection" could just be "stop working".
 {
   const twoElements: ZoomMicCandidate[] = [
-    { selector: 'button.join-audio-container__btn', index: 0, probe: probe(liveProbeFields) },
+    { selector: 'button.join-audio-container__btn', index: 0, probe: probe(clickableProbeFields) },
     {
       selector: 'footer button[aria-label*="mute" i]',
       index: 1,
@@ -2625,8 +2676,12 @@ console.log('\n=== W8: structural discriminators — icon whitelist over VISIBLE
 //     still read, at the lower confidence the evidence declares.
 {
   const r = readZoomMicState(probe({ descendantClassNames: ['SvgSomethingNewlyRenamedUnmuted'] }));
-  assertEqual(r.kind, 'unmuted', '[M72] a renamed glyph still reads via the substring fallback');
+  assertEqual(r.kind, 'unmuted-unconfirmed', '[M72] a renamed glyph still reads a DIRECTION via the substring fallback');
   assertEqual(r.evidence.includes('class hint'), true, '[M72] and the evidence marks it as the WEAK tier');
+  // The muted direction is NOT demoted — it only ever declines to act, so the
+  // rename resilience M72 exists to protect is fully intact there.
+  const m = readZoomMicState(probe({ descendantClassNames: ['SvgSomethingNewlyRenamedMuted'] }));
+  assertEqual(m.kind, 'muted', '[M72] and a renamed MUTED glyph still reads muted — the safe direction keeps full strength');
 }
 
 console.log('\n=== W8: structural discriminators — the caret is REPORTED, never gated ===');
@@ -3294,7 +3349,11 @@ const clickReport = (after: ZoomMicSelection | null, afterDetail = 'd') =>
 //      and every working click would report "unreadable". The key excludes both
 //      for exactly this reason; this pins that it still holds.
 {
-  const before = candA({ ariaLabel: 'audio', descendantClassNames: ['SvgAudioUnmuted'] });
+  // W11: the before-state uses a RENDERED glyph, so it reads actionable
+  // `unmuted` on the precise tier. A hidden class hint would now read
+  // `unmuted-unconfirmed` and could never have triggered the click this test is
+  // about — the fixture has to be a state the watcher would really act on.
+  const before = candA({ ariaLabel: 'audio', visibleDescendantClassNames: ['SvgAudioUnmuted'] });
   const afterSameElement = candA({ ariaLabel: 'Unmute', descendantClassNames: ['SvgAudioMuted'] });
   assertEqual(before.probe.elementKey, afterSameElement.probe.elementKey, '[M93] the key survives a class AND aria-label change');
   assertEqual(readZoomMicState(before.probe).kind, 'unmuted', '[M93] FIXTURE: the before-state really does read unmuted');
@@ -3514,11 +3573,15 @@ console.log('\n=== W15: contradicting state glyphs resolve to MUTED, and the tie
 
   // THE M3 TRAP, asserted directly: an unmuted-only control must NOT be read as
   // a conflict just because its token contains the substring "muted".
+  // The CONTROLs assert the non-conflict direction. They now expect
+  // `unmuted-unconfirmed` (W11 demoted the actionable reading), which is still
+  // a distinct kind from the `muted` a blob-level conflict test would produce —
+  // so the M3 trap remains caught.
   const unmutedOnly = readZoomMicState(probe({ descendantClassNames: ['SvgAudioUnmuted'] }));
-  assertEqual(unmutedOnly.kind, 'unmuted', '[M123] CONTROL: "svgaudiounmuted" alone is NOT a conflict (it merely contains "muted")');
+  assertEqual(unmutedOnly.kind, 'unmuted-unconfirmed', '[M123] CONTROL: "svgaudiounmuted" alone is NOT a conflict (it merely contains "muted")');
   assertEqual(unmutedOnly.evidence.includes('CONFLICTING'), false, '[M123] CONTROL: and is not reported as one');
   const bareUnmuted = readZoomMicState(probe({ descendantClassNames: ['something--unmuted-state'] }));
-  assertEqual(bareUnmuted.kind, 'unmuted', '[M123] CONTROL: the bare-word fallback still survives a rename');
+  assertEqual(bareUnmuted.kind, 'unmuted-unconfirmed', '[M123] CONTROL: the bare-word fallback still survives a rename');
   assertEqual(bareUnmuted.evidence.includes('CONFLICTING'), false, '[M123] CONTROL: and is not a conflict either');
 }
 
@@ -4273,6 +4336,343 @@ async function runAsyncTests(): Promise<void> {
     else delete g.navigator;
   }
 }
+
+console.log('\n=== W11: the 2026-09-02 live digest — a MUTED bot that read "unmuted" ===');
+
+/**
+ * THE PRODUCER'S OWN OUTPUT, transcribed from the live run.
+ *
+ * Container: image zoom-bot:v0.1.14, real Zoom meeting, 2026-09-02 11:06–11:10.
+ * The meeting SUCCEEDED and the user visually confirmed the participant list
+ * showed the bot as MUTED. Container-side (`bot mic VERIFIED muted at the
+ * capture level (source=bot_mic)`) and page-side (`blockedUnmutes=1`,
+ * `sweepAlreadyDisabled=1`) agreed. The DOM reader disagreed with all of it:
+ *
+ *   button.join-audio-container__btn[0]
+ *     key=path:div:2/div:4/div:0/div:0/div:0/div:0/div:0/footer:2/div:0/div:0/div:0/button:0
+ *     aria-label="audio"  label="Audio"  aria-pressed=absent
+ *     -> unmuted (class hint "svgaudiounmuted" [caret: yes])
+ *
+ *   footer button[aria-label*="audio" i][1]
+ *     key=path:div:0/div:0/div:0/div:0/footer:2/div:0/div:0/div:0/div:1/div:0/div:0/button:0
+ *     aria-label="More audio controls"  label=""  aria-pressed=absent
+ *     -> not-mute-toggle (aria-label "more audio controls" unrecognised [caret: yes])
+ *
+ * WHAT IS TRANSCRIBED AND WHAT IS INFERRED, stated so nobody mistakes one for
+ * the other:
+ *   - transcribed verbatim: the selector, the index, the elementKey, aria-label,
+ *     label, `aria-pressed=absent`, the evidence tier, and `[caret: yes]`.
+ *   - inferred from the digest, and each inference is asserted below rather
+ *     than assumed: the unmuted glyph was NOT among the RENDERED descendants
+ *     (otherwise the precise whitelist tier would have fired and the evidence
+ *     would read "visible icon class", not "class hint"); and the raw class
+ *     attribute casing is unrecoverable from the evidence string, which prints
+ *     the normalised list entry — 'SvgAudioUnmuted' is used because that is the
+ *     spelling Zoom ships, and normalisation makes the casing irrelevant.
+ *   - NOT reported by the digest, so left absent: the element's own textContent
+ *     (`label=` is the label NODE) and its class attribute.
+ */
+const live0902_audioBtnKey = 'path:div:2/div:4/div:0/div:0/div:0/div:0/div:0/footer:2/div:0/div:0/div:0/button:0';
+const live0902_moreBtnKey = 'path:div:0/div:0/div:0/div:0/footer:2/div:0/div:0/div:0/div:1/div:0/div:0/button:0';
+
+const live0902_audioBtn: Partial<ZoomMicProbe> = {
+  ariaLabel: 'audio',
+  labelText: 'Audio',
+  ariaPressed: null,
+  className: 'footer-button-base__button ax-outline join-audio-container__btn',
+  descendantClassNames: ['zm-icon SvgAudioUnmuted'],
+  visibleDescendantClassNames: [],
+  caretNearby: true,
+  elementKey: live0902_audioBtnKey,
+};
+
+const live0902_moreBtn: Partial<ZoomMicProbe> = {
+  ariaLabel: 'More audio controls',
+  labelText: '',
+  ariaPressed: null,
+  caretNearby: true,
+  elementKey: live0902_moreBtnKey,
+};
+
+// The digest listed FOUR rows: three selectors matching the same button, plus
+// the "More audio controls" sibling. Reproduced at the same indices, because
+// "the same element under several selector names" is the shape that made a
+// selector-keyed rejection useless (M59).
+const live0902Candidates: ZoomMicCandidate[] = [
+  { selector: 'button.join-audio-container__btn', index: 0, probe: probe(live0902_audioBtn) },
+  { selector: 'button[class*="join-audio-container" i]', index: 0, probe: probe(live0902_audioBtn) },
+  { selector: 'footer button[aria-label*="audio" i]', index: 0, probe: probe(live0902_audioBtn) },
+  { selector: 'footer button[aria-label*="audio" i]', index: 1, probe: probe(live0902_moreBtn) },
+];
+
+// 109. [W11-HAZARD] FIRST, prove the hazard was really present in this input —
+//      otherwise the assertions below could be passing for the wrong reason (a
+//      fixture the producer never emits, or one no tier reads at all).
+{
+  const p = probe(live0902_audioBtn);
+  const hintTokens = p.descendantClassNames.join(' ').toLowerCase();
+  assertEqual(
+    zoomMicUnmutedClassHints.some((h) => hintTokens.includes(h)),
+    true,
+    '[W11-HAZARD] the fixture DOES carry an unmuted-directed class hint — the weak tier was reachable',
+  );
+  const visibleTokens = p.visibleDescendantClassNames.join(' ').toLowerCase();
+  assertEqual(
+    [...zoomMicIconUnmutedClasses, ...zoomMicIconMutedClasses].some((c) => visibleTokens.includes(c)),
+    false,
+    '[W11-HAZARD] and NO precise glyph was rendered — nothing could outrank that hint',
+  );
+  // Defuse the new guard (caret absent) and the old, dangerous path is still
+  // exactly what this input reaches: the weakest tier, pointing at unmuted.
+  const guardOff = readZoomMicState(probe({ ...live0902_audioBtn, caretNearby: false }));
+  assertEqual(guardOff.kind, 'unmuted-unconfirmed', '[W11-HAZARD] with the options guard defused it still reaches the WEAK tier');
+  assertEqual(
+    guardOff.evidence.includes('class hint "svgaudiounmuted"'),
+    true,
+    '[W11-HAZARD] on precisely the hint the live run reported — this is the reading that shipped as "unmuted"',
+  );
+}
+
+// 110. [W11] THE FIXTURE THAT IS THE POINT OF THIS CHANGE. Every row of the live
+//      digest must classify NON-ACTIONABLE.
+{
+  const kinds = live0902Candidates.map((c) => readZoomMicState(c.probe).kind);
+  assertEqual(kinds, ['not-mute-toggle', 'not-mute-toggle', 'not-mute-toggle', 'not-mute-toggle'], '[W11] all four live rows read not-mute-toggle');
+  assertEqual(kinds.includes('unmuted'), false, '[W11] and NOT ONE of them reads "unmuted" — the reading that triggers a click');
+
+  const audio = readZoomMicState(probe(live0902_audioBtn));
+  assertEqual(audio.evidence.includes('AUDIO OPTIONS control'), true, '[W11] the "Audio"/caret control is POSITIVELY identified, not left as "unrecognised"');
+  const more = readZoomMicState(probe(live0902_moreBtn));
+  assertEqual(more.evidence.includes('AUDIO OPTIONS control'), true, '[W11] and so is the "More audio controls" sibling');
+}
+
+// 111. [W11] No selection => no click. This is the assertion that the four
+//      ineffective clicks of the live run cannot happen again.
+{
+  assertEqual(selectZoomMicToggle(live0902Candidates), null, '[W11] the live candidate set yields NO selection, so nothing is clicked');
+  const step = stepZoomMuteWatcher(zoomMuteWatcherInitialState, 'none', 1_000, zoomMuteWatcherDefaultConfig);
+  assertEqual(step.action, 'none', '[W11] and the watcher step takes no action on "none"');
+  assertEqual(step.state.clicks, 0, '[W11] with the click counter untouched');
+  // Belt and braces: even if a selection were somehow produced, not-mute-toggle
+  // is not an actionable reading.
+  assertEqual(
+    stepZoomMuteWatcher(zoomMuteWatcherInitialState, 'not-mute-toggle', 1_000, zoomMuteWatcherDefaultConfig).action,
+    'none',
+    '[W11] a not-mute-toggle reading is never actionable either',
+  );
+  // THE DEMOTED READING'S DISPATCH, driven PAST the confirmation threshold.
+  //
+  // A single step here proves nothing and is the vacuous shape this codebase
+  // keeps producing: with confirmations=2, the FIRST 'unmuted' step also
+  // returns action 'none', so a one-step assertion passes whether or not the
+  // demoted kind is treated as actionable. It has to be driven far enough that
+  // a genuine 'unmuted' would have clicked — and that CONTROL is asserted
+  // first, so the ambient value cannot be mistaken for the result.
+  {
+    const cfg = zoomMuteWatcherDefaultConfig;
+    const drive = (reading: Parameters<typeof stepZoomMuteWatcher>[1]) => {
+      let st = zoomMuteWatcherInitialState;
+      let clicks = 0;
+      for (let i = 0; i < cfg.confirmations + 3; i++) {
+        const step = stepZoomMuteWatcher(st, reading, 1_000 + i * (cfg.cooldownMs + 1_000), cfg);
+        st = step.state;
+        if (step.action === 'click') clicks++;
+      }
+      return clicks;
+    };
+    assertEqual(drive('unmuted') > 0, true, '[W11] CONTROL: a genuine "unmuted" DOES click once driven past the confirmation threshold');
+    assertEqual(drive('unmuted-unconfirmed'), 0, '[W11] but "unmuted-unconfirmed" NEVER clicks, however many passes it is driven for');
+    assertEqual(drive('not-mute-toggle'), 0, '[W11] and neither does "not-mute-toggle"');
+    assertEqual(drive('unknown'), 0, '[W11] nor "unknown"');
+  }
+
+  // ...and the demoted reading must not be SELECTABLE either. The live rows are
+  // rejected one tier earlier by the options guard, so without this fixture the
+  // demotion's own dispatch through selectZoomMicToggle is never exercised.
+  {
+    const hintOnly = candidate('button.join-audio-container__btn', 0, { descendantClassNames: ['zm-icon SvgAudioUnmuted'], elementKey: 'k-hint' });
+    assertEqual(readZoomMicState(hintOnly.probe).kind, 'unmuted-unconfirmed', '[W11] FIXTURE: a hint-only candidate really does read unmuted-unconfirmed');
+    assertEqual(selectZoomMicToggle([hintOnly]), null, '[W11] and it is NOT selectable, so no click can reach it');
+    // CONTROL: the same element with the glyph RENDERED is selectable, so the
+    // assertion above is about the demotion and not about selection being broken.
+    const rendered = candidate('button.join-audio-container__btn', 0, { visibleDescendantClassNames: ['zm-icon SvgAudioUnmuted'], elementKey: 'k-vis' });
+    assertEqual(selectZoomMicToggle([rendered])?.reading.kind, 'unmuted', '[W11] CONTROL: the same element with a RENDERED glyph IS selected');
+  }
+}
+
+// 112. [W11] REQUIREMENT 4: the retirement machinery must not be exercised at
+//      all on this DOM. A reset every ~60s for a healthy, muted bot is noise
+//      that would mask a real problem.
+{
+  assertEqual(
+    zoomRetirementIsAbsorbing(live0902Candidates, new Set()),
+    false,
+    '[W11] with nothing retired, the absorbing check is false — no reset',
+  );
+  // The stronger property: even with a retirement set, there is no CONFIDENT
+  // candidate to be absorbed by, so the reset can never fire on this DOM.
+  assertEqual(
+    zoomRetirementIsAbsorbing(live0902Candidates, new Set([live0902_audioBtnKey, live0902_moreBtnKey])),
+    false,
+    '[W11] and no confidently-readable candidate exists, so it stays false even with keys retired',
+  );
+  // CONTROL — the check is not simply always false. A confident candidate that
+  // IS retired does make it absorbing, which is how the live run reached two
+  // resets. Without this control the assertions above are vacuous.
+  assertEqual(
+    zoomRetirementIsAbsorbing([{ selector: 's', index: 0, probe: probe({ ariaLabel: 'Mute', elementKey: 'k' }) }], new Set(['k'])),
+    true,
+    '[W11] CONTROL: a retired CONFIDENT candidate does make it absorbing (so the check can return true)',
+  );
+
+  // The other half of "the machinery is not exercised": a STRIKE can only come
+  // from a click's post-click report, so a pass that clicks nothing cannot
+  // strike anything. That is structural — setInterval + Playwright — so it is a
+  // SOURCE guard, and weaker than the behavioural assertions above.
+  const fn = (() => {
+    const src = readPrepareSource();
+    const start = src.indexOf('export function startZoomMuteWatcher');
+    return src.slice(start, src.indexOf('\n}\n', start));
+  })();
+  const clickBranch = "if (step.action === 'click' && selection) {";
+  assertEqual(fn.includes(clickBranch), true, '[W11] the watcher gates its whole click path on step.action');
+  assertEqual(
+    fn.indexOf('stepZoomRetirement(retirement, report.rejectKey)') > fn.indexOf(clickBranch),
+    true,
+    '[W11] and retirement is stepped only INSIDE that branch — no click, no strike, no reset',
+  );
+  assertEqual(
+    codeOnly(fn).split('stepZoomRetirement(').length - 1,
+    1,
+    '[W11] with exactly ONE call site, so the guard above covers every path to a strike',
+  );
+}
+
+console.log('\n=== W11: isZoomAudioOptionsControl — five conditions, each load-bearing ===');
+
+// 113. [W11] The base case is the live element, so every refusal below is a
+//      one-field delta from a fixture that really fires.
+assertEqual(isZoomAudioOptionsControl(probe(live0902_audioBtn)), true, '[W11] BASE: the live "Audio"/caret element is the audio-options control');
+assertEqual(isZoomAudioOptionsControl(probe(live0902_moreBtn)), true, '[W11] BASE: so is "More audio controls" with an empty visible label');
+
+// 114. [W11] Condition 1 — caret PRESENCE, never absence. Absence is the M30
+//      blindness hazard: if these selectors stop matching, a presence-keyed rule
+//      stops REJECTING (safe) whereas an absence-keyed one vetoes everything.
+assertEqual(isZoomAudioOptionsControl(probe({ ...live0902_audioBtn, caretNearby: false })), false, '[W11] no caret => not the options control');
+assertEqual(isZoomAudioOptionsControl(probe({ ...live0902_audioBtn, caretNearby: null })), false, '[W11] caret NOT PROBED is not a yes either');
+
+// 115. [W11] Condition 2/3 — WHOLE-LABEL equality. This is the over-matching
+//      guard: "audio" is a substring of real state labels, and rejecting on the
+//      substring would silence the reader on exactly the labels it must read.
+{
+  for (const [label, expectedKind] of [['unmute my audio', 'muted'], ['mute audio', 'unmuted'], ['mute my audio', 'unmuted']] as const) {
+    assertEqual(isZoomAudioOptionsControl(probe({ ...live0902_audioBtn, ariaLabel: label, labelText: null })), false, `[W11] "${label}" contains "audio" but is NOT the options control`);
+    assertEqual(readZoomMicState(probe({ ...live0902_audioBtn, ariaLabel: label, labelText: null })).kind, expectedKind, `[W11] and "${label}" still reads ${expectedKind}`);
+  }
+  assertEqual(isZoomAudioOptionsControl(probe({ ...live0902_audioBtn, ariaLabel: 'Reactions', labelText: null })), false, '[W11] an unrelated label is not the options control');
+  assertEqual(isZoomAudioOptionsControl(probe({ caretNearby: true })), false, '[W11] a caret with NO label at all rejects nothing — no positive evidence');
+  // Mixed: one field generic, the other saying something real. The real one wins.
+  assertEqual(isZoomAudioOptionsControl(probe({ ...live0902_audioBtn, labelText: 'Mute' })), false, '[W11] aria-label "audio" + label node "Mute" => NOT the options control');
+  assertEqual(readZoomMicState(probe({ ...live0902_audioBtn, labelText: 'Mute' })).kind, 'unmuted', '[W11] and that element is read as unmuted, on the label node');
+  assertEqual(readZoomMicState(probe({ ...live0902_audioBtn, labelText: 'Unmute' })).kind, 'muted', '[W11] and "Unmute" as muted, with the right polarity');
+}
+
+// 116. [W11] Condition 4/5 — the guard DEFERS to every stronger signal. This is
+//      what makes its position in readZoomMicState unable to change a verdict,
+//      which kills the "someone reorders the branches" mutation class instead of
+//      pinning one order.
+{
+  assertEqual(isZoomAudioOptionsControl(probe({ ...live0902_audioBtn, ariaPressed: 'true' })), false, '[W11] aria-pressed="true" outranks the guard');
+  assertEqual(readZoomMicState(probe({ ...live0902_audioBtn, ariaPressed: 'true' })).kind, 'muted', '[W11] and that element reads muted');
+
+  const withVisibleUnmuted = { ...live0902_audioBtn, visibleDescendantClassNames: ['zm-icon SvgAudioUnmuted'] };
+  assertEqual(isZoomAudioOptionsControl(probe(withVisibleUnmuted)), false, '[W11] a RENDERED unmuted glyph outranks the guard');
+  assertEqual(readZoomMicState(probe(withVisibleUnmuted)).kind, 'unmuted', '[W11] and the precise tier reads it as unmuted — still clickable');
+
+  const withVisibleMuted = { ...live0902_audioBtn, visibleDescendantClassNames: ['zm-icon SvgAudioMuted'] };
+  assertEqual(isZoomAudioOptionsControl(probe(withVisibleMuted)), false, '[W11] a RENDERED muted glyph outranks it too');
+  assertEqual(readZoomMicState(probe(withVisibleMuted)).kind, 'muted', '[W11] and reads muted — the join-time "already muted" path is intact');
+
+  const withHeadset = { ...live0902_audioBtn, visibleDescendantClassNames: ['zm-icon SvgJoinAudio'] };
+  assertEqual(isZoomAudioOptionsControl(probe(withHeadset)), false, '[W11] and so does the UNJOINED glyph');
+  assertEqual(
+    readZoomMicState(probe(withHeadset)).evidence.includes('UNJOINED audio control'),
+    true,
+    '[W11] so the more specific "unjoined" evidence survives instead of being swallowed by the guard',
+  );
+
+  // Non-mic vocabulary is checked BEFORE the guard and must stay that way: a
+  // "Mute All" verdict is the one whose consequence is muting every human.
+  assertEqual(readZoomMicState(probe({ ariaLabel: 'Mute All', caretNearby: true })).kind, 'not-mic-control', '[W11] "Mute All" is still not-mic-control, caret or no caret');
+}
+
+// 117. [W11] SPELLING LOCK on the vocabulary list. Adding 'mute audio' here
+//      would make the guard swallow a real state label, so the list is asserted
+//      to carry no mute vocabulary at all.
+{
+  assertEqual(zoomAudioOptionsExactLabels.length > 0, true, '[W11] the audio-options vocabulary is non-empty (an empty list would silently disable the guard)');
+  assertEqual(zoomAudioOptionsExactLabels.includes('audio'), true, '[W11] and contains the live spelling "audio"');
+  assertEqual(zoomAudioOptionsExactLabels.includes('more audio controls'), true, '[W11] and the live sibling spelling "more audio controls"');
+  for (const entry of zoomAudioOptionsExactLabels) {
+    assertEqual(readZoomMuteVocabulary(entry), null, `[W11] "${entry}" carries no mute vocabulary — a generic label may never swallow a state word`);
+    assertEqual(entry, normaliseZoomMicText(entry), `[W11] "${entry}" is already normalised, so whole-label equality can match it`);
+  }
+}
+
+// 118. [W11] NON-REGRESSION: the 2026-09-01 shape. `aria-label="audio"` was a
+//      deliberately-supported shape and must NOT be blacklisted. With no caret
+//      probed, the guard cannot fire and the element falls through to the state
+//      tiers exactly as it did before.
+{
+  const nineteen = probe({ ariaLabel: 'audio', className: 'footer-button-base__button ax-outline join-audio-container__btn' });
+  assertEqual(isZoomAudioOptionsControl(nineteen), false, '[W11] the 2026-09-01 shape is NOT matched by the options guard');
+  const r = readZoomMicState(nineteen);
+  assertEqual(r.kind, 'not-mute-toggle', '[W11] it still reads not-mute-toggle (unchanged)');
+  assertEqual(r.evidence.includes('AUDIO OPTIONS control'), false, '[W11] and NOT via the options guard — the tier that decided it is unchanged');
+  assertEqual(r.evidence.includes('carries no mute state'), true, '[W11] it is still the known-non-state-label tier that decides it');
+  // ...and the same element with a real state signal is still readable.
+  assertEqual(readZoomMicState(probe({ ariaLabel: 'audio', ariaPressed: 'true' })).kind, 'muted', '[W11] aria-label="audio" + aria-pressed="true" => muted, as before');
+}
+
+// 119. [W11] NON-REGRESSION: the state-word readings. "Muted"/"You are muted"
+//      are STATE, not an offered action, and a caret must not change that.
+{
+  for (const label of ['Muted', 'You are muted', 'muted']) {
+    assertEqual(readZoomMicState(probe({ ariaLabel: label, caretNearby: true })).kind, 'muted', `[W11] "${label}" => muted, caret present`);
+  }
+  assertEqual(readZoomMicState(probe({ ariaLabel: 'Mute', caretNearby: true })).kind, 'unmuted', '[W11] "Mute" (action offered) => unmuted, caret present');
+  assertEqual(readZoomMicState(probe({ ariaLabel: 'Unmute', caretNearby: true })).kind, 'muted', '[W11] "Unmute" (action offered) => muted, caret present');
+}
+
+console.log('\n=== W11: the overstated warnings (the 9th and 10th) ===');
+
+// 120. [W11] The layer-1 WARNING asserted "the bot may APPEAR unmuted to
+//      participants" / "the participant list may show this bot as unmuted".
+//      Both are claims about the ROOM, and both were FALSE on 2026-09-02 while
+//      firing. The lines may now say only that the DOM could not be read.
+{
+  const idx = codeOnly(readZoomWebSource('index.ts'));
+  assertEqual(idx.includes('may APPEAR unmuted to participants'), false, '[W11] index.ts no longer claims the bot may appear unmuted');
+  assertEqual(idx.includes('DOM mute STATE could not be read'), true, '[W11] it states only that the STATE was unreadable');
+  assertEqual(idx.includes('NOT evidence that the bot appears unmuted'), true, '[W11] and explicitly disclaims the inference');
+  assertEqual(idx.includes('participant list'), true, '[W11] pointing at the authority on APPEARANCE');
+  assertEqual(idx.includes('outbound-audio guard heartbeat'), true, '[W11] and at the authority on SILENCE');
+
+  const prep = codeOnly(readPrepareSource());
+  assertEqual(prep.includes('the participant list may show this bot as unmuted'), false, '[W11] prepare.ts drops the same claim');
+  assertEqual(prep.includes('could not read the in-meeting mute STATE from the DOM'), true, '[W11] and states only what it observed');
+  assertEqual(prep.includes('NOT that the bot appears unmuted'), true, '[W11] with the inference disclaimed there too');
+}
+
+// 121. [W11] The selectors.ts note said "if the bot appeared unmuted, fix these
+//      selectors". On 2026-09-02 the selectors matched, the reader said unmuted,
+//      and the room saw MUTED — so that inference is not available either.
+{
+  const sel = readZoomWebSource('selectors.ts');
+  assertEqual(sel.includes('If you are here because the bot appeared unmuted, fix these'), false, '[W11] the selectors.ts note drops the unsupported inference');
+  assertEqual(sel.includes('CORRECTED 2026-09-02'), true, '[W11] and records why');
+}
+
 
 runAsyncTests()
   .then(runZoomPollTests)

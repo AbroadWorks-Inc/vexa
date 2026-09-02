@@ -122,7 +122,14 @@ export async function handleZoomWeb(
         void ensureZoomMutedInMeeting(page)
           .then((outcome) => {
             if (!outcome.muted) {
-              log('[Zoom Web] WARNING: in-meeting DOM mute NOT confirmed — the bot may APPEAR unmuted to participants; the track-level seal is separate and its state is in the outbound-audio guard heartbeat; re-verify zoomMicToggleSelectors against the live DOM');
+              // REWRITTEN 2026-09-02. The previous wording asserted "the bot may
+              // APPEAR unmuted to participants", which is a claim about the
+              // meeting that this code cannot make and that was FALSE the last
+              // time it fired: the DOM read unmuted for the whole call and the
+              // participant list showed the bot muted. This says only what is
+              // known — the mute STATE could not be read — and names the two
+              // things that actually are authoritative.
+              log('[Zoom Web] WARNING: in-meeting DOM mute STATE could not be read — this is NOT evidence that the bot appears unmuted (on 2026-09-02 it read unmuted all call while the participant list showed the bot MUTED). Check the participant list for how the bot APPEARS, and the outbound-audio guard heartbeat for whether it is SILENT; if the DOM reading matters to you, re-verify zoomMicToggleSelectors against the live DOM');
             }
           })
           .catch((e: any) => log(`[Zoom Web] ensureZoomMutedInMeeting failed: ${e?.message ?? e}`));
