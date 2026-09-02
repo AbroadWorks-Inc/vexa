@@ -13,6 +13,10 @@ import {
   installZoomOutboundAudioLock,
   describeOutboundAudioLock,
   startZoomMuteWatcher,
+  isZoomAudioTouchAllowed,
+  probeZoomSendSide,
+  describeZoomSendSide,
+  zoomAudioLockMode,
 } from './prepare';
 import { startZoomWebRecording } from './recording';
 import { startZoomWebRemovalMonitor } from './removal';
@@ -46,7 +50,25 @@ export async function handleZoomWeb(
       //   Layer 1 (DOM mute)    makes the participant list SHOW the bot muted.
       //
       // A voice-agent bot legitimately transmits TTS and is exempt from BOTH.
-      if (!voiceAgentEnabled) {
+      // Hands-off mode (ZOOM_AUDIO_LOCK=none): steps 1-3 all mutate tracks or
+      // install patches, so they are skipped wholesale. Step 4 (the DOM mute
+      // watcher) and ensureZoomMutedInMeeting still run — they touch only Zoom's
+      // own UI. This is the configuration that lets a live audio-join failure be
+      // isolated: 'off' still writes track.enabled = false, so it cannot tell a
+      // rejected WRITE apart from a rejected unreadable getter.
+      // SEND-SIDE CANARY, awaited, in EVERY mode (it patches nothing and touches
+      // no track, so it is safe even in hands-off). This is the ONLY line that
+      // reports whether the start.sh microphone fix is in force: the earlier
+      // "AUDIO JOIN OK" line counts inbound <audio> elements and prints
+      // identically whether or not a capture device exists.
+      const sendSide = await probeZoomSendSide(page);
+      log(`[Zoom Web] SEND-SIDE CHECK — ${describeZoomSendSide(sendSide, zoomAudioLockMode())} | (the earlier "AUDIO JOIN OK" line describes the RECEIVE side only)`);
+
+      const touchAllowed = isZoomAudioTouchAllowed();
+      if (!voiceAgentEnabled && !touchAllowed) {
+        log('[Zoom Web] Outbound audio machinery SKIPPED — ZOOM_AUDIO_LOCK hands-off mode: no sweep, no lock, no guard, no track touched. Silence rests entirely on the PulseAudio source mute (start.sh); the DOM mute path below still runs');
+      }
+      if (!voiceAgentEnabled && touchAllowed) {
         // Step 1, AWAITED — silence NOW with the least invasive primitive, so
         // the bot is quiet before anything more elaborate is attempted.
         const sweep = await sweepZoomOutboundAudio(page, false);
@@ -63,7 +85,11 @@ export async function handleZoomWeb(
         const lock = await installZoomOutboundAudioLock(page, voiceAgentEnabled);
         log(
           lock
-            ? `[Zoom Web] Outbound audio lock re-asserted (bot cannot be unmuted) — ${describeOutboundAudioLock(lock)}`
+            // Report the mechanism and its counters, not an absolute. "bot
+            // cannot be unmuted" was a claim the counters do not establish on
+            // their own (tracksLocked was 0 for the whole 2026-09-02 meeting);
+            // describeOutboundAudioLock says what was actually patched/sealed.
+            ? `[Zoom Web] Outbound audio lock re-asserted — ${describeOutboundAudioLock(lock)}`
             : '[Zoom Web] WARNING: outbound audio lock re-assert could not run — the page-load arm may still be in force',
         );
         if (lock && !lock.alreadyInstalled) {
@@ -73,20 +99,30 @@ export async function handleZoomWeb(
         // Step 3 — backstop for anything the patches cannot see. Self-clears on
         // page close; unref'd.
         startZoomOutboundAudioGuard(page, false);
+      }
 
-        // Step 4 — keep the bot LOOKING muted for the whole call (a host can
-        // request an unmute). Visual only; silence is already guaranteed above.
+      // Steps 4 and 5 are the DOM-ONLY half: they read and click Zoom's own UI
+      // and never touch a track, so they run in hands-off mode too. In that mode
+      // they are the ONLY thing maintaining the visual state, which is exactly
+      // why the click verification and candidate discovery matter there.
+      if (!voiceAgentEnabled) {
+        // Step 4 — try to keep the bot LOOKING muted for the whole call (a
+        // host can request an unmute). Visual only, and best-effort: on
+        // 2026-09-02 two watcher clicks landed and the control still read
+        // unmuted, so every click is now re-read and reported as what it was.
         startZoomMuteWatcher(page, false);
 
         // Layer 1 stays NON-blocking (it retries for ~30s and must not delay
         // recording), but the outcome is no longer swallowed — a failure to mute
-        // is a privacy-relevant fact and gets logged as such. Not fatal: layer 2
-        // already guarantees no audio leaves, so tearing the meeting down here
-        // would cost a recording to fix a cosmetic-only residue.
+        // is a privacy-relevant fact and gets logged as such. Not fatal, and
+        // deliberately so: tearing the meeting down here would cost a recording.
+        // What backs the silence depends on the mode — the track seal in 'on',
+        // the enabled=false write in 'off', and in 'none' the PulseAudio source
+        // mute alone. It is never this DOM path, in any mode.
         void ensureZoomMutedInMeeting(page)
           .then((outcome) => {
             if (!outcome.muted) {
-              log('[Zoom Web] WARNING: in-meeting DOM mute NOT confirmed — bot is silent (track-level) but may still APPEAR unmuted to participants; re-verify zoomMicToggleSelectors against the live DOM');
+              log('[Zoom Web] WARNING: in-meeting DOM mute NOT confirmed — the bot may APPEAR unmuted to participants; the track-level seal is separate and its state is in the outbound-audio guard heartbeat; re-verify zoomMicToggleSelectors against the live DOM');
             }
           })
           .catch((e: any) => log(`[Zoom Web] ensureZoomMutedInMeeting failed: ${e?.message ?? e}`));

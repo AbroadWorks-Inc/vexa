@@ -1,7 +1,7 @@
 import { Page } from 'playwright';
 import { BotConfig } from '../../../types';
 import { log, callJoiningCallback } from '../../../utils';
-import { installOutboundAudioLockInPage, isZoomAudioSealEnabled, readZoomMicState } from './prepare';
+import { installOutboundAudioLockInPage, isZoomAudioSealEnabled, isZoomAudioTouchAllowed, readZoomMicState, makeZoomMicProbe } from './prepare';
 import {
   zoomNameInputSelector,
   zoomJoinButtonSelector,
@@ -81,6 +81,11 @@ export async function joinZoomWebMeeting(page: Page | null, botConfig: BotConfig
   // Teams init paths are untouched.
   if (botConfig.voiceAgentEnabled) {
     log('[Zoom Web] Outbound audio lock NOT armed at page load — voice agent must transmit TTS');
+  } else if (!isZoomAudioTouchAllowed()) {
+    // Hands-off mode installs NOTHING. Gated here rather than inside the in-page
+    // function so the init script is never even registered — "installs nothing"
+    // has to mean nothing runs, not that something runs and returns early.
+    log('[Zoom Web] Outbound audio lock NOT armed at page load — ZOOM_AUDIO_LOCK hands-off mode; no patch is installed and no track is touched. The bot\'s silence rests entirely on the PulseAudio source mute from start.sh');
   } else {
     try {
       await page.addInitScript(installOutboundAudioLockInPage, {
@@ -229,12 +234,17 @@ export async function joinZoomWebMeeting(page: Page | null, botConfig: BotConfig
   if (!isVoiceAgent) {
     try {
       const muteBtn = page.locator(zoomPreviewMuteSelector);
-      const probe = {
+      // Built through the factory so every field this preview read cannot
+      // supply defaults to "absent" rather than to a value that could assert a
+      // state. `id` IS supplied: zoomPreviewMuteSelector is an id selector, so
+      // it is the element identity the reader would otherwise have to guess.
+      const probe = makeZoomMicProbe({
         ariaLabel: await muteBtn.getAttribute('aria-label').catch(() => null),
         ariaPressed: await muteBtn.getAttribute('aria-pressed').catch(() => null),
         className: await muteBtn.getAttribute('class').catch(() => null),
-        descendantClassNames: [] as string[],
-      };
+        id: 'preview-audio-control-button',
+        elementKey: '#preview-audio-control-button',
+      });
       const reading = readZoomMicState(probe);
 
       // WHY this is no longer `ariaLabel === 'Mute'`:
