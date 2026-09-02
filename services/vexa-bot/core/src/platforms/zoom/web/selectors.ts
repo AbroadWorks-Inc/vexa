@@ -192,9 +192,16 @@ export const zoomEndForAllSelector = 'button:has-text("End for All")';
 // is precisely why the mute guarantee does not rest on it: this layer only makes
 // the participant list SHOW the bot as muted. The actual guarantee that no audio
 // leaves the bot is silenceOutboundAudioTracks() in prepare.ts, which reads no
-// DOM at all. If you are here because the bot appeared unmuted, fix these
-// selectors; if you are here because the bot was HEARD, the track-level guard is
-// what failed and these selectors are not the bug.
+// DOM at all. If you are here because the bot was HEARD, the track-level guard
+// is what failed and these selectors are not the bug.
+//
+// CORRECTED 2026-09-02: this note used to say "if you are here because the bot
+// appeared unmuted, fix these selectors". That is not a safe inference. On
+// 2026-09-02 these selectors matched fine, the reader reported `unmuted` for a
+// whole meeting, AND the participant list showed the bot MUTED (user-confirmed,
+// with the container-level `bot mic VERIFIED muted` line agreeing). A reading of
+// `unmuted` off this layer is therefore not evidence about what the room sees.
+// The participant list is the only authority on appearance.
 //
 // Pure CSS only: these are fed to document.querySelectorAll inside page.evaluate,
 // so Playwright-only pseudo-classes (:has-text) must NOT appear here. The CSS
@@ -249,6 +256,32 @@ export const zoomNonMicLabelSubstrings: string[] = [
 export const zoomMicNonToggleExactLabels: string[] = ['audio', 'audio settings', 'mic', 'microphone'];
 export const zoomMicNonToggleSubstrings: string[] = ['join audio', 'connect audio', 'audio settings'];
 
+// ---- Zoom's audio OPTIONS control (added 2026-09-02) ----
+// The split-button half / dropdown that sits BESIDE the mute toggle. It is not
+// a mute toggle at all, and on 2026-09-02 the reader spent a whole meeting
+// clicking one: aria-label="audio", visible label "Audio", a caret in its own
+// container, and a separate sibling button labelled "More audio controls".
+//
+// WHOLE-LABEL EQUALITY ONLY — never a substring. "audio" is a substring of
+// "unmute my audio" and "mute audio", both of which are REAL state labels, and
+// blacklisting the substring would silence the reader on those. Nothing here
+// may contain mute vocabulary (readZoomMuteVocabulary must return null for
+// every entry); mute-guarantee.test.ts asserts that, so a careless addition
+// like 'mute audio' fails the suite rather than shipping.
+//
+// This list ALONE never rejects anything — isZoomAudioOptionsControl() also
+// requires a caret in the same container and the absence of every stronger
+// signal. That is what keeps the 2026-09-01 shape (a bare aria-label="audio" on
+// what really was the mic control, with no caret probed) readable.
+export const zoomAudioOptionsExactLabels: string[] = [
+  'audio',
+  'audio options',
+  'audio option',
+  'audio controls',
+  'more audio controls',
+  'more audio options',
+];
+
 // Secondary, UNVERIFIED-LIVE evidence: class hooks Zoom has used to mark the mic
 // control's state, read off the button and its icon descendants when neither
 // aria-label mute vocabulary nor aria-pressed settled the state. These rank
@@ -286,11 +319,22 @@ export const zoomMicNotJoinedTextSubstrings: string[] = ['join audio', 'connect 
 // the toggle ONLY once audio is joined, so a caret in the same container is a
 // structural marker of the joined state and its absence marks the unjoined one.
 //
-// UNVERIFIED LIVE — this list is a GUESS. Nothing in readZoomMicState GATES on
-// it: it is harvested and reported so one live run can establish whether these
-// selectors match the real caret. Promoting it to a discriminator before that
-// would risk exactly the failure M30 fixed — a watcher made permanently blind by
-// a veto keyed on a selector that never matches.
+// VERIFIED LIVE 2026-09-02 — the live run these were added for reported
+// `[caret: yes]` on the real footer control, alongside a genuine sibling button
+// labelled "More audio controls". That was the stated precondition for using
+// them, so they are now used — in EXACTLY ONE place and in EXACTLY ONE
+// direction: isZoomAudioOptionsControl() requires caret PRESENCE as one of
+// several conditions.
+//
+// PRESENCE, NEVER ABSENCE. A veto keyed on caret ABSENCE is the M30 failure — if
+// these selectors ever stop matching, every reading is vetoed and the watcher
+// goes permanently blind. Keyed on presence, a selector that stops matching
+// simply stops rejecting, which degrades to the pre-2026-09-02 behaviour instead
+// of to blindness. Do not invert this.
+//
+// A caret is expected NEXT TO THE REAL MIC TOGGLE too (that is what "split
+// button" means), so caret presence on its own says nothing about whether an
+// element is the toggle or the options half. It is only ever a corroborator.
 export const zoomMicCaretSelectors: string[] = [
   '[class*="caret" i]',
   '[class*="chevron" i]',
