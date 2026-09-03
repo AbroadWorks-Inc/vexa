@@ -27,7 +27,7 @@ import { ensureBrowserDataDir, syncBrowserDataFromS3, syncBrowserDataToS3, clean
 import { TranscriptionClient } from './services/transcription-client';
 import { SegmentPublisher, SPEAKER_EVENT_STREAM_MAXLEN } from './services/segment-publisher';
 import { SpeakerStreamManager } from './services/speaker-streams';
-import { resolveSpeakerName, clearSpeakerNameCache, isTrackLocked, isNameTaken, reportTrackAudio, getLockedMapping } from './services/speaker-identity';
+import { resolveSpeakerName, isTrackLocked, isNameTaken, reportTrackAudio, getLockedMapping } from './services/speaker-identity';
 import { createSpeakerBoundaryTracker, SpeakerBoundaryTracker } from './services/speaker-boundaries';
 import { SileroVAD } from './services/vad';
 import { isHallucination } from './services/hallucination-filter';
@@ -1719,8 +1719,8 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
       }
     }
 
-    // Detect participant count change → invalidate ALL mappings (including locks)
-    // Google Meet reassigns audio tracks when participants join/leave.
+    // Detect participant count change — for observability only. It no longer
+    // invalidates mappings (see below).
     const lastResolve = lastReResolveTime.get(speakerId) || 0;
     const reResolveInterval = locked ? 5_000 : (currentName ? 5_000 : 1_000);
     if (Date.now() - lastResolve > reResolveInterval) {
@@ -1736,9 +1736,17 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
           return 0;
         });
         if (lastParticipantCount > 0 && currentCount !== lastParticipantCount) {
-          log(`[SpeakerIdentity] Participant count changed: ${lastParticipantCount} → ${currentCount}. Invalidating all mappings (including locks).`);
-          clearSpeakerNameCache();
-          locked = false; // Force re-resolve below
+          // Do NOT wipe locks on a count change. Google Meet multiplexes every
+          // participant over a small pool of ~3 audio elements, so a join/leave
+          // changes the count constantly WITHOUT reassigning a locked track's
+          // owner. The former clearSpeakerNameCache() + locked=false wiped every
+          // lock on every join/leave — live evidence (2026-09-03, 7-participant
+          // meeting: ~20 wipes) showed this drove the entire track→name
+          // oscillation, repeatedly re-attributing a settled speaker to whoever
+          // happened to be talking at the moment. Leave existing locks intact;
+          // only still-unmapped tracks continue to re-resolve below. Kept purely
+          // as an observability breadcrumb.
+          log(`[SpeakerIdentity] Participant count changed: ${lastParticipantCount} → ${currentCount} — keeping existing speaker locks (only unmapped tracks re-resolve).`);
         }
         lastParticipantCount = currentCount;
       } catch {}
