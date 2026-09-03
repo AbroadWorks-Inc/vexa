@@ -37,7 +37,11 @@ __all__ = [
 # Meet needs remapping ("google_meet" → "meet"); Zoom's Vexa string is already
 # "zoom", so the entry is an identity mapping kept explicit for symmetry — a
 # future teams-bot ("teams" → "teams") slots in the same way (plan §5a).
-_PLATFORM_MAP: dict[str, str] = {"google_meet": "meet", "zoom": "zoom"}
+_PLATFORM_MAP: dict[str, str] = {
+    "google_meet": "meet",
+    "zoom": "zoom",
+    "teams": "teams",
+}
 
 _MIN_DOMINANT_UTTERANCE_DEFAULT_MS = 1500
 
@@ -190,6 +194,11 @@ class VexaSpeakerEvent:
     # Which bot producer emitted this. "audio" = the per-track audio-activity
     # state machine, whose START/END pairs are reliable enough to form intervals.
     # "dom" = the DOM/CSS speaking-indicator bridge, whose pairing is not.
+    # "caption" = Microsoft Teams' own live-caption author, which comes from
+    # Microsoft's server-side diarisation. Point-only like "dom" (a caption line
+    # has no reliable END), but a far better SIGNAL than Teams' DOM fallback,
+    # which keys on `vdi-frame-occlusion` — a Virtual-Desktop frame marker, not a
+    # speaking indicator. See `_preferred_point_events`.
     # None = an older bot image that predates provenance tagging; treated as
     # untrusted (point-only), never paired.
     source: str | None = None
@@ -312,7 +321,7 @@ class VexaSessionAdapter:
             # ("Timeline has no speaker events, cannot map speakers") and the
             # transcript reverts to raw SPEAKER_NN.
             origin_ms = int(session.session_start_ts.timestamp() * 1000)
-            for ev in sorted(session.speaker_events, key=lambda e: e.relative_ms):
+            for ev in self._preferred_point_events(session.speaker_events):
                 if ev.event_type != "SPEAKER_START":
                     continue
                 timeline_events.append(
@@ -398,6 +407,50 @@ class VexaSessionAdapter:
             speaker_timeline=timeline_events,
             speaker_intervals=speaker_intervals,
         )
+
+    def _preferred_point_events(
+        self, events: list[VexaSpeakerEvent]
+    ) -> list[VexaSpeakerEvent]:
+        """Order events for the point-only timeline, dropping weaker provenance.
+
+        For every platform except Teams this returns the events sorted by time and
+        NOTHING else — Meet and Zoom keep a byte-for-byte identical timeline.
+
+        Teams is the exception because it is the only platform with two competing
+        point producers. Its captions carry Microsoft's own server-side diarisation;
+        its DOM fallback keys on `vdi-frame-occlusion`, a Virtual-Desktop frame
+        marker that happens to correlate with speaking and is read as if it were a
+        speaking indicator. Interleaving them lets a spurious DOM point sit between
+        two correct caption points and win the worker's nearest-preceding-event
+        rule, renaming a segment that the captions had right.
+
+        Preference applies ONLY when at least one caption event exists. With no
+        captions (the user never enabled them, or Teams withheld them) the DOM
+        events are kept: a noisy timeline still yields names, whereas an empty one
+        makes notetaker-worker bail out and the transcript reverts to raw
+        SPEAKER_NN. That is the same fail-open reasoning as the safety valve this
+        helper serves, and it is why the filter is "prefer", not "require".
+        """
+        ordered = sorted(events, key=lambda e: e.relative_ms)
+        if self._platform != "teams":
+            return ordered
+        captions = [ev for ev in ordered if ev.source == "caption"]
+        # KNOWN TRADE-OFF, per-session and not per-speaker: one caption event
+        # anywhere in the session discards EVERY DOM point, including those of a
+        # speaker who never captioned (joined as captions were toggled, or a
+        # transient caption-service gap). Their points are dropped rather than
+        # falling back to DOM for that speaker alone.
+        #
+        # Deliberately not made per-speaker. Teams live captions are a
+        # meeting-wide toggle, so a caption-less speaker in a captioned session
+        # is unconfirmed speculation; and per-speaker mixing would reintroduce
+        # the very interleaving this exists to prevent — a `vdi-frame-occlusion`
+        # DOM point landing between two correct caption points and winning the
+        # worker's nearest-preceding rule for someone ELSE's segment. Pinned as
+        # observed behaviour by `test_teams_caption_in_session_drops_a_dom_only_
+        # speakers_points`, so a future change here is a decision, not a
+        # surprise.
+        return captions or ordered
 
     def _build_dominant_speaker_timeline(
         self,

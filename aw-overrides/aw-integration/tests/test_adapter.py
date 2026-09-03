@@ -378,6 +378,23 @@ def _dom(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
     )
 
 
+def _caption(name: str, event_type: str, relative_ms: int) -> VexaSpeakerEvent:
+    """A Teams live-caption event — Microsoft's own server-side diarisation.
+
+    Point-only like `_dom` (a caption line has no reliable END), but a far better
+    signal: Teams' DOM fallback keys on `vdi-frame-occlusion`, a Virtual-Desktop
+    frame marker, not a speaking indicator.
+    """
+    return VexaSpeakerEvent(
+        uid="conn-abc123def456",
+        relative_ms=relative_ms,
+        event_type=event_type,
+        participant_name=name,
+        meeting_id="42",
+        source="caption",
+    )
+
+
 def _attribute(timeline: list, segment_start_sec: float) -> str | None:
     """Replicate notetaker-worker's mapping rule EXACTLY, unchanged.
 
@@ -2194,3 +2211,158 @@ def test_stream_read_count_covers_writer_cap() -> None:
             f"read window {_adapter._STREAM_READ_COUNT} < TypeScript writer cap "
             f"{ts_cap}: Redis retains what this reader cannot see"
         )
+
+
+class TestTeamsCaptionPreference:
+    """Teams prefers caption points over DOM points (§13.9, plan finding C).
+
+    Teams is the only platform with two competing point producers. Captions carry
+    Microsoft's server-side diarisation; the DOM fallback keys on
+    `vdi-frame-occlusion`, a Virtual-Desktop frame marker that merely correlates
+    with speaking. Interleaved, a spurious DOM point can sit between two correct
+    caption points and win the worker's nearest-preceding-event rule.
+
+    Teams has no audio-derived events at all (`markTrackAudioActivity` is
+    per-track and Teams has one mixed stream), so interval-building yields
+    nothing and the point-only safety valve is ALWAYS the path Teams takes.
+    """
+
+    def test_teams_drops_dom_points_when_captions_exist(self, tmp_path: Path) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        # A spurious DOM point naming the WRONG person lands between two correct
+        # caption points, exactly straddling a segment that starts at 7.0s.
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _dom("Bob Müller", "SPEAKER_START", 6_000),
+            _caption("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen", "Bob Müller"]
+        assert [e.relative_sec for e in timeline] == pytest.approx([2.0, 10.0])
+        # The point of the whole change: a 7.0s segment is still Alice. With the
+        # DOM point retained it would have been misattributed to Bob.
+        assert _attribute(timeline, 7.0) == "Alice Chen"
+
+    def test_teams_keeps_dom_points_when_no_captions(self, tmp_path: Path) -> None:
+        """FAIL-OPEN. With no captions the DOM events are kept: a noisy timeline
+        still yields names, whereas an empty one makes notetaker-worker bail out
+        ("Timeline has no speaker events") and the transcript reverts to raw
+        SPEAKER_NN. This is why the filter is "prefer", not "require"."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _dom("Alice Chen", "SPEAKER_START", 2_000),
+            _dom("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen", "Bob Müller"]
+        # The TIMES are what prove the DOM events were kept. Names alone prove
+        # nothing: the fixture's segments carry these same two names, so if the
+        # preference returned an empty list the NEXT fallback would rebuild the
+        # timeline from segments (4.0s / 20.0s) and a name-only assertion would
+        # still pass. Verified by mutation — `captions or ordered` -> `captions`
+        # survived until these two lines existed.
+        assert [e.relative_sec for e in timeline] == pytest.approx([2.0, 10.0])
+
+    def test_teams_keeps_untagged_points_when_no_captions(self, tmp_path: Path) -> None:
+        """Same fail-open path for an older bot image with no provenance tags."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _untagged("Alice Chen", "SPEAKER_START", 2_000),
+            _untagged("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen", "Bob Müller"]
+        # Times, not just names — see the note on the DOM-only case above.
+        assert [e.relative_sec for e in timeline] == pytest.approx([2.0, 10.0])
+
+    def test_teams_caption_in_session_drops_a_dom_only_speakers_points(
+        self, tmp_path: Path
+    ) -> None:
+        """DOCUMENTS A KNOWN TRADE-OFF rather than asserting an ideal.
+
+        The preference is per-SESSION, not per-speaker: one caption anywhere
+        discards every DOM point, so a speaker who never captioned loses their
+        points entirely instead of falling back to DOM for just them. Raised by
+        code review as a plausible (unconfirmed) edge case. Left as-is
+        deliberately — Teams captions are a meeting-wide toggle, and per-speaker
+        mixing would reintroduce the interleaving the preference exists to stop.
+
+        This test exists so the behaviour is PINNED. If a live meeting ever shows
+        a caption-less speaker being lost, change the code and this test together
+        — do not discover the trade-off from an artifact.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            # Bob never captions — only the DOM ever saw him.
+            _dom("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # Bob is absent. That is the accepted cost, not a bug.
+        assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        # And the consequence made explicit: Bob's 10s speech reads as Alice.
+        assert _attribute(timeline, 10.5) == "Alice Chen"
+
+    def test_teams_emits_no_intervals(self, tmp_path: Path) -> None:
+        """Teams must stay points-only. An interval built from caption events
+        would never close and would erase every other speaker."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _caption("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        assert adapter.build_speaker_timeline().speaker_intervals == []
+
+    # --- REGRESSION GUARDS: the two proven platforms must not change ---------
+
+    @pytest.mark.parametrize("platform", ["google_meet", "zoom"])
+    def test_meet_and_zoom_keep_every_point_regardless_of_source(
+        self, tmp_path: Path, platform: str
+    ) -> None:
+        """REGRESSION GUARD. The caption preference is Teams-ONLY. `adapter.py`
+        is shared by Meet, Zoom and Jitsi, so an ungated filter would silently
+        drop points from the two platforms that are live and proven.
+
+        Caption-tagged events are fed on purpose: without them this test would
+        pass even with the platform gate deleted, since nothing else in the
+        fixture is a caption. Verified by mutation — it must go red when the
+        `_platform != "teams"` early return is removed."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = platform
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _dom("Bob Müller", "SPEAKER_START", 6_000),
+            _untagged("Carol Díaz", "SPEAKER_START", 10_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        # All three survive, in time order — nothing filtered.
+        assert [e.speaker_name for e in timeline] == [
+            "Alice Chen",
+            "Bob Müller",
+            "Carol Díaz",
+        ]
+
+    def test_platform_map_has_teams_identity_entry(self) -> None:
+        """Mirrors the zoom identity entry. The `.get(x, x)` fallback already
+        returned "teams", so this pins intent, not behaviour: the S3 prefix and
+        the artifact `platform` field are built from `_platform`, and a silent
+        rename there would strand Teams artifacts under the wrong prefix."""
+        from aw_integration.adapter import _PLATFORM_MAP
+
+        assert _PLATFORM_MAP["teams"] == "teams"

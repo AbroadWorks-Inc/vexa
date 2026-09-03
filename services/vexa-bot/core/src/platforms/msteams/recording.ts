@@ -19,6 +19,15 @@ import {
   teamsMeetingContainerSelectors,
   teamsCaptionSelectors
 } from "./selectors";
+import {
+  AloneTimerState,
+  TeamsPresenceReading,
+  TeamsAloneTickResult,
+  readTeamsLeaveTimeouts,
+  resolveBotDisplayName,
+  teamsAloneTick,
+} from "./alone-timer";
+import { CaptionSpeakerEventPublisher } from "./caption-speaker-events";
 
 // Modified to use new services - Teams recording functionality
 export async function startTeamsRecording(page: Page, botConfig: BotConfig): Promise<void> {
@@ -119,12 +128,46 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
     }
   });
 
+  // ── Left-alone decision (Node side) ────────────────────────────────────────
+  // The DECISION lives here, in the pure, unit-tested `alone-timer` module; the
+  // page only READS the DOM and reports what it saw. It used to be arithmetic
+  // inlined in the page's monitoring loop, fed by a participant count that
+  // counted rows in a Participants panel nothing ever opens — see the module
+  // docstring for the two failure modes that produced.
+  const aloneTimeouts = readTeamsLeaveTimeouts((botConfig as any)?.automaticLeave);
+  const botDisplayName = resolveBotDisplayName(botConfig);
+  log(
+    `[Teams Recording] Leave thresholds: noOneJoined=${aloneTimeouts.noOneJoinedMs}ms, ` +
+      `everyoneLeft=${aloneTimeouts.everyoneLeftMs}ms, presenceWindow=${aloneTimeouts.presenceWindowMs}ms, ` +
+      `staleEvidence=${aloneTimeouts.staleEvidenceMs}ms; botDisplayName="${botDisplayName}"`
+  );
+
+  await page.exposeFunction(
+    "__vexaTeamsAloneTick",
+    (state: AloneTimerState, reading: TeamsPresenceReading): TeamsAloneTickResult =>
+      teamsAloneTick(state, reading, aloneTimeouts)
+  );
+
+  // ── Caption provenance ─────────────────────────────────────────────────────
+  const captionEvents = new CaptionSpeakerEventPublisher(
+    botConfig.redisUrl || process.env.REDIS_URL || "redis://localhost:6379",
+    botConfig.connectionId || "",
+    botConfig.meeting_id != null ? String(botConfig.meeting_id) : ""
+  );
+  await page.exposeFunction(
+    "__vexaTeamsCaptionSpeakerEvent",
+    async (speaker: string, relativeMs: number): Promise<boolean> =>
+      captionEvents.publish(speaker, relativeMs)
+  );
+
   await ensureBrowserUtils(page, require('path').join(__dirname, '../../browser-utils.global.js'));
 
   // Pass the necessary config fields and the resolved URL into the page context
-  await page.evaluate(
+  const recordingRun = page.evaluate(
     async (pageArgs: {
       botConfigData: BotConfig;
+      /** Resolved ONCE on the Node side — the page never does a field lookup. */
+      botDisplayName: string;
       selectors: {
         participantSelectors: string[];
         speakingClasses: string[];
@@ -147,7 +190,7 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
         };
       };
     }) => {
-      const { botConfigData, selectors } = pageArgs;
+      const { botConfigData, botDisplayName, selectors } = pageArgs;
       const selectorsTyped = selectors as any;
 
       // Use browser utility classes from the global bundle
@@ -407,6 +450,25 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
               
               // Teams-specific configuration for speaker detection
               const participantSelectors = selectors.participantSelectors;
+
+              // ── Presence evidence ──────────────────────────────────────────
+              // Wall-clock ms of the last positive evidence that a HUMAN (not
+              // the bot) spoke; 0 = never. Written by the caption path and by
+              // the DOM speaking transitions below, and read by
+              // getTeamsPresenceReading() — the only participant signal in this
+              // file that does not depend on the Participants panel being open.
+              let lastHumanEvidenceMs = 0;
+              const markHumanEvidence = () => { lastHumanEvidenceMs = Date.now(); };
+
+              // The bot's own display name, resolved on the NODE side by
+              // resolveBotDisplayName(). The page deliberately does no field
+              // lookup: the two `botConfigData?.name` reads this replaces were
+              // always undefined, because the orchestrator sets `botName`.
+              const botNameLower = (botDisplayName || 'vexa').toLowerCase();
+              const isBotName = (candidate: string): boolean => {
+                const c = (candidate || '').toLowerCase();
+                return c.includes(botNameLower) || c.includes('vexa');
+              };
               
               // ============================================================================
               // UNIFIED SPEAKER DETECTION SYSTEM (NO FALLBACKS)
@@ -845,6 +907,14 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
                 const eventType = state === 'speaking' ? 'SPEAKER_START' : 'SPEAKER_END';
                 const emoji = state === 'speaking' ? '🎤' : '🔇';
 
+                // A DOM speaking transition for someone who is not the bot is
+                // (weak) evidence that a human is present. Weak because the
+                // signal is `vdi-frame-occlusion`, a Virtual-Desktop frame
+                // marker; it is corroborating evidence, never the only source.
+                if (state === 'speaking' && !isBotName(identity.name)) {
+                  markHumanEvidence();
+                }
+
                 (window as any).logBot(`${emoji} [Unified] ${eventType}: ${identity.name} (ID: ${identity.id}) [signal-based]`);
                 sendTeamsSpeakerEvent(eventType, identity);
               }
@@ -938,7 +1008,7 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
               
               const countParticipants = () => {
                 const names = collectAriaParticipants();
-                const totalCount = botConfigData?.name ? names.length + 1 : names.length;
+                const totalCount = names.length ? names.length + 1 : 0;
                 if (totalCount !== currentParticipantCount) {
                   (window as any).logBot(`🔢 Participant count: ${currentParticipantCount} → ${totalCount}`);
                   currentParticipantCount = totalCount;
@@ -1000,7 +1070,6 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
                 const ctx = new AudioContext({ sampleRate: 16000 });
                 const source = ctx.createMediaStreamSource(stream);
                 const processor = ctx.createScriptProcessor(4096, 1, 1);
-                const botNameLower = ((botConfigData as any)?.botName || (botConfigData as any)?.name || 'vexa').toLowerCase();
 
                 processor.onaudioprocess = (e: AudioProcessingEvent) => {
                   const data = e.inputBuffer.getChannelData(0);
@@ -1083,17 +1152,39 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
                 lastProcessedCaptionKey = captionKey;
 
                 const now = Date.now();
-                const botNameLower2 = ((botConfigData as any)?.botName || (botConfigData as any)?.name || 'vexa').toLowerCase();
                 const speakerLower = speaker.toLowerCase();
-                if (speakerLower.includes(botNameLower2) || speakerLower.includes('vexa')) return;
+                if (isBotName(speaker)) return;
+
+                // Past the bot filter, so this caption is a human speaking —
+                // the strongest presence signal Teams gives us (Microsoft's own
+                // server-side diarisation, not our DOM guesswork).
+                markHumanEvidence();
 
                 if (speaker !== lastCaptionSpeaker) {
+                  // Publish this boundary to `speaker_events_relative` tagged
+                  // `source: "caption"` — see ./caption-speaker-events.ts for why
+                  // the tag cannot come from the existing publishers. On SPEAKER
+                  // CHANGE only, so the stream carries dominant-speaker
+                  // transitions (what notetaker-worker's last-event-at-or-before
+                  // rule expects) rather than one event per caption refinement.
+                  const captionSessionStart = audioService.getSessionAudioStartTime();
+                  if (
+                    captionSessionStart !== null &&
+                    typeof (window as any).__vexaTeamsCaptionSpeakerEvent === 'function'
+                  ) {
+                    // Fire-and-forget: a Redis stall must never delay caption
+                    // processing, which is what routes audio to the speaker.
+                    void (window as any)
+                      .__vexaTeamsCaptionSpeakerEvent(speaker, now - captionSessionStart)
+                      .catch(() => { /* publisher logs its own failures */ });
+                  }
+
                   // Speaker changed. Queue contains new speaker's audio
                   // (~1-1.5s accumulated during caption delay). Flush to
                   // new speaker to preserve their opening words.
                   lastFlushedTextLength = 0;
                   const queued = audioQueue.length;
-                  if (queued > 0 && !speakerLower.includes(botNameLower2) && !speakerLower.includes('vexa')) {
+                  if (queued > 0 && !speakerLower.includes(botNameLower) && !speakerLower.includes('vexa')) {
                     // Only flush recent chunks (last 2s) — the caption delay lookback.
                     // Older chunks are stale silence from the gap between speakers.
                     const lookbackCutoff = now - 2000;
@@ -1133,7 +1224,7 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
                 // Flush when: text grew by >3 chars (new words), OR text is
                 // shorter (new caption entry = new sentence, always flush)
                 if (textGrowth > MIN_TEXT_GROWTH || text.length < lastFlushedTextLength) {
-                  if (!speakerLower.includes(botNameLower2) && !speakerLower.includes('vexa')) {
+                  if (!speakerLower.includes(botNameLower) && !speakerLower.includes('vexa')) {
                     let flushed = 0;
                     while (audioQueue.length > 0) {
                       const entry = audioQueue.shift()!;
@@ -1230,6 +1321,15 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
               
               // Expose participant count for meeting monitoring
               // Accessible-roles based participant collection (robust and simple)
+              //
+              // ⚠ READ THIS BEFORE TRUSTING THE RETURN VALUE. These rows live in
+              // the PARTICIPANTS PANEL, and nothing in msteams/ or
+              // platforms/shared/ ever opens that panel (the only .click() sites
+              // in msteams/ are the captions menu, the leave/hangup buttons, the
+              // pre-join dialogs and the removal "Dismiss" button). So an empty
+              // result is the NORMAL case and means "not readable", never "the
+              // meeting is empty". getTeamsPresenceReading() encodes exactly that
+              // distinction by reporting `rosterHumans: null` for an empty read.
               function collectAriaParticipants(): string[] {
                 try {
                   // Find all menuitems in the Participants panel that contain an avatar/image
@@ -1258,37 +1358,94 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
               }
 
               (window as any).getTeamsActiveParticipantsCount = () => {
-                // Use ARIA role-based collection and include the bot if name is known
+                // Diagnostic only — the leave decision uses
+                // getTeamsPresenceReading(). Rows include the bot's own row when
+                // the panel is open, so this is the panel's total, and 0 means
+                // "panel not readable".
                 const names = collectAriaParticipants();
-                const total = botConfigData?.name ? names.length + 1 : names.length;
-                return total;
+                return names.length;
               };
               (window as any).getTeamsActiveParticipants = () => {
-                // Return ARIA role-based names plus bot (if known)
+                // Return the ARIA role-based names verbatim. The bot's own name
+                // is NOT appended: it used to be appended behind
+                // `botConfigData?.name`, which the orchestrator never sets (it
+                // sets `botName`), so the branch was dead and the log lied about
+                // what it was showing.
                 const names = collectAriaParticipants();
-                if (botConfigData?.name) names.push(botConfigData.name);
                 (window as any).logBot(`🔍 [ARIA Participants] ${JSON.stringify(names)}`);
                 return names;
+              };
+
+              /**
+               * Count participant elements on the meeting STAGE that carry Teams'
+               * voice-level signal. Independent of the Participants panel, which
+               * is why it exists: it is readable during a normal meeting, and the
+               * roster is not.
+               *
+               * Same element set and same signal predicate that
+               * scanAndObserveAll() already uses, so this cannot disagree with
+               * what the speaker detector is observing.
+               */
+              const countSignalTiles = (): number => {
+                try {
+                  const allSelectors = [...participantSelectors, '[role="menuitem"]'];
+                  const seen = new Set<HTMLElement>();
+                  for (const selector of allSelectors) {
+                    document.querySelectorAll(selector).forEach(el => {
+                      if (el instanceof HTMLElement && detector.hasRequiredSignal(el)) {
+                        seen.add(el);
+                      }
+                    });
+                  }
+                  return seen.size;
+                } catch {
+                  return 0;
+                }
+              };
+
+              /**
+               * One tick of presence evidence for the Node-side alone timer.
+               * Three independent sources, because no single one of them is
+               * readable in every state — see resolveTeamsAloneCount() in
+               * ./alone-timer.ts for how they are combined and why.
+               */
+              (window as any).getTeamsPresenceReading = () => {
+                const rosterNames = collectAriaParticipants();
+                // null (not 0) when the panel yielded nothing: an unopened panel
+                // is not an empty meeting.
+                const rosterHumans = rosterNames.length
+                  ? rosterNames.filter(n => !isBotName(n)).length
+                  : null;
+                return {
+                  rosterHumans,
+                  signalTiles: countSignalTiles(),
+                  humanEvidenceAgeMs:
+                    lastHumanEvidenceMs === 0 ? null : Date.now() - lastHumanEvidenceMs,
+                };
               };
             };
 
             // Setup Teams meeting monitoring (browser context)
-            const setupTeamsMeetingMonitoring = (botConfigData: any, audioService: any, resolve: any) => {
+            // `_botConfigData` is unused since the leave thresholds moved to the
+            // Node side; kept in the signature so the call site is unchanged.
+            const setupTeamsMeetingMonitoring = (_botConfigData: any, audioService: any, resolve: any) => {
               (window as any).logBot("Setting up Teams meeting monitoring...");
               
-              const leaveCfg = (botConfigData && (botConfigData as any).automaticLeave) || {};
-              // Config values are in milliseconds, convert to seconds
-              const startupAloneTimeoutSeconds = leaveCfg.noOneJoinedTimeout
-                ? Math.floor(Number(leaveCfg.noOneJoinedTimeout) / 1000)
-                : Number(leaveCfg.startupAloneTimeoutSeconds ?? (20 * 60));
-              const everyoneLeftTimeoutSeconds = leaveCfg.everyoneLeftTimeout
-                ? Math.floor(Number(leaveCfg.everyoneLeftTimeout) / 1000)
-                : Number(leaveCfg.everyoneLeftTimeoutSeconds ?? 60);
-              
-              let aloneTime = 0;
-              let lastParticipantCount = 0;
-              let speakersIdentified = false;
-              let hasEverHadMultipleParticipants = false;
+              // The leave DECISION and the thresholds it uses live on the Node
+              // side, in the pure `./alone-timer.ts` module, exposed here as
+              // __vexaTeamsAloneTick. This block used to hold that arithmetic
+              // inline, fed by a Participants-panel row count nothing ever
+              // populated. The page's job is now only to read the DOM and to
+              // carry out the decision.
+              let aloneState: { aloneMs: number; sawOthers: boolean } = {
+                aloneMs: 0,
+                sawOthers: false,
+              };
+              let lastReportedCount = -1;
+              // One tick at a time: __vexaTeamsAloneTick is an exposed function,
+              // so it round-trips to Node and can outlive the 1s interval.
+              // Overlapping ticks would advance the timer twice for one second.
+              let tickInFlight = false;
               let monitoringStopped = false;
 
               const stopWithFlush = async (
@@ -1360,61 +1517,64 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
                   );
                   return;
                 }
-                // Check participant count using the comprehensive speaker detection system
-                const currentParticipantCount = (window as any).getTeamsActiveParticipantsCount ? (window as any).getTeamsActiveParticipantsCount() : 0;
-                
-                if (currentParticipantCount !== lastParticipantCount) {
-                  (window as any).logBot(`🔢 Teams participant count changed: ${lastParticipantCount} → ${currentParticipantCount}`);
-                  const participantList = (window as any).getTeamsActiveParticipants ? (window as any).getTeamsActiveParticipants() : [];
-                  (window as any).logBot(`👥 Current participants: ${JSON.stringify(participantList)}`);
-                  
-                  lastParticipantCount = currentParticipantCount;
-                  
-                  // Track if we've ever had multiple participants
-                  if (currentParticipantCount > 1) {
-                    hasEverHadMultipleParticipants = true;
-                    speakersIdentified = true; // Once we see multiple participants, we've identified speakers
-                    (window as any).logBot("Teams Speakers identified - switching to post-speaker monitoring mode");
-                  }
-                }
+                // Read the DOM, then let the Node-side timer decide. Every
+                // failure here is a HOLD, never a leave: a missing reading, a
+                // closed page, or a rejected round-trip must not be able to end
+                // a meeting early.
+                if (tickInFlight) return;
+                tickInFlight = true;
+                void (async () => {
+                  try {
+                    const readReading = (window as any).getTeamsPresenceReading;
+                    if (typeof readReading !== 'function') return;
+                    const reading = readReading();
+                    const tick = await (window as any).__vexaTeamsAloneTick(aloneState, reading);
+                    if (!tick || monitoringStopped) return;
+                    aloneState = tick.state;
 
-                if (currentParticipantCount === 0) {
-                  aloneTime++;
-                  
-                  // Determine timeout based on whether speakers have been identified
-                  const currentTimeout = speakersIdentified ? everyoneLeftTimeoutSeconds : startupAloneTimeoutSeconds;
-                  const timeoutDescription = speakersIdentified ? "post-speaker" : "startup";
-                  
-                  (window as any).logBot(`⏱️ Teams bot alone time: ${aloneTime}s/${currentTimeout}s (${timeoutDescription} mode, speakers identified: ${speakersIdentified})`);
-                  
-                  if (aloneTime >= currentTimeout) {
-                    if (speakersIdentified) {
-                      (window as any).logBot(`Teams meeting ended or bot has been alone for ${everyoneLeftTimeoutSeconds} seconds after speakers were identified. Stopping recorder...`);
-                      void stopWithFlush("left_alone_timeout", () =>
-                        reject(new Error("TEAMS_BOT_LEFT_ALONE_TIMEOUT"))
-                      );
-                    } else {
-                      (window as any).logBot(`Teams bot has been alone for ${startupAloneTimeoutSeconds} seconds during startup with no other participants. Stopping recorder...`);
-                      void stopWithFlush("startup_alone_timeout", () =>
-                        reject(new Error("TEAMS_BOT_STARTUP_ALONE_TIMEOUT"))
+                    if (tick.count !== lastReportedCount) {
+                      lastReportedCount = tick.count;
+                      (window as any).logBot(
+                        `🔢 Teams presence: count=${tick.count} ` +
+                          `(roster=${reading.rosterHumans === null ? 'unreadable' : reading.rosterHumans}, ` +
+                          `signalTiles=${reading.signalTiles}, ` +
+                          `evidenceAge=${reading.humanEvidenceAgeMs === null ? 'never' : reading.humanEvidenceAgeMs + 'ms'})`
                       );
                     }
-                  } else if (aloneTime > 0 && aloneTime % 10 === 0) { // Log every 10 seconds to avoid spam
-                    if (speakersIdentified) {
-                      (window as any).logBot(`Teams bot has been alone for ${aloneTime} seconds (${timeoutDescription} mode). Will leave in ${currentTimeout - aloneTime} more seconds.`);
-                    } else {
-                      const remainingMinutes = Math.floor((currentTimeout - aloneTime) / 60);
-                      const remainingSeconds = (currentTimeout - aloneTime) % 60;
-                      (window as any).logBot(`Teams bot has been alone for ${aloneTime} seconds during startup. Will leave in ${remainingMinutes}m ${remainingSeconds}s.`);
+
+                    if (tick.shouldLeave) {
+                      // Tokens are consumed by platforms/shared/meetingFlow.ts,
+                      // which maps them to the left_alone_timeout /
+                      // startup_alone_timeout graceful-leave reasons. Do not
+                      // rename them.
+                      if (tick.label === 'everyone left') {
+                        (window as any).logBot(
+                          `Teams meeting ended or bot has been alone for ${tick.state.aloneMs}ms after speakers were identified. Stopping recorder...`
+                        );
+                        void stopWithFlush("left_alone_timeout", () =>
+                          reject(new Error("TEAMS_BOT_LEFT_ALONE_TIMEOUT"))
+                        );
+                      } else {
+                        (window as any).logBot(
+                          `Teams bot has been alone for ${tick.state.aloneMs}ms during startup with no other participants. Stopping recorder...`
+                        );
+                        void stopWithFlush("startup_alone_timeout", () =>
+                          reject(new Error("TEAMS_BOT_STARTUP_ALONE_TIMEOUT"))
+                        );
+                      }
+                    } else if (tick.label && tick.state.aloneMs % 10000 === 0) {
+                      (window as any).logBot(
+                        `Teams bot alone for ${tick.state.aloneMs}ms (${tick.label}).`
+                      );
                     }
+                  } catch (err: any) {
+                    (window as any).logBot?.(
+                      `[Teams Recording] Alone-timer tick failed (holding): ${err?.message || err}`
+                    );
+                  } finally {
+                    tickInFlight = false;
                   }
-                } else {
-                  aloneTime = 0; // Reset if others are present
-                  if (hasEverHadMultipleParticipants && !speakersIdentified) {
-                    speakersIdentified = true;
-                    (window as any).logBot("Teams speakers identified - switching to post-speaker monitoring mode");
-                  }
-                }
+                })();
               }, 1000);
 
               // Listen for page unload
@@ -1455,6 +1615,7 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
     },
     {
       botConfigData: botConfig,
+      botDisplayName,
       selectors: {
         participantSelectors: teamsParticipantSelectors,
         speakingClasses: teamsSpeakingClassNames,
@@ -1472,4 +1633,14 @@ export async function startTeamsRecording(page: Page, botConfig: BotConfig): Pro
       } as any
     }
   );
+
+  try {
+    await recordingRun;
+  } finally {
+    // The caption publisher holds its own Redis connection for the length of the
+    // meeting; a live connection keeps the Node event loop alive, so it must be
+    // closed on EVERY exit path, including the reject that the in-page monitor
+    // uses to signal a left-alone / removed leave.
+    await captionEvents.close();
+  }
 }
