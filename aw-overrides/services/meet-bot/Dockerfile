@@ -50,10 +50,26 @@ COPY --from=ts-build /usr/local/bin/node /usr/local/bin/node
 
 COPY notetaker-common/pyproject.toml notetaker-common/pyproject.toml
 COPY notetaker-common/notetaker_common/ notetaker-common/notetaker_common/
-RUN pip install --no-cache-dir ./notetaker-common
+# --ignore-installed: the v1.56.0-noble base now ships pip 25.3, which REFUSES to
+# uninstall apt-managed packages (no RECORD file) — and pydantic==2.5.0 pulls a
+# newer typing_extensions than the apt one in /usr/lib/python3/dist-packages,
+# so a plain install dies with `uninstall-no-record-file`. Installing pip-managed
+# copies ALONGSIDE the apt ones (shadowing them in site-packages) sidesteps the
+# uninstall entirely. Reinstalling notetaker-common's full dependency closure this
+# way also shadows every apt-managed Python package pip touches (certifi, idna,
+# urllib3, python-dateutil, typing_extensions), so the later pip layers below hit
+# no further uninstall-no-record-file errors. Pins are preserved — this is a local
+# pinned package, so re-resolution keeps pydantic==2.5.0 et al.
+RUN pip install --no-cache-dir --ignore-installed ./notetaker-common
 
 COPY vexa-fork/aw-overrides/aw-integration/pyproject.toml aw-integration/pyproject.toml
 COPY vexa-fork/aw-overrides/aw-integration/aw_integration/ aw-integration/aw_integration/
+# NOT --ignore-installed here: aw-integration depends on notetaker-common, which is
+# a LOCAL package installed in the step above (not on any index). --ignore-installed
+# would make pip re-resolve that dep from PyPI and fail ("No matching distribution
+# for notetaker-common"). A plain install reuses the already-installed copy, and by
+# now the apt-managed packages are already shadowed by line 53, so there is no
+# uninstall-no-record-file risk left to defend against.
 RUN pip install --no-cache-dir ./aw-integration
 
 RUN pip install --no-cache-dir "fastapi==0.109.0" "uvicorn[standard]==0.27.0" "python-multipart" "prometheus-fastapi-instrumentator==6.1.0"
