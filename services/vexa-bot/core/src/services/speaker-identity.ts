@@ -209,21 +209,46 @@ async function queryBrowserState(
                /devices\//.test(name);
       };
 
+      // Google Meet CHROME (control / menu / panel labels) that the roster
+      // scraper can pick up as if they were participant names. Observed live
+      // 2026-09-03: "Backgrounds and effects" (the visual-effects control) was
+      // accepted as a speaker and reached BOTH the transcript and the participant
+      // list. Matched as a lower-cased substring; every entry is multi-word Meet
+      // chrome, so it cannot collide with a real display name. This is a denylist
+      // of UI text, NOT of names — only add control/menu strings here.
+      const uiLabelPatterns = [
+        'let participants', 'send messages', 'turn on captions', 'turn off captions',
+        'backgrounds and effects', 'visual effects', 'apply visual effects',
+        'more options', 'raise hand', 'lower hand', 'present now', 'stop presenting',
+        'turn on microphone', 'turn off microphone', 'turn on camera', 'turn off camera',
+        'leave call', 'meeting details', 'chat with everyone', 'add people',
+        'call controls', 'host controls',
+      ];
+      const isUiLabel = (name: string): boolean => {
+        const lower = name.toLowerCase();
+        return uiLabelPatterns.some(p => lower.includes(p));
+      };
+
       const getNames = (window as any).__vexaGetAllParticipantNames;
       if (typeof getNames !== 'function') return null;
 
       const data = getNames() as { names: Record<string, string>; speaking: string[] };
       const selfLower = selfName.toLowerCase();
-      const junkPatterns = ['let participants', 'send messages', 'turn on captions'];
 
-      const filteredNames = Object.values(data.names).filter(n => {
+      // A name is rejected if it is the bot itself, a Meet UI label, or structural
+      // junk. Applied to BOTH the roster and the speaking[] list so a UI label can
+      // never enter voting from either source (previously `speaking` was only
+      // isJunk-filtered, which let a scraped control label through).
+      const reject = (n: string): boolean => {
         const lower = n.toLowerCase();
-        if (lower.includes(selfLower) || selfLower.includes(lower)) return false;
-        if (junkPatterns.some(p => lower.includes(p))) return false;
-        if (isJunk(n)) return false;
-        return true;
-      });
-      const speaking = data.speaking.filter(n => !isJunk(n));
+        if (lower.includes(selfLower) || selfLower.includes(lower)) return true;
+        if (isUiLabel(n)) return true;
+        if (isJunk(n)) return true;
+        return false;
+      };
+
+      const filteredNames = Object.values(data.names).filter(n => !reject(n));
+      const speaking = data.speaking.filter(n => !reject(n));
 
       return { filteredNames, speaking };
     }, botName || 'Vexa Bot');
