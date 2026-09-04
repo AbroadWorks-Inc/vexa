@@ -403,6 +403,63 @@ def test_the_package_extractor_reads_install_lines_not_comments(
     assert not any("sources.list.d" in p for p in packages), packages
 
 
+def test_notetaker_common_is_installed_with_ignore_installed(
+    dockerfile: str,
+) -> None:
+    """The local-package install must carry --ignore-installed.
+
+    The v1.56.0-noble base ships pip 25.3, which REFUSES to uninstall an
+    apt-managed package (no RECORD file). pydantic==2.5.0 pulls a newer
+    typing_extensions than the apt one, so a plain install dies with
+    `uninstall-no-record-file`.
+
+    This is a BUILD-TIME-ONLY failure, invisible to every other test in this
+    suite, and it actually happened: teams-bot was copied from zoom-bot's
+    Dockerfile, which predates the meet-bot fix (vexa-fork cc9e758b), so the
+    first real build of teams-bot:v0.1.0 failed at exactly this line after
+    ~220s of work.
+    """
+    line = next(
+        (
+            ln
+            for ln in dockerfile.splitlines()
+            if ln.startswith("RUN pip install") and "./notetaker-common" in ln
+        ),
+        None,
+    )
+    assert line is not None, "no `RUN pip install ... ./notetaker-common` line found"
+    assert "--ignore-installed" in line, (
+        "notetaker-common must be installed with --ignore-installed or the build "
+        f"fails with uninstall-no-record-file; got: {line}"
+    )
+
+
+def test_aw_integration_is_installed_WITHOUT_ignore_installed(
+    dockerfile: str,
+) -> None:
+    """And aw-integration must NOT carry it — the opposite mistake.
+
+    aw-integration depends on notetaker-common, a LOCAL package on no index.
+    --ignore-installed would make pip re-resolve that dependency from PyPI and
+    fail with "No matching distribution for notetaker-common". So this is not a
+    case of "add the flag everywhere": the two lines must differ, and a
+    well-meaning tidy-up that unifies them breaks the build the other way.
+    """
+    line = next(
+        (
+            ln
+            for ln in dockerfile.splitlines()
+            if ln.startswith("RUN pip install") and "./aw-integration" in ln
+        ),
+        None,
+    )
+    assert line is not None, "no `RUN pip install ... ./aw-integration` line found"
+    assert "--ignore-installed" not in line, (
+        "aw-integration must NOT use --ignore-installed; pip would re-resolve "
+        f"notetaker-common from PyPI and fail. Got: {line}"
+    )
+
+
 def test_dockerfile_installs_ffmpeg(dockerfile: str) -> None:
     # The WebM -> s16le/16 kHz/mono transcode is the PRIMARY Teams audio path:
     # _convert_container_to_pcm shells out to `ffmpeg` for every session. Nothing
