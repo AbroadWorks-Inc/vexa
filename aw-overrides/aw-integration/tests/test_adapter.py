@@ -2241,10 +2241,20 @@ class TestTeamsCaptionPreference:
         timeline = adapter.build_speaker_timeline().speaker_timeline
 
         assert [e.speaker_name for e in timeline] == ["Alice Chen", "Bob Müller"]
-        assert [e.relative_sec for e in timeline] == pytest.approx([2.0, 10.0])
+        # 0.0, not 2.0: the earliest event is ANCHORED to the recording origin for
+        # Teams as well as Zoom (see the anchor block in adapter.py). 10.0 is what
+        # still discriminates this from the segment fallback, which would give
+        # 4.0/20.0 — the reason these timestamps are asserted at all.
+        assert [e.relative_sec for e in timeline] == pytest.approx([0.0, 10.0])
         # The point of the whole change: a 7.0s segment is still Alice. With the
         # DOM point retained it would have been misattributed to Bob.
         assert _attribute(timeline, 7.0) == "Alice Chen"
+        # And the anchor's own purpose: a segment at 0.5s, BEFORE the first caption,
+        # now attributes to Alice instead of falling through to a raw SPEAKER_NN.
+        # This is the live 2026-09-07 defect: Teams' first caption landed at 11.3s
+        # and the transcript opened "[00:00] SPEAKER_00: Okay, so this is another
+        # test run...".
+        assert _attribute(timeline, 0.5) == "Alice Chen"
 
     def test_teams_keeps_dom_points_when_no_captions(self, tmp_path: Path) -> None:
         """FAIL-OPEN. With no captions the DOM events are kept: a noisy timeline
@@ -2267,7 +2277,10 @@ class TestTeamsCaptionPreference:
         # timeline from segments (4.0s / 20.0s) and a name-only assertion would
         # still pass. Verified by mutation — `captions or ordered` -> `captions`
         # survived until these two lines existed.
-        assert [e.relative_sec for e in timeline] == pytest.approx([2.0, 10.0])
+        # 0.0 = anchored earliest (Teams is anchored like Zoom). The SECOND value
+        # is what proves the DOM events were kept: the segment fallback would give
+        # 4.0/20.0, so 10.0 could only have come from the DOM event.
+        assert [e.relative_sec for e in timeline] == pytest.approx([0.0, 10.0])
 
     def test_teams_keeps_untagged_points_when_no_captions(self, tmp_path: Path) -> None:
         """Same fail-open path for an older bot image with no provenance tags."""
@@ -2282,7 +2295,10 @@ class TestTeamsCaptionPreference:
 
         assert [e.speaker_name for e in timeline] == ["Alice Chen", "Bob Müller"]
         # Times, not just names — see the note on the DOM-only case above.
-        assert [e.relative_sec for e in timeline] == pytest.approx([2.0, 10.0])
+        # 0.0 = anchored earliest (Teams is anchored like Zoom). The SECOND value
+        # is what proves the DOM events were kept: the segment fallback would give
+        # 4.0/20.0, so 10.0 could only have come from the DOM event.
+        assert [e.relative_sec for e in timeline] == pytest.approx([0.0, 10.0])
 
     def test_teams_caption_in_session_drops_a_dom_only_speakers_points(
         self, tmp_path: Path
@@ -2366,3 +2382,74 @@ class TestTeamsCaptionPreference:
         from aw_integration.adapter import _PLATFORM_MAP
 
         assert _PLATFORM_MAP["teams"] == "teams"
+
+
+class TestTeamsT0Anchor:
+    """Teams joins Zoom in anchoring the earliest event to the recording origin.
+
+    LIVE DEFECT, 2026-09-07: a 2-person Teams meeting produced a transcript that
+    opened "[00:00] SPEAKER_00: Okay, so this is another test run..." even though
+    both speakers were correctly named everywhere else. Teams' first CAPTION event
+    landed at 11.342s -- captions take ~10s to start flowing -- and the worker maps
+    a segment to the last event at-or-before it, so everything before 11.3s had no
+    event to map to and fell through to the raw Whisper label.
+
+    The anchor already existed for Zoom. Teams was excluded for conservatism, not
+    because the anchor is wrong for it.
+    """
+
+    def test_teams_anchors_earliest_event_when_two_speakers(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 11_342),  # the live offset
+            _caption("Bob Müller", "SPEAKER_START", 30_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert timeline[0].relative_sec == pytest.approx(0.0)
+        assert timeline[0].speaker_name == "Alice Chen"
+        # The defect, directly: a segment at 0.0s is Alice, not SPEAKER_NN.
+        assert _attribute(timeline, 0.0) == "Alice Chen"
+        assert _attribute(timeline, 5.0) == "Alice Chen"
+        # Only the EARLIEST is moved; later onsets keep their true times.
+        assert timeline[-1].relative_sec == pytest.approx(30.0)
+
+    def test_teams_does_NOT_anchor_with_only_one_speaker(self, tmp_path: Path) -> None:
+        """The >= 2-speaker guard is retained, and it is the load-bearing half.
+
+        With one named speaker, anchoring them to t=0 makes the worker's
+        last-event-at-or-before rule donate the WHOLE meeting to that one name --
+        including the other, unnamed speaker's words. Observed live on Zoom
+        (2026-08-25). Unattributed speech must stay an honest SPEAKER_NN rather
+        than become a confident wrong name.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 11_342),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert [e.speaker_name for e in timeline] == ["Alice Chen"]
+        assert timeline[0].relative_sec == pytest.approx(11.342), "must NOT anchor"
+        assert _attribute(timeline, 0.0) is None, "pre-speech stays unattributed"
+
+    def test_meet_is_still_NOT_anchored(self, tmp_path: Path) -> None:
+        """REGRESSION GUARD. Meet remains excluded so the stable meet-bot's
+        timeline is byte-for-byte unchanged when that image is rebuilt. Widening
+        the gate to Meet must turn this red."""
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "google_meet"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 11_342),
+            _caption("Bob Müller", "SPEAKER_START", 30_000),
+        ]
+
+        timeline = adapter.build_speaker_timeline().speaker_timeline
+
+        assert timeline[0].relative_sec == pytest.approx(11.342), "Meet must not anchor"

@@ -356,10 +356,16 @@ class VexaSessionAdapter:
         # the first speaker instead of a raw SPEAKER_NN — the recurring
         # "SPEAKER_NN at the very start of the transcript".
         #
-        # GATED to Zoom AND >= 2 distinct named speakers. Two reasons:
-        #  1. Zoom-only keeps every non-Zoom platform (Google Meet, Teams) BYTE-for-
-        #     byte unchanged — this anchor is a Zoom-track fix and must not alter the
-        #     stable meet-bot's timeline when that image is rebuilt.
+        # GATED to Zoom AND TEAMS, and to >= 2 distinct named speakers. Two reasons:
+        #  1. Meet is still excluded, which keeps the stable meet-bot's timeline
+        #     byte-for-byte unchanged when that image is rebuilt. Teams was
+        #     ORIGINALLY excluded for the same conservatism, not because the anchor
+        #     is wrong for it — and a live 2-person Teams meeting on 2026-09-07
+        #     showed it is needed: Teams' first CAPTION event landed at 11.342s
+        #     (captions take ~10s to start flowing), so every segment before that
+        #     had no event at-or-before it and the transcript opened with
+        #     "[00:00] SPEAKER_00: Okay, so this is another test run...". The
+        #     speaker was known; only the anchor was missing.
         #  2. The >= 2-speaker gate prevents the failure mode observed live
         #     (2026-08-25, session c90bfaad…): when only ONE speaker resolves a name
         #     (the other's tile is unreadable → 0 events), anchoring that lone speaker
@@ -372,7 +378,7 @@ class VexaSessionAdapter:
         # Only the single earliest event is mutated; affects only the bot-produced
         # speaker_timeline.json (Jitsi uses Prosody's separate timeline, untouched).
         distinct_speakers = {ev.speaker_id for ev in timeline_events}
-        if self._platform == "zoom" and len(distinct_speakers) >= 2:
+        if self._platform in ("zoom", "teams") and len(distinct_speakers) >= 2:
             earliest = min(timeline_events, key=lambda ev: ev.relative_sec)
             if earliest.relative_sec > 0:
                 earliest.relative_sec = 0.0
