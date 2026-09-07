@@ -188,6 +188,28 @@ _REASON_MAP: dict[
     "startup_alone_timeout": "last_participant",
     "post_join_setup_error": "error",
     "join_meeting_error": "error",
+    # Admission failures. The bot reached the lobby and was never let in, so no
+    # recording exists. Mapped to "error" rather than "host_ended" because the
+    # host did NOT end anything -- nobody admitted the bot. `bot_left_reason` is
+    # a Literal in notetaker_common.schemas (host_ended | last_participant |
+    # hard_deadline | error) and a dedicated "never_admitted" value would be a
+    # cross-repo contract change (notetaker-common + the talke worker + portal),
+    # so "error" is the honest choice inside the existing contract: the session
+    # failed to record. See the WARNING below for the unmapped case.
+    "awaiting_admission_timeout": "error",
+    "admission_timeout": "error",
+    "waiting_room_timeout": "error",
+    "removed_from_waiting_room": "error",
+    "admission_rejected_by_admin": "error",
+    "awaiting_admission_rejected": "error",
+    "join_error_page_alive": "error",
+    "unknown_blocking_state": "error",
+    # Eviction is a human removing the bot -> matches the "removed_by_admin"
+    # precedent rather than reading as a fault.
+    "evicted": "host_ended",
+    # Left unmapped on purpose (the WARNING surfaces them): "stopped" (a
+    # deliberate external stop, no Literal fits), and "ambiguous" /
+    # "waiting_room_timeout_approaching" (non-terminal, never reach the pipeline).
 }
 
 app = FastAPI(title="aw-output-hook")
@@ -255,7 +277,26 @@ async def receive_callback(payload: dict[str, Any]) -> dict[str, str]:
     # some flows. Prefer completion_reason, fall back to reason (§2 fix — we were
     # reading only completion_reason, which was empty on abrupt ends).
     reason = str(payload.get("completion_reason") or payload.get("reason") or "")
-    bot_left_reason = _REASON_MAP.get(reason, "host_ended")
+    # DEFAULT IS "error", NOT "host_ended".
+    #
+    # This used to default to "host_ended", which meant every unmapped reason --
+    # and every callback with no reason at all -- claimed the host ended the
+    # meeting. Live on 2026-09-04 a bot that was never admitted reported
+    # `completed / awaiting_admission_timeout` and the row read "host_ended", so
+    # the portal would have told the user the host hung up when the truth was
+    # "nobody let the bot in". A confident wrong reason is worse than an honest
+    # unknown: it sends whoever is debugging to the wrong place entirely.
+    #
+    # "error" is the least-wrong value in the existing Literal for "we do not
+    # know why this ended", and it is loud rather than plausible.
+    bot_left_reason = _REASON_MAP.get(reason, "error")
+    if reason not in _REASON_MAP:
+        logger.warning(
+            "UNMAPPED leave reason %r (status=%s); defaulting bot_left_reason=error. "
+            "Add it to _REASON_MAP so the row says something true.",
+            reason,
+            payload.get("status"),
+        )
     logger.info(
         "callback status=%s reason=%s -> bot_left_reason=%s",
         payload.get("status"),

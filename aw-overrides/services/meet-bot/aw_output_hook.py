@@ -173,6 +173,32 @@ _REASON_MAP: dict[
     "startup_alone_timeout": "last_participant",
     "post_join_setup_error": "error",
     "join_meeting_error": "error",
+    # ── Admission and blocking failures ─────────────────────────────────────
+    # The bot never got in, or was thrown out. NONE of these is the host ending
+    # the meeting, which is what they all used to report via the default below.
+    #
+    # `bot_left_reason` is a Literal in notetaker_common.schemas
+    # (host_ended | last_participant | hard_deadline | error), so "error" is the
+    # least-wrong value available for "the session failed to record". A dedicated
+    # "never_admitted" would be a cross-repo contract change (notetaker-common +
+    # the talke worker + portal) and is deliberately NOT done here.
+    "admission_timeout": "error",
+    "awaiting_admission_timeout": "error",
+    "admission_rejected_by_admin": "error",
+    "awaiting_admission_rejected": "error",
+    "waiting_room_timeout": "error",
+    "removed_from_waiting_room": "error",
+    "join_error_page_alive": "error",
+    "unknown_blocking_state": "error",
+    # Eviction is a human removing the bot, so it matches the existing
+    # "removed_by_admin" -> host_ended precedent rather than reading as a fault.
+    "evicted": "host_ended",
+    # DELIBERATELY LEFT UNMAPPED, so the WARNING below surfaces them with real
+    # data rather than a guess baked in now:
+    #   "stopped"  - a deliberate external stop; no Literal value fits, and
+    #                calling it "error" would be as wrong as "host_ended".
+    #   "ambiguous", "waiting_room_timeout_approaching" - non-terminal, so they
+    #                never reach the end pipeline at all.
 }
 
 app = FastAPI(title="aw-output-hook")
@@ -267,7 +293,26 @@ async def receive_callback(payload: dict[str, Any]) -> dict[str, str]:
     # some flows. Prefer completion_reason, fall back to reason (§2 fix — we were
     # reading only completion_reason, which was empty on abrupt ends).
     reason = str(payload.get("completion_reason") or payload.get("reason") or "")
-    bot_left_reason = _REASON_MAP.get(reason, "host_ended")
+    # DEFAULT IS "error", NOT "host_ended".
+    #
+    # It used to be "host_ended", so every unmapped reason -- and every callback
+    # with no reason at all -- claimed the host ended the meeting. Nine reasons
+    # the shared Vexa code can emit were unmapped, including `evicted` (the bot
+    # was thrown out) and `admission_rejected_by_admin` (someone denied it). All
+    # of them reported "host ended the meeting": a plausible, benign explanation
+    # for a missing recording, which is why nobody investigates and nobody finds
+    # out the bot is being blocked.
+    #
+    # An honest unknown beats a confident wrong answer. Verified live on
+    # 2026-09-04, where a never-admitted Teams bot reported host_ended.
+    bot_left_reason = _REASON_MAP.get(reason, "error")
+    if reason not in _REASON_MAP:
+        logger.warning(
+            "UNMAPPED leave reason %r (status=%s); defaulting bot_left_reason=error. "
+            "Add it to _REASON_MAP so the row says something true.",
+            reason,
+            payload.get("status"),
+        )
     logger.info(
         "callback status=%s reason=%s -> bot_left_reason=%s",
         payload.get("status"),

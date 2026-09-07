@@ -226,7 +226,26 @@ def test_post_callback_maps_reason_from_both_fields(client: TestClient) -> None:
         ("reason", "meeting_ended", "host_ended"),
         ("reason", "removed_by_admin", "host_ended"),
         ("reason", "left_alone_timeout", "last_participant"),
-        ("reason", "totally_unknown", "host_ended"),
+        # An UNMAPPED reason must NOT claim "host_ended". That default was the
+        # 2026-09-04 bug: a bot that was never admitted reported
+        # `completed / awaiting_admission_timeout` and the row said the host
+        # ended the meeting. An honest "error" beats a confident wrong reason.
+        ("reason", "totally_unknown", "error"),
+        # Admission failures: the bot reached the lobby and nobody let it in.
+        ("reason", "awaiting_admission_timeout", "error"),
+        ("completion_reason", "admission_timeout", "error"),
+        ("reason", "waiting_room_timeout", "error"),
+        ("reason", "removed_from_waiting_room", "error"),
+        ("reason", "admission_rejected_by_admin", "error"),
+        ("reason", "join_error_page_alive", "error"),
+        ("reason", "unknown_blocking_state", "error"),
+        # Eviction follows the existing removed_by_admin precedent, so it must
+        # stay host_ended and NOT be flattened into "error" with the rest.
+        ("reason", "evicted", "host_ended"),
+        # Regression guard: the reasons that genuinely DO mean the host ended it
+        # must still map to host_ended, so the fix above did not flatten
+        # everything into "error".
+        ("reason", "normal_completion", "host_ended"),
     ]
     for field, value, expected in cases:
         payload: dict[str, Any] = {
@@ -657,3 +676,38 @@ def test_run_pipeline_and_signal_writes_sentinel_even_on_error(
     ):
         asyncio.run(hook._run_pipeline_and_signal(bot_left_reason="host_ended"))
     assert sentinel.exists()
+
+
+def test_mapped_reasons_do_not_warn_but_unmapped_ones_do(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The WARNING is the only OBSERVABLE difference between a reason that is
+    explicitly mapped to "error" and one that merely defaults to it.
+
+    Without this test, deleting an explicit mapping is an EQUIVALENT MUTANT:
+    the outcome assertions still pass because the default produces the same
+    value. Verified by mutation - dropping `"admission_timeout": "error"`
+    survived the whole suite until this existed.
+    """
+    with patch("aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock):
+        # explicitly mapped -> silent
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            client.post(
+                "/callback",
+                json={"status": "completed", "reason": "admission_timeout"},
+            )
+        assert not [
+            r for r in caplog.records if "UNMAPPED" in r.message
+        ], "an explicitly mapped reason must not warn"
+
+        # genuinely unknown -> warns, so it gets noticed and mapped
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            client.post(
+                "/callback",
+                json={"status": "completed", "reason": "brand_new_reason_xyz"},
+            )
+        assert [
+            r for r in caplog.records if "UNMAPPED" in r.message
+        ], "an unmapped reason must warn"
