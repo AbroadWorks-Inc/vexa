@@ -2102,11 +2102,24 @@ async function handleTeamsCaptionData(speakerName: string, captionText: string, 
     : timestampMs / 1000;
   captionEventLog.push({ speaker: speakerName, text: captionText, timestamp: sessionRelativeSec });
 
-  // Publish caption as a speaker event for downstream consumers
+  // Publish caption as a speaker event for downstream consumers.
+  //
+  // `source: 'caption'` is REQUIRED here, not decorative. aw-integration's Teams
+  // preference discards DOM points in favour of caption points by selecting on
+  // this exact value, and Teams' DOM fallback keys on `vdi-frame-occlusion` — a
+  // Virtual-Desktop frame marker, which in the 2026-09-07 live run emitted ONE
+  // anonymous `Teams Participant (<uuid>)` for all three humans. Untagged, these
+  // named events were invisible to that preference (10 of 707 tagged) and it was
+  // effectively inert.
+  //
+  // NOT pairable: 'caption' is provenance only. The adapter builds intervals from
+  // `source == "audio"` exclusively, so this stays a point-in-time claim, which is
+  // correct — a caption line has no reliable END. Teams-only call site.
   await segmentPublisher.publishSpeakerEvent({
     speaker: speakerName,
     type: 'started_speaking',
     timestamp: timestampMs,
+    source: 'caption',
   });
 
   log(`[📝 TEAMS CAPTION] "${speakerName}": ${captionText.substring(0, 80)}${captionText.length > 80 ? '...' : ''}`);

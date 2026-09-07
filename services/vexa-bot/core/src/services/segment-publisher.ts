@@ -48,8 +48,22 @@ export interface SpeakerEvent {
    * Zoom never arm the boundary tracker, so ALL of their traffic has that shape —
    * this is the normal case there, not an edge case. Leaving `source` undefined
    * routes them to the point-based path, i.e. their existing behaviour.
+   *
+   * `'caption'` is a THIRD value with different semantics: pure provenance, never
+   * a pairing licence. aw-integration pairs on `source == "audio"` ONLY
+   * (`adapter.py`, the interval builder), so a caption-tagged event can never
+   * open an interval — it stays a point, exactly like an untagged one. What the
+   * tag buys is the Teams caption-vs-DOM preference in the adapter, which selects
+   * on `source == "caption"`.
+   *
+   * Measured motivation (2026-09-07, live 3-person Teams meeting): 707 speaker
+   * events reached Redis with correct names, but only 10 carried the tag, because
+   * `handleTeamsCaptionData` published untagged while `CaptionSpeakerEventPublisher`
+   * tagged only on speaker CHANGE. The adapter's preference therefore selected 10
+   * of 707. It was fail-safe (`captions or ordered` falls back to everything, and
+   * untagged events still carry real names) but the preference was near-inert.
    */
-  source?: 'audio';
+  source?: 'audio' | 'caption';
 }
 
 export interface SegmentPublisherConfig {
