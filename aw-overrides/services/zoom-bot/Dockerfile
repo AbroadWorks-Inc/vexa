@@ -55,10 +55,30 @@ COPY --from=ts-build /usr/local/bin/node /usr/local/bin/node
 
 COPY notetaker-common/pyproject.toml notetaker-common/pyproject.toml
 COPY notetaker-common/notetaker_common/ notetaker-common/notetaker_common/
-RUN pip install --no-cache-dir ./notetaker-common
+# --ignore-installed: the v1.56.0-noble base ships pip 25.3, which REFUSES to
+# uninstall an apt-managed package (no RECORD file) -- and pydantic==2.5.0 pulls a
+# newer typing_extensions than the apt one in /usr/lib/python3/dist-packages, so a
+# plain install dies with `uninstall-no-record-file`. Installing pip-managed copies
+# ALONGSIDE the apt ones (shadowing them in site-packages) sidesteps the uninstall
+# entirely. Reinstalling the full dependency closure this way also shadows every
+# other apt-managed package pip touches (certifi, idna, urllib3, python-dateutil,
+# typing_extensions), so the later pip layers need no flag of their own. Pins are
+# preserved -- this is a local pinned package, so re-resolution keeps
+# pydantic==2.5.0 et al.
+#
+# THIRD OCCURRENCE of this bug: meet-bot hit it and fixed it (cc9e758b), teams-bot
+# inherited it by being modelled on THIS file and fixed it, and zoom-bot then
+# failed its first rebuild since the base image moved to pip 25.3. The image that
+# is live today was built before that, which is why nothing appeared broken.
+RUN pip install --no-cache-dir --ignore-installed ./notetaker-common
 
 COPY vexa-fork/aw-overrides/aw-integration/pyproject.toml aw-integration/pyproject.toml
 COPY vexa-fork/aw-overrides/aw-integration/aw_integration/ aw-integration/aw_integration/
+# NOT --ignore-installed here, deliberately: aw-integration depends on
+# notetaker-common, a LOCAL package on no index. --ignore-installed would make pip
+# re-resolve that dependency from PyPI and fail with "No matching distribution for
+# notetaker-common". A plain install reuses the copy installed above, and the
+# apt-managed packages are already shadowed, so there is no uninstall risk left.
 RUN pip install --no-cache-dir ./aw-integration
 
 RUN pip install --no-cache-dir "fastapi==0.109.0" "uvicorn[standard]==0.27.0" "python-multipart" "prometheus-fastapi-instrumentator==6.1.0"
