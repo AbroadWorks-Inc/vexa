@@ -13,9 +13,12 @@
  * if someone edits the Teams copy, these fail here without touching Zoom.
  */
 
+import { readFileSync } from 'node:fs';
 import {
   AloneTimerState,
+  TeamsAloneTimeouts,
   TeamsPresenceReading,
+  TEAMS_ROSTER_GONE_STALE_MS,
   TEAMS_DEFAULT_EVERYONE_LEFT_MS,
   TEAMS_DEFAULT_NO_ONE_JOINED_MS,
   TEAMS_POLL_MS,
@@ -209,7 +212,14 @@ const resolve = (r: Partial<TeamsPresenceReading>) => resolveTeamsAloneCount(rea
     state = t.state;
     if (t.shouldLeave) break;
   }
-  assertEqual(state, { aloneMs: 0, sawOthers: true }, '30 min of captions never accumulates alone time');
+  // `rosterEverReadable: false` because this scenario keeps the panel SHUT for
+  // the whole 30 minutes (`reading()` defaults rosterHumans to null), so the
+  // latch never fires. That is the case the long stale hold still protects.
+  assertEqual(
+    state,
+    { aloneMs: 0, sawOthers: true, rosterEverReadable: false },
+    '30 min of captions never accumulates alone time'
+  );
 
   // Then everyone leaves: no more evidence, and the roster becomes readable and
   // empty (Teams shows the roster when you are the last one).
@@ -410,6 +420,99 @@ const resolve = (r: Partial<TeamsPresenceReading>) => resolveTeamsAloneCount(rea
 {
   const f = buildCaptionSpeakerEventFields({ uid: 'u', meetingId: '1', participantName: '  José Núñez ', relativeMs: 1 })!;
   assertEqual(f.participant_name, 'José Núñez', 'name is trimmed, not otherwise altered');
+}
+
+// ---------------------------------------------------------------------------
+// rosterEverReadable — the 2026-09-07 live finding
+//
+// A 30-min Teams meeting kept the bot alive ~19 min past the end (15 min stale
+// + 2 min everyone-left), uploading ~60 silent chunks. Mid-meeting the reading
+// was `roster=1` (READABLE); it became `roster=unreadable` only once everyone
+// left. So a null roster after a readable one is DEPARTURE, not blindness.
+// ---------------------------------------------------------------------------
+{
+  const timeouts: TeamsAloneTimeouts = {
+    pollMs: 1_000,
+    everyoneLeftMs: 120_000,
+    noOneJoinedMs: 600_000,
+    presenceWindowMs: 60_000,
+    staleEvidenceMs: 900_000,
+  };
+  const rd = (o: Partial<TeamsPresenceReading> = {}): TeamsPresenceReading => ({
+    rosterHumans: null, signalTiles: 0, humanEvidenceAgeMs: null, ...o,
+  });
+
+  // 1. the latch sets when the roster is readable, and never clears
+  let st: AloneTimerState = { aloneMs: 0, sawOthers: false };
+  st = teamsAloneTick(st, rd({ rosterHumans: 2, humanEvidenceAgeMs: 1_000 }), timeouts).state;
+  assertEqual(st.rosterEverReadable, true, 'latch sets on a readable roster');
+  st = teamsAloneTick(st, rd({ humanEvidenceAgeMs: 200_000 }), timeouts).state;
+  assertEqual(st.rosterEverReadable, true, 'latch survives a later null roster');
+
+  // 2. THE FIX: readable-then-gone leaves in ~4 min, not ~17
+  let s2: AloneTimerState = { aloneMs: 0, sawOthers: false };
+  s2 = teamsAloneTick(s2, rd({ rosterHumans: 2, humanEvidenceAgeMs: 1_000 }), timeouts).state;
+  let leftAt = -1;
+  for (let i = 1; i <= 1200; i++) {
+    // roster gone, no tiles, evidence ageing past the SHORT bound
+    const t = teamsAloneTick(s2, rd({ humanEvidenceAgeMs: 60_000 + i * 1_000 }), timeouts);
+    s2 = t.state;
+    if (t.shouldLeave) { leftAt = i; break; }
+  }
+  assertEqual(leftAt > 0 && leftAt <= 200, true, `leaves within ~200s of roster loss (got ${leftAt})`);
+
+  // 3. REGRESSION GUARD: never-readable roster keeps the LONG hold
+  let s3: AloneTimerState = { aloneMs: 0, sawOthers: true };
+  let left3 = -1;
+  for (let i = 1; i <= 400; i++) {
+    const t = teamsAloneTick(s3, rd({ humanEvidenceAgeMs: 60_000 + i * 1_000 }), timeouts);
+    s3 = t.state;
+    if (t.shouldLeave) { left3 = i; break; }
+  }
+  assertEqual(s3.rosterEverReadable, false, 'never-readable roster does not latch');
+  assertEqual(left3, -1, 'never-readable roster still holds past 400s (long bound intact)');
+
+  // 4. live evidence still wins over the short bound - a quiet-but-present
+  //    meeting must not be abandoned
+  let s4: AloneTimerState = { aloneMs: 0, sawOthers: false };
+  s4 = teamsAloneTick(s4, rd({ rosterHumans: 3, humanEvidenceAgeMs: 1_000 }), timeouts).state;
+  let left4 = -1;
+  for (let i = 1; i <= 600; i++) {
+    const t = teamsAloneTick(s4, rd({ humanEvidenceAgeMs: 5_000 }), timeouts);
+    s4 = t.state;
+    if (t.shouldLeave) { left4 = i; break; }
+  }
+  assertEqual(left4, -1, 'recent captions keep the bot in, latch or no latch');
+}
+
+// ---------------------------------------------------------------------------
+// SOURCE GUARD: the Teams caption publish must carry source: 'caption'
+//
+// `handleTeamsCaptionData` lives in index.ts, a ~2,600-line orchestration file
+// with no unit-test seam, so this is a static assertion over the source text --
+// the same approach teams-bot's suite uses for its Dockerfile.
+//
+// Why it is worth pinning: on 2026-09-07 a live 3-person meeting put 707 named
+// speaker events into Redis and only 10 carried the tag, because this call site
+// published untagged. aw-integration's Teams preference selects on
+// `source == "caption"`, so it saw 10 of 707 and was effectively inert, while
+// the DOM fallback was emitting ONE anonymous `Teams Participant (<uuid>)` for
+// all three humans. Untagged is fail-safe, never correct.
+// ---------------------------------------------------------------------------
+{
+  // Resolved from the repo layout rather than `import.meta.url`: this package's
+  // tsconfig `module` target predates import.meta, and tsc rejects it (tsx does
+  // not, which is exactly how a type error can hide behind a green suite).
+  const src = readFileSync('src/index.ts', 'utf8');
+  const i = src.indexOf("type: 'started_speaking'");
+  assertEqual(i > 0, true, "index.ts still has the 'started_speaking' caption publish");
+  // the source field must appear inside this call, before the closing brace
+  const call = src.slice(Math.max(0, i - 400), i + 200);
+  assertEqual(
+    /source:\s*'caption'/.test(call),
+    true,
+    "the Teams caption publish carries source: 'caption'"
+  );
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

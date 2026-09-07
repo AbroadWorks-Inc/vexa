@@ -43,6 +43,23 @@
 export interface AloneTimerState {
   aloneMs: number;
   sawOthers: boolean;
+  /**
+   * Has the Participants roster been readable AT ANY POINT this session?
+   *
+   * This is the discriminator between the two things a `null` roster can mean.
+   * `TEAMS_STALE_EVIDENCE_MS` was written on the assumption that an unreadable
+   * roster is Teams' STEADY state (nothing opens the panel), so a null roster
+   * says nothing and the bot must hold. A live 3-person meeting on 2026-09-07
+   * disproved that for the admitted case: mid-meeting the reading was
+   * `roster=1` — readable — and it became `roster=unreadable` only once
+   * everyone left.
+   *
+   * So once the roster has been readable, its DISAPPEARANCE is evidence of
+   * departure rather than blindness, and holding the full 15 minutes is wrong.
+   * When it has never been readable, the original reasoning still applies and
+   * the long hold is kept.
+   */
+  rosterEverReadable?: boolean;
 }
 
 /**
@@ -65,13 +82,21 @@ export function stepAloneTimer(
   noOneJoinedMs: number
 ): { state: AloneTimerState; shouldLeave: boolean; label: 'everyone left' | 'no one joined' | null } {
   if (count >= 2) {
-    return { state: { aloneMs: 0, sawOthers: true }, shouldLeave: false, label: null };
+    return {
+      state: { aloneMs: 0, sawOthers: true, rosterEverReadable: state.rosterEverReadable },
+      shouldLeave: false,
+      label: null,
+    };
   }
   if (count === 1) {
     const aloneMs = state.aloneMs + pollMs;
     const threshold = state.sawOthers ? everyoneLeftMs : noOneJoinedMs;
     const label = state.sawOthers ? 'everyone left' : 'no one joined';
-    return { state: { aloneMs, sawOthers: state.sawOthers }, shouldLeave: aloneMs >= threshold, label };
+    return {
+      state: { aloneMs, sawOthers: state.sawOthers, rosterEverReadable: state.rosterEverReadable },
+      shouldLeave: aloneMs >= threshold,
+      label,
+    };
   }
   // count === 0 → unreadable → hold.
   return { state, shouldLeave: false, label: null };
@@ -140,6 +165,21 @@ export const TEAMS_PRESENCE_WINDOW_MS = 60_000;
 export const TEAMS_STALE_EVIDENCE_MS = 15 * 60_000;
 
 /** Default when the orchestrator sends no `noOneJoinedTimeout` (today's case). */
+/**
+ * The stale-evidence hold used once the roster HAS been readable this session.
+ *
+ * Two minutes, not fifteen. A roster that was readable and is now null is a
+ * transition, so the bot does not need to assume blindness — but it still waits
+ * out a short window rather than acting on one tick, because a panel can also
+ * close or re-render mid-meeting. Combined with the everyone-left timer this
+ * puts the total at roughly four minutes instead of nineteen.
+ *
+ * Measured motivation: on 2026-09-07 a 30-minute Teams meeting kept the bot
+ * alive ~19 minutes past the end (15 min stale + 2 min everyone-left + poll
+ * slack), uploading ~60 chunks of pure silence and padding the recording.
+ */
+export const TEAMS_ROSTER_GONE_STALE_MS = 2 * 60_000;
+
 export const TEAMS_DEFAULT_NO_ONE_JOINED_MS = 20 * 60_000;
 
 /** Default when the orchestrator sends no `everyoneLeftTimeout`. */
@@ -178,7 +218,8 @@ export interface TeamsAloneTimeouts {
 export function resolveTeamsAloneCount(
   reading: TeamsPresenceReading,
   presenceWindowMs: number,
-  staleEvidenceMs: number
+  staleEvidenceMs: number,
+  rosterEverReadable: boolean = false
 ): TeamsAloneCount {
   const { rosterHumans, signalTiles, humanEvidenceAgeMs } = reading;
 
@@ -194,7 +235,13 @@ export function resolveTeamsAloneCount(
   if (humanEvidenceAgeMs === null) {
     return 1;
   }
-  if (humanEvidenceAgeMs > staleEvidenceMs) {
+  // A roster that was readable earlier and is null NOW is a transition, so the
+  // long blindness hold does not apply -- a much shorter window does. When the
+  // roster has never been readable, `staleEvidenceMs` still governs.
+  const effectiveStaleMs = rosterEverReadable
+    ? Math.min(staleEvidenceMs, TEAMS_ROSTER_GONE_STALE_MS)
+    : staleEvidenceMs;
+  if (humanEvidenceAgeMs > effectiveStaleMs) {
     return 1;
   }
   return 0;
@@ -217,10 +264,17 @@ export function teamsAloneTick(
   reading: TeamsPresenceReading,
   timeouts: TeamsAloneTimeouts
 ): TeamsAloneTickResult {
+  // Latch BEFORE resolving: a readable roster this tick is remembered for the
+  // rest of the session, so a later null roster reads as departure rather than
+  // blindness. Latch-only (never cleared) -- the fact being recorded is "this
+  // bot CAN see the roster in this meeting", which does not stop being true.
+  const rosterEverReadable = state.rosterEverReadable === true || reading.rosterHumans !== null;
+
   const count = resolveTeamsAloneCount(
     reading,
     timeouts.presenceWindowMs,
-    timeouts.staleEvidenceMs
+    timeouts.staleEvidenceMs,
+    rosterEverReadable
   );
   const stepped = stepAloneTimer(
     state,
@@ -229,7 +283,12 @@ export function teamsAloneTick(
     timeouts.everyoneLeftMs,
     timeouts.noOneJoinedMs
   );
-  return { state: stepped.state, count, shouldLeave: stepped.shouldLeave, label: stepped.label };
+  return {
+    state: { ...stepped.state, rosterEverReadable },
+    count,
+    shouldLeave: stepped.shouldLeave,
+    label: stepped.label,
+  };
 }
 
 /** True for a value usable as a positive millisecond threshold. */
