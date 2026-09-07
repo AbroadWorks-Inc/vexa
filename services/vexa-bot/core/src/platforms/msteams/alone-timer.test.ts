@@ -437,6 +437,7 @@ const resolve = (r: Partial<TeamsPresenceReading>) => resolveTeamsAloneCount(rea
     noOneJoinedMs: 600_000,
     presenceWindowMs: 60_000,
     staleEvidenceMs: 900_000,
+    rosterGoneStaleMs: TEAMS_ROSTER_GONE_STALE_MS,
   };
   const rd = (o: Partial<TeamsPresenceReading> = {}): TeamsPresenceReading => ({
     rosterHumans: null, signalTiles: 0, humanEvidenceAgeMs: null, ...o,
@@ -513,6 +514,67 @@ const resolve = (r: Partial<TeamsPresenceReading>) => resolveTeamsAloneCount(rea
     true,
     "the Teams caption publish carries source: 'caption'"
   );
+}
+
+// ---------------------------------------------------------------------------
+// rosterGoneStaleTimeout is operator-tunable (user request, 2026-09-07)
+//
+// Measured live before this: 4m6s from presence=0 to exit. The ask was ~90s, to
+// match Meet's EMPTY_GRACE_TICKS = 90. Total latency is
+// rosterGoneStaleMs + everyoneLeftMs, FLOORED by presenceWindowMs because the
+// count cannot leave the "present" state until evidence is older than that.
+// ---------------------------------------------------------------------------
+{
+  const rd = (o: Partial<TeamsPresenceReading> = {}): TeamsPresenceReading => ({
+    rosterHumans: null, signalTiles: 0, humanEvidenceAgeMs: null, ...o,
+  });
+
+  // 1. the config value is READ, and overrides the constant
+  const t = readTeamsLeaveTimeouts({
+    rosterGoneStaleTimeout: 60_000,
+    everyoneLeftTimeout: 30_000,
+  });
+  assertEqual(t.rosterGoneStaleMs, 60_000, 'rosterGoneStaleTimeout is read from config');
+  assertEqual(t.everyoneLeftMs, 30_000, 'everyoneLeftTimeout is read from config');
+
+  // 2. unset falls back to the constant, not to zero
+  const d = readTeamsLeaveTimeouts({});
+  assertEqual(d.rosterGoneStaleMs, TEAMS_ROSTER_GONE_STALE_MS, 'unset -> constant');
+
+  // 3. END TO END: 60s + 30s leaves in ~90s, not ~240s
+  const tuned: TeamsAloneTimeouts = {
+    pollMs: 1_000,
+    everyoneLeftMs: 30_000,
+    noOneJoinedMs: 600_000,
+    presenceWindowMs: 60_000,
+    staleEvidenceMs: 900_000,
+    rosterGoneStaleMs: 60_000,
+  };
+  let st: AloneTimerState = { aloneMs: 0, sawOthers: false };
+  st = teamsAloneTick(st, rd({ rosterHumans: 2, humanEvidenceAgeMs: 1_000 }), tuned).state;
+  let leftAt = -1;
+  for (let i = 1; i <= 600; i++) {
+    const r = teamsAloneTick(st, rd({ humanEvidenceAgeMs: 1_000 + i * 1_000 }), tuned);
+    st = r.state;
+    if (r.shouldLeave) { leftAt = i; break; }
+  }
+  assertEqual(
+    leftAt > 0 && leftAt <= 100,
+    true,
+    `tuned to 60s+30s leaves within ~100s (got ${leftAt})`
+  );
+
+  // 4. and the DEFAULTS still give the old ~4 min, so this is opt-in only
+  const defs: TeamsAloneTimeouts = { ...tuned, everyoneLeftMs: 120_000, rosterGoneStaleMs: 120_000 };
+  let s2: AloneTimerState = { aloneMs: 0, sawOthers: false };
+  s2 = teamsAloneTick(s2, rd({ rosterHumans: 2, humanEvidenceAgeMs: 1_000 }), defs).state;
+  let left2 = -1;
+  for (let i = 1; i <= 600; i++) {
+    const r = teamsAloneTick(s2, rd({ humanEvidenceAgeMs: 1_000 + i * 1_000 }), defs);
+    s2 = r.state;
+    if (r.shouldLeave) { left2 = i; break; }
+  }
+  assertEqual(left2 > 200, true, `untuned still ~4min (got ${left2})`);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

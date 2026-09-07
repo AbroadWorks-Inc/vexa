@@ -192,6 +192,13 @@ export interface TeamsAloneTimeouts {
   noOneJoinedMs: number;
   presenceWindowMs: number;
   staleEvidenceMs: number;
+  /**
+   * The SHORT stale bound used once the roster has been readable this session.
+   * Operator-tunable via `automaticLeave.rosterGoneStaleTimeout`: the total
+   * "everyone left -> bot gone" latency is this plus `everyoneLeftMs`, and the
+   * right value is a product decision, not a code constant.
+   */
+  rosterGoneStaleMs: number;
 }
 
 /**
@@ -219,7 +226,8 @@ export function resolveTeamsAloneCount(
   reading: TeamsPresenceReading,
   presenceWindowMs: number,
   staleEvidenceMs: number,
-  rosterEverReadable: boolean = false
+  rosterEverReadable: boolean = false,
+  rosterGoneStaleMs: number = TEAMS_ROSTER_GONE_STALE_MS
 ): TeamsAloneCount {
   const { rosterHumans, signalTiles, humanEvidenceAgeMs } = reading;
 
@@ -239,7 +247,7 @@ export function resolveTeamsAloneCount(
   // long blindness hold does not apply -- a much shorter window does. When the
   // roster has never been readable, `staleEvidenceMs` still governs.
   const effectiveStaleMs = rosterEverReadable
-    ? Math.min(staleEvidenceMs, TEAMS_ROSTER_GONE_STALE_MS)
+    ? Math.min(staleEvidenceMs, rosterGoneStaleMs)
     : staleEvidenceMs;
   if (humanEvidenceAgeMs > effectiveStaleMs) {
     return 1;
@@ -274,7 +282,8 @@ export function teamsAloneTick(
     reading,
     timeouts.presenceWindowMs,
     timeouts.staleEvidenceMs,
-    rosterEverReadable
+    rosterEverReadable,
+    timeouts.rosterGoneStaleMs
   );
   const stepped = stepAloneTimer(
     state,
@@ -325,12 +334,21 @@ export function readTeamsLeaveTimeouts(automaticLeave: unknown): TeamsAloneTimeo
       ? positiveMs(cfg.everyoneLeftTimeoutSeconds)! * 1000
       : TEAMS_DEFAULT_EVERYONE_LEFT_MS);
 
+  // Operator-tunable. Total "everyone left -> bot gone" latency is
+  // `rosterGoneStaleMs + everyoneLeftMs`, with a FLOOR of `presenceWindowMs`:
+  // the count cannot leave the "present" state until the last human evidence is
+  // older than that window. So 60s + 30s ~= 90s, matching Google Meet's
+  // EMPTY_GRACE_TICKS = 90.
+  const rosterGoneStaleMs =
+    positiveMs(cfg.rosterGoneStaleTimeout) ?? TEAMS_ROSTER_GONE_STALE_MS;
+
   return {
     pollMs: TEAMS_POLL_MS,
     everyoneLeftMs,
     noOneJoinedMs,
     presenceWindowMs: TEAMS_PRESENCE_WINDOW_MS,
     staleEvidenceMs: TEAMS_STALE_EVIDENCE_MS,
+    rosterGoneStaleMs,
   };
 }
 
