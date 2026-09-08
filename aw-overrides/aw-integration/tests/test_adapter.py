@@ -2331,14 +2331,136 @@ class TestTeamsCaptionPreference:
         # And the consequence made explicit: Bob's 10s speech reads as Alice.
         assert _attribute(timeline, 10.5) == "Alice Chen"
 
-    def test_teams_emits_no_intervals(self, tmp_path: Path) -> None:
-        """Teams must stay points-only. An interval built from caption events
-        would never close and would erase every other speaker."""
+    def test_teams_derives_intervals_from_caption_RUNS(self, tmp_path: Path) -> None:
+        """Teams now emits caption-derived intervals, and this is why.
+
+        The worker picks its mapper on the PRESENCE of `speaker_intervals`. With
+        none, Teams got the legacy "owner at the segment's first instant" rule,
+        and a live 3-way meeting on 2026-09-08 showed the cost: one speaker's
+        "hello hello" took the whole of the next speaker's sentence. With
+        intervals present the worker uses dominant overlap AND splits a segment
+        where the speaker changes.
+
+        The old version of this test asserted `speaker_intervals == []` and
+        justified it as "an interval built from caption events would never close
+        and would erase every other speaker". That reasoning was about the AUDIO
+        boundary machine -- one mixed stream, a single interval that never closes
+        -- and it does not apply here: a caption run closes at the NEXT speaker's
+        first point, as asserted below.
+        """
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         adapter._session.platform = "teams"
         adapter._session.speaker_events = [
             _caption("Alice Chen", "SPEAKER_START", 2_000),
-            _caption("Bob Müller", "SPEAKER_START", 10_000),
+            _caption("Bob M\u00fcller", "SPEAKER_START", 10_000),
+        ]
+
+        ivs = adapter.build_speaker_timeline().speaker_intervals
+
+        assert [(iv.speaker_name, iv.start_sec, iv.end_sec) for iv in ivs] == [
+            # Alice starts at 0.0, not 2.0: the t=0 anchor already pulled the
+            # earliest point to the origin, and the interval follows it.
+            ("Alice Chen", 0.0, 10.0),
+            # Closed at the next speaker's first point -- NOT left open.
+            ("Bob M\u00fcller", 10.0, 60.0),  # 60.0 = session end
+        ]
+
+    def test_a_RUN_of_points_becomes_ONE_interval_not_one_each(
+        self, tmp_path: Path
+    ) -> None:
+        """Captions arrive ~1/sec, so per-point intervals would be useless.
+
+        A live meeting produced 673 points over 582s. One interval per point
+        would give the worker 673 sub-second spans -- which is word-level
+        attribution by the back door, the approach that was merged and REVERTED
+        for chopping single sentences across speakers. Runs are the unit.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 1_000),
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _caption("Alice Chen", "SPEAKER_START", 3_000),
+            _caption("Bob M\u00fcller", "SPEAKER_START", 20_000),
+            _caption("Bob M\u00fcller", "SPEAKER_START", 21_000),
+        ]
+
+        ivs = adapter.build_speaker_timeline().speaker_intervals
+
+        assert len(ivs) == 2, f"5 points must collapse to 2 runs, got {len(ivs)}"
+        assert [(iv.speaker_name, iv.start_sec, iv.end_sec) for iv in ivs] == [
+            ("Alice Chen", 0.0, 20.0),
+            ("Bob M\u00fcller", 20.0, 60.0),
+        ]
+
+    def test_a_cross_speaker_timestamp_TIE_is_deterministic_and_never_zero_length(
+        self, tmp_path: Path
+    ) -> None:
+        """Two different speakers at the same instant: pick one, always the same one.
+
+        Teams caption timestamps are coarse, so a genuine tie is plausible. Two
+        properties must hold, and neither was tested before gate 1 asked:
+
+        1. NO zero-length interval reaches the artifact. The worker requires
+           `end > start` and silently discards anything else, so a zero-length
+           span is invisible waste that also hides the tie from anyone reading
+           the file.
+        2. The artifact is DETERMINISTIC. The same input must always produce the
+           same bytes -- the tie-break discipline the surrounding code already
+           follows for `timeline_events`. A tie resolved by dict or set ordering
+           would make two runs of the same meeting disagree, which is exactly the
+           kind of thing that is impossible to debug later.
+
+        Losing one instant of attribution to the tie is acceptable. A
+        nondeterministic artifact would not be.
+        """
+
+        def build() -> list[tuple[str, float, float]]:
+            adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+            adapter._session.platform = "teams"
+            adapter._session.speaker_events = [
+                # The tie is deliberately NOT at the earliest point. The t=0
+                # anchor moves the earliest event to 0.0, which incidentally
+                # BREAKS a tie there -- so a tie on the first point never
+                # exercises this path. It has to be mid-conversation.
+                _caption("Alice Chen", "SPEAKER_START", 1_000),
+                _caption("Bob M\u00fcller", "SPEAKER_START", 10_000),
+                _caption("Carol Diaz", "SPEAKER_START", 10_000),  # exact tie
+                _caption("Dave Okonkwo", "SPEAKER_START", 20_000),
+            ]
+            return [
+                (iv.speaker_name, iv.start_sec, iv.end_sec)
+                for iv in adapter.build_speaker_timeline().speaker_intervals
+            ]
+
+        first = build()
+
+        assert all(
+            end > start for _, start, end in first
+        ), f"a zero-length interval reached the artifact: {first}"
+        assert build() == first, "the same input produced different intervals"
+        # The tie costs exactly one instant: 4 points, one mid-conversation
+        # tie -> 3 runs, because the zero-length one is dropped.
+        assert len(first) == 3, f"expected 3 runs from 4 points with a tie: {first}"
+        names = [n for n, _, _ in first]
+        assert len(set(names)) == 3, f"one speaker must lose the tie: {names}"
+
+    def test_teams_with_ONE_named_speaker_still_emits_NO_intervals(
+        self, tmp_path: Path
+    ) -> None:
+        """The safety gate, carried over from the t=0 anchor for the same reason.
+
+        With one named speaker, an interval spanning the session donates the
+        ENTIRE meeting to them -- including the unnamed speaker's words. That is
+        the 2026-08-25 Zoom incident (session c90bfaad), where everything clogged
+        under the host. Below two named speakers, stay points-only and let
+        unattributed speech remain an honest SPEAKER_NN.
+        """
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _caption("Alice Chen", "SPEAKER_START", 9_000),
         ]
 
         assert adapter.build_speaker_timeline().speaker_intervals == []
