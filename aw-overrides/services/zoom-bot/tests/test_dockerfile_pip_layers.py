@@ -10,6 +10,7 @@ rebuild failed after ~104s with `uninstall-no-record-file`. Hence a guard rather
 than a fourth fix.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -57,4 +58,35 @@ def test_aw_integration_does_NOT_use_ignore_installed(dockerfile: str) -> None:
     assert "--ignore-installed" not in line, (
         "aw-integration must NOT use --ignore-installed; pip would re-resolve "
         f"notetaker-common from PyPI and fail. Got: {line}"
+    )
+
+
+def test_dockerfile_installs_ffmpeg_in_the_RUNTIME_stage(dockerfile: str) -> None:
+    """ffmpeg is needed by two paths and was asserted by neither until now.
+
+    It transcodes chunks to PCM for transcription, and encodes the whole-session
+    blob into `full_session.m4a`. Both fail only at the END of a real meeting,
+    after the audio is already captured -- the most expensive moment to discover
+    a missing binary.
+
+    ⚠ Scoped to the FINAL stage on purpose. An earlier version matched any line
+    equal to "ffmpeg" anywhere in the file, which would have passed with ffmpeg
+    installed ONLY in the discarded `ts-build` builder stage -- a false green on
+    an image that has no ffmpeg at all. It also demanded ffmpeg be alone on its
+    line, so the ordinary `ffmpeg curl \\` would have failed a correct
+    Dockerfile. Both directions are wrong; this checks the package appears as a
+    word in an apt-install line after the last FROM.
+    """
+    stages = re.split(r"^FROM ", dockerfile, flags=re.M)
+    runtime = stages[-1]
+    assert "FROM" not in runtime.split("\n")[0] or True  # last stage by construction
+
+    apt_block = re.search(
+        r"(apt-get|apt)\s+install[^\n]*(\n(?:[^\n]*\\\n)*[^\n]*)", runtime
+    )
+    assert apt_block, "no apt install in the runtime stage -- re-derive this guard"
+    installed = re.findall(r"[\w.+-]+", apt_block.group(0))
+    assert "ffmpeg" in installed, (
+        "ffmpeg must be installed in the RUNTIME stage; found only: "
+        f"{sorted(set(installed))[:20]}"
     )
