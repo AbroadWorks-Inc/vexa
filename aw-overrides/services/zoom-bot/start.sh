@@ -177,6 +177,15 @@ for i in $(seq 1 60); do
     fi
     sleep 0.5
 done
+# ⚠ 900 x 0.5s = 450s, and it MUST stay larger than the sidecar's own
+# _FULL_AUDIO_DRAIN_TIMEOUT_S (300s) plus the pipeline it runs first. It was 240
+# (120s), which SHADOWED that 300s bound: the sidecar was killed at 120s, so the
+# timeout written in the code was never the timeout that fired, and a 4h playback
+# encode (measured 124.6s) finished only by a photo finish -- losing outright to a
+# slow S3 PUT or a contended CPU, and then the artifact is silently absent. The
+# loop still breaks the instant the sentinel appears, so the normal path is
+# unaffected; this only widens the worst case. Pinned by
+# tests/test_start_sh.py::test_the_sentinel_window_is_wider_than_the_drain_bound.
 
 # --- Knock at the door only when the meeting is nearly due ---
 # The pod is spawned ~10 min early so the runtime (Xvfb, PulseAudio, the sidecar,
@@ -210,9 +219,9 @@ node /app/dist/docker.js && BOT_RC=0 || BOT_RC=$?
 # §2 end-of-meeting handling: on graceful leave the bot POSTs a session-end
 # callback that kicks off the output pipeline (assemble -> S3 -> /process) in the
 # sidecar. Killing the sidecar immediately would cut that off and lose the
-# recording. Wait (bounded ~120s) for the sidecar to signal /tmp/pipeline_done,
+# recording. Wait (bounded ~450s) for the sidecar to signal /tmp/pipeline_done,
 # or exit early if it's already gone.
-for _ in $(seq 1 240); do
+for _ in $(seq 1 900); do
     [ -f /tmp/pipeline_done ] && break
     kill -0 "$HOOK_PID" 2>/dev/null || break
     sleep 0.5

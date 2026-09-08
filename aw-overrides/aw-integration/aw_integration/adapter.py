@@ -384,6 +384,55 @@ class VexaSessionAdapter:
                 earliest.relative_sec = 0.0
                 earliest.timestamp_ms = int(session.session_start_ts.timestamp() * 1000)
 
+        # ── Teams: derive intervals from the caption POINTS ──────────────────
+        #
+        # The worker picks its speaker mapper on the PRESENCE of
+        # `speaker_intervals` (`notetaker_worker.py`: `if timeline_data.get(
+        # "speaker_intervals")`). With none, Teams fell through to the legacy rule
+        # -- "whoever spoke at the segment's FIRST INSTANT owns the whole segment"
+        # -- and a live 3-way meeting on 2026-09-08 showed the cost: Sujoy's
+        # "hello hello" took the whole of the next speaker's sentence, and a
+        # closing remark landed inside a 45s segment and wore that speaker's name.
+        #
+        # With intervals present the worker uses dominant overlap AND SPLITS a
+        # segment where the speaker genuinely changes -- code already live and
+        # already measured there: "15 of 53 segments held two speakers and ~16% of
+        # all words sat under the wrong name ... only division can fix those".
+        #
+        # This does NOT reopen the reason Teams is points-only. That reason was the
+        # AUDIO boundary machine: one mixed stream, so the per-track activity path
+        # would emit a SINGLE interval that never closes and erases every other
+        # speaker. Caption runs cannot do that -- each point carries its own
+        # speaker and a run closes at the next speaker's first point.
+        #
+        # ⚠ Honest about the field: these are caption-derived approximations and
+        # they include pauses, where audio-paired intervals exclude silence. The
+        # worker derives exactly these spans itself when intervals are absent
+        # (`_speaker_spans`), so the DATA is no worse -- only the field's meaning
+        # is looser. Emitted one hop earlier so the platform gate lives here, in
+        # the one place that already knows the platform.
+        #
+        # The `>= 2 named speakers` gate is the SAME safety the anchor above
+        # carries, for the same reason: with one named speaker, an interval
+        # spanning the session donates the entire meeting to them -- including an
+        # unnamed speaker's words (the 2026-08-25 incident). Below two, stay
+        # points-only and let unattributed speech remain an honest SPEAKER_NN.
+        # ⚠ ORDER MATTERS: this runs AFTER the t=0 anchor above and depends on
+        # it. `timeline_events` here already has its earliest `relative_sec`
+        # zeroed in place, which is the only reason the first interval starts at
+        # 0.0 and covers the leading speech. Hoisting this into its own method, or
+        # swapping the two blocks, silently breaks that -- and the test that would
+        # catch it lives in another file, so the failure would not point here.
+        # Both blocks deliberately share the same `>= 2 distinct_speakers` gate.
+        if (
+            self._platform == "teams"
+            and not paired_intervals
+            and len(distinct_speakers) >= 2
+        ):
+            paired_intervals = self._intervals_from_points(
+                timeline_events, duration_sec
+            )
+
         # Convert the raw paired intervals to the schema type, preserving
         # overlap as-is — no merging, clipping, or de-overlapping. Sorted by
         # start (then end, then speaker) for a deterministic, byte-identical
@@ -413,6 +462,61 @@ class VexaSessionAdapter:
             speaker_timeline=timeline_events,
             speaker_intervals=speaker_intervals,
         )
+
+    def _intervals_from_points(
+        self, events: list[SpeakerEvent], duration_sec: float
+    ) -> list[tuple[str, int, int]]:
+        """Collapse runs of same-speaker points into closed (name, start_ms, end_ms).
+
+        One interval per consecutive stretch of points naming the same speaker. A
+        run closes at the first point naming somebody else, and the final run
+        Equivalent to what the worker's own `_speaker_spans` derives from points
+        for every purpose that matters -- but NOT byte-identical, and the comment
+        used to claim it was. The worker closes its final span at
+        `audio_end = max(segment ends)`; this closes at the recording's
+        `duration_sec`, which is normally the later of the two. Harmless, because
+        no transcript segment can extend past `audio_end` by construction, so the
+        extra tail never enters any per-segment overlap sum -- but "cannot
+        disagree" was wrong and worth stating precisely.
+
+        Returned in the same shape and units as the audio-paired intervals
+        (relative milliseconds), so the existing conversion below handles them
+        with no special case.
+
+        Zero-length runs are dropped: the worker requires `end > start` and would
+        discard them anyway, so emitting them would only pad the artifact.
+
+        A genuine tie -- two DIFFERENT speakers at the same `relative_sec` -- is
+        therefore resolved deterministically rather than arbitrarily: the sort key
+        puts the lower `speaker_id` first, that run has zero length and is
+        dropped, and the instant goes to the other speaker. Losing one instant is
+        acceptable; a nondeterministic artifact from the same input would not be,
+        and neither would a zero-length interval reaching the worker.
+
+        A tie on the EARLIEST point never reaches this path at all: the t=0 anchor
+        above has already moved that event to 0.0, which breaks the tie. So only a
+        mid-conversation tie can drop a run -- which is what the test has to
+        construct to exercise it.
+        """
+        ordered = sorted(events, key=lambda ev: (ev.relative_sec, ev.speaker_id))
+        session_end_ms = max(0, int(round(duration_sec * 1000)))
+        out: list[tuple[str, int, int]] = []
+        i = 0
+        while i < len(ordered):
+            name = ordered[i].speaker_name
+            start_ms = int(round(ordered[i].relative_sec * 1000))
+            j = i + 1
+            while j < len(ordered) and ordered[j].speaker_name == name:
+                j += 1
+            stop_ms = (
+                int(round(ordered[j].relative_sec * 1000))
+                if j < len(ordered)
+                else session_end_ms
+            )
+            if stop_ms > start_ms:
+                out.append((name, start_ms, stop_ms))
+            i = j
+        return out
 
     def _preferred_point_events(
         self, events: list[VexaSpeakerEvent]
