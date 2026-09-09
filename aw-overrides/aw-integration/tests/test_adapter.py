@@ -1187,6 +1187,121 @@ class TestBuildParticipants:
         result = adapter.build_participants()
         assert result.host.name == "host"
 
+    # -- Phantom roster entries (live defect, 2026-09-09) ------------------
+    #
+    # A 3-person Teams meeting rendered "9 participants" in the portal: two real
+    # names plus SEVEN `Teams Participant (<uuid>)` chips. Measured from
+    # `teams_manual_ed0740b2…_0fbd7277…/participants.json` — 9 entries, 7 of them
+    # placeholders, and every one sharing the identical `joined_at` because none
+    # had a segment to date them from.
+    #
+    # They are not people. Teams' DOM roster scan matches broad selectors
+    # (`[role="listitem"]`, plus four `*=` substring matches on
+    # "participant"/"roster"), so non-person elements get enumerated; each yields
+    # its own element UUID, and `extractName`'s own denylist rejects any
+    # candidate containing "participant" — so those elements can ONLY ever
+    # resolve to the `Teams Participant (<uuid>)` fallback.
+    #
+    # The timeline already excluded them: `_preferred_point_events` discards DOM
+    # points when captions exist, and the shipped timeline held 652 points from
+    # exactly 2 speakers, with ZERO from any phantom. `build_participants` simply
+    # did not apply the same filter, so the roster disagreed with the timeline
+    # beside it. That inconsistency is the bug — not the placeholder itself.
+
+    def test_teams_roster_excludes_dom_phantoms_when_captions_exist(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        # Shaped exactly as production wrote them, UUIDs included.
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _caption("Bob Müller", "SPEAKER_START", 10_000),
+            _dom(
+                "Teams Participant (ff5c3e51-4fc7-4655-a605-4ece87c25595)",
+                "SPEAKER_START",
+                3_000,
+            ),
+            _dom(
+                "Teams Participant (5e639bfd-fcc3-4c5b-9470-298baa590af1)",
+                "SPEAKER_START",
+                4_000,
+            ),
+            _dom(
+                "Teams Participant (12a487a7-2de6-4703-9132-70e7da7c8710)",
+                "SPEAKER_START",
+                5_000,
+            ),
+        ]
+
+        names = {p.name for p in adapter.build_participants().participants}
+
+        assert names == {"Alice Chen", "Bob Müller"}
+        # Asserted as a PROPERTY, not by matching the placeholder's spelling: the
+        # fix is "use the events the timeline used", so a renamed placeholder is
+        # still excluded. A denylist on the literal string would not survive the
+        # bot changing its fallback wording.
+        assert not any("Teams Participant" in n for n in names)
+
+    def test_teams_roster_matches_the_timeline_it_ships_beside(
+        self, tmp_path: Path
+    ) -> None:
+        # The real invariant. The portal shows the roster and the worker reads the
+        # timeline; if they disagree, one of the two screens is lying about the
+        # same meeting.
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.segments = []
+        adapter._session.speaker_events = [
+            _caption("Alice Chen", "SPEAKER_START", 2_000),
+            _dom(
+                "Teams Participant (ff5c3e51-4fc7-4655-a605-4ece87c25595)",
+                "SPEAKER_START",
+                3_000,
+            ),
+        ]
+
+        roster = {p.name for p in adapter.build_participants().participants}
+        timeline = {
+            e.speaker_name for e in adapter.build_speaker_timeline().speaker_timeline
+        }
+
+        assert roster == timeline
+
+    def test_teams_roster_KEEPS_dom_names_when_there_are_no_captions(
+        self, tmp_path: Path
+    ) -> None:
+        # FAIL-OPEN, and the control that stops the fix becoming "drop all DOM
+        # names". With no captions the DOM events are all there is, so the
+        # timeline keeps them — and the roster must keep them for the same
+        # reason. Dropping them here would empty the roster of a caption-less
+        # meeting entirely.
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.platform = "teams"
+        adapter._session.segments = []
+        adapter._session.speaker_events = [
+            _dom("Alice Chen", "SPEAKER_START", 2_000),
+            _dom("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        names = {p.name for p in adapter.build_participants().participants}
+        assert names == {"Alice Chen", "Bob Müller"}
+
+    def test_non_teams_roster_is_unchanged_by_the_filter(self, tmp_path: Path) -> None:
+        # `_preferred_point_events` returns early for every platform but Teams,
+        # so Meet and Zoom rosters must be byte-identical to before. This is the
+        # tripwire for that: it fails if the filter is applied unconditionally.
+        adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
+        adapter._session.segments = []
+        adapter._session.speaker_events = [
+            _dom("Alice Chen", "SPEAKER_START", 2_000),
+            _caption("Bob Müller", "SPEAKER_START", 10_000),
+        ]
+
+        names = {p.name for p in adapter.build_participants().participants}
+        # Both kept: on Meet the caption/DOM preference does not apply at all.
+        assert names == {"Alice Chen", "Bob Müller"}
+
     def test_participants_list_contains_unique_speakers(self, tmp_path: Path) -> None:
         adapter, _, _ = make_adapter(tmp_path, pcm_bytes=bytes(32000))
         result = adapter.build_participants()

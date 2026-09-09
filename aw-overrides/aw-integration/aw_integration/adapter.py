@@ -749,7 +749,34 @@ class VexaSessionAdapter:
         for seg in session.segments:
             slug = self._slug(seg.speaker)
             speaker_names.setdefault(slug, seg.speaker)
-        for ev in session.speaker_events:
+        # `_preferred_point_events`, NOT `session.speaker_events` — the roster
+        # must be drawn from the same events the TIMELINE is built from
+        # (`build_speaker_timeline` already filters through this helper).
+        #
+        # Reading the raw list shipped a roster that contradicted the timeline
+        # beside it. Live on 2026-09-09, a 3-person Teams meeting produced 9
+        # roster entries: two real names and SEVEN
+        # `Teams Participant (<uuid>)` placeholders, while the timeline held 652
+        # points from exactly 2 speakers and ZERO from any placeholder. The
+        # portal renders the roster, so the meeting displayed as "9
+        # participants" with internal element UUIDs shown to the user.
+        #
+        # Those placeholders are Teams' DOM roster scan enumerating non-person
+        # elements: its selectors are broad (`[role="listitem"]` and four `*=`
+        # substring matches on "participant"/"roster"), each matched element
+        # yields its own UUID, and the bot's own name extractor rejects any
+        # candidate containing "participant" — so such an element can ONLY
+        # resolve to that fallback. `_preferred_point_events` already drops DOM
+        # points whenever captions exist, which is precisely the signal that
+        # separates them from real speakers.
+        #
+        # Filtering here rather than matching the placeholder's spelling: the
+        # rule is "trust the same events the timeline trusts", so a change to
+        # the bot's fallback wording cannot reopen this. It is also FAIL-OPEN
+        # for the same reason the timeline is — with no captions the DOM events
+        # are all there is, and the helper keeps them, so a caption-less
+        # meeting's roster is not emptied.
+        for ev in self._preferred_point_events(session.speaker_events):
             slug = self._slug(ev.participant_name)
             speaker_names.setdefault(slug, ev.participant_name)
 
