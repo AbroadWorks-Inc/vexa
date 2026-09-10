@@ -38,6 +38,12 @@ export type BotConfig = {
   videoReceiveEnabled?: boolean;  // Receive+decode video from participants (default: false)
   cameraEnabled?: boolean;        // Outgoing virtual camera/avatar (default: false)
 
+  // AW Phase 1 "force guest": when "guest", the Meet bot ignores any saved
+  // Google session (GOOGLE_NOTETAKER_STORAGE_STATE) and joins anonymously.
+  // Forwarded by the orchestrator from BotJob.join.join_mode, Meet-gated.
+  // Zoom/Teams already join as guests and never read this.
+  joinMode?: "guest" | "authenticated";
+
   // Authenticated meeting mode (uses persistent browser context with stored userdata)
   authenticated?: boolean;
   userdataS3Path?: string;   // e.g. "users/123/browser-userdata"
