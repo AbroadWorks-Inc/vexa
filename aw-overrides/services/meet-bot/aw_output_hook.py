@@ -119,6 +119,40 @@ def _persist_full_session_to_s3(data: bytes) -> None:
         logger.error("failed to persist full-session recording to S3: %s", exc)
 
 
+def _lobby_marker_s3_key() -> str:
+    """S3 key for the bot's admission-status (lobby) marker.
+
+    Read by the portal to show whether the bot is waiting to be let in, was
+    never admitted, or was rejected (BS-2 admission visibility).
+    """
+    return f"{_JOB.s3_key}lobby_state.json"
+
+
+def _persist_lobby_marker(state: str, reason: str | None) -> None:
+    """Persist the admission (lobby) state to S3. Best-effort, like chunks.
+
+    Hard schema contract with the portal team: exactly ``{state, reason,
+    updated_at}``, states ``awaiting_admission`` | ``not_admitted`` |
+    ``admission_rejected``.
+    """
+    global _s3_client
+    try:
+        if _s3_client is None:
+            _s3_client = S3Client()
+        body = json.dumps(
+            {
+                "state": state,
+                "reason": reason,
+                "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+            }
+        ).encode()
+        _s3_client.put_object(
+            key=_lobby_marker_s3_key(), body=body, content_type="application/json"
+        )
+    except Exception as exc:  # noqa: BLE001 - marker persistence is best-effort
+        logger.error("failed to persist lobby marker state=%s: %s", state, exc)
+
+
 def _chunk_s3_key(seq: int) -> str:
     """S3 key for a durable raw audio chunk under the job's prefix.
 
@@ -199,6 +233,18 @@ _REASON_MAP: dict[
     #                calling it "error" would be as wrong as "host_ended".
     #   "ambiguous", "waiting_room_timeout_approaching" - non-terminal, so they
     #                never reach the end pipeline at all.
+}
+
+# BS-2: terminal admission-failure reason -> lobby marker state. Reasons NOT in
+# this map write no marker (behaviour unchanged). Independent of _REASON_MAP,
+# which maps to bot_left_reason — a different vocabulary.
+_LOBBY_TERMINAL_STATE: dict[str, str] = {
+    "awaiting_admission_timeout": "not_admitted",
+    "admission_timeout": "not_admitted",
+    "waiting_room_timeout": "not_admitted",
+    "removed_from_waiting_room": "not_admitted",
+    "awaiting_admission_rejected": "admission_rejected",
+    "admission_rejected_by_admin": "admission_rejected",
 }
 
 app = FastAPI(title="aw-output-hook")
@@ -325,8 +371,18 @@ async def receive_callback(payload: dict[str, Any]) -> dict[str, str]:
         logger.error("bot reported failure; callback payload=%s", payload)
     status = str(payload.get("status") or "")
     if status not in _TERMINAL_STATUSES:
+        # BS-2: persist the "waiting to be let in" state so the portal can show
+        # it live. Other non-terminal statuses are still logged-and-dropped.
+        if status == "awaiting_admission":
+            await asyncio.to_thread(_persist_lobby_marker, "awaiting_admission", None)
         logger.info("callback status=%s (non-terminal); skipping end pipeline", status)
         return {"status": "ok"}
+    # BS-2: a terminal admission failure means the bot never got in / was thrown
+    # out. Record it BEFORE the pipeline so the portal can distinguish it from a
+    # normal end. Reasons not in the map write nothing.
+    lobby_state = _LOBBY_TERMINAL_STATE.get(reason)
+    if lobby_state is not None:
+        await asyncio.to_thread(_persist_lobby_marker, lobby_state, reason)
     asyncio.create_task(_run_pipeline_and_signal(bot_left_reason=bot_left_reason))
     # Vexa's unified-callback only accepts: processed | ok | container_updated | ignored.
     return {"status": "ok"}
