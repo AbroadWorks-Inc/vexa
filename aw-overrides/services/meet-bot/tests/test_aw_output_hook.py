@@ -797,6 +797,107 @@ def test_empty_final_chunk_marker_not_written_to_s3(
     hermetic_s3.put_object.assert_not_called()  # no zero-byte S3 object
 
 
+# --- BS-2: admission-status lobby marker persisted to S3 --------------------
+#
+# The sidecar receives the bot's admission-status callbacks. The non-terminal
+# ones were logged and dropped; now the awaiting_admission state and the
+# terminal admission-failure reasons are persisted to lobby_state.json so the
+# portal can read whether the bot is waiting, was never admitted, or rejected.
+# Hard contract for the portal team: exactly {state, reason, updated_at}, key
+# lobby_state.json, states awaiting_admission | not_admitted | admission_rejected.
+
+
+def _lobby_marker_calls(fake_s3: Any) -> list[Any]:
+    return [
+        c
+        for c in fake_s3.put_object.call_args_list
+        if c.kwargs["key"].endswith("lobby_state.json")
+    ]
+
+
+def test_lobby_marker_s3_key_under_job_prefix() -> None:
+    assert hook._lobby_marker_s3_key() == f"{hook._JOB.s3_key}lobby_state.json"
+
+
+def test_awaiting_admission_callback_writes_lobby_marker(
+    client: TestClient, hermetic_s3: Any
+) -> None:
+    resp = client.post(
+        "/callback",
+        json={"connection_id": "job001", "status": "awaiting_admission"},
+    )
+    assert resp.status_code == 200
+    calls = _lobby_marker_calls(hermetic_s3)
+    assert len(calls) == 1
+    kwargs = calls[0].kwargs
+    assert kwargs["key"] == f"{hook._JOB.s3_key}lobby_state.json"
+    assert kwargs["content_type"] == "application/json"
+    body = json.loads(kwargs["body"])
+    assert body["state"] == "awaiting_admission"
+    assert body["reason"] is None
+    # updated_at must be a parseable UTC ISO8601 instant, not just truthy.
+    assert datetime.fromisoformat(body["updated_at"]).tzinfo is not None
+
+
+def test_terminal_not_admitted_reason_writes_lobby_marker(
+    client: TestClient, hermetic_s3: Any
+) -> None:
+    with patch("aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock):
+        resp = client.post(
+            "/callback",
+            json={
+                "connection_id": "job001",
+                "status": "failed",
+                "reason": "awaiting_admission_timeout",
+            },
+        )
+    assert resp.status_code == 200
+    calls = _lobby_marker_calls(hermetic_s3)
+    assert len(calls) == 1
+    body = json.loads(calls[0].kwargs["body"])
+    assert body["state"] == "not_admitted"
+    assert body["reason"] == "awaiting_admission_timeout"
+
+
+def test_terminal_admission_rejected_reason_writes_lobby_marker(
+    client: TestClient, hermetic_s3: Any
+) -> None:
+    with patch("aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock):
+        resp = client.post(
+            "/callback",
+            json={
+                "connection_id": "job001",
+                "status": "failed",
+                "reason": "awaiting_admission_rejected",
+            },
+        )
+    assert resp.status_code == 200
+    calls = _lobby_marker_calls(hermetic_s3)
+    assert len(calls) == 1
+    body = json.loads(calls[0].kwargs["body"])
+    assert body["state"] == "admission_rejected"
+    assert body["reason"] == "awaiting_admission_rejected"
+
+
+def test_normal_terminal_callback_writes_no_lobby_marker(
+    client: TestClient, hermetic_s3: Any
+) -> None:
+    # POSITIVE CONTROL: a normal end-of-meeting terminal callback whose reason is
+    # NOT an admission failure must write NO lobby marker. Removing the "write
+    # nothing for unmapped reasons" guard turns this red.
+    with patch("aw_output_hook._run_pipeline_and_signal", new_callable=AsyncMock):
+        resp = client.post(
+            "/callback",
+            json={
+                "connection_id": "job001",
+                "status": "completed",
+                "reason": "meeting_ended",
+            },
+        )
+    assert resp.status_code == 200
+    assert _lobby_marker_calls(hermetic_s3) == []
+
+
 def test_mapped_reasons_do_not_warn_but_unmapped_ones_do(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:

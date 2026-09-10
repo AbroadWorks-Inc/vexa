@@ -26,6 +26,7 @@ import { ensureBrowserDataDir, syncBrowserDataFromS3, syncBrowserDataToS3, clean
 // Per-speaker transcription pipeline
 import { TranscriptionClient } from './services/transcription-client';
 import { SegmentPublisher, SPEAKER_EVENT_STREAM_MAXLEN } from './services/segment-publisher';
+import { decideMeetStorageState } from './services/meet-auth';
 import { SpeakerStreamManager } from './services/speaker-streams';
 import { resolveSpeakerName, isTrackLocked, isNameTaken, reportTrackAudio, getLockedMapping } from './services/speaker-identity';
 import { createSpeakerBoundaryTracker, SpeakerBoundaryTracker } from './services/speaker-boundaries';
@@ -2419,25 +2420,27 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
   // path. We only set `authenticated` (NOT userdataS3Path), so the S3 persistent-profile
   // branch below stays inactive and control reaches the standard Meet branch, while
   // join.ts takes the authenticated ("Join now") flow.
+  // Phase 1 "force guest": when the dispatcher marks the job joinMode="guest",
+  // the saved Google session is dropped and the bot joins anonymously EVEN IF a
+  // valid secret is present — so a Google-revoked session (roughly every 14 days)
+  // can no longer take the Meet bot down. The decision is a pure function
+  // (services/meet-auth.ts) so it is unit-testable; the file write + logging stay
+  // here. Zoom/Teams never reach this — GOOGLE_NOTETAKER_STORAGE_STATE is only on
+  // the meet-bot Secret — and already join as guests.
   let awStorageStatePath: string | undefined;
-  const awStorageStateRaw = process.env.GOOGLE_NOTETAKER_STORAGE_STATE;
-  if (awStorageStateRaw && awStorageStateRaw.trim().length > 8) {
-    try {
-      // Accept both seeding formats: raw storage_state JSON (--from-file) and
-      // base64-encoded JSON (--from-literal). '{' is not in the base64 alphabet.
-      const trimmed = awStorageStateRaw.trim();
-      const decoded = trimmed.startsWith("{")
-        ? trimmed
-        : Buffer.from(trimmed, "base64").toString("utf8");
-      JSON.parse(decoded); // validate real storage_state JSON before trusting it
-      awStorageStatePath = "/tmp/google_storage_state.json";
-      require("fs").writeFileSync(awStorageStatePath, decoded, { mode: 0o600 });
-      botConfig.authenticated = true;
-      log("[Bot] AW: Google storage_state loaded -> authenticated Meet join enabled");
-    } catch (e: any) {
-      awStorageStatePath = undefined;
-      log(`[Bot] AW: GOOGLE_NOTETAKER_STORAGE_STATE present but invalid (${e?.message}); anonymous fallback`);
-    }
+  const awMeetAuth = decideMeetStorageState(
+    botConfig.joinMode,
+    process.env.GOOGLE_NOTETAKER_STORAGE_STATE,
+  );
+  if (awMeetAuth.authenticated) {
+    awStorageStatePath = "/tmp/google_storage_state.json";
+    require("fs").writeFileSync(awStorageStatePath, awMeetAuth.storageStateJson, { mode: 0o600 });
+    botConfig.authenticated = true;
+    log("[Bot] AW: Google storage_state loaded -> authenticated Meet join enabled");
+  } else if (awMeetAuth.reason === "guest_forced") {
+    log("[Bot] AW: joinMode=guest -> forcing anonymous Meet join (storage_state ignored)");
+  } else if (awMeetAuth.reason === "invalid_secret") {
+    log("[Bot] AW: GOOGLE_NOTETAKER_STORAGE_STATE present but invalid; anonymous fallback");
   }
 
   // --- Authenticated bot: use persistent context with userdata from S3 ---
