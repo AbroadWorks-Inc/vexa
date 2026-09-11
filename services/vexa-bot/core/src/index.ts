@@ -713,6 +713,16 @@ async function performGracefulLeave(
     log(`[Graceful Leave] Per-speaker pipeline cleanup error: ${pipelineCleanupErr.message}`);
   }
 
+  // Final RTP-probe report. No-op unless RTP_SPEAKER_PROBE=true. Wrapped
+  // because a probe must never be able to interrupt a graceful leave — the
+  // bot's actual job is finishing the recording, not finishing the report.
+  try {
+    const { stopRtpSpeakerProbe } = await import("./services/rtp-speaker-probe");
+    stopRtpSpeakerProbe();
+  } catch (probeErr: any) {
+    log(`[Graceful Leave] RTP probe report error (non-fatal): ${probeErr?.message || probeErr}`);
+  }
+
   // Google Meet: stop the Node-side PulseAudio capture and finalize the WAV.
   // Must happen HERE, and before both the video-mux block and the audio upload
   // below read the file. It cannot live in leaveGoogleMeet(): every ending other
@@ -2702,6 +2712,21 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     Object.defineProperty(window, "outerWidth", { get: () => 1920 });
     Object.defineProperty(window, "outerHeight", { get: () => 1080 });
   });
+
+  // RTP speaker-source probe (Option 5): install the peer-connection registry the
+  // probe reads. Without this a plain recording bot never populates
+  // window.__vexa_peer_connections (only the virtual-camera init does), so the
+  // probe found zero receivers (diagnosed live 2026-09-11). Meet-only, self-gated
+  // on RTP_SPEAKER_PROBE, and a no-op when the camera init already owns the
+  // registry — proven flows are untouched. MUST run before handleGoogleMeet navigates.
+  if (botConfig.platform === "google_meet") {
+    try {
+      const { installRtpPcRegistry } = await import("./services/rtp-speaker-probe");
+      await installRtpPcRegistry(page);
+    } catch (e: any) {
+      log(`[Bot] [RtpProbe] PC registry init failed (non-fatal): ${e?.message || e}`);
+    }
+  }
 
   // Virtual camera is controlled by cameraEnabled (independent of voiceAgentEnabled).
   // TTS speaker bots can speak without streaming an avatar.
