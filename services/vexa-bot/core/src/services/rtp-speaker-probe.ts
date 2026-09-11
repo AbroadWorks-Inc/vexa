@@ -229,12 +229,17 @@ export function stopRtpSpeakerProbe(): void {
  * registry as an INIT script, so it runs BEFORE the meeting page creates its
  * connections (a constructor patch cannot capture already-open connections).
  *
- * OFF unless RTP_SPEAKER_PROBE=true, and a no-op if the camera init already owns
+ * OFF unless RTP_SPEAKER_PROBE=true or TIER1_SPEAKER_CAPTURE=true (Tier 1
+ * per-receiver capture reads the same registry), and a no-op if the camera init already owns
  * the registry — so it never changes a production bot's behaviour. Call it before
  * navigating to the meeting.
  */
 export async function installRtpPcRegistry(page: Page): Promise<void> {
-  if (process.env.RTP_SPEAKER_PROBE !== "true") return;
+  if (
+    process.env.RTP_SPEAKER_PROBE !== "true" &&
+    process.env.TIER1_SPEAKER_CAPTURE !== "true"
+  )
+    return;
   try {
     await page.addInitScript(() => {
       const w = window as any;

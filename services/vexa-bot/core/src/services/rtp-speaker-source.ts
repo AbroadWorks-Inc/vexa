@@ -71,6 +71,48 @@ export function activeSourceAt(samples: RtpSample[], tMs: number): number | null
   return best === null ? null : best.sourceId;
 }
 
+/**
+ * Precompute the loudest audible source for EVERY instant in one pass.
+ *
+ * `activeSourceAt` answers the question for a single `tMs` by rescanning the
+ * whole `samples` array; calling it once per name event is O(nameEvents ×
+ * samples), which on a long meeting is 10⁸–10⁹ ops per resolve cycle on the
+ * bot's single event-loop thread — a real stall. This builds the same answer
+ * for all instants in O(samples), so `mapSourcesToNames` can then look each
+ * event's `tMs` up in O(1).
+ *
+ * The winner rule is byte-identical to `activeSourceAt`:
+ *   - a sample below `SILENCE_LEVEL` contributes nothing;
+ *   - the loudest audible source at that instant wins;
+ *   - ties keep the FIRST-seen loudest — enforced with a strict `>` update,
+ *     exactly as `activeSourceAt`'s `sample.audioLevel > best.audioLevel`,
+ *     and relying on the same left-to-right array order.
+ *
+ * Every distinct `tMs` present in the data gets an entry: an audible instant
+ * maps to its winning `sourceId`, an all-quiet instant maps to `null`. So a
+ * lookup can tell "quiet here" from "no data" the way `activeSourceAt` does —
+ * both yield `null` — via `index.get(tMs) ?? null`.
+ */
+export function buildActiveSourceIndex(samples: RtpSample[]): Map<number, number | null> {
+  const index = new Map<number, number | null>();
+  // tMs -> best audible level seen so far at that instant (audible samples only).
+  const bestLevel = new Map<number, number>();
+  for (const sample of samples) {
+    // Record the instant even when it is all-quiet, so absence-of-data and
+    // silence stay distinguishable exactly as activeSourceAt keeps them.
+    if (!index.has(sample.tMs)) index.set(sample.tMs, null);
+    if (sample.audioLevel < SILENCE_LEVEL) continue;
+    const prev = bestLevel.get(sample.tMs);
+    // Strict `>` — a later sample only wins on being STRICTLY louder, so the
+    // first-seen loudest keeps a tie, matching activeSourceAt.
+    if (prev === undefined || sample.audioLevel > prev) {
+      bestLevel.set(sample.tMs, sample.audioLevel);
+      index.set(sample.tMs, sample.sourceId);
+    }
+  }
+  return index;
+}
+
 /** Per-source audio activity — how a real speaker is told from a silent-but-listed id. */
 export interface SourceActivity {
   sourceId: number;
@@ -170,8 +212,14 @@ export function mapSourcesToNames(
   // sourceId -> (name -> votes), in first-seen order so the output is stable.
   const tally = new Map<number, Map<string, number>>();
 
+  // Precompute the winner for every instant ONCE (O(samples)), then look each
+  // event up in O(1) instead of rescanning samples per event (O(nameEvents ×
+  // samples)). The index applies activeSourceAt's exact rule, so the result is
+  // byte-identical to calling activeSourceAt in the loop.
+  const activeIndex = buildActiveSourceIndex(samples);
+
   for (const event of nameEvents) {
-    const sourceId = activeSourceAt(samples, event.tMs);
+    const sourceId = activeIndex.get(event.tMs) ?? null;
     // No source was audibly emitting when the DOM claimed a speaker. That is
     // evidence about the DOM's lag, not about this source — discard the vote
     // rather than guess.
@@ -219,6 +267,77 @@ export function namesClaimedByMultipleSources(mapping: SourceName[]): string[] {
   const out: string[] = [];
   for (const [name, ids] of idsPerName) {
     if (ids.size > 1) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Below this confidence a learned id→name mapping is not trustworthy enough to
+ * be a person.
+ *
+ * A stable sender votes for ONE name every time, so its confidence sits at 1.0.
+ * The live probe found id 42 mirrors whoever is loudest, so across the session
+ * it is attributed to MANY names — its votes split and its confidence collapses.
+ * Dropping anything below this floor removes that mirror without needing to know
+ * its id in advance. Deliberately loose: a genuine speaker occasionally
+ * mis-voted by DOM lag still clears it, while a source spread across three or
+ * more names cannot.
+ */
+export const MIN_IDENTITY_CONFIDENCE = 0.5;
+
+/**
+ * Resolve stable per-person identities from CSRC/SSRC samples.
+ *
+ * The identity brain of Tier 1 per-speaker audio. `mapSourcesToNames` learns a
+ * raw id→name mapping; this turns that into a clean, one-entry-per-person list
+ * fit to key audio on, by stripping the two ways a mapping lies:
+ *
+ *  1. LOW CONFIDENCE — a "mirror" source (live probe: id 42) follows whoever is
+ *     loudest, so its votes scatter across names and its confidence falls below
+ *     `MIN_IDENTITY_CONFIDENCE`. Such sources are dropped.
+ *  2. A NAME CLAIMED BY MULTIPLE IDS — when the same person surfaces under a
+ *     real id AND a mirror id, `namesClaimedByMultipleSources` flags the name;
+ *     only the highest-confidence source for that name is kept (tie → most
+ *     votes), the rest dropped. This catches a mirror that sat above the floor.
+ *
+ * Output is one `{ sourceId, name }` per surviving person, in first-appearance
+ * order (inherited from `mapSourcesToNames`, which keys by first vote).
+ */
+export function resolveSpeakerIdentities(
+  samples: RtpSample[],
+  nameEvents: NameEvent[],
+): { sourceId: number; name: string }[] {
+  const mapping = mapSourcesToNames(samples, nameEvents);
+  const contested = new Set(namesClaimedByMultipleSources(mapping));
+
+  // For each contested name, decide the single source that keeps it: highest
+  // confidence, tie broken by raw votes. A mirror splits its votes, so a real
+  // sender almost always wins here even when the mirror cleared the floor.
+  const keptSourceForName = new Map<string, number>();
+  for (const name of contested) {
+    let best: SourceName | null = null;
+    for (const entry of mapping) {
+      if (entry.name !== name) continue;
+      if (
+        best === null ||
+        entry.confidence > best.confidence ||
+        (entry.confidence === best.confidence && entry.votes > best.votes)
+      ) {
+        best = entry;
+      }
+    }
+    if (best !== null) keptSourceForName.set(name, best.sourceId);
+  }
+
+  const out: { sourceId: number; name: string }[] = [];
+  for (const entry of mapping) {
+    // Guard 1 — confidence floor: drop mirrors whose votes scattered.
+    if (entry.confidence < MIN_IDENTITY_CONFIDENCE) continue;
+    // Guard 2 — one id per name: for a contested name keep only the winner.
+    if (contested.has(entry.name) && keptSourceForName.get(entry.name) !== entry.sourceId) {
+      continue;
+    }
+    out.push({ sourceId: entry.sourceId, name: entry.name });
   }
   return out;
 }

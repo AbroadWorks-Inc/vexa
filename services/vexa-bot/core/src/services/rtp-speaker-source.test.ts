@@ -21,11 +21,14 @@
 import {
   sourceStability,
   activeSourceAt,
+  buildActiveSourceIndex,
   mapSourcesToNames,
   namesClaimedByMultipleSources,
   sampleReceivers,
   sourceActivity,
   concurrentActivity,
+  resolveSpeakerIdentities,
+  MIN_IDENTITY_CONFIDENCE,
   RtpSample,
   NameEvent,
 } from './rtp-speaker-source';
@@ -298,6 +301,193 @@ console.log('\nconcurrentActivity — the overlap-separation proof');
     concurrentActivity(samples),
     { distinctTicks: 1, maxConcurrent: 1, ticksWithOverlap: 0 },
     'a silent listed source is not counted as a concurrent speaker',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nresolveSpeakerIdentities — the identity brain: one clean id per person');
+// ---------------------------------------------------------------------------
+{
+  // THE HAPPY PATH. One sender, one id, every DOM observation agreeing → a
+  // clean, high-confidence identity that survives every filter.
+  const samples = [
+    s(1111, 1_000, 0.9), s(1111, 2_000, 0.9), s(1111, 3_000, 0.9),
+  ];
+  const names: NameEvent[] = [
+    { name: 'Alice Chen', tMs: 1_000 },
+    { name: 'Alice Chen', tMs: 2_000 },
+    { name: 'Alice Chen', tMs: 3_000 },
+  ];
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [{ sourceId: 1111, name: 'Alice Chen' }],
+    'a single high-confidence id → one person, kept',
+  );
+}
+
+{
+  // THE MIRROR, THRESHOLD BRANCH. Live probe: id 42 mirrors whoever is loudest,
+  // so across time it is attributed to MANY names — its votes split and its
+  // confidence collapses below MIN_IDENTITY_CONFIDENCE. Here 42's names are held
+  // by NOBODY else, so nothing but the confidence floor can catch it — this
+  // isolates the threshold guard. The two real ids must survive.
+  const samples = [
+    s(1111, 1_000, 0.9), s(1111, 2_000, 0.9),            // Alice
+    s(2222, 3_000, 0.9), s(2222, 4_000, 0.9),            // Bob
+    s(42, 5_000, 0.9), s(42, 6_000, 0.9), s(42, 7_000, 0.9), // mirror: 3 names
+  ];
+  const names: NameEvent[] = [
+    { name: 'Alice Chen', tMs: 1_000 },
+    { name: 'Alice Chen', tMs: 2_000 },
+    { name: 'Bob Müller', tMs: 3_000 },
+    { name: 'Bob Müller', tMs: 4_000 },
+    { name: 'Carol Diaz', tMs: 5_000 },
+    { name: 'Dave Okoro', tMs: 6_000 },
+    { name: 'Eve Petrov', tMs: 7_000 },
+  ];
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [
+      { sourceId: 1111, name: 'Alice Chen' },
+      { sourceId: 2222, name: 'Bob Müller' },
+    ],
+    'a mirror id split across many names falls below the confidence floor and is dropped; real ids kept',
+  );
+}
+
+{
+  // THE MIRROR, DEDUPE BRANCH. Here the mirror (42) mostly mirrors Alice, so it
+  // claims her NAME too — at confidence 0.6, ABOVE the floor. The threshold
+  // alone would keep it; only namesClaimedByMultipleSources can catch that two
+  // ids hold one name, keeping the HIGHER-confidence real id and dropping the
+  // mirror. This isolates the dedupe guard from the threshold guard.
+  const samples = [
+    s(1111, 1_000, 0.9), s(1111, 2_000, 0.9),            // real Alice: 2/2 → 1.0
+    s(42, 3_000, 0.9), s(42, 4_000, 0.9), s(42, 5_000, 0.9), // mirror → Alice x3
+    s(42, 6_000, 0.9), s(42, 7_000, 0.9),                // mirror → Frank x2
+  ];
+  const names: NameEvent[] = [
+    { name: 'Alice Chen', tMs: 1_000 },
+    { name: 'Alice Chen', tMs: 2_000 },
+    { name: 'Alice Chen', tMs: 3_000 },
+    { name: 'Alice Chen', tMs: 4_000 },
+    { name: 'Alice Chen', tMs: 5_000 },
+    { name: 'Frank Ito', tMs: 6_000 },
+    { name: 'Frank Ito', tMs: 7_000 },
+  ];
+  // Sanity: the mirror sits at 0.6, ABOVE the floor — so only the dedupe rule
+  // can drop it, not the threshold.
+  const mirror = mapSourcesToNames(samples, names).find((m) => m.sourceId === 42);
+  assertEqual(
+    mirror !== undefined && mirror.confidence >= MIN_IDENTITY_CONFIDENCE,
+    true,
+    'the mirror is above the confidence floor (so the dedupe rule, not the floor, must catch it)',
+  );
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [{ sourceId: 1111, name: 'Alice Chen' }],
+    'two ids claim one name → keep only the higher-confidence source, drop the mirror',
+  );
+}
+
+{
+  // A plain below-threshold source is dropped even when its name is unique. A
+  // real speaker (1111) stands beside a source (42) whose votes split evenly
+  // across names it alone claims → confidence 0.4 < 0.5 → dropped.
+  const samples = [
+    s(1111, 1_000, 0.9), s(1111, 2_000, 0.9),
+    s(42, 3_000, 0.9), s(42, 4_000, 0.9), s(42, 5_000, 0.9),
+    s(42, 6_000, 0.9), s(42, 7_000, 0.9),
+  ];
+  const names: NameEvent[] = [
+    { name: 'Alice Chen', tMs: 1_000 },
+    { name: 'Alice Chen', tMs: 2_000 },
+    { name: 'Xavier One', tMs: 3_000 },
+    { name: 'Xavier One', tMs: 4_000 },
+    { name: 'Yuki Two', tMs: 5_000 },
+    { name: 'Yuki Two', tMs: 6_000 },
+    { name: 'Zed Three', tMs: 7_000 },
+  ];
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [{ sourceId: 1111, name: 'Alice Chen' }],
+    'a below-threshold source is dropped even with a name no one else claims',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nbuildActiveSourceIndex — the O(1) lookup must match activeSourceAt exactly');
+// ---------------------------------------------------------------------------
+{
+  // The index is the performance fix: mapSourcesToNames used to rescan the
+  // whole samples array once PER name event (O(nameEvents × samples)); it now
+  // precomputes the winner for every instant in one pass and looks each event
+  // up in O(1). This test pins that the index's winner-per-instant is
+  // byte-identical to activeSourceAt across the tricky cases: several events at
+  // one instant, an instant with no audible source (no vote), and a tie at one
+  // instant (first-seen loudest wins).
+  const samples = [
+    // t=1000: 1111 (0.9) beats 2222 (0.3) → winner 1111.
+    s(1111, 1_000, 0.9), s(2222, 1_000, 0.3),
+    // t=2000: TIE at 0.7 between 3333 (seen first) and 4444 → strict `>` keeps
+    // the first-seen loudest → winner 3333.
+    s(3333, 2_000, 0.7), s(4444, 2_000, 0.7),
+    // t=3000: both below the silence floor → all-quiet → no winner, no vote.
+    s(5555, 3_000, 0.004), s(6666, 3_000, 0.002),
+  ];
+
+  // The index winner at each instant equals activeSourceAt at that instant.
+  const index = buildActiveSourceIndex(samples);
+  assertEqual(index.get(1_000) ?? null, activeSourceAt(samples, 1_000), 'index[1000] == activeSourceAt(1000)');
+  assertEqual(index.get(2_000) ?? null, activeSourceAt(samples, 2_000), 'index[2000] == activeSourceAt(2000) (tie → first-seen loudest)');
+  assertEqual(index.get(3_000) ?? null, activeSourceAt(samples, 3_000), 'index[3000] == activeSourceAt(3000) (all-quiet → null)');
+
+  // And the end-to-end mapSourcesToNames output over the same data matches the
+  // pre-optimization expectation: multiple events at the tie instant and at the
+  // winner instant all attribute to the right ids, and the silent instant casts
+  // no vote (so 5555/6666 never appear).
+  const names: NameEvent[] = [
+    { name: 'Alice Chen', tMs: 1_000 },   // → 1111
+    { name: 'Alice Chen', tMs: 1_000 },   // → 1111 again (same instant, multiple events)
+    { name: 'Bob Müller', tMs: 2_000 },   // → 3333 (tie winner)
+    { name: 'Bob Müller', tMs: 2_000 },   // → 3333 again
+    { name: 'Ghost Name', tMs: 3_000 },   // all-quiet → discarded, invents no source
+  ];
+  assertEqual(
+    mapSourcesToNames(samples, names),
+    [
+      { sourceId: 1111, name: 'Alice Chen', votes: 2, total: 2, confidence: 1 },
+      { sourceId: 3333, name: 'Bob Müller', votes: 2, total: 2, confidence: 1 },
+    ],
+    'index-path mapSourcesToNames matches activeSourceAt semantics: multi-event/tie/silent-instant all correct',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nMIN_IDENTITY_CONFIDENCE — the 0.5 boundary is INCLUSIVE (F1)');
+// ---------------------------------------------------------------------------
+{
+  // F1: pin the confidence floor at EXACTLY 0.5. The guard in
+  // resolveSpeakerIdentities is `entry.confidence < MIN_IDENTITY_CONFIDENCE` —
+  // so a source sitting EXACTLY on the floor must be KEPT. Construct source 100
+  // as the sole audible source at t=0 and t=500, with name events splitting its
+  // votes Alice:1 / Bob:1 → winner votes 1 of total 2 → confidence 0.5, and no
+  // other source claims either name (uncontested), so only the threshold guard
+  // can act on it. Mutating `<` → `<=` drops it and turns this test red.
+  const samples = [s(100, 0, 0.9), s(100, 500, 0.9)];
+  const names: NameEvent[] = [
+    { name: 'Alice Chen', tMs: 0 },
+    { name: 'Bob Müller', tMs: 500 },
+  ];
+
+  // Sanity: the confidence really is exactly the boundary value.
+  const mapped = mapSourcesToNames(samples, names).find((m) => m.sourceId === 100);
+  assertEqual(mapped?.confidence, MIN_IDENTITY_CONFIDENCE, 'source 100 sits at confidence == 0.5 (the boundary)');
+
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [{ sourceId: 100, name: 'Alice Chen' }],
+    'a source EXACTLY at the confidence floor is kept (< is exclusive; <= would drop it)',
   );
 }
 

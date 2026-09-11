@@ -60,8 +60,8 @@ const STRINGIFIED_NULLISH_NAMES = new Set(['null', 'undefined']);
 export interface SpeakerBoundaryDeps {
   /** Publish one boundary. `timestampMs` is in whatever domain the caller clamps to. */
   publish(type: SpeakerBoundaryType, speaker: string, timestampMs: number): Promise<void>;
-  /** Currently resolved display name for a track, or '' when still unmapped. */
-  resolveName(trackIndex: number): string;
+  /** Currently resolved display name for a source, or '' when still unmapped. */
+  resolveName(sourceKey: string): string;
   /** Clock. Injected so tests can drive the hangover without sleeping. Defaults to `Date.now`. */
   now?: () => number;
   /** Diagnostic sink. Defaults to a no-op; production passes `utils.log`. */
@@ -105,8 +105,8 @@ export interface SpeakerBoundaryTracker {
   arm(): void;
   /** Whether publishing is currently armed. */
   isArmed(): boolean;
-  /** Record audio activity for a track, opening a new utterance on a silent→speaking edge. */
-  markTrackAudioActivity(trackIndex: number, atMs: number): void;
+  /** Record audio activity for a source, opening a new utterance on a silent→speaking edge. */
+  markTrackAudioActivity(sourceKey: string, atMs: number): void;
   /** Run one sweep pass. Exposed directly so tests can drive it without a timer. */
   sweep(): Promise<void>;
   /** Begin the periodic sweep. Idempotent. */
@@ -157,13 +157,12 @@ export function resolveSilenceHangoverMs(log?: (message: string) => void): numbe
 }
 
 /**
- * Stable placeholder identity for a track whose utterance ended with no name
+ * Stable placeholder identity for a source whose utterance ended with no name
  * ever resolved (see the `decide()` fallback below).
  *
- * Derived purely from the track index — never from a running counter — so the
- * SAME track keeps the SAME placeholder for the whole session, which is what
+ * Derived purely from the source key — never from a running counter — so the
+ * SAME source keeps the SAME placeholder for the whole session, which is what
  * makes two unresolved humans two DISTINCT speakers downstream instead of one.
- * 1-based only for readability in `transcript.txt`.
  *
  * The "(unresolved)" qualifier is load-bearing, not decorative. Every platform
  * resolver in `speaker-identity.ts` (Meet, Teams, Zoom) hands back a
@@ -178,11 +177,18 @@ export function resolveSilenceHangoverMs(log?: (message: string) => void): numbe
  *
  * Note this label is NOT routed through `isNameTaken` in `speaker-identity.ts`
  * (this file must not import that module — see the file header); uniqueness comes
- * from the label being a pure function of the track index, so two tracks can
+ * from the label being a pure function of the source key, so two sources can
  * never receive the same one.
  */
-export function syntheticSpeakerLabel(trackIndex: number): string {
-  return `Unknown Speaker ${trackIndex + 1} (unresolved)`;
+export function syntheticSpeakerLabel(sourceKey: string): string {
+  // Only ever called on the synthesize path, which today is Zoom alone, whose keys
+  // are the DOM per-element track index ("0","1","2"). Keep the historical 1-based
+  // numbering so the flag-off fallback output stays BYTE-IDENTICAL — track "0" →
+  // "Unknown Speaker 1". A non-numeric key (never produced today; Meet's CSRC path
+  // does not synthesize) is embedded verbatim rather than rendered "NaN".
+  const n = Number(sourceKey);
+  const label = Number.isInteger(n) ? String(n + 1) : sourceKey;
+  return `Unknown Speaker ${label} (unresolved)`;
 }
 
 /**
@@ -201,11 +207,11 @@ export function sanitizeResolvedName(raw: string | null | undefined): string {
 }
 
 class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
-  private readonly trackSpeech: Map<number, TrackSpeechState> = new Map();
-  /** Tracks that fell back to a synthetic identity — logged once each. */
-  private readonly unnamedUtteranceLogged: Set<number> = new Set();
-  /** Tracks whose resolver returned a stringified-nullish name — logged once each. */
-  private readonly junkNameLogged: Set<number> = new Set();
+  private readonly trackSpeech: Map<string, TrackSpeechState> = new Map();
+  /** Sources that fell back to a synthetic identity — logged once each. */
+  private readonly unnamedUtteranceLogged: Set<string> = new Set();
+  /** Sources whose resolver returned a stringified-nullish name — logged once each. */
+  private readonly junkNameLogged: Set<string> = new Set();
 
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   /**
@@ -266,11 +272,11 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
     return this.hangover;
   }
 
-  markTrackAudioActivity(trackIndex: number, atMs: number): void {
-    let st = this.trackSpeech.get(trackIndex);
+  markTrackAudioActivity(sourceKey: string, atMs: number): void {
+    let st = this.trackSpeech.get(sourceKey);
     if (!st) {
       st = { speaking: false, onsetMs: atMs, lastAudioMs: atMs, startEmitted: false, emittedName: null };
-      this.trackSpeech.set(trackIndex, st);
+      this.trackSpeech.set(sourceKey, st);
     }
     st.lastAudioMs = atMs;
     if (!st.speaking) {
@@ -281,20 +287,20 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
     }
   }
 
-  /** Resolved name for a track with stringified-nullish junk rejected. */
-  private nameFor(trackIndex: number): string {
+  /** Resolved name for a source with stringified-nullish junk rejected. */
+  private nameFor(sourceKey: string): string {
     let raw: string;
     try {
-      raw = this.deps.resolveName(trackIndex);
+      raw = this.deps.resolveName(sourceKey);
     } catch (err: unknown) {
-      this.log(`[SpeakerBoundary] Track ${trackIndex} name lookup failed: ${errMessage(err)}`);
+      this.log(`[SpeakerBoundary] Track ${sourceKey} name lookup failed: ${errMessage(err)}`);
       return '';
     }
     const clean = sanitizeResolvedName(raw);
     // Only shout about junk, not about the ordinary "still unmapped" case.
-    if (!clean && String(raw ?? '').trim() && !this.junkNameLogged.has(trackIndex)) {
-      this.junkNameLogged.add(trackIndex);
-      this.log(`[SpeakerBoundary] Track ${trackIndex} resolver returned stringified-nullish name — treating as unmapped`);
+    if (!clean && String(raw ?? '').trim() && !this.junkNameLogged.has(sourceKey)) {
+      this.junkNameLogged.add(sourceKey);
+      this.log(`[SpeakerBoundary] Track ${sourceKey} resolver returned stringified-nullish name — treating as unmapped`);
     }
     return clean;
   }
@@ -351,7 +357,7 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
     const nowMs = this.now();
     const pending: PendingBoundary[] = [];
 
-    for (const [idx, st] of this.trackSpeech) {
+    for (const [sourceKey, st] of this.trackSpeech) {
       // Retroactive START — ONLY for a currently open utterance.
       //
       // The `st.speaking` guard is the fix for the duplicate-START defect: the END
@@ -361,7 +367,7 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
       // name and re-published START at the now-STALE onset, once per utterance —
       // 48 duplicate-timestamp events in a 429-event live timeline.
       if (st.speaking && !st.startEmitted) {
-        const name = this.nameFor(idx);
+        const name = this.nameFor(sourceKey);
         if (name) {
           st.startEmitted = true;
           st.emittedName = name;
@@ -369,7 +375,7 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
             type: 'started_speaking',
             speaker: name,
             timestampMs: st.onsetMs,
-            logLine: `[SpeakerBoundary] Track ${idx} START "${name}" @onset=${st.onsetMs}`,
+            logLine: `[SpeakerBoundary] Track ${sourceKey} START "${name}" @onset=${st.onsetMs}`,
           });
         }
       }
@@ -390,7 +396,7 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
             type: 'stopped_speaking',
             speaker: closingName,
             timestampMs: closingAtMs,
-            logLine: `[SpeakerBoundary] Track ${idx} END "${closingName}" @${closingAtMs}`,
+            logLine: `[SpeakerBoundary] Track ${sourceKey} END "${closingName}" @${closingAtMs}`,
           });
         } else if (hadStart) {
           // A published START with no name to close it against. `startEmitted`
@@ -398,13 +404,13 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
           // unreachable — but the alternative to guarding it is emitting a
           // SECOND START (below) for an utterance that already has one, leaving
           // an orphan in the timeline. Report it instead of guessing.
-          this.log(`[SpeakerBoundary] BUG: Track ${idx} had a published START with no name at close — emitting nothing rather than a duplicate START`);
+          this.log(`[SpeakerBoundary] BUG: Track ${sourceKey} had a published START with no name at close — emitting nothing rather than a duplicate START`);
         } else if (!this.synthesizeUnresolved()) {
           // NOT opted in (Google Meet, Teams, any future caller): the pre-existing
           // behaviour, unchanged — no boundary, and the original log line, verbatim.
-          if (!this.unnamedUtteranceLogged.has(idx)) {
-            this.unnamedUtteranceLogged.add(idx);
-            this.log(`[SpeakerBoundary] Track ${idx} utterance dropped — no name resolved before it ended`);
+          if (!this.unnamedUtteranceLogged.has(sourceKey)) {
+            this.unnamedUtteranceLogged.add(sourceKey);
+            this.log(`[SpeakerBoundary] Track ${sourceKey} utterance dropped — no name resolved before it ended`);
           }
         } else {
           // No name ever resolved before this utterance ended. This used to be
@@ -422,22 +428,22 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
           // resolved one. Exactly one START/END pair either way — never both this
           // branch and the retroactive one for the same utterance.
           const onsetSnapshot = st.onsetMs;
-          const synthetic = syntheticSpeakerLabel(idx);
+          const synthetic = syntheticSpeakerLabel(sourceKey);
           pending.push({
             type: 'started_speaking',
             speaker: synthetic,
             timestampMs: onsetSnapshot,
-            logLine: `[SpeakerBoundary] Track ${idx} START "${synthetic}" @onset=${onsetSnapshot} (synthetic identity)`,
+            logLine: `[SpeakerBoundary] Track ${sourceKey} START "${synthetic}" @onset=${onsetSnapshot} (synthetic identity)`,
           });
           pending.push({
             type: 'stopped_speaking',
             speaker: synthetic,
             timestampMs: closingAtMs,
-            logLine: `[SpeakerBoundary] Track ${idx} END "${synthetic}" @${closingAtMs} (synthetic identity)`,
+            logLine: `[SpeakerBoundary] Track ${sourceKey} END "${synthetic}" @${closingAtMs} (synthetic identity)`,
           });
-          if (!this.unnamedUtteranceLogged.has(idx)) {
-            this.unnamedUtteranceLogged.add(idx);
-            this.log(`[SpeakerBoundary] Track ${idx} NEVER RESOLVED a name — its speech is published as "${synthetic}" rather than dropped (dropping donated it to another track)`);
+          if (!this.unnamedUtteranceLogged.has(sourceKey)) {
+            this.unnamedUtteranceLogged.add(sourceKey);
+            this.log(`[SpeakerBoundary] Track ${sourceKey} NEVER RESOLVED a name — its speech is published as "${synthetic}" rather than dropped (dropping donated it to another track)`);
           }
         }
       }
@@ -503,9 +509,9 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
 
     // Decide the whole flush synchronously, then publish — same rule as `sweep()`.
     const pending: PendingBoundary[] = [];
-    for (const [idx, st] of this.trackSpeech) {
+    for (const [sourceKey, st] of this.trackSpeech) {
       if (st.speaking && !st.startEmitted) {
-        const name = this.nameFor(idx);
+        const name = this.nameFor(sourceKey);
         if (name) {
           st.startEmitted = true;
           st.emittedName = name;
@@ -513,7 +519,7 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
             type: 'started_speaking',
             speaker: name,
             timestampMs: st.onsetMs,
-            logLine: `[SpeakerBoundary] Track ${idx} START "${name}" @onset=${st.onsetMs} (finalize flush)`,
+            logLine: `[SpeakerBoundary] Track ${sourceKey} START "${name}" @onset=${st.onsetMs} (finalize flush)`,
           });
         }
       }
@@ -522,7 +528,7 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
           type: 'stopped_speaking',
           speaker: st.emittedName,
           timestampMs: st.lastAudioMs,
-          logLine: `[SpeakerBoundary] Track ${idx} END "${st.emittedName}" @${st.lastAudioMs} (finalize flush)`,
+          logLine: `[SpeakerBoundary] Track ${sourceKey} END "${st.emittedName}" @${st.lastAudioMs} (finalize flush)`,
         });
       } else if (st.speaking && this.synthesizeUnresolved()) {
         // Still speaking at teardown and STILL nameless — the meeting's final
@@ -530,18 +536,18 @@ class SpeakerBoundaryMachine implements SpeakerBoundaryTracker {
         // have caught it, but the sweep never runs again, so without this the
         // last utterance is dropped and donated to whoever else resolved. Same
         // rule, same synthetic identity, so the two paths cannot disagree.
-        const synthetic = syntheticSpeakerLabel(idx);
+        const synthetic = syntheticSpeakerLabel(sourceKey);
         pending.push({
           type: 'started_speaking',
           speaker: synthetic,
           timestampMs: st.onsetMs,
-          logLine: `[SpeakerBoundary] Track ${idx} START "${synthetic}" @onset=${st.onsetMs} (finalize flush, no name resolved)`,
+          logLine: `[SpeakerBoundary] Track ${sourceKey} START "${synthetic}" @onset=${st.onsetMs} (finalize flush, no name resolved)`,
         });
         pending.push({
           type: 'stopped_speaking',
           speaker: synthetic,
           timestampMs: st.lastAudioMs,
-          logLine: `[SpeakerBoundary] Track ${idx} END "${synthetic}" @${st.lastAudioMs} (finalize flush, no name resolved)`,
+          logLine: `[SpeakerBoundary] Track ${sourceKey} END "${synthetic}" @${st.lastAudioMs} (finalize flush, no name resolved)`,
         });
       }
       st.speaking = false;
