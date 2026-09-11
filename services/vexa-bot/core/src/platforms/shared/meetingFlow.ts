@@ -181,6 +181,21 @@ export async function runMeetingFlow(
           log(`[PerSpeaker] Post-admission audio capture error (non-fatal): ${err?.message || err}`);
         });
 
+        // RTP-layer speaker-source probe. OFF unless RTP_SPEAKER_PROBE=true, so
+        // a production bot is byte-for-byte unaffected. Instrumentation only:
+        // it reads receivers and logs, publishes no speaker events and changes
+        // no attribution. Measures whether the RTP source id is a stable
+        // per-person key (Option 5 of the audio-element-multiplexing plan).
+        import("../../services/rtp-speaker-probe")
+          .then(({ startRtpSpeakerProbe }) =>
+            startRtpSpeakerProbe(page).catch((err: any) => {
+              log(`[RtpProbe] start failed (non-fatal): ${err?.message || err}`);
+            }),
+          )
+          .catch((err: any) => {
+            log(`[RtpProbe] module load failed (non-fatal): ${err?.message || err}`);
+          });
+
         // Enable live captions for Teams — captions provide speaker-attributed
         // text directly from Teams ASR, used as primary speaker detection signal.
         // Captions are per-user, so the bot can always enable them for itself.

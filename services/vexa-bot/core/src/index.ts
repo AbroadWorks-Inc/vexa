@@ -30,6 +30,11 @@ import { decideMeetStorageState } from './services/meet-auth';
 import { SpeakerStreamManager } from './services/speaker-streams';
 import { resolveSpeakerName, isTrackLocked, isNameTaken, reportTrackAudio, getLockedMapping } from './services/speaker-identity';
 import { createSpeakerBoundaryTracker, SpeakerBoundaryTracker } from './services/speaker-boundaries';
+// Tier 1 CSRC-keyed per-speaker capture (flag-gated: TIER1_SPEAKER_CAPTURE=true, Meet only).
+// These modules are inert with the flag unset — see the flag-gating in
+// startPerSpeakerAudioCapture() and receiver-capture.ts / rtp-speaker-probe.ts.
+import { setReceiverAudioSink, startReceiverTrackCapture, stopReceiverTrackCapture, ReceiverAudioPayload } from './services/receiver-capture';
+import { resolveSpeakerIdentities, RtpSample, NameEvent } from './services/rtp-speaker-source';
 import { SileroVAD } from './services/vad';
 import { isHallucination } from './services/hallucination-filter';
 import { SpeakerStreamHandle } from './services/audio';
@@ -711,6 +716,16 @@ async function performGracefulLeave(
     await cleanupPerSpeakerPipeline();
   } catch (pipelineCleanupErr: any) {
     log(`[Graceful Leave] Per-speaker pipeline cleanup error: ${pipelineCleanupErr.message}`);
+  }
+
+  // Final RTP-probe report. No-op unless RTP_SPEAKER_PROBE=true. Wrapped
+  // because a probe must never be able to interrupt a graceful leave — the
+  // bot's actual job is finishing the recording, not finishing the report.
+  try {
+    const { stopRtpSpeakerProbe } = await import("./services/rtp-speaker-probe");
+    stopRtpSpeakerProbe();
+  } catch (probeErr: any) {
+    log(`[Graceful Leave] RTP probe report error (non-fatal): ${probeErr?.message || probeErr}`);
   }
 
   // Google Meet: stop the Node-side PulseAudio capture and finalize the WAV.
@@ -1548,6 +1563,144 @@ let lastParticipantCount = 0;
 /** Per-speaker last audio received timestamp (Node.js side) — for silence monitoring */
 const speakerLastAudioMs: Map<string, number> = new Map();
 
+// ─── Tier 1 CSRC-keyed per-speaker capture (FLAG-GATED) ──────────────────────
+// Active only when TIER1_SPEAKER_CAPTURE=true AND platform is google_meet. It
+// captures each RTCRtpReceiver's own audio (receiver-capture.ts) tagged with the
+// SFU's loudest CSRC id, keys speakers by `csrc-<id>` instead of the DOM path's
+// pooled `speaker-<idx>`, and learns id→name from the GMeet active-speaker signal
+// via the tested pure functions in rtp-speaker-source.ts. Everything below is
+// inert while the flag is off, so the production DOM path is untouched.
+
+/** Whether the Tier 1 path owns capture this session (flag ON + Meet). Read by resolveName. */
+let tier1SpeakerCaptureActive = false;
+/** Bounded RtpSample accumulator (CSRC id + level + bucketed tMs) for identity resolution. */
+const tier1RtpSamples: RtpSample[] = [];
+/** NameEvent accumulator fed from the GMeet active-speaker-name signal (bucketed tMs). */
+const tier1NameEvents: NameEvent[] = [];
+/** Capture-relative time origin for Tier 1 tMs stamping (Date.now() at capture start). */
+let tier1CaptureStartMs = 0;
+/** Periodic name-poll + identity-resolve timer for the Tier 1 path. */
+let tier1IdentityInterval: ReturnType<typeof setInterval> | null = null;
+
+/** Cap for both Tier 1 accumulators — mirrors the RTP probe's bound. */
+const TIER1_SAMPLE_CAP = 200_000;
+/**
+ * Correlation bucket shared by RtpSamples AND NameEvents. resolveSpeakerIdentities
+ * correlates a name to a source by EXACT tMs equality (activeSourceAt), so both
+ * must be quantised onto one grid or nothing ever matches. 500ms comfortably
+ * spans one ~256ms receiver buffer and the 1s name poll, so a name and the audio
+ * around it reliably co-bucket.
+ */
+const TIER1_TICK_MS = 500;
+/** How often the Tier 1 timer polls the active-speaker names. */
+const TIER1_NAME_POLL_MS = 1000;
+/** Resolve identities every Nth poll tick (~every 3s). */
+const TIER1_RESOLVE_EVERY_TICKS = 3;
+
+/** Quantise a capture-relative time onto the shared correlation grid. */
+function tier1BucketMs(rawMs: number): number {
+  return Math.round(rawMs / TIER1_TICK_MS) * TIER1_TICK_MS;
+}
+
+/**
+ * Sink for one CSRC-tagged receiver audio buffer. Registered via
+ * setReceiverAudioSink() only on the Tier 1 path. Synchronous and non-fatal by
+ * contract: any error logs and returns so capture can never break recording.
+ */
+function onReceiverAudio(payload: ReceiverAudioPayload): void {
+  try {
+    // No audible source on this buffer — the in-page half could not pick a CSRC
+    // above the silence floor. Drop rather than guess an owner.
+    if (payload.csrc == null) return;
+    if (!speakerManager) return;
+
+    const csrc = payload.csrc;
+    const speakerId = `csrc-${csrc}`;
+    const nowMs = Date.now();
+
+    // Accumulate a CSRC sample (bucketed) for periodic identity resolution.
+    tier1RtpSamples.push({
+      sourceId: csrc,
+      audioLevel: payload.audioLevel,
+      tMs: tier1BucketMs(nowMs - tier1CaptureStartMs),
+    });
+    if (tier1RtpSamples.length > TIER1_SAMPLE_CAP) {
+      tier1RtpSamples.splice(0, tier1RtpSamples.length - TIER1_SAMPLE_CAP);
+    }
+
+    // Register the source unmapped ('') and safe; the resolver names it later.
+    if (!speakerManager.hasSpeaker(speakerId)) {
+      speakerManager.addSpeaker(speakerId, '');
+    }
+
+    // The in-page half already gated this buffer against CAPTURE_SILENCE (the same
+    // 0.005 floor the DOM path applies), so this is real speech — feed it straight
+    // in. (Node-side Silero VAD, which the DOM path also applies, is skipped here
+    // deliberately to keep the sink synchronous and non-blocking.)
+    speakerManager.feedAudio(speakerId, new Float32Array(payload.samples));
+
+    // Audio-derived boundary — SAME machine as the DOM path. markTrackAudioActivity
+    // forwards String(csrc); resolveName (Tier 1 branch) reads it as `csrc-<csrc>`.
+    markTrackAudioActivity(csrc, nowMs);
+    speakerLastAudioMs.set(speakerId, nowMs);
+  } catch (err: any) {
+    log(`[Tier1] onReceiverAudio error (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/** Poll the GMeet active-speaker signal and append NameEvents (bucketed tMs). */
+function tier1PollNames(): void {
+  if (!page || page.isClosed()) return;
+  page
+    .evaluate(() => {
+      try {
+        const getNames = (window as any).__vexaGetAllParticipantNames;
+        if (typeof getNames !== 'function') return [] as string[];
+        const data = getNames() as { names: Record<string, string>; speaking: string[] };
+        return Array.isArray(data?.speaking) ? data.speaking : ([] as string[]);
+      } catch {
+        return [] as string[];
+      }
+    })
+    .then((speaking: string[]) => {
+      const tMs = tier1BucketMs(Date.now() - tier1CaptureStartMs);
+      const selfLower = (currentBotConfig?.botName || '').toLowerCase();
+      for (const raw of speaking) {
+        const name = (raw || '').trim();
+        if (!name) continue;
+        const lower = name.toLowerCase();
+        // Never let the bot's own name become a speaker identity.
+        if (selfLower && (lower.includes(selfLower) || selfLower.includes(lower))) continue;
+        tier1NameEvents.push({ name, tMs });
+      }
+      if (tier1NameEvents.length > TIER1_SAMPLE_CAP) {
+        tier1NameEvents.splice(0, tier1NameEvents.length - TIER1_SAMPLE_CAP);
+      }
+    })
+    .catch(() => {});
+}
+
+/** Resolve stable CSRC→name identities and push them into the SpeakerStreamManager. */
+function tier1ResolveIdentities(): void {
+  if (!speakerManager) return;
+  try {
+    const identities = resolveSpeakerIdentities(tier1RtpSamples, tier1NameEvents);
+    for (const { sourceId, name } of identities) {
+      if (!name) continue;
+      const speakerId = `csrc-${sourceId}`;
+      if (!speakerManager.hasSpeaker(speakerId)) continue;
+      const current = speakerManager.getSpeakerName(speakerId) || '';
+      if (current === name) continue;
+      // Keep the DOM path's uniqueness safety: never assign a name already held.
+      if (isDuplicateSpeakerName(name, speakerId)) continue;
+      speakerManager.updateSpeakerName(speakerId, name);
+      log(`[Tier1] CSRC ${sourceId} → "${name}" (identity resolved)`);
+    }
+  } catch (err: any) {
+    log(`[Tier1] identity resolve error (non-fatal): ${err?.message || err}`);
+  }
+}
+
 // ─── Audio-derived speaker boundaries (CSS-INDEPENDENT) ──────────────────────
 // The state machine itself lives in services/speaker-boundaries.ts so it can be
 // unit-tested with no browser (this module imports playwright-extra at top level,
@@ -1590,9 +1743,17 @@ const speakerBoundaries: SpeakerBoundaryTracker = createSpeakerBoundaryTracker({
       source: 'audio',
     });
   },
-  resolveName: (trackIndex) => {
+  resolveName: (sourceKey) => {
     if (!speakerManager) return '';
-    return speakerManager.getSpeakerName(`speaker-${trackIndex}`) || '';
+    // One resolver, two paths. The boundary machine is shared between the DOM
+    // per-element path and the flag-gated Tier 1 CSRC path, and each stores its
+    // names under a different speakerId scheme. The sourceKey it hands us is the
+    // key we passed to markTrackAudioActivity: the DOM path's track index (→
+    // `speaker-<idx>`) or Tier 1's CSRC id (→ `csrc-<csrc>`). tier1SpeakerCaptureActive
+    // is false unless the flag is on AND platform is Meet, so flag-off resolves to
+    // exactly `speaker-<idx>` as before.
+    const speakerId = tier1SpeakerCaptureActive ? `csrc-${sourceKey}` : `speaker-${sourceKey}`;
+    return speakerManager.getSpeakerName(speakerId) || '';
   },
   /**
    * Zoom ONLY. A predicate, not a boolean: this options object is built at module
@@ -1618,7 +1779,9 @@ export function armSpeakerBoundaries(): void {
 
 /** Record audio activity for a track, opening a new utterance on a silent→speaking edge. */
 function markTrackAudioActivity(trackIndex: number, atMs: number): void {
-  speakerBoundaries.markTrackAudioActivity(trackIndex, atMs);
+  // A3 re-keyed the boundary machine to STRING source keys. The DOM path's track
+  // index is bridged with String(); resolveName() reverses it as `speaker-<idx>`.
+  speakerBoundaries.markTrackAudioActivity(String(trackIndex), atMs);
 }
 
 function startSpeakerBoundarySweep(): void {
@@ -1979,6 +2142,30 @@ async function cleanupPerSpeakerPipeline(): Promise<void> {
     pipelineTelemetryInterval = null;
   }
 
+  // Tear down the Tier 1 CSRC path (no-op when it was never active). Clear the
+  // sink first so any late in-page buffer is dropped rather than touching a
+  // torn-down manager, then stop the timer and reset accumulators/flag.
+  if (tier1SpeakerCaptureActive) {
+    setReceiverAudioSink(null);
+    // Tear down the in-page capture: clear the scan interval, disconnect the
+    // per-receiver nodes, and close the shared AudioContext. Non-fatal by
+    // contract; guarded here too so a teardown fault never blocks session_end.
+    try {
+      await stopReceiverTrackCapture(page);
+    } catch (err: any) {
+      log(`[Tier1] stopReceiverTrackCapture failed (non-fatal): ${err?.message || err}`);
+    }
+    if (tier1IdentityInterval) {
+      clearInterval(tier1IdentityInterval);
+      tier1IdentityInterval = null;
+    }
+    tier1RtpSamples.length = 0;
+    tier1NameEvents.length = 0;
+    tier1CaptureStartMs = 0;
+    tier1SpeakerCaptureActive = false;
+    log('[Tier1] Per-receiver capture torn down');
+  }
+
   // Stop browser-side audio capture
   for (const handle of activeSpeakerStreamHandles) {
     try {
@@ -2163,6 +2350,47 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
       }
     }
     // Teams audio routing + caption observer is set up in recording.ts page.evaluate
+    return;
+  }
+
+  // ─── Tier 1 CSRC-keyed capture (FLAG-GATED, Meet only) ───────────────────────
+  // When TIER1_SPEAKER_CAPTURE=true and this is Google Meet, capture each
+  // participant's OWN receiver track (tagged with its loudest CSRC) instead of the
+  // pooled DOM <audio> elements, and do NOT start the DOM __vexaPerSpeakerAudioData
+  // capture below. Flag off → this whole block is skipped and the proven DOM path
+  // runs byte-for-byte as before.
+  if (process.env.TIER1_SPEAKER_CAPTURE === 'true' && currentPlatform === 'google_meet') {
+    tier1SpeakerCaptureActive = true;
+    tier1CaptureStartMs = Date.now();
+    log('[Tier1] TIER1_SPEAKER_CAPTURE enabled — using per-receiver CSRC capture (DOM per-element capture suppressed)');
+
+    // Begin closing utterances that fall silent (same sweep the DOM path uses).
+    startSpeakerBoundarySweep();
+
+    // Register the sink, then install per-receiver capture. receiver-capture.ts
+    // owns the __vexaReceiverAudio exposeFunction bridge; it is a no-op unless the
+    // flag is set, and non-fatal on any failure.
+    setReceiverAudioSink(onReceiverAudio);
+    try {
+      await startReceiverTrackCapture(pageToCaptureFrom);
+    } catch (err: any) {
+      log(`[Tier1] startReceiverTrackCapture failed (non-fatal): ${err?.message || err}`);
+    }
+
+    // Periodic: poll the active-speaker names into the NameEvent accumulator, and
+    // every few ticks resolve stable CSRC→name identities into the manager.
+    let tier1Tick = 0;
+    tier1IdentityInterval = setInterval(() => {
+      try {
+        tier1PollNames();
+        tier1Tick += 1;
+        if (tier1Tick % TIER1_RESOLVE_EVERY_TICKS === 0) tier1ResolveIdentities();
+      } catch (err: any) {
+        log(`[Tier1] identity timer error (non-fatal): ${err?.message || err}`);
+      }
+    }, TIER1_NAME_POLL_MS);
+
+    log('[Tier1] Per-receiver audio capture started (CSRC-keyed)');
     return;
   }
 
@@ -2702,6 +2930,21 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     Object.defineProperty(window, "outerWidth", { get: () => 1920 });
     Object.defineProperty(window, "outerHeight", { get: () => 1080 });
   });
+
+  // RTP speaker-source probe (Option 5): install the peer-connection registry the
+  // probe reads. Without this a plain recording bot never populates
+  // window.__vexa_peer_connections (only the virtual-camera init does), so the
+  // probe found zero receivers (diagnosed live 2026-09-11). Meet-only, self-gated
+  // on RTP_SPEAKER_PROBE, and a no-op when the camera init already owns the
+  // registry — proven flows are untouched. MUST run before handleGoogleMeet navigates.
+  if (botConfig.platform === "google_meet") {
+    try {
+      const { installRtpPcRegistry } = await import("./services/rtp-speaker-probe");
+      await installRtpPcRegistry(page);
+    } catch (e: any) {
+      log(`[Bot] [RtpProbe] PC registry init failed (non-fatal): ${e?.message || e}`);
+    }
+  }
 
   // Virtual camera is controlled by cameraEnabled (independent of voiceAgentEnabled).
   // TTS speaker bots can speak without streaming an avatar.

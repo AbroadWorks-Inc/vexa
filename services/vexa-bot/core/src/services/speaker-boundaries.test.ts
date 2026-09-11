@@ -25,6 +25,17 @@
  * whichever other track's name is known, asserting a false attribution rather
  * than an honest unknown. The fix emits it under a stable per-track synthetic
  * identity (`syntheticSpeakerLabel`) instead of dropping it.
+ *
+ * ── Re-key to a STRING source key ────────────────────────────────────────────
+ * Tier 1 attribution re-keys per-track state from a NUMERIC DOM track index (a
+ * browser-local <audio> attachment, not a person) to a STRING source key (a CSRC
+ * id), so state is per-SENDER. This suite is the original regression suite,
+ * mechanically adapted to the string API — every key is a string. syntheticSpeakerLabel
+ * (called only on the Zoom synthesize path, whose keys are numeric track indices)
+ * keeps its historical 1-based numbering so the flag-off output is byte-identical
+ * (key "0" → "Unknown Speaker 1"). Every original scenario survives.
+ * A new overlap case (section 14) pins the property the re-key exists for: two
+ * different string keys are two INDEPENDENT utterances that can be OPEN at once.
  */
 
 import {
@@ -72,8 +83,8 @@ interface Rig {
   advance(ms: number): void;
   /** Current fake time. */
   clock(): number;
-  /** Set the name `resolveName` will return for a track ('' = unmapped). */
-  setName(trackIndex: number, name: string): void;
+  /** Set the name `resolveName` will return for a source key ('' = unmapped). */
+  setName(sourceKey: string, name: string): void;
   /** Make the next `publish` calls resolve only when `releasePublish()` is called. */
   blockPublish(): void;
   releasePublish(): void;
@@ -87,7 +98,7 @@ function makeRig(opts: { hangoverMs?: number; synthesizeUnresolved?: boolean } =
   let nowMs = T0;
   const events: Published[] = [];
   const logs: string[] = [];
-  const names = new Map<number, string>();
+  const names = new Map<string, string>();
 
   let gate: Promise<void> | null = null;
   let openGate: (() => void) | null = null;
@@ -101,7 +112,7 @@ function makeRig(opts: { hangoverMs?: number; synthesizeUnresolved?: boolean } =
       synthesizeUnresolvedSpeakers: () => opts.synthesizeUnresolved ?? false,
       now: () => nowMs,
       log: (m) => { logs.push(m); },
-      resolveName: (idx) => names.get(idx) ?? '',
+      resolveName: (key) => names.get(key) ?? '',
       publish: async (type, speaker, timestampMs) => {
         if (gate) await gate;
         events.push({ type, speaker, timestampMs });
@@ -111,7 +122,7 @@ function makeRig(opts: { hangoverMs?: number; synthesizeUnresolved?: boolean } =
     logs,
     advance: (ms) => { nowMs += ms; },
     clock: () => nowMs,
-    setName: (idx, name) => { names.set(idx, name); },
+    setName: (key, name) => { names.set(key, name); },
     blockPublish: () => {
       gate = new Promise<void>((resolve) => { openGate = resolve; });
     },
@@ -125,11 +136,11 @@ function makeRig(opts: { hangoverMs?: number; synthesizeUnresolved?: boolean } =
   return rig;
 }
 
-/** Speak on `track` for `durationMs`, feeding activity every 100ms. */
-async function speak(rig: Rig, track: number, durationMs: number): Promise<void> {
+/** Speak on `sourceKey` for `durationMs`, feeding activity every 100ms. */
+async function speak(rig: Rig, sourceKey: string, durationMs: number): Promise<void> {
   const step = 100;
   for (let elapsed = 0; elapsed < durationMs; elapsed += step) {
-    rig.tracker.markTrackAudioActivity(track, rig.clock());
+    rig.tracker.markTrackAudioActivity(sourceKey, rig.clock());
     await rig.tracker.sweep();
     rig.advance(step);
   }
@@ -158,10 +169,10 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Speaker A');
+    rig.setName("0", 'Speaker A');
 
     const onset = rig.clock();
-    await speak(rig, 0, 1_000);
+    await speak(rig, "0", 1_000);
     const lastAudio = rig.clock() - 100; // last markTrackAudioActivity timestamp
 
     // Long silence: 3s at the production cadence = 15 sweeps after the END.
@@ -184,15 +195,15 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Alice');
+    rig.setName("0", 'Alice');
 
     const onset1 = rig.clock();
-    await speak(rig, 0, 500);
+    await speak(rig, "0", 500);
     const lastAudio1 = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
     const onset2 = rig.clock();
-    await speak(rig, 0, 500);
+    await speak(rig, "0", 500);
     const lastAudio2 = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
@@ -213,15 +224,15 @@ async function run(): Promise<void> {
     rig.tracker.arm();
     // Deliberately unmapped at onset — this is the normal GMeet case, where
     // vote-and-lock needs a few seconds to settle.
-    rig.setName(0, '');
+    rig.setName("0", '');
 
     const trueOnset = rig.clock();
-    await speak(rig, 0, 600); // 6 sweeps, no name → nothing published
+    await speak(rig, "0", 600); // 6 sweeps, no name → nothing published
     check('nothing published while the track is unmapped', rig.events.length, 0);
 
     const resolutionTime = rig.clock();
-    rig.setName(0, 'Bob');
-    rig.tracker.markTrackAudioActivity(0, rig.clock());
+    rig.setName("0", 'Bob');
+    rig.tracker.markTrackAudioActivity("0", rig.clock());
     await rig.tracker.sweep();
 
     check('START published once the name resolves', rig.events.length, 1);
@@ -233,10 +244,10 @@ async function run(): Promise<void> {
   console.log('\nArming gate:');
   {
     const rig = makeRig();
-    rig.setName(0, 'Carol');
+    rig.setName("0", 'Carol');
 
     const onset = rig.clock();
-    await speak(rig, 0, 600); // unarmed
+    await speak(rig, "0", 600); // unarmed
     check('nothing published before arm()', rig.events.length, 0);
     checkTrue(
       'the unarmed warning is logged',
@@ -260,10 +271,10 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Dave');
+    rig.setName("0", 'Dave');
 
     const onset = rig.clock();
-    await speak(rig, 0, 400);
+    await speak(rig, "0", 400);
     const lastAudio = rig.clock() - 100;
     await rig.tracker.stopSweep(); // meeting ends mid-utterance
 
@@ -277,8 +288,8 @@ async function run(): Promise<void> {
   }
   {
     const rig = makeRig();
-    rig.setName(0, 'Erin'); // never armed — bot never admitted
-    await speak(rig, 0, 400);
+    rig.setName("0", 'Erin'); // never armed — bot never admitted
+    await speak(rig, "0", 400);
     await rig.tracker.stopSweep();
 
     check('never-armed teardown publishes NOTHING', rig.events.length, 0);
@@ -305,14 +316,14 @@ async function run(): Promise<void> {
     for (const junk of ['null', 'undefined']) {
       const rig = makeRig({ synthesizeUnresolved: true });
       rig.tracker.arm();
-      rig.setName(0, junk);
+      rig.setName("0", junk);
 
       const onset = rig.clock();
-      await speak(rig, 0, 600);
+      await speak(rig, "0", 600);
       const lastAudio = rig.clock() - 100;
       await stayQuiet(rig, 2_000);
 
-      const synthetic = syntheticSpeakerLabel(0);
+      const synthetic = syntheticSpeakerLabel("0");
       check(`resolveName()="${junk}" is emitted under the synthetic identity, not dropped`, rig.shape(), [
         `started_speaking@${onset}`,
         `stopped_speaking@${lastAudio}`,
@@ -348,10 +359,10 @@ async function run(): Promise<void> {
     // line read st.emittedName after that await and rendered `END "null"`.
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Frank');
+    rig.setName("0", 'Frank');
 
     const onset = rig.clock();
-    await speak(rig, 0, 400);
+    await speak(rig, "0", 400);
     const lastAudio = rig.clock() - 100;
 
     rig.blockPublish();
@@ -360,7 +371,7 @@ async function run(): Promise<void> {
     await Promise.resolve();
     // Audio arrives mid-publish, exactly as it does in production.
     const newOnset = rig.clock();
-    rig.tracker.markTrackAudioActivity(0, newOnset);
+    rig.tracker.markTrackAudioActivity("0", newOnset);
     rig.releasePublish();
     await sweeping;
 
@@ -380,18 +391,18 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Grace');
+    rig.setName("0", 'Grace');
 
-    await speak(rig, 0, 300);
+    await speak(rig, "0", 300);
     // Vote-and-lock changes its mind mid-utterance (participant count changed).
-    rig.setName(0, 'Heidi');
-    await speak(rig, 0, 300);
+    rig.setName("0", 'Heidi');
+    await speak(rig, "0", 300);
     await stayQuiet(rig, 2_000);
 
     check('both boundaries use the START-time name', rig.events.map((e) => e.speaker), ['Grace', 'Grace']);
     check('one pair, not two', rig.shape().length, 2);
     // The NEXT utterance is free to pick up the new name.
-    await speak(rig, 0, 300);
+    await speak(rig, "0", 300);
     await stayQuiet(rig, 2_000);
     check('the next utterance adopts the new name', rig.events.slice(2).map((e) => e.speaker), ['Heidi', 'Heidi']);
   }
@@ -401,10 +412,10 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Ivan');
+    rig.setName("0", 'Ivan');
 
     const onset = rig.clock();
-    rig.tracker.markTrackAudioActivity(0, onset);
+    rig.tracker.markTrackAudioActivity("0", onset);
 
     rig.blockPublish();
     // Fire four sweeps while the first is still stuck inside publish — exactly
@@ -445,10 +456,10 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Judith');
+    rig.setName("0", 'Judith');
 
     const onset = rig.clock();
-    rig.tracker.markTrackAudioActivity(0, onset);
+    rig.tracker.markTrackAudioActivity("0", onset);
 
     rig.blockPublish();
     const inflightSweep = rig.tracker.sweep();   // parks inside publish
@@ -495,23 +506,23 @@ async function run(): Promise<void> {
   {
     const rig = makeRig({ synthesizeUnresolved: true }); // Zoom opts in
     rig.tracker.arm();
-    rig.setName(1, 'Utpalendu Sarkar'); // resolved
-    rig.setName(0, '');                 // never resolves
-    rig.setName(2, '');                 // never resolves
+    rig.setName("1", 'Utpalendu Sarkar'); // resolved
+    rig.setName("0", '');                 // never resolves
+    rig.setName("2", '');                 // never resolves
 
     // Turn-taking: unresolved, resolved, unresolved.
     const onset0 = rig.clock();
-    await speak(rig, 0, 500);
+    await speak(rig, "0", 500);
     const last0 = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
     const onset1 = rig.clock();
-    await speak(rig, 1, 500);
+    await speak(rig, "1", 500);
     const last1 = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
     const onset2 = rig.clock();
-    await speak(rig, 2, 500);
+    await speak(rig, "2", 500);
     const last2 = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
@@ -543,9 +554,18 @@ async function run(): Promise<void> {
     );
     check(
       'the two unresolved tracks get DIFFERENT placeholders',
-      syntheticSpeakerLabel(0) === syntheticSpeakerLabel(2),
+      syntheticSpeakerLabel("0") === syntheticSpeakerLabel("2"),
       false,
     );
+    // Flag-off invariant (pins Finding 1): a NUMERIC key keeps 1-based numbering,
+    // so Zoom's synthesize-path output is byte-identical to before the CSRC re-key.
+    // A non-numeric CSRC key is embedded verbatim. Hardcoded on purpose — computing
+    // the expected via syntheticSpeakerLabel() would move both sides together and
+    // pin nothing.
+    check('numeric key stays 1-based (Zoom flag-off byte-identical)',
+      syntheticSpeakerLabel("0"), 'Unknown Speaker 1 (unresolved)');
+    check('a later numeric key is 1-based too',
+      syntheticSpeakerLabel("2"), 'Unknown Speaker 3 (unresolved)');
     // "Impossible to confuse with a real resolved name" — asserted as a property,
     // not as a spelling: no placeholder may equal any resolved name, and every
     // placeholder must be recognisable as one.
@@ -566,14 +586,14 @@ async function run(): Promise<void> {
     const rig = makeRig({ synthesizeUnresolved: true }); // Zoom opts in
     rig.tracker.arm();
     for (let turn = 0; turn < 3; turn++) {
-      await speak(rig, 4, 400);
+      await speak(rig, "4", 400);
       await stayQuiet(rig, 2_000);
     }
     check('three utterances from one unresolved track → 6 events', rig.events.length, 6);
     check(
       'all six carry the SAME placeholder',
       Array.from(new Set(rig.events.map((e) => e.speaker))),
-      [syntheticSpeakerLabel(4)],
+      [syntheticSpeakerLabel("4")],
     );
     check(
       'every placeholder START has a matching END',
@@ -588,16 +608,16 @@ async function run(): Promise<void> {
     const rig = makeRig({ synthesizeUnresolved: true }); // Zoom opts in
     rig.tracker.arm();
 
-    await speak(rig, 0, 400);
+    await speak(rig, "0", 400);
     await stayQuiet(rig, 2_000);
     check('first utterance is a placeholder', rig.events.map((e) => e.speaker), [
-      syntheticSpeakerLabel(0),
-      syntheticSpeakerLabel(0),
+      syntheticSpeakerLabel("0"),
+      syntheticSpeakerLabel("0"),
     ]);
 
-    rig.setName(0, 'sujoy sarkar'); // the live lowercase display name
+    rig.setName("0", 'sujoy sarkar'); // the live lowercase display name
     const onset = rig.clock();
-    await speak(rig, 0, 400);
+    await speak(rig, "0", 400);
     const last = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
@@ -606,7 +626,7 @@ async function run(): Promise<void> {
       rig.events.slice(2).map((e) => `${e.speaker}|${e.type}@${e.timestampMs}`),
       [`sujoy sarkar|started_speaking@${onset}`, `sujoy sarkar|stopped_speaking@${last}`],
     );
-    check('the earlier placeholder is NOT rewritten', rig.events[0].speaker, syntheticSpeakerLabel(0));
+    check('the earlier placeholder is NOT rewritten', rig.events[0].speaker, syntheticSpeakerLabel("0"));
   }
   {
     // Teardown path: an utterance still OPEN and still nameless when the meeting
@@ -616,7 +636,7 @@ async function run(): Promise<void> {
     const rig = makeRig({ synthesizeUnresolved: true }); // Zoom opts in
     rig.tracker.arm();
     const onset = rig.clock();
-    await speak(rig, 7, 500);
+    await speak(rig, "7", 500);
     const last = rig.clock() - 100;
     // No silence: the utterance is still open.
     check('precondition: nothing published yet', rig.events.length, 0);
@@ -630,7 +650,7 @@ async function run(): Promise<void> {
     check(
       'both teardown boundaries use the track placeholder',
       Array.from(new Set(rig.events.map((e) => e.speaker))),
-      [syntheticSpeakerLabel(7)],
+      [syntheticSpeakerLabel("7")],
     );
     check('teardown clears state', rig.tracker.trackCount(), 0);
   }
@@ -639,7 +659,7 @@ async function run(): Promise<void> {
     // a track whose utterance already closed has nothing left to publish.
     const rig = makeRig({ synthesizeUnresolved: true }); // Zoom opts in
     rig.tracker.arm();
-    await speak(rig, 8, 400);
+    await speak(rig, "8", 400);
     await stayQuiet(rig, 2_000);
     const beforeTeardown = rig.events.length;
     await rig.tracker.stopSweep();
@@ -664,7 +684,7 @@ async function run(): Promise<void> {
     const rig = makeRig(); // no opt-in — the Google Meet / Teams path
     rig.tracker.arm();
 
-    await speak(rig, 0, 600);
+    await speak(rig, "0", 600);
     await stayQuiet(rig, 2_000);
 
     check('an unresolved utterance publishes NOTHING (pre-existing behaviour)', rig.events.length, 0);
@@ -685,7 +705,7 @@ async function run(): Promise<void> {
     const rig = makeRig(); // no opt-in
     rig.tracker.arm();
     // Teardown with an utterance still OPEN and nameless — the other call site.
-    await speak(rig, 3, 500);
+    await speak(rig, "3", 500);
     await rig.tracker.stopSweep();
     check('teardown publishes NOTHING for a nameless open utterance either', rig.events.length, 0);
     check(
@@ -701,9 +721,9 @@ async function run(): Promise<void> {
     for (const synthesize of [false, true]) {
       const rig = makeRig({ synthesizeUnresolved: synthesize });
       rig.tracker.arm();
-      rig.setName(0, 'Named Person');
+      rig.setName("0", 'Named Person');
       const onset = rig.clock();
-      await speak(rig, 0, 600);
+      await speak(rig, "0", 600);
       const lastAudio = rig.clock() - 100;
       await stayQuiet(rig, 2_000);
       check(`CONTROL: a RESOLVED utterance is identical with synthesis=${synthesize}`, rig.shape(), [
@@ -733,7 +753,7 @@ async function run(): Promise<void> {
     });
     tracker.arm();
     for (let i = 0; i < 6; i++) {
-      tracker.markTrackAudioActivity(0, nowMs);
+      tracker.markTrackAudioActivity("0", nowMs);
       await tracker.sweep();
       nowMs += 100;
     }
@@ -752,7 +772,7 @@ async function run(): Promise<void> {
       0,
     );
     // Teardown, same tracker, same omission.
-    tracker.markTrackAudioActivity(0, nowMs);
+    tracker.markTrackAudioActivity("0", nowMs);
     await tracker.stopSweep();
     check('with the option OMITTED, teardown publishes nothing either', events.length, 0);
   }
@@ -761,14 +781,14 @@ async function run(): Promise<void> {
   {
     const rig = makeRig();
     rig.tracker.arm();
-    rig.setName(0, 'Alice');
-    rig.setName(1, 'Bob');
+    rig.setName("0", 'Alice');
+    rig.setName("1", 'Bob');
 
     const onsetA = rig.clock();
-    await speak(rig, 0, 400);
+    await speak(rig, "0", 400);
     const lastA = rig.clock() - 100;
     const onsetB = rig.clock();
-    await speak(rig, 1, 400);
+    await speak(rig, "1", 400);
     const lastB = rig.clock() - 100;
     await stayQuiet(rig, 2_000);
 
@@ -808,7 +828,7 @@ async function run(): Promise<void> {
       },
     });
     tracker.arm();
-    tracker.markTrackAudioActivity(0, nowMs);
+    tracker.markTrackAudioActivity("0", nowMs);
     await tracker.sweep();               // START publish throws
     nowMs += 1_000;
     await tracker.sweep();               // END must still be attempted
@@ -840,16 +860,67 @@ async function run(): Promise<void> {
       publish: async (type, speaker, timestampMs) => { events.push({ type, speaker, timestampMs }); },
     });
     tracker.arm();
-    tracker.markTrackAudioActivity(0, nowMs);
+    tracker.markTrackAudioActivity("0", nowMs);
     await tracker.sweep(); // resolver throws — must be swallowed
     check('nothing published when the resolver throws', events.length, 0);
     checkTrue('the resolver failure is logged', logs.some((l) => l.includes('name lookup failed')));
 
     boom = false;
     nowMs += 100;
-    tracker.markTrackAudioActivity(0, nowMs);
+    tracker.markTrackAudioActivity("0", nowMs);
     await tracker.sweep();
     check('the machine recovers on the next sweep', events.length, 1);
+  }
+
+  // ── 14. Overlap: two DIFFERENT string keys are two INDEPENDENT utterances ─
+  //
+  // The one genuinely-new case, carried over from the string-API replacement
+  // suite. This is the whole point of the re-key from a numeric DOM track index
+  // to a string CSRC id: state is per-SENDER, so two people talking at once must
+  // OPEN two utterances at the same instant and each must close to its OWN
+  // speaker — never collapse to one, never cross-attribute.
+  console.log('\nOverlap — two CSRC keys open concurrently:');
+  {
+    const A = '873496081';
+    const B = '35925926';
+    const rig = makeRig();
+    rig.tracker.arm();
+    rig.setName(A, 'Alice Chen');
+    rig.setName(B, 'Bob Müller');
+
+    const t = rig.clock();
+    rig.tracker.markTrackAudioActivity(A, t);
+    rig.tracker.markTrackAudioActivity(B, t);
+    await rig.tracker.sweep();
+
+    check(
+      'both keys OPEN in one sweep — two STARTs, zero ENDs (concurrently open = overlap)',
+      rig.events.map((e) => ({ type: e.type, speaker: e.speaker })),
+      [
+        { type: 'started_speaking', speaker: 'Alice Chen' },
+        { type: 'started_speaking', speaker: 'Bob Müller' },
+      ],
+    );
+    check('two distinct keys hold two distinct states (not merged)', rig.tracker.trackCount(), 2);
+
+    // Silence past the hangover closes both, independently, each to its own name.
+    rig.advance(700 + 1);
+    await rig.tracker.sweep();
+    check(
+      'each key closes to its OWN speaker — no cross-attribution',
+      rig.events.map((e) => ({ type: e.type, speaker: e.speaker })),
+      [
+        { type: 'started_speaking', speaker: 'Alice Chen' },
+        { type: 'started_speaking', speaker: 'Bob Müller' },
+        { type: 'stopped_speaking', speaker: 'Alice Chen' },
+        { type: 'stopped_speaking', speaker: 'Bob Müller' },
+      ],
+    );
+    check(
+      'START uses onset, END uses last-audio — both at the onset instant here',
+      rig.events.map((e) => e.timestampMs),
+      [t, t, t, t],
+    );
   }
 
   console.log(`\n=== ${passed} passed, ${failed} failed ===\n`);
