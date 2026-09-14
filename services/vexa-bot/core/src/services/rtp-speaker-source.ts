@@ -93,7 +93,10 @@ export function activeSourceAt(samples: RtpSample[], tMs: number): number | null
  * lookup can tell "quiet here" from "no data" the way `activeSourceAt` does —
  * both yield `null` — via `index.get(tMs) ?? null`.
  */
-export function buildActiveSourceIndex(samples: RtpSample[]): Map<number, number | null> {
+export function buildActiveSourceIndex(
+  samples: RtpSample[],
+  exclude?: ReadonlySet<number>,
+): Map<number, number | null> {
   const index = new Map<number, number | null>();
   // tMs -> best audible level seen so far at that instant (audible samples only).
   const bestLevel = new Map<number, number>();
@@ -101,6 +104,12 @@ export function buildActiveSourceIndex(samples: RtpSample[]): Map<number, number
     // Record the instant even when it is all-quiet, so absence-of-data and
     // silence stay distinguishable exactly as activeSourceAt keeps them.
     if (!index.has(sample.tMs)) index.set(sample.tMs, null);
+    // An excluded id (the Meet active-speaker MIRROR, echoed loud across every
+    // receiver) must never WIN an instant. Excluding it only from the final
+    // mapping is too late: the mirror is loudest at nearly every tick, so it
+    // would take every vote and the real, quieter speaker beneath it would never
+    // be seen. Dropping it here lets the loudest REAL source at that instant win.
+    if (exclude && exclude.has(sample.sourceId)) continue;
     if (sample.audioLevel < SILENCE_LEVEL) continue;
     const prev = bestLevel.get(sample.tMs);
     // Strict `>` — a later sample only wins on being STRICTLY louder, so the
@@ -208,15 +217,17 @@ export interface SourceName {
 export function mapSourcesToNames(
   samples: RtpSample[],
   nameEvents: NameEvent[],
+  exclude?: ReadonlySet<number>,
 ): SourceName[] {
   // sourceId -> (name -> votes), in first-seen order so the output is stable.
   const tally = new Map<number, Map<string, number>>();
 
   // Precompute the winner for every instant ONCE (O(samples)), then look each
   // event up in O(1) instead of rescanning samples per event (O(nameEvents ×
-  // samples)). The index applies activeSourceAt's exact rule, so the result is
-  // byte-identical to calling activeSourceAt in the loop.
-  const activeIndex = buildActiveSourceIndex(samples);
+  // samples)). The index applies activeSourceAt's exact rule (skipping any
+  // excluded mirror id), so the result is byte-identical to calling
+  // activeSourceAt in the loop when `exclude` is empty/undefined.
+  const activeIndex = buildActiveSourceIndex(samples, exclude);
 
   for (const event of nameEvents) {
     const sourceId = activeIndex.get(event.tMs) ?? null;
@@ -286,6 +297,51 @@ export function namesClaimedByMultipleSources(mapping: SourceName[]): string[] {
 export const MIN_IDENTITY_CONFIDENCE = 0.5;
 
 /**
+ * Known live-measured Meet active-speaker sentinel CSRC id(s).
+ *
+ * Meet echoes an "active-speaker channel" mirror CSRC that follows whoever is
+ * loudest and is emitted ACROSS receivers (live-measured id 42). Cross-receiver
+ * detection (`sharedActiveCsrcs`) catches it dynamically, but this constant is a
+ * belt-and-braces fallback for the case that detection cannot see it — e.g. a
+ * single mixed receiver, where "shared across receivers" has nothing to compare.
+ * The effective exclusion used by callers is this set UNION the dynamically
+ * detected shared ids. Deliberately NOT a coverage-ratio heuristic: a ratio can
+ * wrongly exclude a genuinely dominant real speaker; an explicit id cannot.
+ */
+export const MIRROR_SENTINEL_CSRCS: ReadonlySet<number> = new Set([42]);
+
+/**
+ * Decide which currently-named CSRC speakers must have their name CLEARED.
+ *
+ * The live resolver only ever ADDS or UPDATES names; it never takes one back. Two
+ * things must retract a name: (1) the id turns out to be a mirror — the known
+ * sentinel or a dynamically detected cross-receiver id, in `excluded`; or (2) the
+ * id was named earlier but the latest resolve no longer returns it (its votes
+ * became contested or fell below the confidence floor). `resolved` is recomputed
+ * from the whole accumulated history each cycle, so a real speaker with any
+ * standing votes stays present — an absence therefore means a genuine demotion,
+ * not merely "quiet this window". Pure so the decision is testable; the caller
+ * does the thin SpeakerStreamManager mutation.
+ *
+ * Returns the source ids to clear, in the iteration order of `currentNames`.
+ */
+export function speakerIdsToClear(
+  currentNames: Map<number, string>,
+  resolved: { sourceId: number; name: string }[],
+  excluded: ReadonlySet<number>,
+): number[] {
+  const resolvedIds = new Set<number>();
+  for (const r of resolved) resolvedIds.add(r.sourceId);
+  const out: number[] = [];
+  for (const [sourceId, name] of currentNames) {
+    // Only a source that actually holds a name can have one to clear.
+    if (!name) continue;
+    if (excluded.has(sourceId) || !resolvedIds.has(sourceId)) out.push(sourceId);
+  }
+  return out;
+}
+
+/**
  * Resolve stable per-person identities from CSRC/SSRC samples.
  *
  * The identity brain of Tier 1 per-speaker audio. `mapSourcesToNames` learns a
@@ -302,12 +358,25 @@ export const MIN_IDENTITY_CONFIDENCE = 0.5;
  *
  * Output is one `{ sourceId, name }` per surviving person, in first-appearance
  * order (inherited from `mapSourcesToNames`, which keys by first vote).
+ *
+ * `excludeSourceIds` adds ids to suppress beyond the always-excluded
+ * `MIRROR_SENTINEL_CSRCS` — the live cross-receiver mirror set. Exclusion is
+ * applied at VOTE time (via `mapSourcesToNames`), not just as a post-filter: the
+ * mirror is loudest at nearly every instant, so if it were only stripped from the
+ * final mapping it would already have stolen every vote and the real speaker
+ * beneath it would never appear. Suppressing it during the tally lets the loudest
+ * REAL source win each instant.
  */
 export function resolveSpeakerIdentities(
   samples: RtpSample[],
   nameEvents: NameEvent[],
+  excludeSourceIds?: ReadonlySet<number>,
 ): { sourceId: number; name: string }[] {
-  const mapping = mapSourcesToNames(samples, nameEvents);
+  // Effective exclusion = the known sentinel UNION any dynamically supplied ids.
+  const excluded = new Set<number>(MIRROR_SENTINEL_CSRCS);
+  if (excludeSourceIds) for (const id of excludeSourceIds) excluded.add(id);
+
+  const mapping = mapSourcesToNames(samples, nameEvents, excluded);
   const contested = new Set(namesClaimedByMultipleSources(mapping));
 
   // For each contested name, decide the single source that keeps it: highest

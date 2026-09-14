@@ -15,7 +15,13 @@
  * a buffer belongs to, and whether a receiver already has a context.
  */
 
-import { pickActiveCsrc, selectAudioReceivers, markConnected } from "./receiver-capture";
+import {
+  pickActiveCsrc,
+  selectAudioReceivers,
+  markConnected,
+  sharedActiveCsrcs,
+  MIRROR_SENTINEL_CSRCS,
+} from "./receiver-capture";
 import { SILENCE_LEVEL, RtpSourceLike, ReceiverLike } from "./rtp-speaker-source";
 
 let passed = 0;
@@ -126,6 +132,113 @@ console.log("\nmarkConnected — one AudioContext per receiver, ever");
   assertEqual(markConnected("track-abc", connected), false, "the same track is not connected twice");
   assertEqual(markConnected("track-def", connected), true, "a different track is newly connected");
   assertEqual(connected.size, 2, "the ledger holds exactly one entry per distinct track");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\nsharedActiveCsrcs — the cross-receiver mirror signature");
+// ---------------------------------------------------------------------------
+// Sort a Set into an array so the JSON-based assert can compare it. Ordering is
+// not part of the contract; membership is.
+function ids(set: Set<number>): number[] {
+  return Array.from(set).sort((a, b) => a - b);
+}
+{
+  // THE MIRROR'S DEFINING PROPERTY. Meet echoes an "active-speaker channel"
+  // mirror CSRC across MULTIPLE receivers at once (live-measured id 42), loud
+  // because it follows whoever is loudest. A real participant is on exactly ONE
+  // receiver, so an id audible in two or more receivers' contributing-source
+  // lists is the mirror — the thing that must not be allowed to tag every
+  // receiver's buffer.
+  const perReceiver: RtpSourceLike[][] = [
+    [{ source: 42, audioLevel: 0.8 }, { source: 1111, audioLevel: 0.5 }],
+    [{ source: 42, audioLevel: 0.7 }, { source: 2222, audioLevel: 0.6 }],
+  ];
+  assertEqual(ids(sharedActiveCsrcs(perReceiver)), [42], "an id audible in two receivers is a mirror");
+}
+{
+  // A real speaker sits in one receiver only → never flagged as a mirror, so its
+  // own buffers keep their own CSRC.
+  const perReceiver: RtpSourceLike[][] = [
+    [{ source: 1111, audioLevel: 0.8 }],
+    [{ source: 2222, audioLevel: 0.6 }],
+  ];
+  assertEqual(ids(sharedActiveCsrcs(perReceiver)), [], "an id in a single receiver is not a mirror");
+}
+{
+  // Present in two receivers but AUDIBLE (>= floor) in only one is not the mirror
+  // signature: the mirror is loud wherever it appears because it mirrors the
+  // loudest speaker. A source that has merely gone quiet in one receiver's list
+  // (comfort-noise residue) must not be excluded.
+  const perReceiver: RtpSourceLike[][] = [
+    [{ source: 42, audioLevel: 0.8 }],
+    [{ source: 42, audioLevel: 0.004 }], // below SILENCE_LEVEL (0.01)
+  ];
+  assertEqual(ids(sharedActiveCsrcs(perReceiver)), [], "present in two but audible in only one is not shared");
+}
+{
+  // Boundary: exactly at the floor counts as audible (>=), matching pickActiveCsrc
+  // and activeSourceAt. Two receivers each carrying id 42 at the floor → shared.
+  const perReceiver: RtpSourceLike[][] = [
+    [{ source: 42, audioLevel: SILENCE_LEVEL }],
+    [{ source: 42, audioLevel: SILENCE_LEVEL }],
+  ];
+  assertEqual(ids(sharedActiveCsrcs(perReceiver)), [42], "audible at exactly the floor in two receivers is shared");
+}
+{
+  // Within one receiver an id listed twice must not count as two receivers — the
+  // signal is cross-RECEIVER, not cross-entry.
+  const perReceiver: RtpSourceLike[][] = [
+    [{ source: 42, audioLevel: 0.8 }, { source: 42, audioLevel: 0.7 }],
+  ];
+  assertEqual(ids(sharedActiveCsrcs(perReceiver)), [], "the same id twice in ONE receiver is not cross-receiver");
+}
+{
+  assertEqual(ids(sharedActiveCsrcs([])), [], "no receivers → no shared ids");
+  assertEqual(ids(sharedActiveCsrcs([[], []])), [], "two empty receivers → no shared ids");
+}
+{
+  // A missing audioLevel is 0 (Chrome omits it until a packet arrives) → below
+  // the floor → not audible → not shared even across two receivers.
+  const perReceiver: RtpSourceLike[][] = [[{ source: 42 }], [{ source: 42 }]];
+  assertEqual(ids(sharedActiveCsrcs(perReceiver)), [], "a missing audioLevel is not audible, so not shared");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\npickActiveCsrc — honour an exclusion set (mirror suppression)");
+// ---------------------------------------------------------------------------
+{
+  // The mirror is the loudest id on this receiver, but it is excluded, so the
+  // buffer keeps this receiver's OWN real CSRC instead of being stolen.
+  const sources: RtpSourceLike[] = [
+    { source: 42, audioLevel: 0.9 },
+    { source: 1111, audioLevel: 0.5 },
+  ];
+  assertEqual(pickActiveCsrc(sources, new Set([42])), 1111, "an excluded loudest mirror yields the next real id");
+}
+{
+  // Every audible candidate excluded → null, dropped like all-silence rather than
+  // mis-tagged onto an excluded id.
+  const sources: RtpSourceLike[] = [{ source: 42, audioLevel: 0.9 }];
+  assertEqual(pickActiveCsrc(sources, new Set([42])), null, "all candidates excluded reports null");
+}
+{
+  // Backward compatible: no exclusion set = today's behaviour, mirror wins.
+  const sources: RtpSourceLike[] = [
+    { source: 42, audioLevel: 0.9 },
+    { source: 1111, audioLevel: 0.5 },
+  ];
+  assertEqual(pickActiveCsrc(sources), 42, "an undefined exclude leaves behaviour unchanged");
+  assertEqual(pickActiveCsrc(sources, new Set()), 42, "an empty exclude leaves behaviour unchanged");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\nMIRROR_SENTINEL_CSRCS — the known live-measured sentinel constant");
+// ---------------------------------------------------------------------------
+{
+  // The live-measured Meet active-speaker sentinel. Kept as a constant fallback
+  // for the case cross-receiver detection cannot see it (a single mixed receiver).
+  assertEqual(MIRROR_SENTINEL_CSRCS.has(42), true, "42 is a known sentinel mirror id");
+  assertEqual(MIRROR_SENTINEL_CSRCS.has(1111), false, "a real id is not a sentinel");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

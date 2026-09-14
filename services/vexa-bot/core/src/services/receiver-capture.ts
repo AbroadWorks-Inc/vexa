@@ -26,7 +26,18 @@
 
 import { Page } from "playwright";
 import { log } from "../utils";
-import { SILENCE_LEVEL, RtpSourceLike, ReceiverLike } from "./rtp-speaker-source";
+import {
+  SILENCE_LEVEL,
+  RtpSourceLike,
+  ReceiverLike,
+  MIRROR_SENTINEL_CSRCS,
+} from "./rtp-speaker-source";
+
+// Re-exported so callers of the capture module get the sentinel from one place,
+// while its single definition stays in rtp-speaker-source.ts (the leaf module) to
+// avoid a circular import — receiver-capture depends on rtp-speaker-source, never
+// the reverse.
+export { MIRROR_SENTINEL_CSRCS };
 
 /** How often the page re-scans for newly-attached audio receivers. */
 const SCAN_INTERVAL_MS = 3000;
@@ -62,10 +73,18 @@ export interface ReceiverAudioPayload {
  * speaker failure the DOM path already suffers. Uses `>=` at the floor and
  * strict `>` to break ties, matching `activeSourceAt` in rtp-speaker-source.ts.
  */
-export function pickActiveCsrc(sources: RtpSourceLike[]): number | null {
+export function pickActiveCsrc(
+  sources: RtpSourceLike[],
+  exclude?: ReadonlySet<number>,
+): number | null {
   let bestSource: number | null = null;
   let bestLevel = 0;
   for (const s of sources) {
+    // Excluded ids (the Meet active-speaker mirror, echoed loud across receivers)
+    // must never own a buffer, or one participant's audio is stolen and funnelled
+    // under the mirror's id — the whole-meeting misattribution this exists to stop.
+    // Excluding it here keeps THIS receiver's buffer tagged with its own real CSRC.
+    if (exclude && exclude.has(s.source)) continue;
     // Chrome omits audioLevel until a packet has arrived; 0 keeps it below the
     // floor so an un-started source is never chosen.
     const level = s.audioLevel ?? 0;
@@ -76,6 +95,44 @@ export function pickActiveCsrc(sources: RtpSourceLike[]): number | null {
     }
   }
   return bestSource;
+}
+
+/**
+ * CSRC ids audible in TWO OR MORE receivers at once — the mirror signature.
+ *
+ * A real participant sends on exactly one `RTCRtpReceiver`, so its CSRC is
+ * audible in one receiver's contributing-source list. The Meet active-speaker
+ * MIRROR (live-measured id 42) is echoed across receivers and is loud wherever it
+ * appears, because it follows the loudest speaker — so an id audible (>=
+ * `SILENCE_LEVEL`) in two or more receivers is the mirror, and must be excluded
+ * from tagging. This CANNOT flag a genuinely dominant real speaker, who is still
+ * single-receiver however loud they are.
+ *
+ * Audibility is judged per receiver: an id merely PRESENT in a second receiver's
+ * list but below the floor there (comfort-noise residue) does not count — the
+ * mirror is loud everywhere it appears. Duplicate entries within one receiver
+ * count as that one receiver only; the signal is cross-receiver, not cross-entry.
+ */
+export function sharedActiveCsrcs(perReceiverSources: RtpSourceLike[][]): Set<number> {
+  // sourceId -> number of DISTINCT receivers in which it was audible.
+  const receiverCount = new Map<number, number>();
+  for (const sources of perReceiverSources) {
+    // Dedup within this receiver first, so one id listed twice is still one vote.
+    const audibleHere = new Set<number>();
+    for (const s of sources) {
+      const level = s.audioLevel ?? 0;
+      if (level < SILENCE_LEVEL) continue;
+      audibleHere.add(s.source);
+    }
+    for (const id of audibleHere) {
+      receiverCount.set(id, (receiverCount.get(id) ?? 0) + 1);
+    }
+  }
+  const shared = new Set<number>();
+  for (const [id, count] of receiverCount) {
+    if (count >= 2) shared.add(id);
+  }
+  return shared;
 }
 
 /**
@@ -146,10 +203,21 @@ export async function startReceiverTrackCapture(page: Page): Promise<void> {
 
   try {
     await page.evaluate(
-      ({ scanMs, bufferSize, sampleRate, captureSilence, silenceFloor }) => {
+      ({ scanMs, bufferSize, sampleRate, captureSilence, silenceFloor, mirrorSentinels }) => {
         const w = window as any;
         if (w.__vexaReceiverCaptureStarted) return;
         w.__vexaReceiverCaptureStarted = true;
+
+        // Mirror-CSRC exclusion set, recomputed once per scan by `scan()` below.
+        // A buffer is never tagged with an id in this set: the Meet active-speaker
+        // MIRROR CSRC is echoed loud across many receivers, so leaving it eligible
+        // funnels every participant's audio under one id (the whole-meeting
+        // misattribution this fix removes). Seeded with the known sentinel(s) so a
+        // buffer that fires before the first scan still excludes them. This is the
+        // in-page twin of sharedActiveCsrcs(...) ∪ MIRROR_SENTINEL_CSRCS — keep it
+        // in lockstep with those tested pure functions on any edit.
+        let exclusionSet: Set<number> = new Set(mirrorSentinels);
+        w.__vexaReceiverExclusionCsrcs = Array.from(exclusionSet);
 
         // ONE shared AudioContext for the whole page. Chromium caps concurrent
         // AudioContexts (~6/page): a per-receiver context made the 7th receiver in
@@ -185,16 +253,19 @@ export async function startReceiverTrackCapture(page: Page): Promise<void> {
               }
               if (peak <= captureSilence) return;
 
-              // Loudest CSRC above the floor owns this buffer; none audible → null,
-              // and the buffer is still posted so the sink can drop it rather than
-              // this dumb half deciding attribution.
-              // MIRRORS the pure `pickActiveCsrc` (this module) — its tested twin;
-              // keep the two in lockstep on any edit.
+              // Loudest NON-EXCLUDED CSRC above the floor owns this buffer; none
+              // audible → null, and the buffer is still posted so the sink can drop
+              // it rather than this dumb half deciding attribution.
+              // MIRRORS the pure `pickActiveCsrc(sources, exclude)` (this module) —
+              // its tested twin; keep the two in lockstep on any edit. `exclusionSet`
+              // is recomputed once per scan and read here on every buffer, so a
+              // mirror id can never steal this receiver's own audio.
               let csrc: number | null = null;
               let bestLevel = 0;
               const sources =
                 typeof r.getContributingSources === "function" ? r.getContributingSources() : [];
               for (const s of sources) {
+                if (exclusionSet.has(s.source)) continue;
                 const level = typeof s.audioLevel === "number" ? s.audioLevel : 0;
                 if (level < silenceFloor) continue;
                 if (csrc === null || level > bestLevel) {
@@ -219,13 +290,49 @@ export async function startReceiverTrackCapture(page: Page): Promise<void> {
           }
         };
 
+        // In-page twin of the pure `sharedActiveCsrcs`: the CSRC ids audible
+        // (>= floor) in TWO OR MORE receivers, unioned with the known sentinel(s).
+        // A real participant is single-receiver; an id echoed audibly across
+        // receivers is the Meet active-speaker mirror. Keep in lockstep with
+        // sharedActiveCsrcs() + MIRROR_SENTINEL_CSRCS in this module.
+        const computeExclusion = (audioReceivers: any[]): Set<number> => {
+          const receiverCount = new Map<number, number>();
+          for (const r of audioReceivers) {
+            const sources =
+              typeof r.getContributingSources === "function" ? r.getContributingSources() : [];
+            const audibleHere: Set<number> = new Set();
+            for (const s of sources) {
+              const level = typeof s.audioLevel === "number" ? s.audioLevel : 0;
+              if (level < silenceFloor) continue;
+              audibleHere.add(s.source);
+            }
+            for (const id of audibleHere) {
+              receiverCount.set(id, (receiverCount.get(id) || 0) + 1);
+            }
+          }
+          const next: Set<number> = new Set(mirrorSentinels);
+          for (const [id, count] of receiverCount) {
+            if (count >= 2) next.add(id);
+          }
+          return next;
+        };
+
         const scan = (): void => {
           try {
             const pcs = (w.__vexa_peer_connections || []) as RTCPeerConnection[];
+            const audioReceivers: any[] = [];
             for (const pc of pcs) {
               if (typeof pc.getReceivers !== "function") continue;
-              for (const r of pc.getReceivers()) connectReceiver(r);
+              for (const r of pc.getReceivers()) {
+                connectReceiver(r);
+                if (r.track && r.track.kind === "audio") audioReceivers.push(r);
+              }
             }
+            // Recompute the mirror exclusion set once per scan; onaudioprocess reads
+            // it on every buffer. Published to the window so the Node side can fold
+            // the same live-detected mirror ids into identity resolution.
+            exclusionSet = computeExclusion(audioReceivers);
+            w.__vexaReceiverExclusionCsrcs = Array.from(exclusionSet);
           } catch {
             // Capture must never throw inside the page — an uncaught error here
             // would surface in the meeting tab, not just our logs.
@@ -242,6 +349,10 @@ export async function startReceiverTrackCapture(page: Page): Promise<void> {
         sampleRate: TARGET_SAMPLE_RATE,
         captureSilence: CAPTURE_SILENCE,
         silenceFloor: SILENCE_LEVEL,
+        // Serialised into the page (a Set cannot cross the bridge) and rebuilt into
+        // a Set in-page. The known live-measured sentinel(s), the belt for a single
+        // mixed receiver where cross-receiver detection is blind.
+        mirrorSentinels: Array.from(MIRROR_SENTINEL_CSRCS),
       },
     );
   } catch (err: any) {
@@ -295,6 +406,7 @@ export async function stopReceiverTrackCapture(page: Page | null): Promise<void>
           } catch {}
         }
         w.__vexaReceiverCaptureCtx = null;
+        w.__vexaReceiverExclusionCsrcs = [];
 
         // Reset the guard so a same-page restart re-installs cleanly.
         w.__vexaReceiverCaptureStarted = false;

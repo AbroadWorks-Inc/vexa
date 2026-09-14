@@ -34,7 +34,14 @@ import { createSpeakerBoundaryTracker, SpeakerBoundaryTracker } from './services
 // These modules are inert with the flag unset — see the flag-gating in
 // startPerSpeakerAudioCapture() and receiver-capture.ts / rtp-speaker-probe.ts.
 import { setReceiverAudioSink, startReceiverTrackCapture, stopReceiverTrackCapture, ReceiverAudioPayload } from './services/receiver-capture';
-import { resolveSpeakerIdentities, RtpSample, NameEvent } from './services/rtp-speaker-source';
+import {
+  resolveSpeakerIdentities,
+  speakerIdsToClear,
+  sourceActivity,
+  MIRROR_SENTINEL_CSRCS,
+  RtpSample,
+  NameEvent,
+} from './services/rtp-speaker-source';
 import { SileroVAD } from './services/vad';
 import { isHallucination } from './services/hallucination-filter';
 import { SpeakerStreamHandle } from './services/audio';
@@ -1581,6 +1588,16 @@ const tier1NameEvents: NameEvent[] = [];
 let tier1CaptureStartMs = 0;
 /** Periodic name-poll + identity-resolve timer for the Tier 1 path. */
 let tier1IdentityInterval: ReturnType<typeof setInterval> | null = null;
+/**
+ * Live mirror-CSRC ids detected in-page (cross-receiver) plus the sentinel,
+ * refreshed each name poll from `window.__vexaReceiverExclusionCsrcs`. Fed into
+ * resolveSpeakerIdentities (as the dynamic exclude set) and into the name-removal
+ * decision, so an id the capture layer is already suppressing is also refused a
+ * name and stripped of one it holds.
+ */
+let tier1MirrorCsrcs: Set<number> = new Set<number>();
+/** Per-CSRC captured-buffer counts — diagnostics only, logged once at teardown. */
+const tier1CsrcBufferCounts: Map<number, number> = new Map();
 
 /** Cap for both Tier 1 accumulators — mirrors the RTP probe's bound. */
 const TIER1_SAMPLE_CAP = 200_000;
@@ -1618,6 +1635,9 @@ function onReceiverAudio(payload: ReceiverAudioPayload): void {
     const speakerId = `csrc-${csrc}`;
     const nowMs = Date.now();
 
+    // Diagnostics only (count of buffers routed to this CSRC), logged at teardown.
+    tier1CsrcBufferCounts.set(csrc, (tier1CsrcBufferCounts.get(csrc) ?? 0) + 1);
+
     // Accumulate a CSRC sample (bucketed) for periodic identity resolution.
     tier1RtpSamples.push({
       sourceId: csrc,
@@ -1654,15 +1674,28 @@ function tier1PollNames(): void {
   page
     .evaluate(() => {
       try {
-        const getNames = (window as any).__vexaGetAllParticipantNames;
-        if (typeof getNames !== 'function') return [] as string[];
-        const data = getNames() as { names: Record<string, string>; speaking: string[] };
-        return Array.isArray(data?.speaking) ? data.speaking : ([] as string[]);
+        const w = window as any;
+        const getNames = w.__vexaGetAllParticipantNames;
+        const speaking =
+          typeof getNames === 'function'
+            ? (getNames() as { names: Record<string, string>; speaking: string[] })?.speaking
+            : [];
+        // Read the capture layer's live mirror-CSRC set alongside the names, in one
+        // page round-trip, so the identity layer excludes exactly what capture does.
+        const mirror = Array.isArray(w.__vexaReceiverExclusionCsrcs)
+          ? (w.__vexaReceiverExclusionCsrcs as number[])
+          : [];
+        return {
+          speaking: Array.isArray(speaking) ? speaking : ([] as string[]),
+          mirror,
+        };
       } catch {
-        return [] as string[];
+        return { speaking: [] as string[], mirror: [] as number[] };
       }
     })
-    .then((speaking: string[]) => {
+    .then(({ speaking, mirror }: { speaking: string[]; mirror: number[] }) => {
+      // Refresh the mirror-CSRC set (in-page cross-receiver detection ∪ sentinel).
+      tier1MirrorCsrcs = new Set<number>(mirror);
       const tMs = tier1BucketMs(Date.now() - tier1CaptureStartMs);
       const selfLower = (currentBotConfig?.botName || '').toLowerCase();
       for (const raw of speaking) {
@@ -1684,7 +1717,10 @@ function tier1PollNames(): void {
 function tier1ResolveIdentities(): void {
   if (!speakerManager) return;
   try {
-    const identities = resolveSpeakerIdentities(tier1RtpSamples, tier1NameEvents);
+    // Exclude the live-detected mirror ids (cross-receiver ∪ sentinel) from voting,
+    // so a mirror can never win a name. resolveSpeakerIdentities always folds in
+    // MIRROR_SENTINEL_CSRCS too; passing the live set adds the dynamic ids.
+    const identities = resolveSpeakerIdentities(tier1RtpSamples, tier1NameEvents, tier1MirrorCsrcs);
     for (const { sourceId, name } of identities) {
       if (!name) continue;
       const speakerId = `csrc-${sourceId}`;
@@ -1695,6 +1731,26 @@ function tier1ResolveIdentities(): void {
       if (isDuplicateSpeakerName(name, speakerId)) continue;
       speakerManager.updateSpeakerName(speakerId, name);
       log(`[Tier1] CSRC ${sourceId} → "${name}" (identity resolved)`);
+    }
+
+    // Reconciliation — RETRACT names the resolve no longer supports. The resolver
+    // above only adds/updates; without this a name assigned earlier lingers after
+    // the id turns out to be a mirror or its votes collapse. speakerIdsToClear
+    // (pure, tested) decides which; the mutation below is thin glue. Build the
+    // current CSRC→name map from the manager, keyed by the numeric csrc id.
+    const excluded = new Set<number>(MIRROR_SENTINEL_CSRCS);
+    for (const id of tier1MirrorCsrcs) excluded.add(id);
+    const currentNames = new Map<number, string>();
+    for (const sid of speakerManager.getActiveSpeakers()) {
+      if (!sid.startsWith('csrc-')) continue;
+      const idNum = Number(sid.slice('csrc-'.length));
+      if (!Number.isFinite(idNum)) continue;
+      currentNames.set(idNum, speakerManager.getSpeakerName(sid) || '');
+    }
+    for (const idToClear of speakerIdsToClear(currentNames, identities, excluded)) {
+      const speakerId = `csrc-${idToClear}`;
+      speakerManager.updateSpeakerName(speakerId, '');
+      log(`[Tier1] CSRC ${idToClear} name cleared (mirror or no longer resolved)`);
     }
   } catch (err: any) {
     log(`[Tier1] identity resolve error (non-fatal): ${err?.message || err}`);
@@ -2159,8 +2215,42 @@ async function cleanupPerSpeakerPipeline(): Promise<void> {
       clearInterval(tier1IdentityInterval);
       tier1IdentityInterval = null;
     }
+
+    // Session-end diagnostics — names/ids only, never audio. Lets the next live
+    // meeting confirm the receiver structure (a single mixed receiver vs many) and
+    // that buffers routed to REAL CSRCs rather than a mirror. One block, best-effort.
+    try {
+      const activity = sourceActivity(tier1RtpSamples);
+      const perCsrc = activity
+        .map((a) => {
+          const coverage = a.samples > 0 ? (a.activeSamples / a.samples).toFixed(2) : '0';
+          const buffers = tier1CsrcBufferCounts.get(a.sourceId) ?? 0;
+          return `csrc=${a.sourceId} audibleSamples=${a.activeSamples}/${a.samples} coverage=${coverage} buffers=${buffers} peak=${a.peakLevel.toFixed(3)}`;
+        })
+        .join(' | ');
+      const finalIdentities = resolveSpeakerIdentities(
+        tier1RtpSamples,
+        tier1NameEvents,
+        tier1MirrorCsrcs,
+      );
+      const excludedIds = new Set<number>(MIRROR_SENTINEL_CSRCS);
+      for (const id of tier1MirrorCsrcs) excludedIds.add(id);
+      log('[Tier1][diag] ── session-end speaker-capture summary ──');
+      log(`[Tier1][diag] per-CSRC activity: ${perCsrc || '(none)'}`);
+      log(`[Tier1][diag] mirror CSRCs excluded (cross-receiver ∪ sentinel): [${Array.from(excludedIds).join(', ')}]`);
+      log(
+        `[Tier1][diag] resolved identities: ${
+          finalIdentities.map((i) => `csrc-${i.sourceId}→"${i.name}"`).join(', ') || '(none)'
+        }`,
+      );
+    } catch (err: any) {
+      log(`[Tier1][diag] summary failed (non-fatal): ${err?.message || err}`);
+    }
+
     tier1RtpSamples.length = 0;
     tier1NameEvents.length = 0;
+    tier1CsrcBufferCounts.clear();
+    tier1MirrorCsrcs = new Set<number>();
     tier1CaptureStartMs = 0;
     tier1SpeakerCaptureActive = false;
     log('[Tier1] Per-receiver capture torn down');
