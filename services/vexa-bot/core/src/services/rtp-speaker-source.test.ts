@@ -28,7 +28,9 @@ import {
   sourceActivity,
   concurrentActivity,
   resolveSpeakerIdentities,
+  speakerIdsToClear,
   MIN_IDENTITY_CONFIDENCE,
+  MIRROR_SENTINEL_CSRCS,
   RtpSample,
   NameEvent,
 } from './rtp-speaker-source';
@@ -326,15 +328,18 @@ console.log('\nresolveSpeakerIdentities — the identity brain: one clean id per
 }
 
 {
-  // THE MIRROR, THRESHOLD BRANCH. Live probe: id 42 mirrors whoever is loudest,
-  // so across time it is attributed to MANY names — its votes split and its
-  // confidence collapses below MIN_IDENTITY_CONFIDENCE. Here 42's names are held
-  // by NOBODY else, so nothing but the confidence floor can catch it — this
-  // isolates the threshold guard. The two real ids must survive.
+  // THE MIRROR, THRESHOLD BRANCH. A mirror source mirrors whoever is loudest, so
+  // across time it is attributed to MANY names — its votes split and its
+  // confidence collapses below MIN_IDENTITY_CONFIDENCE. Uses a GENERIC, non-
+  // sentinel mirror id (700) on purpose: the sentinel-belt drops id 42 up front,
+  // which would mask this guard, so 700 isolates the confidence floor as the ONLY
+  // thing that can catch an UNKNOWN mirror. (The sentinel belt has its own test.)
+  // Here 700's names are held by NOBODY else, so only the floor can catch it. The
+  // two real ids must survive.
   const samples = [
     s(1111, 1_000, 0.9), s(1111, 2_000, 0.9),            // Alice
     s(2222, 3_000, 0.9), s(2222, 4_000, 0.9),            // Bob
-    s(42, 5_000, 0.9), s(42, 6_000, 0.9), s(42, 7_000, 0.9), // mirror: 3 names
+    s(700, 5_000, 0.9), s(700, 6_000, 0.9), s(700, 7_000, 0.9), // mirror: 3 names
   ];
   const names: NameEvent[] = [
     { name: 'Alice Chen', tMs: 1_000 },
@@ -356,15 +361,16 @@ console.log('\nresolveSpeakerIdentities — the identity brain: one clean id per
 }
 
 {
-  // THE MIRROR, DEDUPE BRANCH. Here the mirror (42) mostly mirrors Alice, so it
-  // claims her NAME too — at confidence 0.6, ABOVE the floor. The threshold
-  // alone would keep it; only namesClaimedByMultipleSources can catch that two
-  // ids hold one name, keeping the HIGHER-confidence real id and dropping the
-  // mirror. This isolates the dedupe guard from the threshold guard.
+  // THE MIRROR, DEDUPE BRANCH. Here a GENERIC (non-sentinel) mirror id 700 mostly
+  // mirrors Alice, so it claims her NAME too — at confidence 0.6, ABOVE the floor.
+  // The threshold alone would keep it; only namesClaimedByMultipleSources can
+  // catch that two ids hold one name, keeping the HIGHER-confidence real id and
+  // dropping the mirror. Non-sentinel on purpose so the belt does not mask the
+  // dedupe guard — this isolates dedupe from both the threshold and the belt.
   const samples = [
     s(1111, 1_000, 0.9), s(1111, 2_000, 0.9),            // real Alice: 2/2 → 1.0
-    s(42, 3_000, 0.9), s(42, 4_000, 0.9), s(42, 5_000, 0.9), // mirror → Alice x3
-    s(42, 6_000, 0.9), s(42, 7_000, 0.9),                // mirror → Frank x2
+    s(700, 3_000, 0.9), s(700, 4_000, 0.9), s(700, 5_000, 0.9), // mirror → Alice x3
+    s(700, 6_000, 0.9), s(700, 7_000, 0.9),                // mirror → Frank x2
   ];
   const names: NameEvent[] = [
     { name: 'Alice Chen', tMs: 1_000 },
@@ -377,7 +383,7 @@ console.log('\nresolveSpeakerIdentities — the identity brain: one clean id per
   ];
   // Sanity: the mirror sits at 0.6, ABOVE the floor — so only the dedupe rule
   // can drop it, not the threshold.
-  const mirror = mapSourcesToNames(samples, names).find((m) => m.sourceId === 42);
+  const mirror = mapSourcesToNames(samples, names).find((m) => m.sourceId === 700);
   assertEqual(
     mirror !== undefined && mirror.confidence >= MIN_IDENTITY_CONFIDENCE,
     true,
@@ -392,12 +398,13 @@ console.log('\nresolveSpeakerIdentities — the identity brain: one clean id per
 
 {
   // A plain below-threshold source is dropped even when its name is unique. A
-  // real speaker (1111) stands beside a source (42) whose votes split evenly
-  // across names it alone claims → confidence 0.4 < 0.5 → dropped.
+  // real speaker (1111) stands beside a GENERIC (non-sentinel) source 700 whose
+  // votes split evenly across names it alone claims → confidence 0.4 < 0.5 →
+  // dropped by the floor (not the belt, which only knows the sentinel).
   const samples = [
     s(1111, 1_000, 0.9), s(1111, 2_000, 0.9),
-    s(42, 3_000, 0.9), s(42, 4_000, 0.9), s(42, 5_000, 0.9),
-    s(42, 6_000, 0.9), s(42, 7_000, 0.9),
+    s(700, 3_000, 0.9), s(700, 4_000, 0.9), s(700, 5_000, 0.9),
+    s(700, 6_000, 0.9), s(700, 7_000, 0.9),
   ];
   const names: NameEvent[] = [
     { name: 'Alice Chen', tMs: 1_000 },
@@ -488,6 +495,207 @@ console.log('\nMIN_IDENTITY_CONFIDENCE — the 0.5 boundary is INCLUSIVE (F1)');
     resolveSpeakerIdentities(samples, names),
     [{ sourceId: 100, name: 'Alice Chen' }],
     'a source EXACTLY at the confidence floor is kept (< is exclusive; <= would drop it)',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nresolveSpeakerIdentities — the live mirror-CSRC bug (reproduction)');
+// ---------------------------------------------------------------------------
+{
+  // THE LIVE BUG, at the identity layer. Meet's active-speaker MIRROR CSRC (id 42)
+  // is echoed across receivers and is loud because it follows whoever is loudest —
+  // so at EVERY instant it is the loudest source in the samples. Two real speakers
+  // sit beneath it: Amir on 60% of ticks, Amlan on 40%, each quieter than the
+  // mirror. The DOM names them correctly (Amir on his ticks, Amlan on hers).
+  //
+  // WITHOUT the fix, every name event votes for whatever is loudest — the mirror —
+  // so 42 collects ALL names, wins with the majority (Amir, 6/10 = conf 0.6, above
+  // the floor and uncontested since the reals never won a tick), and BOTH real
+  // speakers vanish. That is the whole-meeting misattribution measured live.
+  //
+  // WITH the fix (the sentinel belt threaded into vote-casting), the mirror is
+  // excluded before votes are cast, so at each instant the loudest REAL source
+  // wins: Amir→1111, Amlan→2222, and 42 is never returned.
+  const samples: RtpSample[] = [];
+  const names: NameEvent[] = [];
+  const amirTicks = [1_000, 2_000, 3_000, 4_000, 5_000, 6_000]; // 60%
+  const amlanTicks = [7_000, 8_000, 9_000, 10_000];             // 40%
+  for (const t of amirTicks) {
+    samples.push(s(42, t, 0.9));     // mirror: loudest at every tick
+    samples.push(s(1111, t, 0.5));   // Amir: real, quieter
+    names.push({ name: 'Amir', tMs: t });
+  }
+  for (const t of amlanTicks) {
+    samples.push(s(42, t, 0.9));     // mirror: loudest at every tick
+    samples.push(s(2222, t, 0.5));   // Amlan: real, quieter
+    names.push({ name: 'Amlan', tMs: t });
+  }
+
+  // Sanity: the mirror really would win under the OLD "loudest wins" rule — it is
+  // the loudest source at every instant.
+  assertEqual(
+    buildActiveSourceIndex(samples).get(1_000) ?? null,
+    42,
+    'sanity: with no exclusion the mirror is the loudest source (would take the vote)',
+  );
+
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [
+      { sourceId: 1111, name: 'Amir' },
+      { sourceId: 2222, name: 'Amlan' },
+    ],
+    'the mirror is excluded from voting → each real speaker keeps its own name; the mirror is not returned',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nbuildActiveSourceIndex / mapSourcesToNames — exclusion is honoured at VOTE time');
+// ---------------------------------------------------------------------------
+{
+  // The exclusion must act during winner-selection, not only as a post-filter: if
+  // the mirror is the loudest, a post-filter would already have lost the vote to
+  // it. At t=1000 the mirror (42, 0.9) is louder than the real 1111 (0.5); with 42
+  // excluded, 1111 must WIN the instant.
+  const samples = [s(42, 1_000, 0.9), s(1111, 1_000, 0.5)];
+  assertEqual(
+    buildActiveSourceIndex(samples, new Set([42])).get(1_000) ?? null,
+    1111,
+    'an excluded loudest source does not win the instant; the next real source does',
+  );
+  assertEqual(
+    buildActiveSourceIndex(samples).get(1_000) ?? null,
+    42,
+    'with no exclusion the loudest (mirror) wins — backward compatible',
+  );
+  const names: NameEvent[] = [{ name: 'Real Person', tMs: 1_000 }];
+  assertEqual(
+    mapSourcesToNames(samples, names, new Set([42])),
+    [{ sourceId: 1111, name: 'Real Person', votes: 1, total: 1, confidence: 1 }],
+    'the vote goes to the loudest NON-excluded source',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nresolveSpeakerIdentities — the sentinel belt and the dynamic exclude set');
+// ---------------------------------------------------------------------------
+{
+  // THE BELT. A source keyed on the KNOWN sentinel id (42) must be refused even
+  // when it looks like a perfect, single-name, confidence-1.0 identity — the case
+  // neither the confidence floor nor the dedupe rule would catch. This is the
+  // fallback for a single mixed receiver, where cross-receiver detection is blind.
+  const samples = [
+    s(42, 1_000, 0.9), s(42, 2_000, 0.9),       // sentinel: clean, conf 1.0
+    s(1111, 3_000, 0.9), s(1111, 4_000, 0.9),   // real Alice
+  ];
+  const names: NameEvent[] = [
+    { name: 'Mirror Person', tMs: 1_000 },
+    { name: 'Mirror Person', tMs: 2_000 },
+    { name: 'Alice Chen', tMs: 3_000 },
+    { name: 'Alice Chen', tMs: 4_000 },
+  ];
+  // Sanity: the sentinel WOULD be a clean 1.0 identity if id 42 were not special.
+  assertEqual(
+    mapSourcesToNames(samples, names).find((m) => m.sourceId === 42)?.confidence,
+    1,
+    'sanity: id 42 maps to a single name at confidence 1.0 (only the belt can drop it)',
+  );
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [{ sourceId: 1111, name: 'Alice Chen' }],
+    'the known sentinel id is dropped even at confidence 1.0; the real id survives',
+  );
+}
+{
+  // THE DYNAMIC SET. A cross-receiver mirror id detected live (here 555, NOT the
+  // sentinel) is passed via excludeSourceIds and must be dropped the same way,
+  // while without the param the very same clean identity is KEPT — proving the
+  // parameter, not some incidental rule, is what removes it.
+  const samples = [
+    s(555, 1_000, 0.9), s(555, 2_000, 0.9),     // dynamically-detected mirror
+    s(1111, 3_000, 0.9), s(1111, 4_000, 0.9),   // real Alice
+  ];
+  const names: NameEvent[] = [
+    { name: 'Mirror Person', tMs: 1_000 },
+    { name: 'Mirror Person', tMs: 2_000 },
+    { name: 'Alice Chen', tMs: 3_000 },
+    { name: 'Alice Chen', tMs: 4_000 },
+  ];
+  assertEqual(
+    resolveSpeakerIdentities(samples, names),
+    [
+      { sourceId: 555, name: 'Mirror Person' },
+      { sourceId: 1111, name: 'Alice Chen' },
+    ],
+    'without excludeSourceIds a clean non-sentinel id is kept',
+  );
+  assertEqual(
+    resolveSpeakerIdentities(samples, names, new Set([555])),
+    [{ sourceId: 1111, name: 'Alice Chen' }],
+    'excludeSourceIds drops a dynamically-detected mirror id; real id survives',
+  );
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nspeakerIdsToClear — the live resolver must also RETRACT a name');
+// ---------------------------------------------------------------------------
+function nameMap(entries: [number, string][]): Map<number, string> {
+  return new Map(entries);
+}
+{
+  // REASON 1 — the id is a known/detected mirror. It must be cleared even though
+  // it is still present in the resolved list, because a mirror should never keep a
+  // name. Isolates the `excluded` branch (9000 is present in resolved).
+  const current = nameMap([[1111, 'Alice'], [9000, 'Ghost']]);
+  const resolved = [{ sourceId: 1111, name: 'Alice' }, { sourceId: 9000, name: 'Ghost' }];
+  assertEqual(
+    speakerIdsToClear(current, resolved, new Set([9000])),
+    [9000],
+    'a currently-named mirror id is cleared even when still in the resolved list',
+  );
+}
+{
+  // REASON 2 — the id was named before but the latest resolve no longer returns it
+  // (its votes became contested or fell below the floor). Isolates the "absent
+  // from resolved" branch with an empty exclusion set.
+  const current = nameMap([[1111, 'Alice'], [2222, 'Bob']]);
+  const resolved = [{ sourceId: 1111, name: 'Alice' }];
+  assertEqual(
+    speakerIdsToClear(current, resolved, new Set()),
+    [2222],
+    'a previously-named id dropped by the latest resolve is cleared',
+  );
+}
+{
+  // The stable case must retract nothing, or every cycle would churn names.
+  const current = nameMap([[1111, 'Alice'], [2222, 'Bob']]);
+  const resolved = [{ sourceId: 1111, name: 'Alice' }, { sourceId: 2222, name: 'Bob' }];
+  assertEqual(
+    speakerIdsToClear(current, resolved, new Set()),
+    [],
+    'a fully-resolved, non-mirror set clears nothing',
+  );
+}
+{
+  // Mutation guard: an id with NO name has nothing to clear, even when absent from
+  // resolved. Deleting the `if (!name) continue` guard would return it and make
+  // the caller clear an already-empty name pointlessly.
+  const current = nameMap([[1111, ''], [2222, 'Bob']]);
+  const resolved = [{ sourceId: 2222, name: 'Bob' }];
+  assertEqual(
+    speakerIdsToClear(current, resolved, new Set()),
+    [],
+    'an unnamed id (absent from resolved) is not reported for clearing',
+  );
+}
+{
+  // The sentinel constant is a natural exclusion input for the caller.
+  const current = nameMap([[42, 'Mirror'], [1111, 'Alice']]);
+  const resolved = [{ sourceId: 42, name: 'Mirror' }, { sourceId: 1111, name: 'Alice' }];
+  assertEqual(
+    speakerIdsToClear(current, resolved, MIRROR_SENTINEL_CSRCS),
+    [42],
+    'the sentinel set drives clearing of a mirror-keyed speaker',
   );
 }
 
