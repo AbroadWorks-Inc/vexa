@@ -49,9 +49,10 @@ from datetime import datetime, timezone
 #: already in the waiting room when the owner arrives is admitted faster than one
 #: that has not asked yet.
 #:
-#: Deliberately a constant rather than an env var: `job_launcher` forwards only a
-#: fixed set of variables to bot pods, so an env knob here would need plumbing in
-#: the orchestrator to be settable at all. Tunable in a follow-up if wanted.
+#: This is the FALLBACK, not the whole story: `main` now reads the lead from
+#: ``BOT_KNOCK_LEAD_SECONDS`` (forwarded to the pod by `job_launcher`) and falls
+#: back to this constant when that env var is unset or unparseable. 60 stays the
+#: proven default so behaviour is unchanged when the operator sets nothing.
 DEFAULT_LEAD_SECONDS = 60
 
 #: Hard ceiling on the sleep. Protects against a nonsense far-future
@@ -139,6 +140,28 @@ def seconds_until_knock(
     )
 
 
+def _lead_seconds_from_env() -> int:
+    """Resolve the knock lead from ``BOT_KNOCK_LEAD_SECONDS``, fail-open to default.
+
+    A missing, blank, or unparseable value yields ``DEFAULT_LEAD_SECONDS`` (60)
+    rather than raising: a *configuration* typo must keep the proven hold, not crash
+    the boot path. This is a different fail-open target from the rest of the module —
+    every other bad input here declines to sleep (returns 0), but silently dropping
+    to "knock now" on a mistyped lead would quietly re-open the empty-room bug this
+    module exists to close, so a bad env value keeps the 60s default instead.
+
+    Note ``0`` is a valid, deliberate value (knock right at the start) and is
+    honoured; only a value that cannot be parsed as an int falls back.
+    """
+    raw = os.environ.get("BOT_KNOCK_LEAD_SECONDS")
+    if raw is None or not raw.strip():
+        return DEFAULT_LEAD_SECONDS
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return DEFAULT_LEAD_SECONDS
+
+
 def main() -> int:
     """Print the seconds to sleep on stdout; the reason goes to stderr.
 
@@ -151,7 +174,9 @@ def main() -> int:
     # would otherwise escape it.
     try:
         seconds, reason = seconds_until_knock(
-            os.environ.get("BOT_JOB_JSON"), datetime.now(timezone.utc)
+            os.environ.get("BOT_JOB_JSON"),
+            datetime.now(timezone.utc),
+            lead_seconds=_lead_seconds_from_env(),
         )
         print(seconds)
         print(f"[knock_delay] {reason}", file=sys.stderr)
