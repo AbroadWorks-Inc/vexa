@@ -178,6 +178,84 @@ class TestCeiling:
             assert 0 <= seconds <= kd.MAX_SLEEP_SECONDS, f"at {minutes} min"
 
 
+class TestLeadFromEnv:
+    """BOT_KNOCK_LEAD_SECONDS overrides the lead; bad values fall back to 60.
+
+    Fail-open HERE means "the proven 60s default", NOT "knock now": a config typo
+    must keep the hold this module exists to provide, not silently disable it. That
+    is why an invalid env value resolves to DEFAULT_LEAD_SECONDS rather than 0 (a
+    negative lead passed straight to `seconds_until_knock` is what yields 0).
+    """
+
+    def test_env_override_is_used_as_the_lead(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", "300")
+        assert kd._lead_seconds_from_env() == 300
+
+    def test_unset_falls_back_to_default_60(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("BOT_KNOCK_LEAD_SECONDS", raising=False)
+        assert kd._lead_seconds_from_env() == kd.DEFAULT_LEAD_SECONDS == 60
+
+    @pytest.mark.parametrize("raw", ["5m", "", "   ", "1.5", "sixty", "0x3c", "60s"])
+    def test_invalid_falls_back_to_default_60(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", raw)
+        assert kd._lead_seconds_from_env() == 60
+
+    def test_zero_env_is_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """0 is a valid, deliberate value (knock right at the start), not "bad"."""
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", "0")
+        assert kd._lead_seconds_from_env() == 0
+
+    def test_surrounding_whitespace_is_tolerated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", "  120 ")
+        assert kd._lead_seconds_from_env() == 120
+
+    @pytest.mark.parametrize("raw", ["5m", "", "   ", "not-an-int", "300", "0"])
+    def test_never_raises_on_any_env(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", raw)
+        kd._lead_seconds_from_env()  # must not raise for any input
+
+
+class TestMainThreadsEnvLead:
+    """main() must feed the env-resolved lead into the decision, not the constant."""
+
+    def test_env_lead_shifts_the_computed_sleep(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Start 400s out. lead=300 -> target=now+100 -> sleep ~100s. The default
+        # lead of 60 would give ~340s, so this range is only reachable if the env
+        # value actually reached seconds_until_knock.
+        start = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
+        monkeypatch.setenv("BOT_JOB_JSON", _job(start))
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", "300")
+        assert kd.main() == 0
+        out, err = capsys.readouterr()
+        seconds = int(out.strip())
+        assert 80 <= seconds <= 120, err
+        assert "knocking 300s before" in err
+
+    def test_invalid_env_lead_falls_back_to_60_in_main(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        start = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
+        monkeypatch.setenv("BOT_JOB_JSON", _job(start))
+        monkeypatch.setenv("BOT_KNOCK_LEAD_SECONDS", "5m")
+        assert kd.main() == 0
+        out, err = capsys.readouterr()
+        seconds = int(out.strip())
+        assert 320 <= seconds <= 360, err
+        assert "knocking 60s before" in err
+
+
 class TestMainEntrypoint:
     """stdout must carry ONLY the integer — start.sh parses it."""
 
