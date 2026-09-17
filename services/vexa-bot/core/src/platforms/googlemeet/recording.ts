@@ -1044,7 +1044,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             };
 
             // Setup Google Meet meeting monitoring (browser context)
-            const setupGoogleMeetingMonitoring = (botConfigData: any, audioService: any, resolve: any) => {
+            const setupGoogleMeetingMonitoring = (botConfigData: any, audioService: any, resolve: any, reject: any) => {
               (window as any).logBot("Setting up Google Meet meeting monitoring...");
               
               let lastParticipantCount = -1;
@@ -1096,6 +1096,16 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               // early-joining bot and completed the pod before the meeting ever started.
               let meetingHasStarted = false;
               const EMPTY_GRACE_TICKS = 90; // 90 x 1s = 90s continuous empty before finalizing
+              // How long to sit ADMITTED but alone before giving up, in 1s ticks.
+              // Operator-tunable: BOT_NO_ONE_JOINED_TIMEOUT_MS on the orchestrator ->
+              // automaticLeave.noOneJoinedTimeout, the ONE knob shared with Zoom
+              // (removal.ts:58) and Teams (alone-timer.ts:324). The 900000 fallback
+              // only applies if the key is absent entirely; docker.ts's Zod schema
+              // supplies 600000 when it is, so this is belt-and-braces.
+              const NO_ONE_JOINED_TICKS = Math.max(
+                60,
+                Math.round((Number(botConfigData?.automaticLeave?.noOneJoinedTimeout) || 900000) / 1000)
+              );
               const checkInterval = setInterval(() => {
                 const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount
                   ? (window as any).getGoogleMeetActiveParticipantsCount()
@@ -1135,11 +1145,26 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 }
                 if (rawTiles <= 1 && !presenting) {
                   if (!meetingHasStarted) {
-                    // Joined early; meeting not started. Keep waiting — do NOT finalize.
+                    // Joined early; the meeting never started. Keep waiting -- but NOT
+                    // forever: this branch used to increment without any cap, so a bot
+                    // admitted into a room nobody joined ran to the Job's 4h
+                    // activeDeadlineSeconds and was SIGKILLed inside a 30s grace, which
+                    // is shorter than the ~120s start.sh allows the upload pipeline.
+                    // The capture was lost every time. Live on 2026-09-17:
+                    // meet-bot-2ef08b05c39c45e7 alone 156 min, ...9799a3f4b2aa4186 96 min.
                     emptyTicks = 0;
                     notStartedTicks++;
-                    if (notStartedTicks % 30 === 0) {
-                      (window as any).logBot(`Waiting for the meeting to start — bot alone ${notStartedTicks}s (will not finalize until the meeting has begun).`);
+                    if (notStartedTicks >= NO_ONE_JOINED_TICKS) {
+                      (window as any).logBot(`No one joined within ${NO_ONE_JOINED_TICKS}s — leaving so the recording is finalized and uploaded.`);
+                      // Token consumed by platforms/shared/meetingFlow.ts, which maps it
+                      // to the startup_alone_timeout graceful-leave reason -> the
+                      // sidecar's last_participant. Zoom and Teams emit their own
+                      // equivalents; Meet had none. Do NOT rename it.
+                      void stopWithFlush("startup_alone_timeout", () =>
+                        reject(new Error("GOOGLE_MEET_BOT_STARTUP_ALONE_TIMEOUT"))
+                      );
+                    } else if (notStartedTicks % 30 === 0) {
+                      (window as any).logBot(`Waiting for the meeting to start — bot alone ${notStartedTicks}s (will leave at ${NO_ONE_JOINED_TICKS}s if no one joins).`);
                     }
                   } else {
                     emptyTicks++;
@@ -1170,7 +1195,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               });
             };
 
-            setupGoogleMeetingMonitoring(botConfigData, audioService, resolve);
+            setupGoogleMeetingMonitoring(botConfigData, audioService, resolve, reject);
           }).catch((err: any) => {
             reject(err);
           });

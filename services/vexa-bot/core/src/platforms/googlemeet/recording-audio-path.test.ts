@@ -387,6 +387,50 @@ const WIRING: ReadonlyArray<Wiring> = [
       'is truncated with no error logged anywhere.',
   },
   {
+    label: 'the startup-alone token is emitted from setupGoogleMeetingMonitoring',
+    file: ['platforms', 'googlemeet', 'recording.ts'],
+    anchor: 'const setupGoogleMeetingMonitoring = (',
+    needle: 'GOOGLE_MEET_BOT_STARTUP_ALONE_TIMEOUT',
+    spanMarker: 'EMPTY_GRACE_TICKS',
+    breaks:
+      'a Meet bot ADMITTED into a room nobody ever joins has no exit condition at ' +
+      'all: the !meetingHasStarted branch increments notStartedTicks forever. The ' +
+      'pod then runs to the Job activeDeadlineSeconds (4h) and is SIGKILLed inside ' +
+      'a 30s terminationGracePeriod -- shorter than the ~120s start.sh waits for ' +
+      'the upload pipeline -- so whatever was captured is LOST. Measured live on ' +
+      '2026-09-17: meet-bot-2ef08b05c39c45e7 sat alone 156 minutes and ' +
+      'meet-bot-9799a3f4b2aa4186 96 minutes, both with zero speech captured. ' +
+      'Zoom (removal.ts:263) and Teams (recording.ts:1562) already emit their own ' +
+      'token; Meet was the only platform that could hang indefinitely. The token ' +
+      'name is consumed by platforms/shared/meetingFlow.ts, which maps it to the ' +
+      'startup_alone_timeout graceful-leave reason -- do NOT rename it.',
+  },
+  {
+    label: 'the token is reached from the notStartedTicks comparison',
+    file: ['platforms', 'googlemeet', 'recording.ts'],
+    anchor: 'const setupGoogleMeetingMonitoring = (',
+    needle: 'notStartedTicks >= NO_ONE_JOINED_TICKS',
+    spanMarker: 'EMPTY_GRACE_TICKS',
+    breaks:
+      'the token becomes UNREACHABLE while still present in the source. Checking ' +
+      'only for the token string is a vacuous guard -- replacing this comparison ' +
+      'with `if (false)` left the whole suite green, which is exactly how a bot ' +
+      'that never leaves would ship again with a test claiming otherwise. This ' +
+      'needle pins the CONDITION, not just the payload.',
+  },
+  {
+    label: 'the alone budget is read from automaticLeave, not hardcoded',
+    file: ['platforms', 'googlemeet', 'recording.ts'],
+    anchor: 'const setupGoogleMeetingMonitoring = (',
+    needle: 'noOneJoinedTimeout',
+    spanMarker: 'EMPTY_GRACE_TICKS',
+    breaks:
+      'the wait stops being operator-tunable. BOT_NO_ONE_JOINED_TIMEOUT_MS on the ' +
+      'orchestrator feeds automaticLeave.noOneJoinedTimeout, which is the ONE knob ' +
+      'for all three platforms; a hardcoded constant here would need an image ' +
+      'rebuild to change and would silently diverge from Zoom and Teams.',
+  },
+  {
     label: 'the WAV is opened inside startMeetAudioCapture (RecordingService.start)',
     file: ['platforms', 'googlemeet', 'recording.ts'],
     anchor: 'async function startMeetAudioCapture(',
