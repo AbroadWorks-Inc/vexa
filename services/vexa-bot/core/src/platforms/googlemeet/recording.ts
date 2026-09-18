@@ -4,6 +4,10 @@ import { log } from "../../utils";
 import { BotConfig } from "../../types";
 import { RecordingService } from "../../services/recording";
 import { setActiveRecordingService, getSegmentPublisher, armSpeakerBoundaries } from "../../index";
+import {
+  MEET_UI_LABEL_PATTERNS,
+  parseBotDenylist,
+} from "../../services/meet-participants";
 import { ensureBrowserUtils } from "../../utils/injection";
 import {
   evaluateRemoteCameraTick,
@@ -362,8 +366,12 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
         speakingIndicators: string[];
         peopleButtonSelectors: string[];
       };
+      /** Meet chrome that the tile scraper reads as a name (substring match). */
+      uiLabelPatterns: string[];
+      /** Other vendors' notetaker bots to exclude from the participant count. */
+      botDenylist: string[];
     }) => {
-      const { botConfigData, selectors } = pageArgs;
+      const { botConfigData, selectors, uiLabelPatterns, botDenylist } = pageArgs;
 
       // Use browser utility classes from the global bundle
       const browserUtils = (window as any).VexaBrowserUtils;
@@ -947,6 +955,28 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
 
             let lastKnownParticipantCount = 0;
 
+            // Is this RESOLVED tile name a real participant? Mirrors
+            // `isRealParticipantName` in services/meet-participants.ts, which is
+            // where the rules are unit-tested; the lists arrive as page args
+            // because page.evaluate cannot import.
+            const isRealParticipant = (name: string): boolean => {
+              const trimmed = (name || '').trim();
+              if (!trimmed) return false;
+              // Structural junk getGoogleParticipantName emits when it cannot
+              // resolve a name.
+              if (/^Google Participant \(/.test(trimmed)) return false;
+              if (/spaces\//.test(trimmed) || /devices\//.test(trimmed)) return false;
+              const lower = trimmed.toLowerCase();
+              // Meet chrome. "Backgrounds and effects" carries a participant id
+              // (live 2026-09-18, devices/107) and is NOT a person.
+              if (uiLabelPatterns.some((pat: string) => lower.includes(pat))) return false;
+              // Other vendors' notetakers. "read.ai meeting notes" took the count
+              // 1 -> 2 on 2026-09-18 and disarmed the 15-minute timer on a meeting
+              // no human ever joined. A resolvable NAME is not enough on its own.
+              if (botDenylist.some((b: string) => lower.includes(b))) return false;
+              return true;
+            };
+
             const countParticipantTiles = (): number => {
               const participantElements = document.querySelectorAll('[data-participant-id]');
               const ids = new Set<string>();
@@ -955,6 +985,47 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 if (id) ids.add(id);
               });
               return ids.size;
+            };
+
+            // The count that decides whether the bot is ALONE. Unlike
+            // countParticipantTiles it resolves each tile's name and keeps only
+            // real people. Our OWN bot is deliberately counted -- it holds a tile
+            // and a display name -- which is why the threshold downstream is
+            // `> 1` (the bot plus at least one other) rather than `> 0`.
+            // The count that decides whether the bot is ALONE. Unlike
+            // countParticipantTiles it resolves each tile's NAME and keeps only
+            // real people. Our OWN bot is deliberately counted -- it holds a tile
+            // and a display name -- which is why the threshold downstream is
+            // `> 1` (the bot plus at least one other) rather than `> 0`.
+            //
+            // Reads the same roster `speaker-identity.ts` consumes, rather than
+            // re-walking the DOM: getGoogleParticipantName lives inside
+            // initializeGoogleSpeakerDetection and is not reachable from here.
+            let warnedNoRoster = false;
+            const countIdentifiedParticipants = (): number => {
+              const getNames = (window as any).__vexaGetAllParticipantNames;
+              if (typeof getNames !== 'function') {
+                // Installed just after admission; if it is somehow absent, fall
+                // back to the PREVIOUS behaviour (raw tiles) rather than report 0
+                // -- reporting 0 would leave the timer armed with people present.
+                // Logged once so the degraded path is visible, not silent.
+                if (!warnedNoRoster) {
+                  warnedNoRoster = true;
+                  (window as any).logBot('[Recording] participant-name lookup unavailable; falling back to raw tile count for the alone check.');
+                }
+                return countParticipantTiles();
+              }
+              try {
+                const data = getNames() as { names: Record<string, string> };
+                let n = 0;
+                Object.values(data.names || {}).forEach((name) => {
+                  if (isRealParticipant(name)) n++;
+                });
+                return n;
+              } catch (err: any) {
+                (window as any).logBot?.(`[Recording] participant-name lookup failed (${err?.message || err}); using raw tiles.`);
+                return countParticipantTiles();
+              }
             };
 
             const isBotStillInMeeting = (): boolean => {
@@ -1118,6 +1189,8 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 // genuine empty is detected, but gated by isPresentationActive() so a share
                 // never false-triggers it. Grace period tolerates brief drops / a rejoin.
                 const rawTiles = countParticipantTiles();
+                // Real people only -- excludes Meet chrome and other vendors' bots.
+                const identified = countIdentifiedParticipants();
                 const presenting = isPresentationActive();
 
                 // Remote-camera detection tick — ships raw facts to Node, which owns all
@@ -1139,11 +1212,18 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 }
 
                 // Arm the finalize only once the meeting is genuinely underway.
-                if (!meetingHasStarted && (rawTiles >= 2 || presenting)) {
+                if (!meetingHasStarted && (identified > 1 || presenting)) {
                   meetingHasStarted = true;
                   (window as any).logBot(`Meeting has started (participants present) — empty-room finalize is now armed.`);
                 }
-                if (rawTiles <= 1 && !presenting) {
+                // `identified`, NOT `rawTiles` -- this branch must agree with the
+                // gate above. Its else-arm resets notStartedTicks to 0, so keying it
+                // on the raw count let anything `identified` ignores (Meet chrome, a
+                // denylisted bot) zero the alone counter every tick: the gate held,
+                // the timer could never fire, and the bot sat to the 4h deadline.
+                // Live 2026-09-18, meet-bot-b45481b9354c47a1: 0 "Meeting has started"
+                // lines while the countdown froze at 240s.
+                if (identified <= 1 && !presenting) {
                   if (!meetingHasStarted) {
                     // Joined early; the meeting never started. Keep waiting -- but NOT
                     // forever: this branch used to increment without any cap, so a bot
@@ -1217,7 +1297,11 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
         nameSelectors: googleNameSelectors,
         speakingIndicators: googleSpeakingIndicators,
         peopleButtonSelectors: googlePeopleButtonSelectors
-      } as any
+      } as any,
+      // Passed as DATA because page.evaluate cannot import. Single definition in
+      // services/meet-participants.ts, unit-tested there.
+      uiLabelPatterns: [...MEET_UI_LABEL_PATTERNS],
+      botDenylist: [...parseBotDenylist(process.env.MEET_BOT_DENYLIST)]
     }
   );
 }
