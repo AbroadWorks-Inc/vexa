@@ -387,6 +387,52 @@ const WIRING: ReadonlyArray<Wiring> = [
       'is truncated with no error logged anywhere.',
   },
   {
+    label: 'the alone BRANCH also keys off identified, not raw tiles',
+    file: ['platforms', 'googlemeet', 'recording.ts'],
+    anchor: 'const setupGoogleMeetingMonitoring = (',
+    needle: 'if (identified <= 1 && !presenting)',
+    spanMarker: 'EMPTY_GRACE_TICKS',
+    breaks:
+      'the counter is RESET instead of climbing. Changing only the gate is not ' +
+      'enough: the branch below chooses between "alone" and "not alone", and its ' +
+      'else-arm does `notStartedTicks = 0`. With the branch still on `rawTiles`, ' +
+      'anything `identified` correctly ignores -- Meet chrome, a denylisted bot -- ' +
+      'sends execution down the else-arm and zeroes the counter every tick, so ' +
+      'NO_ONE_JOINED_TICKS is never reached and the bot sits to the 4h deadline. ' +
+      'Observed live 2026-09-18 on meet-bot-b45481b9354c47a1: the gate correctly ' +
+      'refused to flip (0 "Meeting has started" lines) while the countdown froze ' +
+      'at 240s and never resumed. The gate guard below PASSED throughout -- it ' +
+      'pins the payload, not the path that reaches it.',
+  },
+  {
+    label: 'the alone gate counts IDENTIFIED participants, not raw tiles',
+    file: ['platforms', 'googlemeet', 'recording.ts'],
+    anchor: 'const setupGoogleMeetingMonitoring = (',
+    needle: 'identified > 1 || presenting',
+    spanMarker: 'EMPTY_GRACE_TICKS',
+    breaks:
+      'the gate goes back to `rawTiles >= 2`, which counts ANY element Meet gave ' +
+      'a participant id. Two non-people were observed disarming the 15-minute ' +
+      'timer that way on 2026-09-18: "Backgrounds and effects" (Meet chrome, ' +
+      'devices/107) and "read.ai meeting notes" (another vendor bot) -- the ' +
+      'count went 1 -> 2 four log lines after read.ai appeared, on a meeting NO ' +
+      'human ever joined. `> 1` not `> 0`: our own bot holds a tile and a name, ' +
+      'so it is participant #1.',
+  },
+  {
+    label: 'the UI-label and bot denylists reach the page as data',
+    file: ['platforms', 'googlemeet', 'recording.ts'],
+    anchor: 'export async function startGoogleRecording(',
+    needle: 'parseBotDenylist(process.env.MEET_BOT_DENYLIST)',
+    spanMarker: 'peopleButtonSelectors',
+    breaks:
+      'the denylist stops being operator-configurable, or worse gets re-inlined ' +
+      'in the page as a second copy that drifts from ' +
+      'services/meet-participants.ts (where the rules are unit-tested). ' +
+      'page.evaluate cannot import, so passing them as page args beside ' +
+      '`selectors` is what keeps ONE definition.',
+  },
+  {
     label: 'the startup-alone token is emitted from setupGoogleMeetingMonitoring',
     file: ['platforms', 'googlemeet', 'recording.ts'],
     anchor: 'const setupGoogleMeetingMonitoring = (',
