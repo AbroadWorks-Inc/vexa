@@ -28,6 +28,52 @@ RUN npm install
 # incident fix.
 RUN npm run build
 
+# Drop what the RUNTIME never loads, BEFORE stage 2 copies node_modules.
+#
+# This must happen HERE, in the build stage. Deleting the same paths in stage 2
+# would save nothing: image layers are additive, so a later `rm` leaves the bytes
+# in the earlier layer and the download size is unchanged. `COPY --from=ts-build`
+# copies whatever exists at copy time, so pruning here genuinely shrinks the
+# final image.
+#
+# Measured on meet-bot:v0.4.23 (2026-09-21) — node_modules was 670 MB, of which:
+#   onnxruntime-node  548 MB  <- the whole reason for this step
+#   typescript         23 MB
+#   @types            2.7 MB
+#
+# Why removing onnxruntime-node is SAFE, not a gamble:
+#   · it is loaded lazily via require() inside getOrt() (services/vad.ts:23),
+#     never at import time;
+#   · SileroVAD.create() calls getOrt() FIRST (vad.ts:72), and the only caller
+#     (index.ts:1323) wraps it in try/catch which logs
+#     "VAD not available — will send all audio" and sets vadModel = null;
+#   · so a missing module degrades to "no VAD", and VAD was doing no work anyway:
+#     telemetry reported `vad=0/0 (checked/rejected)` on runs WITH the module
+#     present, i.e. it was initialised but never filtered a single audio chunk.
+#
+# CORRECTION (2026-09-21, from the first live run of this pruned image): an
+# earlier version of this comment claimed the PerSpeaker/VAD block "does not run
+# here". THAT WAS WRONG -- it was based on grepping only two pods. The block DOES
+# run on every launch, and now logs:
+#     [PerSpeaker] VAD not available (Cannot find module 'onnxruntime-node')
+# which is the caught, expected path: the bot went on to join, record two named
+# participants, finalise on the empty-room timer and upload, exit code 0.
+# So this prune removes an INITIALISED-BUT-IDLE capability, not dead code.
+#
+# typescript and @types are build-only and `npm run build` has already finished.
+# esbuild (12 MB) is deliberately LEFT IN PLACE: it may be a transitive runtime
+# dependency and 12 MB is not worth that risk.
+#
+# If live transcription (VAD) is ever enabled on this path, REVERT this step --
+# the bot will otherwise silently run without VAD instead of failing loudly.
+#
+# Evidence: docs-utpal/EXPLAINED/2026-09-21-meet-bot-cpu-memory-measured.md §10.3
+RUN rm -rf node_modules/onnxruntime-node \
+           node_modules/@jjhbw \
+           node_modules/typescript \
+           node_modules/@types \
+ && echo "pruned runtime node_modules -> $(du -sh node_modules | cut -f1)"
+
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/playwright/python:v1.56.0-noble
 

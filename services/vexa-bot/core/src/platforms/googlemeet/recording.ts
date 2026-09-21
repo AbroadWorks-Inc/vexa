@@ -370,8 +370,15 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
       uiLabelPatterns: string[];
       /** Other vendors' notetaker bots to exclude from the participant count. */
       botDenylist: string[];
+      /**
+       * OUR display name, so the roster count can exclude us by VALUE instead of
+       * assuming our own tile is present. Passed explicitly rather than read off
+       * botConfigData: a field-name mismatch there fails silently (see the Teams
+       * `name` vs `botName` bug) and this value decides when a meeting starts.
+       */
+      botName: string;
     }) => {
-      const { botConfigData, selectors, uiLabelPatterns, botDenylist } = pageArgs;
+      const { botConfigData, selectors, uiLabelPatterns, botDenylist, botName } = pageArgs;
 
       // Use browser utility classes from the global bundle
       const browserUtils = (window as any).VexaBrowserUtils;
@@ -988,43 +995,74 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             };
 
             // The count that decides whether the bot is ALONE. Unlike
-            // countParticipantTiles it resolves each tile's name and keeps only
-            // real people. Our OWN bot is deliberately counted -- it holds a tile
-            // and a display name -- which is why the threshold downstream is
-            // `> 1` (the bot plus at least one other) rather than `> 0`.
-            // The count that decides whether the bot is ALONE. Unlike
-            // countParticipantTiles it resolves each tile's NAME and keeps only
-            // real people. Our OWN bot is deliberately counted -- it holds a tile
-            // and a display name -- which is why the threshold downstream is
-            // `> 1` (the bot plus at least one other) rather than `> 0`.
+            // countParticipantTiles it resolves each tile's NAME, keeps only real
+            // people, and EXCLUDES our own display name -- see countOtherParticipants
+            // below for why assuming our own tile is present was wrong.
             //
             // Reads the same roster `speaker-identity.ts` consumes, rather than
             // re-walking the DOM: getGoogleParticipantName lives inside
             // initializeGoogleSpeakerDetection and is not reachable from here.
             let warnedNoRoster = false;
-            const countIdentifiedParticipants = (): number => {
+            const ownName = (botName || '').trim().toLowerCase();
+            let lastCountDiag = '';
+
+            /**
+             * How many OTHER real people are in the room -- never counting ourselves.
+             *
+             * The previous version counted every real name including our own and the
+             * caller required `> 1` ("the bot plus at least one other"). That premise
+             * was FALSE: measured live on 2026-09-20 (meet-bot-8d9a850180e44013), the
+             * roster resolved `Utpalendu Sarkar` 84 times and our own `AW Notetaker`
+             * ZERO times, so a 1:1 meeting sat at 1, `1 > 1` was false, and
+             * `meetingHasStarted` never armed for 420s with a human present. Proven by
+             * experiment: admitting a SECOND human took it to 2 and the gate opened
+             * immediately, with no presentation involved.
+             *
+             * Excluding by value is correct whether or not Meet renders a self-tile,
+             * so this no longer depends on a DOM detail we cannot control.
+             */
+            const countOtherParticipants = (): number => {
               const getNames = (window as any).__vexaGetAllParticipantNames;
               if (typeof getNames !== 'function') {
-                // Installed just after admission; if it is somehow absent, fall
-                // back to the PREVIOUS behaviour (raw tiles) rather than report 0
-                // -- reporting 0 would leave the timer armed with people present.
-                // Logged once so the degraded path is visible, not silent.
+                // Installed just after admission; if it is somehow absent, fall back
+                // to raw tiles rather than report 0 -- reporting 0 would finalize a
+                // room that still has people in it. Raw tiles DO include our own, so
+                // subtract one: that reproduces the old `tiles <= 1` rule exactly and
+                // keeps the degraded path's behaviour unchanged.
                 if (!warnedNoRoster) {
                   warnedNoRoster = true;
                   (window as any).logBot('[Recording] participant-name lookup unavailable; falling back to raw tile count for the alone check.');
                 }
-                return countParticipantTiles();
+                return Math.max(0, countParticipantTiles() - 1);
               }
               try {
                 const data = getNames() as { names: Record<string, string> };
-                let n = 0;
-                Object.values(data.names || {}).forEach((name) => {
-                  if (isRealParticipant(name)) n++;
+                const all = Object.values(data.names || {});
+                const kept: string[] = [];
+                const dropped: string[] = [];
+                all.forEach((name) => {
+                  const trimmed = (name || '').trim();
+                  if (ownName && trimmed.toLowerCase() === ownName) {
+                    dropped.push(`${trimmed} (self)`);
+                  } else if (isRealParticipant(trimmed)) {
+                    kept.push(trimmed);
+                  } else {
+                    dropped.push(trimmed);
+                  }
                 });
-                return n;
+                // Diagnostic: the old code logged only the countdown, so establishing
+                // WHY the gate stayed shut needed hours of log archaeology. Emit the
+                // decision, not just its consequence -- but only when it CHANGES, so
+                // a 1s loop cannot flood the log.
+                const diag = `roster=${all.length} others=${kept.length} kept=[${kept.join(', ')}] dropped=[${dropped.join(', ')}]`;
+                if (diag !== lastCountDiag) {
+                  lastCountDiag = diag;
+                  (window as any).logBot(`[Recording] participants: ${diag}`);
+                }
+                return kept.length;
               } catch (err: any) {
                 (window as any).logBot?.(`[Recording] participant-name lookup failed (${err?.message || err}); using raw tiles.`);
-                return countParticipantTiles();
+                return Math.max(0, countParticipantTiles() - 1);
               }
             };
 
@@ -1189,8 +1227,9 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 // genuine empty is detected, but gated by isPresentationActive() so a share
                 // never false-triggers it. Grace period tolerates brief drops / a rejoin.
                 const rawTiles = countParticipantTiles();
-                // Real people only -- excludes Meet chrome and other vendors' bots.
-                const identified = countIdentifiedParticipants();
+                // Other real people only -- excludes Meet chrome, other vendors'
+                // bots, and OURSELVES.
+                const others = countOtherParticipants();
                 const presenting = isPresentationActive();
 
                 // Remote-camera detection tick — ships raw facts to Node, which owns all
@@ -1212,18 +1251,21 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 }
 
                 // Arm the finalize only once the meeting is genuinely underway.
-                if (!meetingHasStarted && (identified > 1 || presenting)) {
+                // `>= 1` because `others` EXCLUDES us: one other human means the
+                // meeting is happening. The old `> 1` assumed our own tile was in
+                // the count and it is not, which kept every 1:1 meeting shut out.
+                if (!meetingHasStarted && (others >= 1 || presenting)) {
                   meetingHasStarted = true;
                   (window as any).logBot(`Meeting has started (participants present) — empty-room finalize is now armed.`);
                 }
-                // `identified`, NOT `rawTiles` -- this branch must agree with the
-                // gate above. Its else-arm resets notStartedTicks to 0, so keying it
-                // on the raw count let anything `identified` ignores (Meet chrome, a
-                // denylisted bot) zero the alone counter every tick: the gate held,
-                // the timer could never fire, and the bot sat to the 4h deadline.
+                // `others`, NOT `rawTiles` -- this branch must agree with the gate
+                // above. Its else-arm resets notStartedTicks to 0, so keying it on the
+                // raw count let anything `others` ignores (Meet chrome, a denylisted
+                // bot) zero the alone counter every tick: the gate held, the timer
+                // could never fire, and the bot sat to the 4h deadline.
                 // Live 2026-09-18, meet-bot-b45481b9354c47a1: 0 "Meeting has started"
                 // lines while the countdown froze at 240s.
-                if (identified <= 1 && !presenting) {
+                if (others === 0 && !presenting) {
                   if (!meetingHasStarted) {
                     // Joined early; the meeting never started. Keep waiting -- but NOT
                     // forever: this branch used to increment without any cap, so a bot
@@ -1301,7 +1343,8 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
       // Passed as DATA because page.evaluate cannot import. Single definition in
       // services/meet-participants.ts, unit-tested there.
       uiLabelPatterns: [...MEET_UI_LABEL_PATTERNS],
-      botDenylist: [...parseBotDenylist(process.env.MEET_BOT_DENYLIST)]
+      botDenylist: [...parseBotDenylist(process.env.MEET_BOT_DENYLIST)],
+      botName: botConfig.botName
     }
   );
 }
