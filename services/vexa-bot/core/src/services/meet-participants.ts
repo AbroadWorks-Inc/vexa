@@ -49,11 +49,16 @@ export const MEET_UI_LABEL_PATTERNS: readonly string[] = [
  * Other vendors' meeting bots, lower-cased, matched as a SUBSTRING so version
  * or suffix changes ("read.ai meeting notes", "Read.ai Notetaker") still match.
  *
- * OUR OWN BOT IS DELIBERATELY ABSENT. The threshold is `> 1` with the bot
- * counted as #1 (it holds its own tile and its own display name), so denylisting
- * ourselves would drop the count to 0 when alone and to 1 when a real person
- * joins -- and `1 > 1` is false, leaving the timer armed with a human present.
- * Adding our own name here inverts the whole feature.
+ * OUR OWN BOT IS DELIBERATELY ABSENT from this list, but NOT because we are
+ * counted: the caller now excludes our display name by value and requires
+ * `others >= 1`.
+ *
+ * The earlier note here claimed the bot "holds its own tile and its own display
+ * name" and that the `> 1` threshold counted it as #1. That was FALSE and it cost
+ * a live meeting: on 2026-09-20 (meet-bot-8d9a850180e44013) the roster resolved
+ * the human 84 times and our own name ZERO times, so a 1:1 meeting sat at 1 and
+ * the gate never armed. Do not reintroduce a threshold that assumes we are in
+ * the roster -- whether Meet renders a self-tile is not ours to control.
  */
 export const DEFAULT_MEET_BOT_DENYLIST: readonly string[] = [
   'read.ai',
