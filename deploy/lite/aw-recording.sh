@@ -8,7 +8,7 @@
 # `export` pulls what upstream keeps OUTSIDE object storage (transcript, participants, meeting row,
 # recording index) as JSON, issues GET /recordings/<id>/master so meeting-api assembles the audio
 # master (finalize-on-read — upstream code, nothing stitched here), then copies the JSON into the
-# local bucket under exports/<platform>_<code>_m<meeting id>/ so BOTH mirrors (RECORDING_DIR + S3) carry it.
+# local bucket under exports/<platform>_<code>_m<id>_<startUTC>/ so BOTH mirrors (RECORDING_DIR + S3) carry it.
 #
 # The API key is read from /run/vexa/key.env INSIDE the app container and never printed or copied out.
 set -euo pipefail
@@ -69,7 +69,10 @@ for sp in speakers: print("  -", sp, "(", sum(1 for s in segs if (s.get("speaker
     tmp_t=$(mktemp); api GET "/transcripts/$platform/$nid" > "$tmp_t"
     tid=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("id") or "")' "$tmp_t")
     [ -n "$tid" ] || { echo "no meeting found for $platform/$nid:"; cat "$tmp_t"; rm -f "$tmp_t"; exit 1; }
-    out="$RECORDING_DIR/exports/${platform}_${nid}_m${tid}"; mkdir -p "$out"
+    # start time in the name too: a fresh database restarts ids at 1, and the S3 prefix keeps history.
+    tstart=$(python3 -c 'import json,sys,re; d=json.load(open(sys.argv[1])); t=d.get("start_time") or ""; print(re.sub(r"[^0-9T]","",t[:16]) or "nostart")' "$tmp_t")
+    exp="${platform}_${nid}_m${tid}_${tstart}"
+    out="$RECORDING_DIR/exports/$exp"; mkdir -p "$out"
     mv "$tmp_t" "$out/transcript.json"
     api GET "/meetings/$platform/$nid/participants"  > "$out/participants.json"
     api GET "/meetings"                              > "$out/_all_meetings.json"
@@ -102,8 +105,8 @@ print(" ".join(str(r["id"]) for r in items if "id" in r))' "$out/recordings.json
     echo "exported → $out"; ls -1 "$out"
     # push the JSON into the bucket so the S3 mirror (and the local one) carry it alongside the audio
     docker run --rm --network "$NETWORK" -v "$out":/exp:ro --entrypoint sh "$MC_IMAGE" -c \
-      "mc alias set store http://$MINIO_CONTAINER:9000 $MINIO_ACCESS_KEY $MINIO_SECRET_KEY >/dev/null && mc cp --recursive /exp/ store/$MINIO_BUCKET/exports/${platform}_${nid}_m${tid}/" >/dev/null \
-      && echo "copied JSON into bucket: exports/${platform}_${nid}_m${tid}/ (mirrors → RECORDING_DIR + S3)"
+      "mc alias set store http://$MINIO_CONTAINER:9000 $MINIO_ACCESS_KEY $MINIO_SECRET_KEY >/dev/null && mc cp --recursive /exp/ store/$MINIO_BUCKET/exports/$exp/" >/dev/null \
+      && echo "copied JSON into bucket: exports/$exp/ (mirrors → RECORDING_DIR + S3)"
     ;;
   *) usage ;;
 esac
