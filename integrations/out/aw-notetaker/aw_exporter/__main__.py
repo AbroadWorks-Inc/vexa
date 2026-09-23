@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -21,6 +22,7 @@ from aw_exporter.vexa_client import MeetingApi
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     settings = Settings.from_env(os.environ)
     s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION"))
     storage = Storage(s3_client)

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ warnings.filterwarnings(
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+import aw_exporter.queue as queue_module  # noqa: E402
 from aw_exporter.app import create_app  # noqa: E402
 from aw_exporter.config import Settings  # noqa: E402
 from aw_exporter.job import Deps, ExportResult  # noqa: E402
@@ -66,6 +68,14 @@ def _envelope(
         "event_type": event_type,
         "data": {"meeting": meeting},
     }
+
+
+def _envelope_missing(*fields: str) -> dict[str, Any]:
+    envelope = _envelope()
+    meeting = envelope["data"]["meeting"]
+    for field in fields:
+        meeting.pop(field, None)
+    return envelope
 
 
 FIXED_TS = "1000"
@@ -204,7 +214,7 @@ def test_enqueue_failure_returns_503(
         clock=_fixed_clock,
         start_worker=False,
     )
-    body = b'{"event_type":"meeting.completed","data":{"meeting":{"id":1}}}'
+    body = json.dumps(_envelope()).encode()
     headers = _sign(body)
     with TestClient(app) as client:
         resp = client.post("/hooks/vexa", content=body, headers=headers)
@@ -243,6 +253,25 @@ def test_missing_meeting_id_returns_400(storage: Storage) -> None:
     with TestClient(app) as client:
         resp = client.post("/hooks/vexa", content=body, headers=headers)
     assert resp.status_code == 400
+
+
+def test_missing_start_time_returns_400_and_not_queued(storage: Storage) -> None:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    app = create_app(
+        settings,
+        queue,
+        _deps(storage, settings),
+        clock=_fixed_clock,
+        start_worker=False,
+    )
+    envelope = _envelope_missing("start_time")
+    body = json.dumps(envelope).encode()
+    headers = _sign(body)
+    with TestClient(app) as client:
+        resp = client.post("/hooks/vexa", content=body, headers=headers)
+    assert resp.status_code == 400
+    assert queue.pending_ids() == []
 
 
 def test_healthz_returns_ok(storage: Storage) -> None:
@@ -321,6 +350,25 @@ def test_restart_semantics_fresh_queue_sees_still_pending_id(storage: Storage) -
     assert fresh_queue.pending_ids() == ["11367"]
 
 
+def test_reenqueue_of_pending_id_refreshes_envelope_but_keeps_attempts(
+    storage: Storage,
+) -> None:
+    queue = PendingQueue(storage, VEXA_BUCKET)
+    queue.enqueue(_envelope())
+    queue.record_failure("11367", "boom", now=lambda: 1000.0)
+
+    updated_envelope = _envelope(end_time="2026-06-18T10:50:00.000Z")
+    queue.enqueue(updated_envelope)
+
+    assert queue.pending_ids() == ["11367"]
+    item = queue.load("11367")
+    assert item is not None
+    assert item["envelope"] == updated_envelope
+    assert item["attempts"] == 1
+    assert item["last_error"] == "boom"
+    assert item["next_attempt_at"] == 1000.0 + 30 * 2**1
+
+
 # ---------------------------------------------------------------------------
 # sweep_once / run_worker
 # ---------------------------------------------------------------------------
@@ -392,6 +440,95 @@ def test_run_worker_exits_when_stop_is_set(storage: Storage) -> None:
         await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(scenario())
+
+
+def test_sweep_once_quarantines_malformed_envelope_without_raising(
+    storage: Storage,
+) -> None:
+    """A pending item seeded directly (bypassing intake validation) missing
+    start_time must not crash sweep_once: export_meeting's own folder_name
+    call raises, the quarantine's own folder_name call also raises, so the
+    marker is skipped but the item still lands under failed/."""
+    settings = _settings(max_attempts=1)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope_missing("start_time"))
+    deps = _deps(storage, settings)
+
+    asyncio.run(sweep_once(queue, deps))  # default job=export_meeting
+
+    assert queue.pending_ids() == []
+    assert storage.get_json(VEXA_BUCKET, "aw-exporter/pending/11367.json") is None
+    failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
+    assert failed is not None
+    assert failed["attempts"] == 1
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
+
+
+def test_sweep_once_isolates_per_id_failures(storage: Storage) -> None:
+    settings = _settings(max_attempts=5)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope(id=1, native_meeting_id="good-meeting"))
+    queue.enqueue(_envelope(id=2, native_meeting_id="bad-meeting"))
+    deps = _deps(storage, settings)
+
+    def selective_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+        if envelope["data"]["meeting"]["id"] == 2:
+            raise RuntimeError("boom")
+        return ExportResult("handed_off", "folder")
+
+    asyncio.run(sweep_once(queue, deps, job=selective_job))
+
+    assert queue.load("1") is None
+    bad_item = queue.load("2")
+    assert bad_item is not None
+    assert bad_item["attempts"] == 1
+
+
+def test_run_worker_survives_sweep_once_raising(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(sweep_seconds=0.01)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    deps = _deps(storage, settings)
+    calls = {"n": 0}
+
+    async def flaky_sweep_once(q: PendingQueue, d: Deps) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(queue_module, "sweep_once", flaky_sweep_once)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(run_worker(queue, deps, stop))
+        await asyncio.sleep(0.2)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+
+    assert calls["n"] >= 2
+
+
+def test_caplog_shows_job_failure_and_quarantine(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="aw_exporter")
+    settings = _settings(max_attempts=1)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+    deps = _deps(storage, settings)
+
+    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+        raise RuntimeError("boom")
+
+    asyncio.run(sweep_once(queue, deps, job=failing_job))
+
+    messages = " | ".join(record.getMessage() for record in caplog.records)
+    assert "export job failed" in messages
+    assert "meeting_id=11367" in messages
+    assert "quarantine" in messages
 
 
 def test_import_main_module_is_safe() -> None:

@@ -6,11 +6,16 @@ as `{"envelope": {...}, "attempts": int, "next_attempt_at": epoch seconds
 float, "last_error": str | None}`; a restart re-lists that prefix, so an
 in-flight job always resumes. Failed ones (>= max_attempts) move to
 `aw-exporter/failed/<id>.json`.
+
+The worker must never die: a bad envelope, a broken S3 call for one id, or
+an unexpected exception anywhere in a single sweep is logged and contained
+to that id/sweep so every other pending meeting keeps draining.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from typing import Any
@@ -18,6 +23,8 @@ from typing import Any
 from aw_exporter.job import Deps, ExportResult, export_meeting
 from aw_exporter.naming import folder_name
 from aw_exporter.storage import Storage
+
+logger = logging.getLogger("aw_exporter")
 
 _PENDING_PREFIX = "aw-exporter/pending/"
 _FAILED_PREFIX = "aw-exporter/failed/"
@@ -27,7 +34,6 @@ class PendingQueue:
     def __init__(self, storage: Storage, bucket: str) -> None:
         self._storage = storage
         self._bucket = bucket
-        self._in_flight: set[str] = set()
 
     def _pending_key(self, meeting_id: str) -> str:
         return f"{_PENDING_PREFIX}{meeting_id}.json"
@@ -36,7 +42,23 @@ class PendingQueue:
         return f"{_FAILED_PREFIX}{meeting_id}.json"
 
     def enqueue(self, envelope: dict[str, Any]) -> None:
+        """Durably enqueue `envelope`. A redelivery of an id already pending
+        refreshes the stored envelope only — attempts/next_attempt_at/
+        last_error are left alone, so a redelivered webhook never resets an
+        in-progress backoff."""
         meeting_id = str(envelope["data"]["meeting"]["id"])
+        existing = self.load(meeting_id)
+        if existing is not None:
+            existing["envelope"] = envelope
+            self._storage.put_json(
+                self._bucket, self._pending_key(meeting_id), existing
+            )
+            logger.info(
+                "enqueue: refreshed pending envelope meeting_id=%s attempts=%s",
+                meeting_id,
+                existing["attempts"],
+            )
+            return
         self._storage.put_json(
             self._bucket,
             self._pending_key(meeting_id),
@@ -47,6 +69,7 @@ class PendingQueue:
                 "last_error": None,
             },
         )
+        logger.info("enqueue: new pending meeting_id=%s", meeting_id)
 
     def pending_ids(self) -> list[str]:
         keys = self._storage.list_keys(self._bucket, _PENDING_PREFIX)
@@ -89,6 +112,27 @@ class PendingQueue:
         self._storage.delete(self._bucket, self._pending_key(meeting_id))
 
 
+def _quarantine_marker(
+    envelope: dict[str, Any], attempts: int, error: str
+) -> tuple[str, dict[str, Any]] | None:
+    """The export-bucket `_export.json` failure marker's (folder, body) for a
+    meeting that has exhausted its attempts; `None` if the envelope is too
+    malformed to derive a folder name (spec §4.1 quarantine) — the caller
+    must still quarantine the pending item even when this returns `None`."""
+    try:
+        m = envelope["data"]["meeting"]
+        folder = folder_name(m["platform"], m["native_meeting_id"], m["start_time"])
+        vexa_meeting_id = m["id"]
+    except (KeyError, ValueError, TypeError):
+        return None
+    return folder, {
+        "state": "failed",
+        "error": error,
+        "attempts": attempts,
+        "vexa_meeting_id": vexa_meeting_id,
+    }
+
+
 async def sweep_once(
     queue: PendingQueue,
     deps: Deps,
@@ -99,47 +143,65 @@ async def sweep_once(
     semaphore = asyncio.Semaphore(settings.concurrency)
 
     async def process_one(meeting_id: str) -> None:
-        if meeting_id in queue._in_flight:
-            return
-        item = queue.load(meeting_id)
-        if item is None:
-            return
-        if float(item.get("next_attempt_at") or 0.0) > now():
-            return
-        envelope: dict[str, Any] = item["envelope"]
-        queue._in_flight.add(meeting_id)
         try:
-            async with semaphore:
-                await asyncio.to_thread(job, envelope, deps)
-        except Exception as exc:  # noqa: BLE001 - retried/backed off, never swallowed
-            attempts = queue.record_failure(meeting_id, str(exc), now=now)
-            if attempts >= settings.max_attempts:
-                m = envelope["data"]["meeting"]
-                folder = folder_name(
-                    m["platform"], m["native_meeting_id"], m["start_time"]
+            item = queue.load(meeting_id)
+            if item is None:
+                return
+            if float(item.get("next_attempt_at") or 0.0) > now():
+                return
+            envelope: dict[str, Any] = item["envelope"]
+            try:
+                async with semaphore:
+                    await asyncio.to_thread(job, envelope, deps)
+            except Exception as exc:  # noqa: BLE001 - contained per id, logged
+                attempts = queue.record_failure(meeting_id, str(exc), now=now)
+                logger.warning(
+                    "export job failed meeting_id=%s attempts=%s error_class=%s",
+                    meeting_id,
+                    attempts,
+                    type(exc).__name__,
                 )
-                deps.storage.put_json(
-                    settings.export_bucket,
-                    settings.export_prefix + folder + "/_export.json",
-                    {
-                        "state": "failed",
-                        "error": str(exc),
-                        "attempts": attempts,
-                        "vexa_meeting_id": m["id"],
-                    },
-                )
-                queue.fail(meeting_id)
-        else:
-            queue.done(meeting_id)
-        finally:
-            queue._in_flight.discard(meeting_id)
+                if attempts >= settings.max_attempts:
+                    marker = _quarantine_marker(envelope, attempts, str(exc))
+                    if marker is None:
+                        logger.error(
+                            "quarantine: meeting_id=%s attempts=%s - envelope too "
+                            "malformed to derive an export folder, skipping marker",
+                            meeting_id,
+                            attempts,
+                        )
+                    else:
+                        folder, body = marker
+                        deps.storage.put_json(
+                            settings.export_bucket,
+                            settings.export_prefix + folder + "/_export.json",
+                            body,
+                        )
+                        logger.error(
+                            "quarantine: meeting_id=%s attempts=%s moved to failed/",
+                            meeting_id,
+                            attempts,
+                        )
+                    queue.fail(meeting_id)
+            else:
+                queue.done(meeting_id)
+        except Exception:  # noqa: BLE001 - one id's bug must not sink the sweep
+            logger.exception(
+                "sweep_once: unhandled error processing meeting_id=%s", meeting_id
+            )
 
-    await asyncio.gather(*(process_one(mid) for mid in queue.pending_ids()))
+    await asyncio.gather(
+        *(process_one(meeting_id) for meeting_id in queue.pending_ids()),
+        return_exceptions=True,
+    )
 
 
 async def run_worker(queue: PendingQueue, deps: Deps, stop: asyncio.Event) -> None:
     while not stop.is_set():
-        await sweep_once(queue, deps)
+        try:
+            await sweep_once(queue, deps)
+        except Exception:  # noqa: BLE001 - the worker loop must never die
+            logger.exception("run_worker: sweep_once raised; continuing")
         try:
             await asyncio.wait_for(stop.wait(), timeout=deps.settings.sweep_seconds)
         except asyncio.TimeoutError:
