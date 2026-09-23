@@ -120,9 +120,29 @@ the `captured-signal.v1` tape:
   with `source="audio"` (the trusted, pairable provenance).
 - **mixed lane** (Zoom/Teams — `{type:"hint", t, name, isEnd}`): each hint → a point event
   (`SPEAKER_START`, or `SPEAKER_END` when `isEnd`), `source="hint"` (point-only; not paired).
-- **Clock origin:** events are relative to the audio master's t=0. Step S1 of the plan measures
-  which epoch that is (first chunk time / tape header `started_at` / recording `created_at`) on the
-  2026-09-22 Meet recording by cross-correlating tape energy against `audio.wav`, and pins it.
+- **Clock origin (measured 2026-09-22 — findings, STOP condition hit, no constant pinned):**
+  Step S1 cross-correlated a 50 ms tape-energy envelope (Σ`rms` per bin) against `master.wav`'s
+  50 ms RMS envelope using a mean-centered (Pearson) NCC over ±120 s — a non-centered cosine
+  similarity is dominated by the shared non-zero baseline of two non-negative energy signals
+  and must not be used. Whole-recording pass: weak peak (NCC 0.059, z≈2.3, several near-tied
+  local maxima 40–106 s away) → measured origin 2026-09-22T17:03:06.937Z, residual **−17.1 s to
+  −67.3 s** against every candidate (tape header `started_at`, `meeting.start_time`,
+  `service_provenance.bot_admitted_at`, `recording.created_at` raw and −15,000 ms). A
+  first-180s-only variant (sharper onset, less averaging) gave a materially different peak
+  (NCC 0.062, z≈3.8) at 2026-09-22T17:02:35.087Z, residual −475 ms to −681 ms against the
+  `meeting.start_time`/`bot_admitted_at`/MediaRecorder-start cluster (which agree with each
+  other within ~480 ms) — closer, but still over the 250 ms bar, and the two variants disagree
+  with each other by ~32 s. **No candidate is within 250 ms; `"meeting.start_time` + measured
+  constant" is explicitly not adopted** — no structurally-justified constant emerged, and a
+  constant derived from one recording risks being an artifact of the correlation window used.
+  **The exporter must compute this lag live, per meeting**, via the Step-2 method, using a
+  mean-centered NCC restricted to an onset-focused window (e.g. first 2–3 min) rather than the
+  whole recording or a hard-coded `origin` rule — this changes Task 5. `RMS_SPEECH_THRESHOLD`
+  default: **0.026** (valley between a silence mode ≈0.005 and a speech mode ≈0.108 in the
+  observed rms histogram). Meet frames confirmed to carry `speakerName` (6 distinct named
+  speakers observed; notably including a speaker missing from the transcript-derived
+  `participants.json` due to that meeting's STT degradation — confirms the audio-lane
+  `speakerName` is the correct, transcript-independent dependency for attribution).
 
 ### 4.4 Config (names only)
 `MEETING_API_URL`, `VEXA_WEBHOOK_SECRET`, `VEXA_BUCKET` (aw-bots), `EXPORT_BUCKET`
