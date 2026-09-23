@@ -32,8 +32,8 @@ Failures back off and retry. After 5 attempts the meeting moves to `failed/`. Th
 | 2 Timing spike | Measured how tape timestamps map onto the audio's t=0, on the 2026-09-22 Meet recording (throwaway scripts, not committed) | Energy cross-correlation over two windows that agree exactly (lag +35 250 ms, z 10.4 / 17.9) | `683c89ce` `1069394b` `e04a3836` | **Yes, big one** — §3 D1 |
 | 3 Config / naming / signature | `Settings.from_env`, `folder_name`, `verify` (HMAC, 300 s window, fails closed) | 16 tests, written test-first | `f65e0537` | Speech threshold default 0.026 (measured, not 0.01); added `RECORD_CHUNK_TIMESLICE_MS` |
 | 4 Output schemas | Pydantic mirror of the `notetaker_common` file formats | Field-order test + round-trip test, checked field by field against `notetaker_common/schemas.py` | `552de54a` | Tests in `test_schemas.py`, not `test_attribution.py` |
-| 5 Tape → events | `parse_tape`, `speech_events` (Meet: loudness + 700 ms hangover; Zoom/Teams: hints) | 12 tests + a local replay of the real tape (235 events, 5 speakers; the early speaker's speech is found) | `e2436104` `44d1e0ad` | Bad lines are skipped instead of crashing; events chosen by lane, not by "has hints" (both bugs were in the plan's own code) |
-| 6 Attribution port | The tuned rules from the old `aw-integration` adapter, now fed by tape events | 50 reference tests ported with unchanged expected values, 8 new; reviewed line by line against the reference | `bfdbe243` | 20 reference tests not ported (platform remapping, segment fallback, DOM/caption preference — none apply to 0.12 tapes); results clipped to the recording |
+| 5 Tape → events | `parse_tape` (**renamed `parse_activity` 2026-09-23, §7**), `speech_events` (Meet: loudness + 700 ms hangover; Zoom/Teams: hints) | 12 tests + a local replay of the real tape (235 events, 5 speakers; the early speaker's speech is found) | `e2436104` `44d1e0ad` | Bad lines are skipped instead of crashing; events chosen by lane, not by "has hints" (both bugs were in the plan's own code) |
+| 6 Attribution port | The tuned rules from the old `aw-integration` adapter, now fed by tape events (**renamed to speaker-activity events 2026-09-23, §7**) | 50 reference tests ported with unchanged expected values, 8 new; reviewed line by line against the reference | `bfdbe243` | 20 reference tests not ported (platform remapping, segment fallback, DOM/caption preference — none apply to 0.12 tapes); results clipped to the recording |
 | 7 I/O adapters | S3 `Storage`, `MeetingApi` (`X-User-Id`), `Notetaker` (retries), `webm_to_wav` | moto S3, `httpx.MockTransport`, real-ffmpeg test | `71a3a67e` `23158fe1` | Transcript read by meeting id; retry on every transport error (timeouts too); ffmpeg gap-filling flag |
 | 8 Export job | `export_meeting` (idempotent), `recording_origin_ms` | 9 job tests on moto buckets | `d087527a` | Participants deduped by slug; `meeting_id` = `vexa-<id>` in the JSON files |
 | 9 Queue + intake | S3-backed `PendingQueue`, `sweep_once` / `run_worker`, FastAPI app, `__main__` | 23 tests, including the worker surviving bad meetings and redelivery | `5a24828b` `79a47266` | Envelope validation at intake, logging, a repeat delivery doesn't reset the retry count, dead in-flight guard removed |
@@ -54,10 +54,11 @@ Failures back off and retry. After 5 attempts the meeting moves to `failed/`. Th
 **D2 — Wait for the capture tape (final review, Critical).**
 - The Vexa bot uploads the capture tape during teardown, after it emits `meeting.completed`.
 - Fix: the job now waits for the tape, up to `TAPE_WAIT_SECONDS` (120) after `end_time`, and only then records `tape: "missing"`. This wasn't in the plan.
+- **Superseded 2026-09-23 (§7):** naming no longer waits on or depends on the tape at all — renamed to `ACTIVITY_WAIT_SECONDS`, waiting on `speaker-activity.jsonl` instead.
 
 **D3 — Tape problems now reduce attribution instead of failing the export (final review).**
-- The tape is recorded in `_export.json` as `ok`, `missing`, `invalid` or `capped`.
-- `capped` means the tape reached Vexa's 250 MB per-meeting limit: at the measured density that's about 50 minutes of meeting.
+- The tape is recorded in `_export.json` as `ok`, `missing`, `invalid` or `capped`. **Superseded 2026-09-23 (§7):** the field is now `_export.json.speaker_activity`, reading `speaker-activity.jsonl` — the debug tape no longer carries naming at all.
+- `capped` meant the tape reached Vexa's 250 MB per-meeting limit: at the measured density that's about 50 minutes of meeting. **Superseded 2026-09-23 (§7):** `capped` now comes from `speaker-activity.jsonl`'s own `{"type":"capped"}` marker line — a marker the bot writes once, not a size measurement the exporter makes.
 - `master.webm` and `audio.wav` are streamed through disk rather than held in memory.
 
 **D4 — Spec additions (§7, §9) not foreseen by the plan.** Deployment:
@@ -67,7 +68,7 @@ Failures back off and retry. After 5 attempts the meeting moves to `failed/`. Th
 - keep a backfill path.
 
 Risks recorded:
-- the signal janitor can delete a tape before export;
+- the signal janitor can delete a tape before export (**superseded 2026-09-23, §7:** this risk now applies to `speaker-activity.jsonl`, alerted as `speaker_activity_missing`, not the debug tape);
 - a meeting with several sessions exports only the newest (counted in `_export.json`);
 - reading a meeting's recordings gets slower as the single account's total meeting count grows;
 - the measurements Task 11 still owes.
@@ -125,7 +126,7 @@ Each line: what I decided — why — what it costs if wrong.
   - intervals are clipped to the WAV's real length;
   - `room_name` comes from `data.constructed_meeting_url`;
   - JSON bodies that aren't objects get 400;
-  - the marker gains `exported_at`, `elapsed_s`, `tape` and `audio_recordings`;
+  - the marker gains `exported_at`, `elapsed_s`, `tape` (**renamed `speaker_activity` 2026-09-23, §7**) and `audio_recordings`;
   - the README lists every env var.
 
   — Cost: one more fix wave.
@@ -150,6 +151,7 @@ Each line: what I decided — why — what it costs if wrong.
    - Before any push, rewrite this unpushed branch (for example, squash the 21 commits into a few), or squash-merge the PR so the message never reaches `development`.
    - A rewrite also fixes the Haiku attribution line on `f65e0537`. I won't rewrite history without your approval.
 2. **Task 11: live validation (plan Task 11).**
+   - **New as of the speaker-activity work (§7 addendum):** the bot and `meeting-api` images must be rebuilt and redeployed from this branch before this test. The currently running images predate the speaker-activity writer/uploader and the accepted `speaker-activity` signal part, so a live meeting today would still exercise the old tape path, not what §7 describes. Run the plan's "Final" live leg (one long Meet call, debug tape OFF) only after that rebuild.
    - It needs the full Vexa compose stack. Its `.env` holds real credentials I'm not allowed to read, so you'd set it up or approve the approach. Settings: `TRANSCRIBE_ENABLED=false`, the system webhook pointing at the exporter, and the stub or real notetaker.
    - Then two people in a Meet meeting, one of them speaking in the first minute, plus one Zoom and one Teams meeting.
    - It measures: the timing residual on more recordings and on Zoom/Teams, how long after `completed` the tape upload lands, tape MB per minute, and bot memory/CPU for the NodePool sizing.
@@ -166,3 +168,68 @@ pytest -m integration -q tests/integration                          # needs Dock
 docker build -t aw-exporter:dev .
 ```
 Env var names are listed in `README.md` and spec §4.4 (names only; no values in the repo).
+
+## 7. Speaker activity (addendum, 2026-09-23)
+
+Read this next to: [`2026-09-23-speaker-activity-design.md`](2026-09-23-speaker-activity-design.md)
+(the spec for this work) and the parent spec's §4.2 step 5 / §4.3 / §4.4 / §7 / §9, updated
+alongside this addendum.
+
+**Why.** The debug capture tape (`captured-signal.jsonl`) is how aw-bots originally told the
+exporter who was speaking when — but it also carries a full copy of everyone's audio, so it runs
+about 5 MB per minute, and aw-bots caps it at 250 MB. On a meeting past about 50 minutes the tape
+stops writing, and everyone who spoke after that loses their name on the transcript.
+
+**What.** aw-bots now writes a second, always-on file with no audio in it —
+`speaker-activity.jsonl` — independent of the debug tape, sized for a 3-hour meeting at roughly
+1–40 MB. The exporter reads only this file for names; the debug tape goes back to being a pure
+debugging tool, off by default (admin-api platform diagnostics `capture_signal=false`), switched
+on only to investigate a specific meeting. There is **no fallback** to the tape: a missing
+`speaker-activity.jsonl` is an alertable incident (the ERROR log `speaker_activity_missing`), but
+the export still completes — the transcript just carries no attribution for that meeting.
+
+**How verified.** Each of the five tasks below was implementer-built, then reviewed independently
+(sonnet/opus/haiku reviewers per task, matched to the risk of the file touched); every "Needs
+fixes" review was answered by a fix round and, where the fix was comment/README-only with no
+behaviour change possible, verified by the controller reading the diff rather than a second full
+review pass (Ruling S5). No live meeting yet — see "Pending" below.
+
+**Commits** (`f6d061a0..HEAD`):
+
+| Commit | Subject |
+|---|---|
+| `dd597f92` | feat(bot): speaker-activity writer — who-spoke-when without audio |
+| `c2ed1db3` | feat(bot): always capture + upload speaker activity, independent of the debug tape |
+| `42586f08` | fix(bot): capped speaker activity still uploads; bound its upload by wall clock |
+| `c035c96d` | feat(meeting-api): accept the speaker-activity signal part |
+| `08328d6e` | docs(meeting-api): describe the speaker-activity part beside the others |
+| `e8bf1c15` | feat(exporter): names come from speaker-activity.jsonl only |
+| `0cf98fbe` | docs(exporter): describe speaker-activity inputs, not tapes |
+
+**Rulings** (from the plan's ledger, `.superpowers/sdd/2026-09-23-speaker-activity-plan/progress.md`):
+
+- **Ruling S1** — the part/file name uses the repo's hyphen convention (`speaker-activity`, like
+  `captured-signal`) rather than the `speaker_activity` spelling used in chat. — Cost if wrong: a
+  rename.
+- **Ruling S2** — a 1 GiB safety ceiling (not "no cap"), so a runaway bug can't fill the pod disk
+  and kill the recording; about 25× a 3-hour meeting. — Cost if wrong: an env change.
+- **Ruling S3** — the "frame/hint written after `close()`" gap is closed by only calling `close()`
+  after capture has stopped, plus a closed guard making post-close calls no-ops (tested). — Cost
+  if wrong: trivial.
+- **Ruling S4** — three fixes from the Task 2 review: (1) the size guard is the ceiling plus 65536
+  bytes of slack, with a test that a capped writer still uploads; (2) the upload gets an explicit
+  8000 ms wall-clock bound (a new optional `wallClockMs`, unset for the debug tape so it's
+  unchanged), with a test that a stalled upload resolves `failed` within the bound; (3) the
+  exporter treats a header-only activity file as a valid empty session (`ok`, zero events), not
+  `invalid`. Two minor items were deferred. — Cost if wrong: small rework.
+- **Ruling S5** — a comment/README-only fix round (no behaviour change possible) is verified by
+  the controller reading the diff, instead of a separate re-review seat; used for both the Task 3
+  and Task 4 fix rounds. — Cost if wrong: a wording nit.
+
+**Pending:**
+- **Live validation** on one long Meet call with the debug tape OFF (the plan's "Final" section):
+  confirm `speaker-activity.jsonl` lands in S3, its size per hour, names holding for the whole
+  call, and the upload landing inside the grace window.
+- **Images must be rebuilt** — the bot image and the `meeting-api` image both predate this work;
+  neither the writer/uploader nor the accepted `speaker-activity` signal part exist in what's
+  currently deployed. See §5 item 2.

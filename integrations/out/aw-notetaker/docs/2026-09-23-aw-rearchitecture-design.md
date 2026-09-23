@@ -101,22 +101,29 @@ replica; per-meeting jobs are independent.
    gap-filled decode reproduces 1935.62 s, matching the PTS span; ~34 s dropped across ~220
    inter-packet gaps) — which silently shifts every downstream speaker-interval timestamp
    computed relative to this wav's t=0. See §4.3 clock origin.
-5. Tape `aw-bots/signal/<user_id>/<meeting_id>/<session_uid>/captured-signal.jsonl` (session uid
-   from `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`, `participants.json`.
-   **Tape wait:** the bot uploads the tape in its teardown, *after* it emits `meeting.completed`,
-   so an absent tape is not yet "missing". While `now < meeting.end_time + TAPE_WAIT_SECONDS`
-   (default 120; naive `end_time` read as UTC) the job raises a retryable `TapeNotReady` before
-   copying anything or calling `/process`, and the queue's backoff re-runs it. Past the deadline
-   (or with no `end_time`, which gives no fixed deadline) it proceeds without a tape. Tape
-   problems degrade attribution, never fail the export — the resulting **tape state** is
-   recorded in `_export.json.tape`:
-   - `ok` — parsed; events used.
-   - `missing` — still absent after the wait → empty timeline/participants.
-   - `invalid` — present but unparseable (no header, bad rows raising in event extraction) →
-     empty timeline/participants, warning logged.
-   - `capped` — parsed and used, but its size is ≥ 98 % of `TAPE_MAX_BYTES` (default
-     262144000, the bot's `DEFAULT_MAX_TAPE_BYTES`), so the bot likely stopped writing before
-     the meeting ended; warning logged.
+5. `speaker-activity.jsonl` (`aw-bots/signal/<user_id>/<meeting_id>/<session_uid>/speaker-activity.jsonl`,
+   session uid from `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`,
+   `participants.json`. This is aw-bots' own always-on who-spoke-when file — no audio in it — and
+   the *only* source of names; there is **no fallback** to the debug capture tape
+   (`captured-signal.jsonl`, off by default, §7). See
+   [speaker-activity design](2026-09-23-speaker-activity-design.md). **Activity wait:** aw-bots
+   uploads it in its teardown, *after* it emits `meeting.completed`, so an absent file is not yet
+   "missing". While `now < meeting.end_time + ACTIVITY_WAIT_SECONDS` (default 120; naive
+   `end_time` read as UTC) the job raises a retryable `ActivityNotReady` before copying anything
+   or calling `/process`, and the queue's backoff re-runs it. Past the deadline (or with no
+   `end_time`, which gives no fixed deadline) it proceeds without it. Problems degrade
+   attribution, never fail the export — the resulting state is recorded in
+   `_export.json.speaker_activity`:
+   - `ok` — parsed; events used. A header-only file (nobody spoke before the bot left, or the
+     meeting ended before anyone did) is also `ok`, with zero events — not an error.
+   - `missing` — still absent after the wait → empty timeline/participants; logged as the ERROR
+     `speaker_activity_missing` (§9).
+   - `invalid` — present but unparseable (no header, or every row fails to parse) → empty
+     timeline/participants, warning logged.
+   - `capped` — parsed and used, but the file itself carries aw-bots' own `{"type":"capped"}`
+     marker line (written once, when `VEXA_SPEAKER_ACTIVITY_MAX_BYTES` is reached; nothing after
+     it was written), so attribution may stop before the meeting ended; warning logged. This is
+     read from the marker, not computed from the file's byte size.
    The timeline's `recording_ended_at` / clip bound is `recording_started_at` + the transcoded
    `audio.wav`'s own duration (not `meeting.end_time`), so intervals never outrun the audio.
    `room_name` = `data.constructed_meeting_url`, else top-level `constructed_meeting_url`, else
@@ -140,13 +147,15 @@ tuned on live meetings and are **ported, not re-invented**: dominant-speaker col
 `MIN_DOMINANT_UTTERANCE_MS` (default 1500), raw paired intervals emitted as `speaker_intervals`,
 the Zoom/Teams t=0 anchor gated on ≥2 named speakers, Teams intervals-from-points, and the file
 shapes of `notetaker_common.schemas` (`SpeakerTimelineFile`, `ParticipantsFile`). Only the INPUT
-changes: v0.10.4's Redis `speaker_events_relative` stream has no writer in 0.12, so events come from
-the `captured-signal.v1` tape:
+changes: v0.10.4's Redis `speaker_events_relative` stream has no writer in 0.12, and the debug
+capture tape (`captured-signal.jsonl`) caps at `VEXA_CAPTURE_SIGNAL_MAX_BYTES` and stops carrying
+names once it does, so events come from aw-bots' own always-on `speaker-activity.jsonl` — no
+fallback to the tape (§4.2 step 5, [speaker-activity design](2026-09-23-speaker-activity-design.md)):
 
-- **gmeet lane** (Meet — per-channel frames `{ts, speakerIndex, speakerName, rms}`): per speaker,
-  a frame with `rms ≥ RMS_SPEECH_THRESHOLD` opens/extends speech; `SPEECH_HANGOVER_MS` (default 700,
-  the bot's silence hangover) of sub-threshold frames closes it → `SPEAKER_START`/`SPEAKER_END`
-  with `source="audio"` (the trusted, pairable provenance).
+- **gmeet lane** (Meet — per-frame `{t, ch, name?, rms, dur_ms}`): per speaker, a frame with
+  `rms ≥ RMS_SPEECH_THRESHOLD` opens/extends speech; `SPEECH_HANGOVER_MS` (default 700, the bot's
+  silence hangover) of sub-threshold frames closes it → `SPEAKER_START`/`SPEAKER_END` with
+  `source="audio"` (the trusted, pairable provenance).
 - **mixed lane** (Zoom/Teams — `{type:"hint", t, name, isEnd}`): each hint → a point event
   (`SPEAKER_START`, or `SPEAKER_END` when `isEnd`), `source="hint"` (point-only; not paired).
 - **Clock origin (re-measured 2026-09-22, fix round 1 — PINNED, N=1, see caveat):** the round-1
@@ -196,9 +205,10 @@ the `captured-signal.v1` tape:
 (aw-chatworks-transcribe), `EXPORT_PREFIX` (recordings/), `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS` (default 15000),
-`TAPE_WAIT_SECONDS` (default 120), `TAPE_MAX_BYTES` (default 262144000 — must match the bot's
-tape budget, i.e. `VEXA_CAPTURE_SIGNAL_MAX_BYTES` if raised per §7), `AWS_REGION`. S3 via IRSA
-(no static keys).
+`ACTIVITY_WAIT_SECONDS` (default 120, replaces `TAPE_WAIT_SECONDS`), `AWS_REGION`. S3 via IRSA
+(no static keys). aw-bots' own safety ceiling for `speaker-activity.jsonl`,
+`VEXA_SPEAKER_ACTIVITY_MAX_BYTES` (default 1 GiB), is a bot-pod env var, not an exporter one —
+see §7 and the [speaker-activity design](2026-09-23-speaker-activity-design.md).
 
 ## 5. Portal → Vexa (aw-notetaker repo; own plan)
 - One Vexa service account (created once by an operator via admin-api); its API key lives in a K8s
@@ -228,6 +238,10 @@ tape budget, i.e. `VEXA_CAPTURE_SIGNAL_MAX_BYTES` if raised per §7), `AWS_REGIO
   `VEXA_SYSTEM_WEBHOOK_URL=http://aw-exporter.<ns>.svc.cluster.local:8080/hooks/vexa`,
   `VEXA_SYSTEM_WEBHOOK_SECRET` (Secret), `VEXA_SYSTEM_WEBHOOK_ALLOW_PRIVATE_HTTP=true`,
   `AUTO_JOIN_LEAD_S` sized to cover node provisioning + bot image pull + browser boot (see risks).
+- admin-api: platform diagnostics `capture_signal=false` — the debug capture tape
+  (`captured-signal.jsonl`) is off by default for every meeting, since naming no longer depends on
+  it (§4.2 step 5, §4.3). Switch it on per platform or per user only to investigate a specific
+  meeting (`_resolve_capture_signal`, `core/identity/services/admin-api`).
 - runtime: `nodeSelector`/`tolerations` → the bots Karpenter NodePool (`ng-bots-133`);
   `workloadResources.meetingBot` per §7.1.
 
@@ -260,9 +274,6 @@ Measured on the OLD bot (v0.10.4, 85 meetings): memory 0.48 GiB (bot alone) → 
 - IAM: meeting-api rw `aw-bots/{recordings,signal}/*`; exporter r `aw-bots/*`, rw
   `aw-bots/aw-exporter/*`, rw `aw-chatworks-transcribe/recordings/*`. Lifecycle per D5.
 - Network: exporter → meeting-api (internal), → `notetaker-api.notetaker:8080`; NetworkPolicy per D12.
-- Bot tape budget: raise `VEXA_CAPTURE_SIGNAL_MAX_BYTES` on bot pods so a full-length meeting's
-  tape fits, size the bot pods' ephemeral disk to it (on top of the browser profile), and set the
-  exporter's `TAPE_MAX_BYTES` to the same value (a tape at ≥ 98 % of it is exported as `capped`).
 - Exporter Deployment: single replica with `strategy: Recreate` — a rolling update would briefly
   run two pods, i.e. two overlapping pending-queue sweepers.
 - Alerting + recovery: alert on intake 401/400 responses — Vexa's webhook delivery drops non-429
@@ -287,8 +298,10 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
 - Mixed-lane hint density for Zoom/Teams untested here — validated live.
 - One service account serialises spawns through Vexa's per-user advisory lock (held for the
   create transaction only) — measured at a top-of-hour burst during live validation.
-- The bot's signal janitor evicts by byte budget and can delete a tape before the exporter reads
-  it; the export then carries `tape: "missing"` (no attribution).
+- `speaker-activity.jsonl` must be present for names to survive — alert on the ERROR log
+  `speaker_activity_missing` (§4.2 step 5). The export still succeeds either way:
+  `_export.json.speaker_activity` records `"missing"`, and the timeline/participants come back
+  empty rather than failing the job.
 - Multi-session meetings (the bot rejoined → several audio recordings) export only one session;
   the count is recorded in `_export.json.audio_recordings` and logged, the other sessions' audio
   is not exported.
