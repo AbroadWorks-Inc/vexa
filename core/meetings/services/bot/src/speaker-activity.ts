@@ -51,9 +51,10 @@ export interface SpeakerActivityOptions {
   now?: () => number;
 }
 
-/** 1 GiB — about 25x a 3-hour meeting's expected size. Exists only so a runaway bug
- *  cannot fill the pod's disk; it is never expected to be reached. */
-export const DEFAULT_MAX_ACTIVITY_BYTES = 1024 * 1024 * 1024;
+/** 128 MiB — about 3x the upper estimate for a 3-hour meeting (~40 MB), and small enough to
+ *  upload inside the 8 s teardown bound in-cluster. Exists only so a runaway bug cannot fill the
+ *  pod's disk; it is never expected to be reached. */
+export const DEFAULT_MAX_ACTIVITY_BYTES = 128 * 1024 * 1024;
 const DEFAULT_DIR = process.env.VEXA_CAPTURE_SIGNAL_DIR ?? '/tmp/captured-signal';
 const DEFAULT_FLUSH_MS = 2000;
 const DEFAULT_MAX_BUFFER = 256 * 1024;
@@ -104,29 +105,33 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
     log(`disabled (header write failed): ${String(e)}`);
   }
 
-  let written = disabled ? 0 : headerLine.length;
+  /** On-disk size of one line: the ceiling is a byte count, and display names are not ASCII. */
+  const bytesOf = (line: string): number => Buffer.byteLength(line, 'utf8');
+
+  let written = disabled ? 0 : bytesOf(headerLine);
   let capped = false;
   let faults = 0;
   let buf: string[] = [];
   let bufBytes = 0;
   let flushing: Promise<void> = Promise.resolve();
 
-  /** Gate one JSONL line against the ceiling. The header already counts toward `written`.
-   *  The first line that would exceed `maxBytes` is replaced by the capped line (written
+  /** Gate one JSONL line against the ceiling, in UTF-8 bytes. The header already counts toward
+   *  `written`. The first line that would exceed `maxBytes` is replaced by the capped line (written
    *  even if it slightly exceeds the ceiling); nothing is buffered after it. */
   const admit = (line: string): boolean => {
     if (capped) return false;
-    if (written + line.length > maxBytes) {
+    const lineBytes = bytesOf(line);
+    if (written + lineBytes > maxBytes) {
       capped = true;
       const bytes = written;
       const cappedLine = JSON.stringify({ type: 'capped', t: now(), bytes }) + '\n';
-      written += cappedLine.length;
+      written += bytesOf(cappedLine);
       buf.push(cappedLine);
-      bufBytes += cappedLine.length;
+      bufBytes += bytesOf(cappedLine);
       signalEvent('speaker-activity-capped', { path, max_bytes: maxBytes, bytes });
       return false;
     }
-    written += line.length;
+    written += lineBytes;
     return true;
   };
 
@@ -149,7 +154,7 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
 
   const push = (line: string): void => {
     buf.push(line);
-    bufBytes += line.length;
+    bufBytes += bytesOf(line);
     if (bufBytes >= maxBuffer) void flush();
   };
 

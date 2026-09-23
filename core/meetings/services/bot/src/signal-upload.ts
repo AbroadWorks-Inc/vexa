@@ -52,7 +52,7 @@ export interface SignalUploadOptions {
   /** A wall-clock deadline on top of `timeoutMs`. req.setTimeout is an IDLE timeout — a receiver
    *  that keeps the socket busy without ever finishing never trips it — so this is the backstop
    *  that bounds the upload's real elapsed time regardless. Only uploadSpeakerActivity sets a
-   *  default; the debug tape path passes nothing and its behaviour is unchanged. */
+   *  default; the debug tape path passes none, so only the idle timeout bounds it. */
   wallClockMs?: number;
 }
 
@@ -67,10 +67,10 @@ export const DEFAULT_UPLOAD_TIMEOUT_MS = 60_000;
 
 /** 64 KiB of slack on top of the writer's own ceiling. The writer's `admit` gate deliberately
  *  writes the capped line even when it slightly exceeds `maxBytes` (speaker-activity.ts), so a
- *  capped file's on-disk size is ALWAYS a little over the ceiling it was capped at — comparing
- *  the upload guard directly against `maxBytes` misreads that designed overshoot as "too large to
- *  ship" and skips the exact file the exporter most needs (a reviewer's probe found this on ~76%
- *  of capped files). One capped line is at most a few hundred bytes; this is generous margin. */
+ *  capped file's on-disk size can sit a little over the ceiling it was capped at — comparing the
+ *  upload guard directly against `maxBytes` would misread that designed overshoot as "too large to
+ *  ship" and skip the exact file the exporter most needs. One capped line is at most a few hundred
+ *  bytes; this is generous margin. */
 export const ACTIVITY_UPLOAD_SLACK_BYTES = 64 * 1024;
 
 /** 8s default wall-clock bound for the speaker-activity upload — see SignalUploadOptions.wallClockMs. */
@@ -180,7 +180,7 @@ export async function uploadSpeakerActivity(
   const url = inv.recordingUploadUrl;
   if (!url) {
     // Same quiet skip as the tape's own: the local hot-loop path lands here every run.
-    signalEvent('tape-upload-skipped', { part: 'speaker-activity', reason: 'no recordingUploadUrl in the invocation' });
+    signalEvent('speaker-activity-upload-skipped', { part: 'speaker-activity', reason: 'no recordingUploadUrl in the invocation' });
     return 'skipped';
   }
   const upload = opts.upload
@@ -193,18 +193,18 @@ export async function uploadSpeakerActivity(
     if (size > maxBytes + ACTIVITY_UPLOAD_SLACK_BYTES) {
       // SKIP, not truncate — the same rule uploadSignalTapes applies to an oversized tape. The
       // slack (not just `maxBytes`) is the guard: a capped file overshoots `maxBytes` by design.
-      signalEvent('tape-upload-skipped', { part: 'speaker-activity', path: writer.path, bytes: size,
-                                           max_bytes: maxBytes, slack_bytes: ACTIVITY_UPLOAD_SLACK_BYTES,
-                                           reason: 'larger than the upload size guard' });
+      signalEvent('speaker-activity-upload-skipped', { part: 'speaker-activity', path: writer.path, bytes: size,
+                                                       max_bytes: maxBytes, slack_bytes: ACTIVITY_UPLOAD_SLACK_BYTES,
+                                                       reason: 'larger than the upload size guard' });
       return 'skipped';
     }
     await upload('speaker-activity', writer.path, size);
-    signalEvent('tape-uploaded', { part: 'speaker-activity', path: writer.path, bytes: size,
-                                   capped: writer.isCapped() });
+    signalEvent('speaker-activity-uploaded', { part: 'speaker-activity', path: writer.path, bytes: size,
+                                               capped: writer.isCapped() });
     return 'uploaded';
   } catch (e) {
     // Dropped, never retried into the meeting path, never rethrown.
-    signalEvent('tape-upload-failed', { part: 'speaker-activity', path: writer.path, error: String(e) });
+    signalEvent('speaker-activity-upload-failed', { part: 'speaker-activity', path: writer.path, error: String(e) });
     return 'failed';
   }
 }
@@ -229,7 +229,7 @@ async function fileSize(path: string): Promise<number | null> {
  * IDLE timeout — it only fires when the socket goes quiet — so a receiver that accepts the
  * connection and dribbles the response, or an intermediary that keeps resetting the idle clock,
  * would never trip it at all. The wall clock guarantees SOME upper bound on real elapsed time
- * regardless. Unset (the debug tape path) ⇒ behaviour is exactly as before.
+ * regardless. Unset (the debug tape path) ⇒ only the idle timeout applies.
  */
 export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: number, wallClockMs?: number): TapeUploader {
   const sessionUid = inv.connectionId ?? '';

@@ -82,6 +82,19 @@ export function makeTelemetryTap(lane: 'gmeet' | 'mixed', telemetry?: TelemetryS
 }
 
 /**
+ * Build the per-frame speaker-activity tap — the EXACT closure both audio callbacks in
+ * startCaptureBridge feed (`__vexaPerSpeakerAudioData`, `__vexaNamedAudioData`), factored out so
+ * it is offline-provable WITHOUT a Playwright page. On Meet the frame's glow name is the naming
+ * source for the whole meeting. Fire-and-forget and never throws: a writer fault must never reach
+ * the pipeline.
+ */
+export function makeSpeakerActivityFrameTap(writer?: SpeakerActivityWriter) {
+  return (ch: number, pcm: Float32Array, ts: number, name?: string): void => {
+    try { writer?.frame(ch, pcm, ts, name); } catch { /* speaker-activity must not break capture */ }
+  };
+}
+
+/**
  * Build the mixed-lane speaker-hint sink — the EXACT closure the bridge exposes as
  * `__vexaSpeakerHint`, factored out so it is offline-provable WITHOUT a Playwright page.
  *
@@ -719,9 +732,7 @@ export async function startCaptureBridge(
   // WHO WAS TALKING WHEN, with no audio — independent of the debug tape's tap above, and always
   // on. Fire-and-forget, like every other tap here: a fault in the writer must never reach the
   // pipeline.
-  const recordActivity = (ch: number, pcm: Float32Array, ts: number, name?: string): void => {
-    try { speakerActivity?.frame(ch, pcm, ts, name); } catch { /* speaker-activity must not break capture */ }
-  };
+  const recordActivity = makeSpeakerActivityFrameTap(speakerActivity);
 
   // ── Node-side frame sink: one capture.v1 frame crossing the Playwright boundary. ──
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the

@@ -490,7 +490,7 @@ console.log('\n── speaker-activity upload ──');
   await w.close();
   check('the writer capped (precondition)', w.isCapped());
   const fileBytes = readFileSync(w.path, 'utf8').length;
-  check('the capped file overshoots its own ceiling (precondition for the guard fix to matter)',
+  check('the capped file overshoots its own ceiling (precondition: the upload guard must tolerate that overshoot)',
     fileBytes > tinyMax, `${fileBytes} vs ${tinyMax}`);
 
   const seen: Array<[TapePart, string, number]> = [];
@@ -501,6 +501,52 @@ console.log('\n── speaker-activity upload ──');
   });
   check('a capped speaker-activity file still uploads (never misread as missing)',
     out === 'uploaded' && seen.length === 1 && seen[0][0] === 'speaker-activity', JSON.stringify({ out, seen }));
+}
+
+// ── speaker-activity upload events — its own names, so alerting can key on them ─────────────────
+console.log('\n── speaker-activity upload events ──');
+/** Run `fn` with console.log captured; return the `event` field of every JSON line it printed. */
+const eventsDuring = async (fn: () => Promise<unknown>): Promise<string[]> => {
+  const seen: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]): void => {
+    try {
+      const obj = JSON.parse(String(args[0])) as { event?: unknown };
+      if (typeof obj.event === 'string') seen.push(obj.event);
+    } catch { /* not a signal event */ }
+  };
+  try { await fn(); } finally { console.log = original; }
+  return seen;
+};
+{
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  const url = 'http://127.0.0.1:1/x';
+
+  const ok = await eventsDuring(() => uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: url }), upload: async () => { /* delivered */ } }));
+  const bad = await eventsDuring(() => uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: url }), upload: async () => { throw new Error('object store is down'); } }));
+  const noUrl = await eventsDuring(() => uploadSpeakerActivity(w, { inv: inv() }));
+  // The oversize case needs the file to exceed maxBytes + the upload slack; pad it past that.
+  const bigPath = join(dir, 'big.speaker-activity.jsonl');
+  writeFileSync(bigPath, 'x'.repeat(70 * 1024));
+  const oversize = await eventsDuring(() => uploadSpeakerActivity({ ...w, path: bigPath }, {
+    inv: inv({ recordingUploadUrl: url }), maxBytes: 1, upload: async () => { /* never reached */ } }));
+
+  check("a delivered file emits 'speaker_activity_uploaded'",
+    ok.includes('capture_signal.speaker_activity_uploaded'), JSON.stringify(ok));
+  check("a failed upload emits 'speaker_activity_upload_failed'",
+    bad.includes('capture_signal.speaker_activity_upload_failed'), JSON.stringify(bad));
+  check("no upload URL emits 'speaker_activity_upload_skipped'",
+    noUrl.includes('capture_signal.speaker_activity_upload_skipped'), JSON.stringify(noUrl));
+  check("an oversize file emits 'speaker_activity_upload_skipped'",
+    oversize.includes('capture_signal.speaker_activity_upload_skipped'), JSON.stringify(oversize));
+  check('the speaker-activity path never emits a debug-tape (tape_*) event',
+    [...ok, ...bad, ...noUrl, ...oversize].every((e) => !e.startsWith('capture_signal.tape_')),
+    JSON.stringify([...ok, ...bad, ...noUrl, ...oversize]));
 }
 
 // ── the real transport, against a loopback receiver ─────────────────────────────────────────────

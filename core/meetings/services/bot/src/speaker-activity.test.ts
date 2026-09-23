@@ -10,7 +10,7 @@
  *
  * Run: npx tsx src/speaker-activity.test.ts
  */
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -18,7 +18,8 @@ import {
   resolveMaxActivityBytes,
   DEFAULT_MAX_ACTIVITY_BYTES,
 } from './speaker-activity.js';
-import { makeSpeakerHintSink } from './capture-bridge.js';
+import { makeSpeakerHintSink, makeSpeakerActivityFrameTap } from './capture-bridge.js';
+import { ACTIVITY_UPLOAD_SLACK_BYTES } from './signal-upload.js';
 import type { Invocation } from './config.js';
 
 let failed = 0;
@@ -216,6 +217,69 @@ const sameShape = (obj: unknown, expected: Record<string, unknown>): boolean => 
   check('the skew warns loudly', warns.length === 1 && /hint-clock-skew/.test(warns[0] ?? ''), JSON.stringify(warns));
   check('the written hint t is re-stamped to epoch, not the implausible 12345',
     typeof hintLine?.t === 'number' && Math.abs((hintLine.t as number) - Date.now()) < 5000, JSON.stringify(hintLine));
+}
+
+// ── 12) makeSpeakerActivityFrameTap: a named and an unnamed frame both land in the file ─────────
+// This is the tap startCaptureBridge feeds from both audio callbacks — on Meet it is the naming
+// source, so a frame that never reaches the writer is a name the transcript never gets.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('google_meet'), { dir, now: () => 0 });
+  const tap = makeSpeakerActivityFrameTap(w);
+  tap(0, Float32Array.of(0.5, -0.5), 1000, 'Ann');
+  tap(1, Float32Array.of(0.1, -0.1), 1100);
+  await w.close();
+
+  const frames = readLines(w.path).slice(1);
+  check('the tap writes exactly the two frames', frames.length === 2, JSON.stringify(frames));
+  check('the named frame lands with its name, channel and time',
+    sameShape(frames[0], { t: 1000, ch: 0, name: 'Ann', rms: 0.5, dur_ms: 0 }), JSON.stringify(frames[0]));
+  check('the unnamed frame lands with no name key',
+    sameShape(frames[1], { t: 1100, ch: 1, rms: 0.1, dur_ms: 0 }), JSON.stringify(frames[1]));
+}
+
+// ── 13) makeSpeakerActivityFrameTap never throws: no writer, or a writer that throws ─────────────
+{
+  let threw = false;
+  try {
+    makeSpeakerActivityFrameTap(undefined)(0, Float32Array.of(0.1), 1000, 'Ann');
+    const exploding = {
+      path: '/dev/null',
+      frame: (): void => { throw new Error('writer broke'); },
+      hint: (): void => { /* unused */ },
+      isCapped: () => false,
+      close: async (): Promise<void> => { /* unused */ },
+    };
+    makeSpeakerActivityFrameTap(exploding)(0, Float32Array.of(0.1), 1000, 'Ann');
+  } catch { threw = true; }
+  check('the frame tap never throws (no writer, or a writer that throws)', !threw);
+}
+
+// ── 14) The ceiling counts UTF-8 bytes, not string length ────────────────────────────────────────
+{
+  // A synthetic multi-byte display name: each CJK character is 3 bytes on disk but 1 in .length.
+  const name = '試験話者'.repeat(25);
+  const maxBytes = 200_000;
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('google_meet', 'utf8-sess'), { dir, maxBytes, now: () => 0 });
+  for (let i = 0; i < 5000; i++) w.frame(0, Float32Array.of(0.1, -0.1), 1000 + i, name);
+  await w.close();
+
+  const onDisk = statSync(w.path).size;
+  check('the writer capped (precondition)', w.isCapped());
+  check('on-disk bytes stay within ceiling + upload slack for a non-ASCII name',
+    onDisk <= maxBytes + ACTIVITY_UPLOAD_SLACK_BYTES, `${onDisk} > ${maxBytes} + ${ACTIVITY_UPLOAD_SLACK_BYTES}`);
+  const capLine = readLines(w.path).find((l) => l.type === 'capped') as Record<string, unknown> | undefined;
+  check('the capped line reports the bytes actually on disk before it',
+    typeof capLine?.bytes === 'number' && (capLine.bytes as number) <= maxBytes
+      && onDisk - (capLine.bytes as number) === Buffer.byteLength(JSON.stringify(capLine) + '\n', 'utf8'),
+    `${JSON.stringify(capLine)} onDisk=${onDisk}`);
+}
+
+// ── 15) The default ceiling is 128 MiB ───────────────────────────────────────────────────────────
+{
+  check('DEFAULT_MAX_ACTIVITY_BYTES is 128 MiB (134217728)', DEFAULT_MAX_ACTIVITY_BYTES === 134217728,
+    `${DEFAULT_MAX_ACTIVITY_BYTES}`);
 }
 
 if (failed) { console.error(`\n❌ speaker-activity: ${failed} check(s) FAILED.`); process.exit(1); }
