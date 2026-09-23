@@ -8,24 +8,37 @@ always starts from the same inputs.
 
 from __future__ import annotations
 
+import logging
 import tempfile
+import wave
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from aw_exporter import __version__
 from aw_exporter.attribution import build_participants, build_speaker_timeline
 from aw_exporter.config import Settings
-from aw_exporter.naming import folder_name
+from aw_exporter.naming import folder_name, parse_utc
 from aw_exporter.notetaker import Notetaker
 from aw_exporter.storage import Storage
+from aw_exporter.tape import TapeEvent, parse_tape, speech_events
 from aw_exporter.tape import names as tape_names
-from aw_exporter.tape import parse_tape, speech_events
 from aw_exporter.vexa_client import MeetingApi
 
+logger = logging.getLogger("aw_exporter")
+
 State = Literal["handed_off", "no_audio", "already_done"]
+TapeState = Literal["ok", "missing", "invalid", "capped"]
+
+# A tape this close to the bot's byte budget was (almost certainly) cut off.
+_CAPPED_FRACTION = 0.98
+
+
+class TapeNotReady(Exception):
+    """The capture tape is absent but the bot may still be uploading it (it
+    does so in teardown, after `meeting.completed`); retryable (spec §4.2)."""
 
 
 @dataclass
@@ -54,17 +67,23 @@ def recording_origin_ms(recording: Mapping[str, Any], timeslice_ms: int) -> int:
     return int(created.timestamp() * 1000) - timeslice_ms
 
 
-def _first_audio_recording(recordings: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for rec in recordings:
-        media_files = rec.get("media_files", [])
-        if any(media.get("type") == "audio" for media in media_files):
-            return rec
-    return None
+def _audio_recordings(recordings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        rec
+        for rec in recordings
+        if any(media.get("type") == "audio" for media in rec.get("media_files", []))
+    ]
+
+
+def _wav_duration_s(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav:
+        return wav.getnframes() / wav.getframerate()
 
 
 def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     settings = deps.settings
     storage = deps.storage
+    started = deps.now()
     m = envelope["data"]["meeting"]
     folder = folder_name(m["platform"], m["native_meeting_id"], m["start_time"])
     base = settings.export_prefix + folder + "/"
@@ -79,59 +98,101 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     platform = m["platform"]
 
     recs = deps.meeting_api.list_recordings(user_id, vexa_meeting_id)
-    rec = _first_audio_recording(recs)
-    if rec is None:
+    audio_recs = _audio_recordings(recs)
+    if not audio_recs:
         storage.put_json(
-            settings.export_bucket, base + "_export.json", {"state": "no_audio"}
+            settings.export_bucket,
+            base + "_export.json",
+            {"state": "no_audio", "audio_recordings": 0},
         )
         return ExportResult("no_audio", folder)
+    if len(audio_recs) > 1:
+        logger.warning(
+            "multi-session meeting vexa_meeting_id=%s audio_recordings=%d; "
+            "exporting the first only",
+            vexa_meeting_id,
+            len(audio_recs),
+        )
+    rec = audio_recs[0]
 
     master = deps.meeting_api.master(user_id, rec["id"])
     storage_path = str(master["storage_path"])
-    storage.copy(
-        settings.vexa_bucket, storage_path, settings.export_bucket, base + "master.webm"
-    )
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        webm_path = Path(tmp_dir) / "master.webm"
-        wav_path = Path(tmp_dir) / "audio.wav"
-        webm_path.write_bytes(
-            storage.get_bytes(settings.export_bucket, base + "master.webm")
-        )
-        deps.transcode(webm_path, wav_path)
-        storage.put_bytes(
-            settings.export_bucket,
-            base + "audio.wav",
-            wav_path.read_bytes(),
-            "audio/wav",
-        )
-
     session_uid = storage_path.split("/")[3]
     signal_prefix = f"signal/{user_id}/{vexa_meeting_id}/{session_uid}/"
     tape_key = signal_prefix + "captured-signal.jsonl"
 
+    tape_size = storage.size(settings.vexa_bucket, tape_key)
+    if tape_size is None:
+        end_time = m.get("end_time")
+        if end_time:
+            deadline = parse_utc(str(end_time)) + timedelta(
+                seconds=settings.tape_wait_seconds
+            )
+            if deps.now() < deadline:
+                raise TapeNotReady(
+                    f"tape not ready for vexa_meeting_id={vexa_meeting_id}; "
+                    f"waiting until {deadline.isoformat()}"
+                )
+
+    storage.copy(
+        settings.vexa_bucket, storage_path, settings.export_bucket, base + "master.webm"
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        webm_path = Path(tmp_dir) / "master.webm"
+        wav_path = Path(tmp_dir) / "audio.wav"
+        storage.download_file(settings.export_bucket, base + "master.webm", webm_path)
+        deps.transcode(webm_path, wav_path)
+        wav_duration_s = _wav_duration_s(wav_path)
+        storage.upload_file(
+            wav_path, settings.export_bucket, base + "audio.wav", "audio/wav"
+        )
+
     origin_ms = recording_origin_ms(rec, settings.record_chunk_timeslice_ms)
     recording_started_at = datetime.fromtimestamp(origin_ms / 1000, tz=timezone.utc)
-    recording_ended_at = datetime.fromisoformat(
-        str(m["end_time"]).replace("Z", "+00:00")
+    recording_ended_at = recording_started_at + timedelta(seconds=wav_duration_s)
+    meeting_data = m.get("data") or {}
+    room_name = str(
+        meeting_data.get("constructed_meeting_url")
+        or m.get("constructed_meeting_url")
+        or m["native_meeting_id"]
     )
-    room_name = str(m.get("constructed_meeting_url") or m["native_meeting_id"])
-    host_email = (m.get("data") or {}).get("organizer_email")
+    host_email = meeting_data.get("organizer_email")
 
-    if storage.exists(settings.vexa_bucket, tape_key):
-        tape = parse_tape(storage.iter_lines(settings.vexa_bucket, tape_key))
-        events = speech_events(
-            tape,
-            origin_ms,
-            settings.rms_speech_threshold,
-            settings.speech_hangover_ms,
-        )
-        speaker_names = tape_names(tape)
-        tape_state: Literal["ok", "missing"] = "ok"
-    else:
-        events = []
-        speaker_names = []
+    events: list[TapeEvent] = []
+    speaker_names: list[str] = []
+    tape_state: TapeState
+    if tape_size is None:
         tape_state = "missing"
+    else:
+        try:
+            tape = parse_tape(storage.iter_lines(settings.vexa_bucket, tape_key))
+            events = speech_events(
+                tape,
+                origin_ms,
+                settings.rms_speech_threshold,
+                settings.speech_hangover_ms,
+            )
+            speaker_names = tape_names(tape)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "tape invalid vexa_meeting_id=%s error_class=%s; "
+                "exporting without attribution",
+                vexa_meeting_id,
+                type(exc).__name__,
+            )
+            events, speaker_names = [], []
+            tape_state = "invalid"
+        else:
+            tape_state = "ok"
+            if tape_size >= _CAPPED_FRACTION * settings.tape_max_bytes:
+                tape_state = "capped"
+                logger.warning(
+                    "tape capped vexa_meeting_id=%s bytes=%d max=%d; "
+                    "attribution may stop early",
+                    vexa_meeting_id,
+                    tape_size,
+                    settings.tape_max_bytes,
+                )
 
     timeline = build_speaker_timeline(
         events,
@@ -184,15 +245,18 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
 
     deps.notetaker.process(meeting_id, base, platform)
 
+    finished = deps.now()
     storage.put_json(
         settings.export_bucket,
         base + "_export.json",
         {
             "state": "handed_off",
             "vexa_meeting_id": vexa_meeting_id,
-            "exported_at": deps.now().isoformat(),
+            "exported_at": finished.isoformat(),
+            "elapsed_s": (finished - started).total_seconds(),
             "exporter_version": __version__,
             "tape": tape_state,
+            "audio_recordings": len(audio_recs),
         },
     )
     return ExportResult("handed_off", folder)

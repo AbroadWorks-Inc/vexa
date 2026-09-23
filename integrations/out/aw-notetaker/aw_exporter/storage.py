@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from botocore.exceptions import ClientError
@@ -26,6 +27,24 @@ class Storage:
                 return False
             raise
         return True
+
+    def size(self, bucket: str, key: str) -> int | None:
+        """Object size in bytes, or None if it does not exist."""
+        try:
+            head = self._client.head_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
+                return None
+            raise
+        return int(head["ContentLength"])
+
+    def download_file(self, bucket: str, key: str, path: Path) -> None:
+        self._client.download_file(bucket, key, str(path))
+
+    def upload_file(self, path: Path, bucket: str, key: str, content_type: str) -> None:
+        self._client.upload_file(
+            str(path), bucket, key, ExtraArgs={"ContentType": content_type}
+        )
 
     def get_bytes(self, bucket: str, key: str) -> bytes:
         return self._client.get_object(Bucket=bucket, Key=key)["Body"].read()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import boto3
 import pytest
@@ -73,3 +74,36 @@ def test_iter_lines_yields_lines_of_a_three_line_object(storage: Storage) -> Non
         "two",
         "three",
     ]
+
+
+def test_size_returns_content_length_or_none(storage: Storage) -> None:
+    assert storage.size("src-bucket", "missing.bin") is None
+    storage.put_bytes("src-bucket", "five.bin", b"12345", "application/octet-stream")
+    assert storage.size("src-bucket", "five.bin") == 5
+
+
+def test_size_reraises_non_404_errors(storage: Storage) -> None:
+    from botocore.exceptions import ClientError
+
+    with pytest.raises(ClientError):
+        storage.size("no-such-bucket-xyz", "k")
+
+
+def test_download_file_writes_object_to_path(storage: Storage, tmp_path: Path) -> None:
+    storage.put_bytes("src-bucket", "master.webm", b"webm-bytes", "video/webm")
+    dst = tmp_path / "master.webm"
+    storage.download_file("src-bucket", "master.webm", dst)
+    assert dst.read_bytes() == b"webm-bytes"
+
+
+def test_upload_file_puts_object_with_content_type(
+    storage: Storage, tmp_path: Path
+) -> None:
+    src = tmp_path / "audio.wav"
+    src.write_bytes(b"RIFF-wav")
+    storage.upload_file(src, "dst-bucket", "recordings/x/audio.wav", "audio/wav")
+    assert storage.get_bytes("dst-bucket", "recordings/x/audio.wav") == b"RIFF-wav"
+    head = storage._client.head_object(
+        Bucket="dst-bucket", Key="recordings/x/audio.wav"
+    )
+    assert head["ContentType"] == "audio/wav"

@@ -28,6 +28,11 @@ class Settings:
     speech_hangover_ms: int = 700
     min_dominant_utterance_ms: int = 1500
     record_chunk_timeslice_ms: int = 15000
+    # The bot uploads the tape in its teardown, AFTER meeting.completed
+    # (spec §4.2 step 5): wait this long past end_time before "missing".
+    tape_wait_seconds: float = 120.0
+    # The bot's DEFAULT_MAX_TAPE_BYTES; a tape within 2 % of it is "capped".
+    tape_max_bytes: int = 262144000
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
@@ -55,4 +60,6 @@ class Settings:
             record_chunk_timeslice_ms=int(
                 env.get("RECORD_CHUNK_TIMESLICE_MS", "15000")
             ),
+            tape_wait_seconds=float(env.get("TAPE_WAIT_SECONDS", "120")),
+            tape_max_bytes=int(env.get("TAPE_MAX_BYTES", "262144000")),
         )

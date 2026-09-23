@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from datetime import datetime, timezone
+import asyncio
+import io
+import logging
+import wave
+from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +16,17 @@ import pytest
 from moto import mock_aws
 
 from aw_exporter.config import Settings
-from aw_exporter.job import Deps, ExportResult, export_meeting, recording_origin_ms
+import aw_exporter.job as job_module
+from aw_exporter.job import (
+    Deps,
+    ExportResult,
+    TapeNotReady,
+    export_meeting,
+    recording_origin_ms,
+)
+from aw_exporter.queue import PendingQueue, sweep_once
 from aw_exporter.storage import Storage
-from tests.builders import frame, header
+from tests.builders import frame, header, two_speaker_gmeet_lines, write_silent_wav
 
 VEXA_BUCKET = "aw-bots"
 EXPORT_BUCKET = "aw-chatworks-transcribe"
@@ -92,8 +104,19 @@ class RaisingNotetaker:
         raise RuntimeError("boom")
 
 
+FAKE_WAV_SECONDS = 60.0
+END_TIME = datetime(2026, 6, 18, 10, 42, 0, tzinfo=timezone.utc)
+
+
 def _fake_transcode(src: Path, dst: Path) -> None:
-    dst.write_bytes(b"RIFF")
+    write_silent_wav(dst, FAKE_WAV_SECONDS)
+
+
+def _transcode_of(duration_s: float) -> Callable[[Path, Path], None]:
+    def transcode(src: Path, dst: Path) -> None:
+        write_silent_wav(dst, duration_s)
+
+    return transcode
 
 
 @pytest.fixture
@@ -129,14 +152,16 @@ def _deps(
     notetaker: Any,
     *,
     settings: Settings | None = None,
+    now: Callable[[], datetime] | None = None,
+    transcode: Callable[[Path, Path], None] = _fake_transcode,
 ) -> Deps:
     return Deps(
         settings=settings or _settings(),
         storage=storage,
         meeting_api=meeting_api,
         notetaker=notetaker,
-        transcode=_fake_transcode,
-        now=lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc),
+        transcode=transcode,
+        now=now or (lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc)),
     )
 
 
@@ -199,13 +224,17 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
     }
     assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
     assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"webm-bytes"
-    assert storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav") == b"RIFF"
+    wav_bytes = storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav")
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+        assert wav.getnframes() / wav.getframerate() == FAKE_WAV_SECONDS
 
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["state"] == "handed_off"
     assert marker["vexa_meeting_id"] == 11367
     assert marker["tape"] == "ok"
     assert marker["exported_at"] == "2026-06-18T11:00:00+00:00"
+    assert marker["elapsed_s"] == 0.0
+    assert marker["audio_recordings"] == 1
 
     meeting_json = storage.get_json(EXPORT_BUCKET, BASE + "meeting.json")
     assert meeting_json["id"] == 11367
@@ -390,3 +419,361 @@ def test_every_timeline_speaker_id_has_a_matching_participant(
     participant_ids = [p["id"] for p in participants["participants"]]
     assert timeline_ids <= set(participant_ids)
     assert len(participant_ids) == len(set(participant_ids))
+
+
+# ---------------------------------------------------------------------------
+# Final-review fixes (spec §4.2 tape wait / tape states, §4.3 clip)
+# ---------------------------------------------------------------------------
+
+
+def _put_master(storage: Storage, rec_id: int, uid: str) -> str:
+    storage_path = f"recordings/1/{rec_id}/{uid}/audio/master.webm"
+    storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
+    return storage_path
+
+
+def _put_tape(storage: Storage, uid: str, lines: list[str]) -> bytes:
+    body = ("\n".join(lines) + "\n").encode()
+    storage.put_bytes(
+        VEXA_BUCKET,
+        f"signal/7/11367/{uid}/captured-signal.jsonl",
+        body,
+        "application/x-ndjson",
+    )
+    return body
+
+
+def _api_for(rec_id: int, storage_path: str) -> FakeMeetingApi:
+    return FakeMeetingApi(
+        recordings=[_audio_recording(rec_id)], master={"storage_path": storage_path}
+    )
+
+
+def test_absent_tape_before_deadline_raises_tape_not_ready_and_does_not_process(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 20, "uid-20")
+    notetaker = FakeNotetaker()
+    deps = _deps(
+        storage,
+        _api_for(20, storage_path),
+        notetaker,
+        now=lambda: END_TIME + timedelta(seconds=60),
+    )
+
+    with pytest.raises(TapeNotReady):
+        export_meeting(_envelope(), deps)
+
+    assert notetaker.calls == []
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json") is None
+
+
+def test_absent_tape_after_deadline_hands_off_with_tape_missing(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 21, "uid-21")
+    notetaker = FakeNotetaker()
+    deps = _deps(
+        storage,
+        _api_for(21, storage_path),
+        notetaker,
+        now=lambda: END_TIME + timedelta(seconds=121),
+    )
+
+    result = export_meeting(_envelope(), deps)
+
+    assert result.state == "handed_off"
+    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["tape"] == "missing"
+
+
+def test_tape_wait_respects_tape_wait_seconds_setting(storage: Storage) -> None:
+    storage_path = _put_master(storage, 22, "uid-22")
+    deps = _deps(
+        storage,
+        _api_for(22, storage_path),
+        FakeNotetaker(),
+        settings=_settings(tape_wait_seconds=30.0),
+        now=lambda: END_TIME + timedelta(seconds=60),
+    )
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+
+def test_naive_end_time_is_treated_as_utc_for_the_tape_wait(storage: Storage) -> None:
+    storage_path = _put_master(storage, 23, "uid-23")
+    deps = _deps(
+        storage,
+        _api_for(23, storage_path),
+        FakeNotetaker(),
+        now=lambda: END_TIME + timedelta(seconds=60),
+    )
+
+    with pytest.raises(TapeNotReady):
+        export_meeting(_envelope(end_time="2026-06-18T10:42:00"), deps)
+
+
+def test_null_end_time_does_not_wait_forever_for_a_tape(storage: Storage) -> None:
+    """A null end_time has no fixed deadline to wait against (anchoring on
+    deps.now() would move the deadline on every retry), so the job does not
+    wait: it hands off with tape "missing"."""
+    storage_path = _put_master(storage, 24, "uid-24")
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, _api_for(24, storage_path), notetaker)
+
+    result = export_meeting(_envelope(end_time=None), deps)
+
+    assert result.state == "handed_off"
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["tape"] == "missing"
+
+
+def test_tape_not_ready_then_retry_with_tape_present_hands_off_once(
+    storage: Storage,
+) -> None:
+    """failure -> retry -> success through the durable queue: the first
+    sweep raises TapeNotReady (backoff recorded), the tape lands, the next
+    sweep hands off; /process is called exactly once."""
+    storage_path = _put_master(storage, 25, "uid-25")
+    notetaker = FakeNotetaker()
+    job_now = [END_TIME + timedelta(seconds=30)]
+    deps = _deps(storage, _api_for(25, storage_path), notetaker, now=lambda: job_now[0])
+    queue = PendingQueue(storage, VEXA_BUCKET)
+    queue.enqueue(_envelope())
+
+    asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
+
+    item = queue.load("11367")
+    assert item is not None and item["attempts"] == 1
+    assert "tape not ready" in item["last_error"]
+    assert notetaker.calls == []
+
+    _put_tape(
+        storage,
+        "uid-25",
+        [header(), frame(_origin_ms(), "Ann Lee", 0.2)],
+    )
+    job_now[0] = END_TIME + timedelta(seconds=90)
+    asyncio.run(sweep_once(queue, deps, now=lambda: 5000.0))
+
+    assert queue.pending_ids() == []
+    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["state"] == "handed_off" and marker["tape"] == "ok"
+
+
+def test_header_less_tape_hands_off_with_tape_invalid(storage: Storage) -> None:
+    storage_path = _put_master(storage, 26, "uid-26")
+    _put_tape(storage, "uid-26", [frame(_origin_ms(), "Ann Lee", 0.2)])
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, _api_for(26, storage_path), notetaker)
+
+    result = export_meeting(_envelope(), deps)
+
+    assert result.state == "handed_off"
+    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["tape"] == "invalid"
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert timeline["speaker_timeline"] == [] and timeline["speaker_intervals"] == []
+    participants = storage.get_json(EXPORT_BUCKET, BASE + "participants.json")
+    assert participants["participants"] == []
+
+
+@pytest.mark.parametrize("exc", [KeyError("t"), TypeError("x"), ValueError("x")])
+def test_speech_events_failure_degrades_to_tape_invalid(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    storage_path = _put_master(storage, 27, "uid-27")
+    _put_tape(storage, "uid-27", [header(), frame(_origin_ms(), "Ann Lee", 0.2)])
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(job_module, "speech_events", boom)
+    deps = _deps(storage, _api_for(27, storage_path), FakeNotetaker())
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["tape"] == "invalid"
+    participants = storage.get_json(EXPORT_BUCKET, BASE + "participants.json")
+    assert participants["participants"] == []
+
+
+def test_tape_at_budget_cap_is_marked_capped_but_still_used(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage_path = _put_master(storage, 28, "uid-28")
+    body = _put_tape(storage, "uid-28", two_speaker_gmeet_lines(_origin_ms()))
+    deps = _deps(
+        storage,
+        _api_for(28, storage_path),
+        FakeNotetaker(),
+        settings=_settings(tape_max_bytes=int(len(body) / 0.98)),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aw_exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["tape"] == "capped"
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert len(timeline["speaker_intervals"]) == 2
+    assert any("capped" in r.getMessage() for r in caplog.records)
+
+
+def test_tape_below_budget_cap_is_ok(storage: Storage) -> None:
+    storage_path = _put_master(storage, 29, "uid-29")
+    body = _put_tape(storage, "uid-29", two_speaker_gmeet_lines(_origin_ms()))
+    deps = _deps(
+        storage,
+        _api_for(29, storage_path),
+        FakeNotetaker(),
+        settings=_settings(tape_max_bytes=len(body) * 2),
+    )
+
+    export_meeting(_envelope(), deps)
+
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["tape"] == "ok"
+
+
+class _SpyStorage(Storage):
+    def __init__(self, inner: Storage) -> None:
+        super().__init__(inner._client)
+        self.get_bytes_keys: list[str] = []
+        self.put_bytes_keys: list[str] = []
+        self.uploads: list[tuple[str, str]] = []
+        self.downloads: list[str] = []
+
+    def get_bytes(self, bucket: str, key: str) -> bytes:
+        self.get_bytes_keys.append(key)
+        return super().get_bytes(bucket, key)
+
+    def put_bytes(self, bucket: str, key: str, data: bytes, content_type: str) -> None:
+        self.put_bytes_keys.append(key)
+        super().put_bytes(bucket, key, data, content_type)
+
+    def download_file(self, bucket: str, key: str, path: Path) -> None:
+        self.downloads.append(key)
+        super().download_file(bucket, key, path)
+
+    def upload_file(self, path: Path, bucket: str, key: str, content_type: str) -> None:
+        self.uploads.append((key, content_type))
+        super().upload_file(path, bucket, key, content_type)
+
+
+def test_audio_is_streamed_via_files_not_held_as_bytes(storage: Storage) -> None:
+    spy = _SpyStorage(storage)
+    storage_path = _put_master(storage, 30, "uid-30")
+    deps = _deps(spy, _api_for(30, storage_path), FakeNotetaker())
+
+    export_meeting(_envelope(), deps)
+
+    assert not [k for k in spy.get_bytes_keys if k.endswith((".webm", ".wav"))]
+    assert not [k for k in spy.put_bytes_keys if k.endswith((".webm", ".wav"))]
+    assert spy.downloads == [BASE + "master.webm"]
+    assert spy.uploads == [(BASE + "audio.wav", "audio/wav")]
+
+
+def test_multiple_audio_recordings_are_counted_and_warned(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage_path = _put_master(storage, 31, "uid-31")
+    meeting_api = FakeMeetingApi(
+        recordings=[_audio_recording(31), _audio_recording(32)],
+        master={"storage_path": storage_path},
+    )
+    deps = _deps(storage, meeting_api, FakeNotetaker())
+
+    with caplog.at_level(logging.WARNING, logger="aw_exporter"):
+        export_meeting(_envelope(), deps)
+
+    assert meeting_api.master_calls == [(7, 31)]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["audio_recordings"] == 2
+    assert any("audio_recordings=2" in r.getMessage() for r in caplog.records)
+
+
+def test_single_audio_recording_logs_no_multi_session_warning(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage_path = _put_master(storage, 33, "uid-33")
+    deps = _deps(storage, _api_for(33, storage_path), FakeNotetaker())
+
+    with caplog.at_level(logging.WARNING, logger="aw_exporter"):
+        export_meeting(_envelope(), deps)
+
+    assert not any("audio_recordings" in r.getMessage() for r in caplog.records)
+
+
+def test_intervals_are_clipped_at_the_wav_duration(storage: Storage) -> None:
+    storage_path = _put_master(storage, 34, "uid-34")
+    origin_ms = _origin_ms()
+    _put_tape(
+        storage,
+        "uid-34",
+        [header()] + [frame(origin_ms + i * 256, "Ann Lee", 0.2) for i in range(20)],
+    )
+    deps = _deps(
+        storage,
+        _api_for(34, storage_path),
+        FakeNotetaker(),
+        transcode=_transcode_of(2.0),
+    )
+
+    export_meeting(_envelope(), deps)
+
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert timeline["duration_sec"] == 2.0
+    assert [(i["start_sec"], i["end_sec"]) for i in timeline["speaker_intervals"]] == [
+        (0.0, 2.0)
+    ]
+    started = datetime.fromisoformat(timeline["recording_started_at"])
+    ended = datetime.fromisoformat(timeline["recording_ended_at"])
+    assert (ended - started).total_seconds() == 2.0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {
+                "constructed_meeting_url": "https://meet.google.com/top-level",
+                "data": {"constructed_meeting_url": "https://meet.google.com/in-data"},
+            },
+            "https://meet.google.com/in-data",
+        ),
+        (
+            {"constructed_meeting_url": "https://meet.google.com/top-level"},
+            "https://meet.google.com/top-level",
+        ),
+        ({"constructed_meeting_url": None, "data": None}, "abc-defg-hij"),
+    ],
+)
+def test_room_name_prefers_data_constructed_meeting_url(
+    storage: Storage, overrides: dict[str, Any], expected: str
+) -> None:
+    storage_path = _put_master(storage, 35, "uid-35")
+    deps = _deps(storage, _api_for(35, storage_path), FakeNotetaker())
+
+    export_meeting(_envelope(**overrides), deps)
+
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert timeline["room_name"] == expected
+
+
+def test_export_marker_records_elapsed_wall_time(storage: Storage) -> None:
+    storage_path = _put_master(storage, 36, "uid-36")
+    _put_tape(storage, "uid-36", [header()])
+    t0 = datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc)
+    ticks = iter([t0])
+
+    def clock() -> datetime:
+        return next(ticks, t0 + timedelta(seconds=7.5))
+
+    deps = _deps(storage, _api_for(36, storage_path), FakeNotetaker(), now=clock)
+
+    export_meeting(_envelope(), deps)
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["elapsed_s"] == 7.5
+    assert marker["exported_at"] == "2026-06-18T11:00:07.500000+00:00"
+    assert marker["tape"] == "ok"
+    assert marker["audio_recordings"] == 1

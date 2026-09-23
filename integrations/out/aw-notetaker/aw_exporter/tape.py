@@ -55,7 +55,10 @@ def parse_tape(lines: Iterable[str]) -> Tape:
         except (ValueError, TypeError):
             continue
         if row.get("type") == "captured_signal_header":
-            sample_rate = int(row.get("sample_rate", 16000))
+            try:
+                sample_rate = int(row.get("sample_rate", 16000))
+            except (ValueError, TypeError):
+                sample_rate = 16000
             if sample_rate <= 0:
                 sample_rate = 16000
             tape = Tape(

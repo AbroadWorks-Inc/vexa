@@ -177,3 +177,24 @@ def test_mixed_lane_with_frames_and_hints_returns_hints_only() -> None:
     assert ("B", 100, "SPEAKER_START", "hint") in events
     assert all(e[3] == "hint" for e in events)  # source is hint only
     assert not any(e[0] == "A" for e in events)  # no A speaker
+
+
+def test_header_non_numeric_sample_rate_falls_back_to_16000() -> None:
+    import json
+
+    bad_header = json.dumps(
+        {"type": "captured_signal_header", "v": 1, "sample_rate": "abc"}
+    )
+    t = parse_tape([bad_header, frame(ORIGIN_MS, "A", 0.2, samples=4096)])
+    assert t.sample_rate == 16000
+    assert t.frames[0].duration_ms == 256
+
+
+def test_header_null_sample_rate_falls_back_to_16000() -> None:
+    import json
+
+    bad_header = json.dumps(
+        {"type": "captured_signal_header", "v": 1, "sample_rate": None}
+    )
+    t = parse_tape([bad_header, frame(ORIGIN_MS, "A", 0.2, samples=4096)])
+    assert t.sample_rate == 16000
