@@ -62,7 +62,7 @@ s3://aw-chatworks-transcribe/recordings/<platform>_<nativeMeetingId>_<startUTC>/
   notes.json, transcript.txt, summary.json[, transcript_en.txt]   — written by notetaker-worker
   live_transcript.json     only if the bot ran with live transcription on
   signal/                  only when EXPORT_DEBUG=1 (botlog, captured-signal, …)
-  _export.json             kept    — exporter marker (state, attempts, timings); written last
+  _export.json             kept    — exporter marker (state, tape, audio_recordings, timings); written last
 ```
 - `platform` = Vexa's value (`google_meet`, `zoom`, `teams`), passed unchanged to `/process`
   (any non-`jitsi` value takes the worker's bot path).
@@ -103,11 +103,33 @@ replica; per-meeting jobs are independent.
    computed relative to this wav's t=0. See §4.3 clock origin.
 5. Tape `aw-bots/signal/<user_id>/<meeting_id>/<session_uid>/captured-signal.jsonl` (session uid
    from `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`, `participants.json`.
+   **Tape wait:** the bot uploads the tape in its teardown, *after* it emits `meeting.completed`,
+   so an absent tape is not yet "missing". While `now < meeting.end_time + TAPE_WAIT_SECONDS`
+   (default 120; naive `end_time` read as UTC) the job raises a retryable `TapeNotReady` before
+   copying anything or calling `/process`, and the queue's backoff re-runs it. Past the deadline
+   (or with no `end_time`, which gives no fixed deadline) it proceeds without a tape. Tape
+   problems degrade attribution, never fail the export — the resulting **tape state** is
+   recorded in `_export.json.tape`:
+   - `ok` — parsed; events used.
+   - `missing` — still absent after the wait → empty timeline/participants.
+   - `invalid` — present but unparseable (no header, bad rows raising in event extraction) →
+     empty timeline/participants, warning logged.
+   - `capped` — parsed and used, but its size is ≥ 98 % of `TAPE_MAX_BYTES` (default
+     262144000, the bot's `DEFAULT_MAX_TAPE_BYTES`), so the bot likely stopped writing before
+     the meeting ended; warning logged.
+   The timeline's `recording_ended_at` / clip bound is `recording_started_at` + the transcoded
+   `audio.wav`'s own duration (not `meeting.end_time`), so intervals never outrun the audio.
+   `room_name` = `data.constructed_meeting_url`, else top-level `constructed_meeting_url`, else
+   the native id. Audio moves through local temp files (`master.webm` download, `audio.wav`
+   upload), never as whole-file bytes in memory.
 6. Write `meeting.json`, `recordings.json`; `live_transcript.json` if the meeting had
    `transcribe_enabled`; copy `signal/*` if `EXPORT_DEBUG=1`.
 7. `POST {NOTETAKER_URL}/process {meeting_id:"vexa-<id>", s3_path:"recordings/<folder>/",
    platform:<platform>, idempotency_key:"vexa-<id>"}`; backoff retry on connect errors/5xx.
-8. `_export.json {state:"handed_off"}` last; delete pending.
+8. `_export.json {state:"handed_off", vexa_meeting_id, exported_at, elapsed_s, exporter_version,
+   tape, audio_recordings}` last; delete pending. `audio_recordings` counts the recordings with
+   an audio media file; when it is > 1 (a multi-session meeting) a warning is logged and only
+   the first is exported (see §9).
 
 After `EXPORT_MAX_ATTEMPTS` (default 5, exponential backoff): `_export.json {state:"failed", error}`,
 pending moved to `aw-exporter/failed/`. `aw-bots` is never modified, so a re-run is always possible.
@@ -174,7 +196,9 @@ the `captured-signal.v1` tape:
 (aw-chatworks-transcribe), `EXPORT_PREFIX` (recordings/), `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS` (default 15000),
-`AWS_REGION`. S3 via IRSA (no static keys).
+`TAPE_WAIT_SECONDS` (default 120), `TAPE_MAX_BYTES` (default 262144000 — must match the bot's
+tape budget, i.e. `VEXA_CAPTURE_SIGNAL_MAX_BYTES` if raised per §7), `AWS_REGION`. S3 via IRSA
+(no static keys).
 
 ## 5. Portal → Vexa (aw-notetaker repo; own plan)
 - One Vexa service account (created once by an operator via admin-api); its API key lives in a K8s
@@ -236,6 +260,15 @@ Measured on the OLD bot (v0.10.4, 85 meetings): memory 0.48 GiB (bot alone) → 
 - IAM: meeting-api rw `aw-bots/{recordings,signal}/*`; exporter r `aw-bots/*`, rw
   `aw-bots/aw-exporter/*`, rw `aw-chatworks-transcribe/recordings/*`. Lifecycle per D5.
 - Network: exporter → meeting-api (internal), → `notetaker-api.notetaker:8080`; NetworkPolicy per D12.
+- Bot tape budget: raise `VEXA_CAPTURE_SIGNAL_MAX_BYTES` on bot pods so a full-length meeting's
+  tape fits, size the bot pods' ephemeral disk to it (on top of the browser profile), and set the
+  exporter's `TAPE_MAX_BYTES` to the same value (a tape at ≥ 98 % of it is exported as `capped`).
+- Exporter Deployment: single replica with `strategy: Recreate` — a rolling update would briefly
+  run two pods, i.e. two overlapping pending-queue sweepers.
+- Alerting + recovery: alert on intake 401/400 responses — Vexa's webhook delivery drops non-429
+  4xx permanently, so a secret mismatch or a rejected envelope loses that meeting's trigger. Keep
+  a backfill path: list completed meetings from meeting-api and re-enqueue them (the job is
+  idempotent on the Vexa meeting id).
 
 ## 8. Out of scope
 Signed-in bots; Jitsi via Vexa (Jibri path unchanged); `notetaker-worker` changes; `/process`'s
@@ -254,3 +287,14 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
 - Mixed-lane hint density for Zoom/Teams untested here — validated live.
 - One service account serialises spawns through Vexa's per-user advisory lock (held for the
   create transaction only) — measured at a top-of-hour burst during live validation.
+- The bot's signal janitor evicts by byte budget and can delete a tape before the exporter reads
+  it; the export then carries `tape: "missing"` (no attribution).
+- Multi-session meetings (the bot rejoined → several audio recordings) export only one session;
+  the count is recorded in `_export.json.audio_recordings` and logged, the other sessions' audio
+  is not exported.
+- With one Vexa service account (D11), every meeting's recordings JSONB lives under one user, so
+  the recordings load meeting-api does per request grows with the total number of meetings.
+- Task 11 must also measure: the mixed-lane (Zoom/Teams) clock-origin residual (§4.3's rule is
+  measured on Meet only), the tape-upload lag after `meeting.completed` (to size
+  `TAPE_WAIT_SECONDS`), and tape MB/min (to size `VEXA_CAPTURE_SIGNAL_MAX_BYTES` and the bot
+  pods' ephemeral disk).

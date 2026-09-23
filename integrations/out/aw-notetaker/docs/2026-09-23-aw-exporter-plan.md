@@ -188,7 +188,7 @@ Candidate epochs: tape header `started_at` (2026-09-22T17:01:59.687Z); recording
 
 - [ ] **Step 2: Cross-correlate** — build a 50 ms energy envelope from (a) `master.wav` and (b) the tape: sum of `rms` of all frames per 50 ms bin at `ts`. Find the lag maximising normalised cross-correlation over ±120 s. The true epoch of wav t=0 = `tape_ts_of_bin0 + lag`. Print the lag and the residual against each candidate epoch.
 
-- [ ] **Step 3: Threshold** — histogram frame `rms`; pick the valley between the silence mode and the speech mode; report the value and the % of named frames above it per speaker (sanity: every speaker in the transcript has speech frames; Rafi Roston has frames in 17:02–17:05).
+- [ ] **Step 3: Threshold** — histogram frame `rms`; pick the valley between the silence mode and the speech mode; report the value and the % of named frames above it per speaker (sanity: every speaker in the transcript has speech frames; the speaker who talked only in the first minutes has frames in 17:02–17:05).
 
 - [ ] **Step 4: Record in spec §4.3** — replace the "Clock origin" bullet with the measured rule + error, and the threshold default. Commit the spec edit only:
 
@@ -721,7 +721,7 @@ def speech_events(tape: Tape, origin_ms: int, rms_threshold: float,
     return sorted(events, key=lambda e: (e.relative_ms, e.name))
 ```
 - [ ] **Step 5: Run** → PASS (adjust expectations only if a test encodes a wrong assumption — say which in the commit body); black/ruff/mypy.
-- [ ] **Step 6: Replay the real tape locally (not committed)** — `python -c` over `recordings/signal/…/captured-signal.jsonl` with Task 2's origin + threshold: print per-speaker event counts; Rafi Roston must have START events before 180 000 ms.
+- [ ] **Step 6: Replay the real tape locally (not committed)** — `python -c` over `recordings/signal/…/captured-signal.jsonl` with Task 2's origin + threshold: print per-speaker event counts; speaker A (the speaker who talked only in the first minutes) must have START events before 180 000 ms.
 - [ ] **Step 7: Commit** `feat(aw-exporter): captured-signal tape -> speaker events`.
 
 ---
