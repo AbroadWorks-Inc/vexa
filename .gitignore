@@ -36,3 +36,4 @@ releases/*/HANDOFF.md
 
 # aw-recording: local meeting recordings mirrored out of MinIO (feat/aw-recording-lite)
 /recordings/
+/reference/
