@@ -37,7 +37,9 @@ import pytest
 import uvicorn
 from botocore.exceptions import ClientError
 
+from aw_exporter.job import recording_origin_ms
 from aw_exporter.naming import folder_name
+from tests.builders import two_speaker_gmeet_lines
 from tests.integration.stub_meeting_api import create_app as create_meeting_api_app
 from tests.integration.stub_notetaker import create_app as create_notetaker_app
 
@@ -66,6 +68,10 @@ START_TIME = "2026-09-23T10:00:00.000Z"
 END_TIME = "2026-09-23T10:00:03.000Z"
 RECORDING_CREATED_AT = "2026-09-23T10:00:00.000Z"
 AUDIO_DURATION_S = 3.0
+
+ORIGIN_MS = recording_origin_ms({"created_at": RECORDING_CREATED_AT}, 15000)
+PENDING_KEY = f"aw-exporter/pending/{VEXA_MEETING_ID}.json"
+SEEDED_VEXA_KEYS = {STORAGE_PATH, TAPE_KEY}
 
 FOLDER = folder_name("google_meet", NATIVE_MEETING_ID, START_TIME)
 BASE = f"recordings/{FOLDER}/"
@@ -186,6 +192,19 @@ def _list_keys(s3: S3Client, bucket: str, prefix: str) -> set[str]:
     return keys
 
 
+def _wait_for_pending_deleted(s3: S3Client, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if PENDING_KEY not in _list_keys(s3, VEXA_BUCKET, "aw-exporter/pending/"):
+            return
+        time.sleep(0.3)
+    raise TimeoutError(f"{PENDING_KEY} still present after {timeout}s")
+
+
+def _get_json(s3: S3Client, bucket: str, key: str) -> Any:
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+
+
 def _wait_for_export_marker(s3: S3Client, timeout: float) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     key = BASE + "_export.json"
@@ -269,20 +288,11 @@ def seeded_s3(s3: S3Client, tmp_path: Path) -> S3Client:
         Body=master_path.read_bytes(),
         ContentType="video/webm",
     )
-    tape_header = json.dumps(
-        {
-            "type": "captured_signal_header",
-            "v": 1,
-            "platform": "google_meet",
-            "lane": "gmeet",
-            "sample_rate": 16000,
-            "started_at": RECORDING_CREATED_AT,
-        }
-    )
+    tape_lines = two_speaker_gmeet_lines(ORIGIN_MS)
     s3.put_object(
         Bucket=VEXA_BUCKET,
         Key=TAPE_KEY,
-        Body=(tape_header + "\n").encode(),
+        Body=("\n".join(tape_lines) + "\n").encode(),
         ContentType="application/x-ndjson",
     )
     return s3
@@ -383,6 +393,8 @@ def test_compose_flow_hands_off_meeting(
 
     marker = _wait_for_export_marker(seeded_s3, timeout=60)
     assert marker["state"] == "handed_off"
+    assert marker["tape"] == "ok"
+    assert marker["audio_recordings"] == 1
 
     keys = _list_keys(seeded_s3, EXPORT_BUCKET, BASE)
     assert keys == EXPECTED_KEYS
@@ -404,3 +416,22 @@ def test_compose_flow_hands_off_meeting(
         assert wav.getframerate() == 16000
         duration = wav.getnframes() / wav.getframerate()
     assert abs(duration - AUDIO_DURATION_S) <= 0.2
+
+    timeline = _get_json(seeded_s3, EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    intervals = timeline["speaker_intervals"]
+    assert [iv["speaker_name"] for iv in intervals] == [
+        "Speaker Alpha",
+        "Speaker Beta",
+    ]
+    assert [iv["speaker_id"] for iv in intervals] == ["speaker_alpha", "speaker_beta"]
+    participants = _get_json(seeded_s3, EXPORT_BUCKET, BASE + "participants.json")
+    assert [p["id"] for p in participants["participants"]] == [
+        "speaker_alpha",
+        "speaker_beta",
+    ]
+
+    _wait_for_pending_deleted(seeded_s3, timeout=10)
+    vexa_keys = _list_keys(seeded_s3, VEXA_BUCKET, "")
+    assert {k for k in vexa_keys if not k.startswith("aw-exporter/")} == (
+        SEEDED_VEXA_KEYS
+    )
