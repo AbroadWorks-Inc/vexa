@@ -3,8 +3,8 @@
 Ported from aw-integration/tests/test_adapter.py (AbroadWorks' own Apache-2.0
 fork, not Attendee). `VexaSpeakerEvent(relative_ms=..., event_type=...,
 participant_name=..., source="audio"/None/"dom"/"caption")` becomes
-`ActivityEvent(name, relative_ms, event_type, "audio"/"hint")` — the 0.12 tape has
-one hint source per lane, so "dom", "caption" and untagged all collapse onto
+`ActivityEvent(name, relative_ms, event_type, "audio"/"hint")` — speaker activity
+carries one hint source per lane, so "dom", "caption" and untagged all collapse onto
 "hint" here. `VexaSessionAdapter.build_speaker_timeline`/`build_participants`
 become the module-level functions of the same name. Expected values are
 unchanged from the reference where ported. See task-6-report.md for the full

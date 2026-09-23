@@ -208,9 +208,9 @@ def build_speaker_timeline(
         # when nothing paired. A noisy timeline still yields names; an empty
         # one makes notetaker-worker bail out and the transcript reverts to
         # raw SPEAKER_NN. Not ported: the reference adapter's caption/DOM
-        # preference between competing point producers — the 0.12 tape has
-        # exactly one hint source per lane, so there is nothing to prefer
-        # between.
+        # preference between competing point producers — speaker activity
+        # carries exactly one hint source per lane, so there is nothing to
+        # prefer between.
         for ev in sorted(events, key=lambda e: e.relative_ms):
             if ev.event_type != "SPEAKER_START":
                 continue
@@ -245,7 +245,7 @@ def build_speaker_timeline(
     if platform == "teams" and not paired_intervals and len(distinct_speakers) >= 2:
         paired_intervals = _intervals_from_points(timeline_events, duration_sec)
 
-    # Clip to the recording: a tape event may start slightly before audio
+    # Clip to the recording: an activity event may start slightly before audio
     # t=0 (a real Meet tape had a speaker's first START at -8ms). Clamp
     # rather than emit a negative offset, or an interval hanging outside
     # [0, duration_sec]; an interval that clamps to zero length is dropped.
