@@ -816,3 +816,17 @@ def test_participant_id_is_slug_of_name() -> None:
         ["Ann Lee"], platform="zoom", meeting_id="vexa-1", joined_at=T0, host_email=None
     )
     assert p.participants[0].id == "ann_lee"
+
+
+def test_participants_deduplicated_by_slug_first_occurrence_wins() -> None:
+    """Ruling T6a: two spellings of one name (same slug) must yield exactly
+    one participant record, keeping the first-seen spelling."""
+    p = build_participants(
+        ["Ann Lee", "ann lee "],
+        platform="zoom",
+        meeting_id="vexa-1",
+        joined_at=T0,
+        host_email=None,
+    )
+    assert [x.id for x in p.participants] == ["ann_lee"]
+    assert p.participants[0].name == "Ann Lee"

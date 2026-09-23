@@ -301,14 +301,21 @@ def build_participants(
         name=host_email.split("@")[0] if host_email else "",
         email=host_email,
     )
+    # De-duplicate by slug, first occurrence wins — same rule as the timeline's
+    # own participant roster (Ruling T6a): two spellings of one name (e.g.
+    # "Ann Lee" / "ann lee ") must not produce two participant records with
+    # the same id.
+    seen: dict[str, str] = {}
+    for name in names:
+        seen.setdefault(_slug(name), name)
     participants = [
         ParticipantInfo(
-            id=_slug(name),
+            id=slug,
             name=name,
             joined_at=joined_at,
             is_external=False,
         )
-        for name in names
+        for slug, name in seen.items()
     ]
     return ParticipantsFile(
         meeting_id=meeting_id,
