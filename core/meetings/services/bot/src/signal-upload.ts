@@ -26,14 +26,17 @@ import http from 'node:http';
 import https from 'node:https';
 import type { Invocation } from './config.js';
 import { DEFAULT_MAX_TAPE_BYTES, signalEvent, type CaptureSignalRecorder } from './telemetry.js';
+import { resolveMaxActivityBytes, type SpeakerActivityWriter } from './speaker-activity.js';
 
 /** The files one session leaves: the frame/hint tape, the STT round-trip sidecar, the Teams CC
- *  sidecar, the transport (CSRC) sidecar, and the observations sidecar. Mirrors meeting-api's
- *  SIGNAL_TAPE_PARTS (a closed set — the part name lands in an object key server-side). Together
- *  they are the WHOLE captured signal of a meeting, which is the point: a replay that is missing
- *  one of them cannot reproduce the decision the live bot made — nor, without the observations,
- *  what the bot noticed going wrong while it made it. */
-export type TapePart = 'captured-signal' | 'stt' | 'captions' | 'csrc' | 'observations' | 'botlog' | 'transcript';
+ *  sidecar, the transport (CSRC) sidecar, the observations sidecar, and the speaker-activity file.
+ *  Mirrors meeting-api's SIGNAL_TAPE_PARTS (a closed set — the part name lands in an object key
+ *  server-side). The first seven are the WHOLE captured signal of a meeting, which is the point: a
+ *  replay that is missing one of them cannot reproduce the decision the live bot made — nor,
+ *  without the observations, what the bot noticed going wrong while it made it. speaker-activity is
+ *  uploaded on its OWN path (uploadSpeakerActivity below), independent of whether the debug tape
+ *  exists at all — it is a member here only so the server's closed set recognizes the part name. */
+export type TapePart = 'captured-signal' | 'stt' | 'captions' | 'csrc' | 'observations' | 'botlog' | 'transcript' | 'speaker-activity';
 
 /** Deliver ONE tape file. Throws on failure; the caller logs and drops. Injected in tests. */
 export type TapeUploader = (part: TapePart, filePath: string, size: number) => Promise<void>;
@@ -139,6 +142,52 @@ export async function uploadSignalTapes(
     }
   }
   return summary;
+}
+
+/**
+ * Upload the speaker-activity file — WHO WAS TALKING WHEN, with no audio (design doc
+ * 2026-09-23-speaker-activity-design.md "The file"). Unlike uploadSignalTapes, this file is not
+ * gated on collection being on: the writer is created unconditionally, so the only gates here are
+ * the ones any upload needs — a configured recordingUploadUrl and a non-empty file.
+ *
+ * NEVER throws, NEVER returns a rejected promise — same rule as uploadSignalTapes, and for the
+ * same reason: the teardown `finally` block that calls this already decided the exit code.
+ */
+export async function uploadSpeakerActivity(
+  writer: SpeakerActivityWriter | null,
+  opts: SignalUploadOptions,
+): Promise<'uploaded' | 'failed' | 'skipped'> {
+  if (!writer) return 'skipped';
+
+  const { inv } = opts;
+  const maxBytes = opts.maxBytes ?? resolveMaxActivityBytes();
+  const url = inv.recordingUploadUrl;
+  if (!url) {
+    // Same quiet skip as the tape's own: the local hot-loop path lands here every run.
+    signalEvent('tape-upload-skipped', { part: 'speaker-activity', reason: 'no recordingUploadUrl in the invocation' });
+    return 'skipped';
+  }
+  const upload = opts.upload
+    ?? streamingTapeUploader(inv, url, opts.timeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS);
+
+  try {
+    const size = await fileSize(writer.path);
+    if (size === null || size === 0) return 'skipped';
+    if (size > maxBytes) {
+      // SKIP, not truncate — the same rule uploadSignalTapes applies to an oversized tape.
+      signalEvent('tape-upload-skipped', { part: 'speaker-activity', path: writer.path, bytes: size,
+                                           max_bytes: maxBytes, reason: 'larger than the upload size guard' });
+      return 'skipped';
+    }
+    await upload('speaker-activity', writer.path, size);
+    signalEvent('tape-uploaded', { part: 'speaker-activity', path: writer.path, bytes: size,
+                                   capped: writer.isCapped() });
+    return 'uploaded';
+  } catch (e) {
+    // Dropped, never retried into the meeting path, never rethrown.
+    signalEvent('tape-upload-failed', { part: 'speaker-activity', path: writer.path, error: String(e) });
+    return 'failed';
+  }
 }
 
 async function fileSize(path: string): Promise<number | null> {

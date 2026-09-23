@@ -23,9 +23,11 @@ import {
   sttTapePath,
   streamingTapeUploader,
   uploadSignalTapes,
+  uploadSpeakerActivity,
   type TapePart,
 } from './signal-upload.js';
 import { createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
+import { createSpeakerActivityWriter } from './speaker-activity.js';
 import type { Invocation } from './config.js';
 import type { CapturedFrame } from './ports.js';
 import type { CsrcRecord, ObservationRecord, TeamsCaptionRecord } from './capture-bridge.js';
@@ -403,6 +405,79 @@ console.log('\n── teardown upload ──');
   await rec.close();
   const out = await uploadSignalTapes(rec, { inv: inv() });   // no recordingUploadUrl
   check('no upload URL → skipped', out.uploaded.length === 0 && out.failed.length === 0);
+}
+
+// ── speaker-activity upload — independent of the debug tape ────────────────────────────────────
+console.log('\n── speaker-activity upload ──');
+{
+  // The file is non-empty (a header + one frame) → uploads as part 'speaker-activity'.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1, -0.1), 1000, 'Ann');
+  await w.close();
+
+  const seen: Array<[TapePart, string, number]> = [];
+  const out = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async (part, path, size) => { seen.push([part, path, size]); },
+  });
+  check("uploads part 'speaker-activity' with the writer's own path",
+    out === 'uploaded' && seen.length === 1 && seen[0][0] === 'speaker-activity' && seen[0][1] === w.path && seen[0][2] > 0,
+    JSON.stringify({ out, seen }));
+}
+{
+  // No recordingUploadUrl → skipped, same as the tape's own quiet skip.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  let called = false;
+  const out = await uploadSpeakerActivity(w, { inv: inv(), upload: async () => { called = true; } });
+  check('no recordingUploadUrl → skipped, nothing attempted', out === 'skipped' && !called);
+}
+{
+  // A null writer (should never happen — the writer is created unconditionally — but the
+  // function must degrade the same way the tape's does) → skipped.
+  let called = false;
+  const out = await uploadSpeakerActivity(null, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async () => { called = true; },
+  });
+  check('a null writer → skipped, nothing attempted', out === 'skipped' && !called);
+}
+{
+  // A rejecting transport → 'failed', never a thrown/rejected promise.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  let rejected = false;
+  const out = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async () => { throw new Error('object store is down'); },
+  }).catch(() => { rejected = true; return null; });
+  check("a failing upload never rejects, and resolves 'failed'", !rejected && out === 'failed');
+}
+{
+  // Independent of the debug tape: the tape recorder is off (null) and uploads nothing, while the
+  // speaker-activity writer still ships on its own.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  const tapeCalls: TapePart[] = [];
+  const activityCalls: TapePart[] = [];
+  const tapeOut = await uploadSignalTapes(null, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async (p) => { tapeCalls.push(p); },
+  });
+  const activityOut = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async (p) => { activityCalls.push(p); },
+  });
+  check('the debug tape (recorder null) uploads nothing', tapeCalls.length === 0 && tapeOut.uploaded.length === 0);
+  check('speaker-activity uploads independently of the tape being off',
+    activityOut === 'uploaded' && activityCalls.join(',') === 'speaker-activity');
 }
 
 // ── the real transport, against a loopback receiver ─────────────────────────────────────────────

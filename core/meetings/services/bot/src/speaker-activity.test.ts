@@ -18,6 +18,7 @@ import {
   resolveMaxActivityBytes,
   DEFAULT_MAX_ACTIVITY_BYTES,
 } from './speaker-activity.js';
+import { makeSpeakerHintSink } from './capture-bridge.js';
 import type { Invocation } from './config.js';
 
 let failed = 0;
@@ -154,6 +155,67 @@ const sameShape = (obj: unknown, expected: Record<string, unknown>): boolean => 
   check('empty string → default', resolveMaxActivityBytes('') === DEFAULT_MAX_ACTIVITY_BYTES);
   check('garbage string → default', resolveMaxActivityBytes('abc') === DEFAULT_MAX_ACTIVITY_BYTES);
   check('a valid number string → that number', resolveMaxActivityBytes('2048') === 2048);
+}
+
+// ── 9) closed guard: frame()/hint() are no-ops once close() has run ──────────────────────────────
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  // A tiny buffer cap: with NO closed guard, a single post-close frame line would trip an
+  // immediate fire-and-forget flush (push() → bufBytes >= maxBuffer → flush()), independent of
+  // the timer (cleared by close()) and of calling close() a second time — so this proves frame()
+  // itself is a no-op rather than merely that a second close() re-flushes nothing.
+  const w = createSpeakerActivityWriter(invOf('google_meet'), { dir, now: () => 0, maxBufferBytes: 1 });
+  w.frame(0, Float32Array.of(0.1, -0.1), 1000, 'Ann');
+  await w.close();
+  const beforeLen = readFileSync(w.path, 'utf8').length;
+
+  let threw = false;
+  try {
+    for (let i = 0; i < 20; i++) w.frame(0, Float32Array.of(0.2, -0.2), 2000 + i, 'Bo');
+    w.hint(3000, 'Cy');
+  } catch { threw = true; }
+  // Give any wrongly-fired fire-and-forget flush a chance to land on disk before we check.
+  await new Promise((r) => setTimeout(r, 100));
+
+  const afterLen = readFileSync(w.path, 'utf8').length;
+  check('frame()/hint() after close() never throw', !threw);
+  check('frame()/hint() after close() are TRUE no-ops (nothing reaches the file, even past the buffer threshold)',
+    afterLen === beforeLen, `${beforeLen} -> ${afterLen}`);
+}
+
+// ── 10) makeSpeakerHintSink taps the writer: a hint line is written even with telemetry unset ────
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('teams'), { dir, now: () => 0 });
+  const received: Array<{ name: string; t: number; isEnd?: boolean }> = [];
+  const pipelineStub = { recordHint: (name: string, t: number, isEnd?: boolean): void => { received.push({ name, t, isEnd }); } };
+  const { sink } = makeSpeakerHintSink(pipelineStub, () => { /* quiet */ }, undefined, w);
+  const epoch = Date.now();
+  sink('Ann', epoch, true);
+  await w.close();
+
+  check('pipeline.recordHint still fires when telemetry is undefined',
+    received.length === 1 && received[0].name === 'Ann' && received[0].isEnd === true, JSON.stringify(received));
+  const hintLines = readLines(w.path).filter((l) => l.type === 'hint');
+  check('a hint line lands in speaker-activity.jsonl even though telemetry is undefined',
+    hintLines.length === 1 && hintLines[0].name === 'Ann' && hintLines[0].t === epoch && hintLines[0].isEnd === true,
+    JSON.stringify(hintLines));
+}
+
+// ── 11) makeSpeakerHintSink taps the writer: skew re-stamping applies to the written t ───────────
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('teams'), { dir, now: () => 0 });
+  const warns: string[] = [];
+  const pipelineStub = { recordHint: (): void => { /* not under test */ } };
+  const { sink } = makeSpeakerHintSink(pipelineStub, (m) => warns.push(m), undefined, w);
+  sink('Bo', 12345); // performance.now()-shaped — implausible skew off the epoch clock
+  await w.close();
+
+  const hintLine = readLines(w.path).find((l) => l.type === 'hint') as Record<string, unknown> | undefined;
+  check('the skew warns loudly', warns.length === 1 && /hint-clock-skew/.test(warns[0] ?? ''), JSON.stringify(warns));
+  check('the written hint t is re-stamped to epoch, not the implausible 12345',
+    typeof hintLine?.t === 'number' && Math.abs((hintLine.t as number) - Date.now()) < 5000, JSON.stringify(hintLine));
 }
 
 if (failed) { console.error(`\n❌ speaker-activity: ${failed} check(s) FAILED.`); process.exit(1); }

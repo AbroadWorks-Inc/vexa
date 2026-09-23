@@ -43,6 +43,7 @@ import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
 import type { RemoteAudioActivityTap } from './aloneness.js';
 import { createTtsPlayback } from './tts-playback.js';
+import type { SpeakerActivityWriter } from './speaker-activity.js';
 
 /** Float32 PCM → base64 of its little-endian bytes — the EXACT codec wire payload, so a stored
  *  captured-signal.v1 frame round-trips through @vexa/capture-codec (encode→decode→same PCM). */
@@ -100,6 +101,9 @@ export function makeSpeakerHintSink(
    *  attribution offline. Teed with the post-guard `t`, so the stored hint carries the clock the
    *  pipeline actually saw. */
   telemetry?: TelemetrySink,
+  /** WHO WAS TALKING WHEN, with no audio — independent of the debug tape above, and always on.
+   *  Teed with the same post-guard `t` telemetry receives, for the same reason. */
+  speakerActivity?: SpeakerActivityWriter,
 ): { sink: (name: string, tMs?: number, isEnd?: boolean) => void; crossed: () => number } {
   let crossed = 0;
   return {
@@ -112,6 +116,7 @@ export function makeSpeakerHintSink(
         warn(`[bot] hint-clock-skew: hint tMs=${t} is ${Math.round(skew / 1000)}s off the epoch audio clock — page emitted a non-epoch timestamp; re-stamping (name=${name})`);
         t = Date.now();
       }
+      try { speakerActivity?.hint(t, name, isEnd); } catch { /* speaker-activity must not break capture */ }
       if (telemetry?.captureHint) {
         try { telemetry.captureHint({ type: 'hint', t, name, isEnd, lane: 'mixed' }); }
         catch { /* telemetry must not break capture */ }
@@ -694,6 +699,9 @@ export async function startCaptureBridge(
   onChat?: (sender: string, text: string) => void,
   /** Active-phase silence signal. It remains unavailable until page capture reports ready. */
   activity?: RemoteAudioActivityTap,
+  /** WHO WAS TALKING WHEN, with no audio — independent of the debug tape (telemetry above) and
+   *  always on. Fed at the same two tap points telemetry is, so it needs no separate wiring path. */
+  speakerActivity?: SpeakerActivityWriter,
 ): Promise<() => Promise<void>> {
   const mixed = isMixedLanePlatform(inv.platform);
   const perTrack = isPerTrackLanePlatform(inv.platform);   // Zoom: per-track through the per-channel lane
@@ -708,6 +716,12 @@ export async function startCaptureBridge(
   // check), so the proven O6 capture path is byte-for-byte unchanged. captureFrame is fire-and-forget.
   const tee = makeTelemetryTap(lane, telemetry);
   const observeRemoteAudio = makeRemoteAudioEnergyTap(activity);
+  // WHO WAS TALKING WHEN, with no audio — independent of the debug tape's tap above, and always
+  // on. Fire-and-forget, like every other tap here: a fault in the writer must never reach the
+  // pipeline.
+  const recordActivity = (ch: number, pcm: Float32Array, ts: number, name?: string): void => {
+    try { speakerActivity?.frame(ch, pcm, ts, name); } catch { /* speaker-activity must not break capture */ }
+  };
 
   // ── Node-side frame sink: one capture.v1 frame crossing the Playwright boundary. ──
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the
@@ -718,6 +732,7 @@ export async function startCaptureBridge(
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
     tee(speakerIndex, pcm, ts);                                 // O-TEL-1: tap BEFORE the pipeline
+    recordActivity(speakerIndex, pcm, ts);
     // Teams/Jitsi (useMix): one combined stream → the pyannote mixed lane. Zoom + gmeet: per-channel —
     // an unbound track (name not yet resolved) arrives with no name → the per-channel lane opens the
     // turn UNKNOWN and upgrades it the moment the resolver binds (gmeet-pipeline onset-adopt); the
@@ -731,11 +746,12 @@ export async function startCaptureBridge(
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
     tee(channel, pcm, ts, glowName);                            // O-TEL-1: tap BEFORE the pipeline
+    recordActivity(channel, pcm, ts, glowName);
     pipeline.feedAudio(channel, glowName, pcm, ts);
   };
   // mixed lane "who is lit" hint (Zoom/Teams active-speaker → the namer's time window).
   // Epoch-clock-guarded + counted; see makeSpeakerHintSink for the clock contract.
-  const { sink: onSpeakerHint, crossed: hintsBridgeCrossed } = makeSpeakerHintSink(pipeline, undefined, telemetry);
+  const { sink: onSpeakerHint, crossed: hintsBridgeCrossed } = makeSpeakerHintSink(pipeline, undefined, telemetry, speakerActivity);
   // Teams live captions: Teams' own ASR names the speaker, which is a second, independent naming
   // source beside the voice-level outline. The AUTHOR (never the text) is now offered to the lane
   // as evidence for a transport TRACK — still not to pipeline.recordHint, because a caption is not

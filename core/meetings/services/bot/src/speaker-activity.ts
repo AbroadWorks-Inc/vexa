@@ -26,13 +26,15 @@ export interface SpeakerActivityWriter {
   /** The session file path. */
   path: string;
   /** One captured audio frame. Meet names it at capture time; Zoom/Teams frames arrive
-   *  unnamed and are attributed later from hints. Never throws. */
+   *  unnamed and are attributed later from hints. Never throws; a no-op once close() has run. */
   frame(ch: number, pcm: Float32Array, ts: number, name?: string): void;
-  /** A mixed-lane active-speaker signal (Zoom/Teams). Never throws. */
+  /** A mixed-lane active-speaker signal (Zoom/Teams). Never throws; a no-op once close() has run. */
   hint(t: number, name: string, isEnd?: boolean): void;
   /** True once the size ceiling stopped the writer. The meeting is unaffected. */
   isCapped(): boolean;
-  /** Flush any buffered lines and stop the flush timer. Idempotent; never throws. */
+  /** Flush any buffered lines and stop the flush timer. Idempotent; never throws. Capture
+   *  already stopped by the time teardown calls this, so frame()/hint() become no-ops here too —
+   *  no lines can arrive out of order after the file is finalized for upload. */
   close(): Promise<void>;
 }
 
@@ -155,7 +157,7 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
   return {
     path,
     frame(ch, pcm, ts, name): void {
-      if (disabled || capped) return;
+      if (disabled || capped || closed) return;
       try {
         const rec: Record<string, unknown> = {
           t: ts,
@@ -170,7 +172,7 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
       } catch (e) { if (faults++ < 5) log(`frame write failed: ${String(e)}`); }
     },
     hint(t, name, isEnd): void {
-      if (disabled || capped) return;
+      if (disabled || capped || closed) return;
       try {
         const rec: Record<string, unknown> = { type: 'hint', t, name, ...(isEnd !== undefined ? { isEnd } : {}) };
         const line = JSON.stringify(rec) + '\n';
