@@ -154,6 +154,45 @@ def test_notetaker_raises_after_exhausting_retries() -> None:
     assert sleeps == [2.0, 4.0, 8.0]
 
 
+def test_notetaker_retries_on_read_timeout_then_succeeds() -> None:
+    calls = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadTimeout("timed out", request=req)
+        return httpx.Response(200, json={"status": "accepted"})
+
+    sleeps: list[float] = []
+    nt = Notetaker(
+        "http://n",
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=sleeps.append,
+    )
+    nt.process("vexa-4", "recordings/w/", "zoom")
+    assert calls["n"] == 3
+    assert sleeps == [2.0, 4.0]
+
+
+def test_notetaker_raises_after_exhausting_retries_on_read_timeout() -> None:
+    calls = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    sleeps: list[float] = []
+    nt = Notetaker(
+        "http://n",
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=sleeps.append,
+    )
+    with pytest.raises(NotetakerError):
+        nt.process("vexa-5", "recordings/v/", "google_meet")
+    assert calls["n"] == 4
+    assert sleeps == [2.0, 4.0, 8.0]
+
+
 def test_webm_to_wav_command_includes_mandatory_aresample_filter(
     tmp_path: Path,
 ) -> None:

@@ -1,8 +1,10 @@
 """Hand-off to the existing notetaker-worker's /process (spec §4.2 step 7).
 
 idempotency_key = meeting_id, so a redelivered webhook or a resumed pending job
-never double-processes a folder. Retries connect errors and 5xx (transient);
-4xx fails immediately (the request itself is wrong, retrying won't help).
+never double-processes a folder. Retries any httpx.TransportError (connect
+errors and all timeouts — /process is idempotent via idempotency_key, so a
+retry after a timeout is safe) and 5xx (transient); 4xx fails immediately
+(the request itself is wrong, retrying won't help).
 """
 
 from __future__ import annotations
@@ -44,11 +46,11 @@ class Notetaker:
                 resp = self._http.post(
                     f"{self._base_url}/process", json=body, timeout=_TIMEOUT_S
                 )
-            except httpx.ConnectError as exc:
+            except httpx.TransportError as exc:
                 if attempt < tries - 1:
                     self._sleep(_BACKOFF_S[attempt])
                     continue
-                raise NotetakerError(f"connect error: {exc}") from exc
+                raise NotetakerError(f"transport error: {exc}") from exc
             if resp.status_code // 100 == 2:
                 return
             if resp.status_code // 100 == 5:
