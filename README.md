@@ -56,6 +56,7 @@ Everything else is upstream Vexa, unchanged.
 |---|---|---|
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
 | **Exporter.** A new small service. | `integrations/out/aw-notetaker/` | Turns each finished meeting into the folder the AW notetaker pipeline reads, and hands it over. |
+| **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
 The design and the reasoning behind each decision live in
@@ -152,6 +153,7 @@ Every setting lives in configuration, not code:
 | Live transcription | Helm values → meeting-api env `TRANSCRIBE_ENABLED` | `false` |
 | Recording | `RECORDING_ENABLED` | `true` |
 | Storage | `MINIO_BUCKET` + `S3_ENDPOINT` (IAM role on EKS, no static keys) | bucket `aw-bots` |
+| meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
 | "Meeting finished" webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (+ `…_ALLOW_PRIVATE_HTTP=true`) | the exporter's in-cluster URL |
 | How early the bot joins | `AUTO_JOIN_LEAD_S` | measured from cold starts |
 | Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the bots NodePool |
@@ -160,6 +162,7 @@ Every setting lives in configuration, not code:
 | Debug tape off | admin-api platform setting `capture_signal=false` | off (turn on only to debug a meeting) |
 | Where the exporter sends meetings | exporter env `NOTETAKER_URL` | `http://notetaker-api.notetaker.svc.cluster.local:8080` |
 | Exporter buckets | `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX` | `aw-bots`, `aw-chatworks-transcribe`, `recordings/` |
+| How long exported files are kept | the exporter tags each object `retention-class`; the bucket's lifecycle rules act on the tag | `master.webm` = `recording-mp4` (30 days), `audio.wav` = `audio` (7 days), JSON = `metadata` (365 days) |
 | Exporter ↔ Vexa | `MEETING_API_URL`, `VEXA_WEBHOOK_SECRET` (same value as `VEXA_SYSTEM_WEBHOOK_SECRET`) | in-cluster |
 
 The full list of exporter settings is in
@@ -174,8 +177,11 @@ The deployment files live in the **aw-notetaker** repo, next to the rest of AW's
 (`deployment/`), not in this fork. In outline:
 
 1. **Buckets and IAM.** Bucket `aw-bots` gets a 14-day expiry on `recordings/` and `signal/`. It holds
-   Vexa's own files; the clean per-meeting folders are in `aw-chatworks-transcribe`. Create IAM roles
-   for meeting-api and the exporter.
+   Vexa's own files; the clean per-meeting folders are in `aw-chatworks-transcribe`, whose existing
+   lifecycle rules expire objects by their `retention-class` tag. Create two IAM roles (IRSA):
+   - meeting-api reads and writes `aw-bots`. The role attaches through `meetingApi.serviceAccount`.
+   - The exporter reads `aw-bots` and writes `aw-chatworks-transcribe`, including
+     `s3:PutObjectTagging`.
 2. **Karpenter NodePool for bots.** **On-demand only** (never spot: a reclaimed node kills the
    meeting). amd64 general-purpose instances. Nodes are removed only when empty, so a live bot is
    never evicted.
