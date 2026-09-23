@@ -11,14 +11,14 @@ import boto3
 import httpx
 import uvicorn
 
-from aw_exporter.app import create_app
-from aw_exporter.audio import webm_to_wav
-from aw_exporter.config import Settings
-from aw_exporter.job import Deps
-from aw_exporter.notetaker import Notetaker
-from aw_exporter.queue import PendingQueue
-from aw_exporter.storage import Storage
-from aw_exporter.vexa_client import MeetingApi
+from exporter.app import create_app
+from exporter.audio import webm_to_wav
+from exporter.config import Settings
+from exporter.job import Deps
+from exporter.notetaker import Notetaker
+from exporter.queue import PendingQueue
+from exporter.storage import Storage
+from exporter.vexa_client import MeetingApi
 
 
 def main() -> None:

@@ -17,17 +17,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from aw_exporter import __version__
-from aw_exporter.attribution import build_participants, build_speaker_timeline
-from aw_exporter.config import Settings
-from aw_exporter.naming import folder_name, parse_utc
-from aw_exporter.notetaker import Notetaker
-from aw_exporter.storage import Storage
-from aw_exporter.tape import TapeEvent, parse_tape, speech_events
-from aw_exporter.tape import names as tape_names
-from aw_exporter.vexa_client import MeetingApi
+from exporter import __version__
+from exporter.attribution import build_participants, build_speaker_timeline
+from exporter.config import Settings
+from exporter.naming import folder_name, parse_utc
+from exporter.notetaker import Notetaker
+from exporter.storage import Storage
+from exporter.tape import TapeEvent, parse_tape, speech_events
+from exporter.tape import names as tape_names
+from exporter.vexa_client import MeetingApi
 
-logger = logging.getLogger("aw_exporter")
+logger = logging.getLogger("exporter")
 
 State = Literal["handed_off", "no_audio", "already_done"]
 TapeState = Literal["ok", "missing", "invalid", "capped"]

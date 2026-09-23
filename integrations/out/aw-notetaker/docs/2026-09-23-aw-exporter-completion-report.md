@@ -14,7 +14,7 @@ Read this next to:
 | Tests | 178 unit tests pass; black, ruff and mypy (strict) clean. 1 integration test passes against the real image, MinIO and ffmpeg. |
 | Repo gates | No new failures from this package. Gates already red before this work: 6 because `uv` isn't installed here, and `gate:readme` on the gitignored `recordings/` and `reference/`. |
 | Core changes | None. Nothing under `core/`, `clients/` or `deploy/` changed. |
-| Code | `aw_exporter/` is 1,593 lines across 14 modules. |
+| Code | `exporter/` is 1,593 lines across 14 modules. |
 
 What it does, end to end:
 1. Vexa sends its signed `meeting.completed` system webhook to `POST /hooks/vexa`.
@@ -28,7 +28,7 @@ Failures back off and retry. After 5 attempts the meeting moves to `failed/`. Th
 
 | Plan task | What was built | How it was verified | Commits | Differs from plan? |
 |---|---|---|---|---|
-| 1 Scaffold + gate baseline | Package, `pyproject.toml`, smoke test, READMEs | Gate baseline before/after (no new reds); pytest/black/ruff/mypy | `1d68dd26` `d0dd9010` | Added READMEs in `aw_exporter/`, `tests/`, `docs/` (upstream `gate:readme` needs one in every folder) |
+| 1 Scaffold + gate baseline | Package, `pyproject.toml`, smoke test, READMEs | Gate baseline before/after (no new reds); pytest/black/ruff/mypy | `1d68dd26` `d0dd9010` | Added READMEs in `exporter/`, `tests/`, `docs/` (upstream `gate:readme` needs one in every folder) |
 | 2 Timing spike | Measured how tape timestamps map onto the audio's t=0, on the 2026-09-22 Meet recording (throwaway scripts, not committed) | Energy cross-correlation over two windows that agree exactly (lag +35 250 ms, z 10.4 / 17.9) | `683c89ce` `1069394b` `e04a3836` | **Yes, big one** — §3 D1 |
 | 3 Config / naming / signature | `Settings.from_env`, `folder_name`, `verify` (HMAC, 300 s window, fails closed) | 16 tests, written test-first | `f65e0537` | Speech threshold default 0.026 (measured, not 0.01); added `RECORD_CHUNK_TIMESLICE_MS` |
 | 4 Output schemas | Pydantic mirror of the `notetaker_common` file formats | Field-order test + round-trip test, checked field by field against `notetaker_common/schemas.py` | `552de54a` | Tests in `test_schemas.py`, not `test_attribution.py` |
@@ -49,7 +49,7 @@ Failures back off and retry. After 5 attempts the meeting moves to `failed/`. Th
 - Measured: the WebM's own timestamps span 1935.65 s; the plain decode came out at 1901.50 s; the gap-filling decode (`-af aresample=async=1:first_pts=0`) gave 1935.62 s. About 34 s went missing across roughly 220 gaps.
 - Effect: the WAV sent to `notetaker-worker` would have drifted up to ~34 s from real time. That drift breaks speaker attribution and would also have skewed transcript times.
 - With the fixed decode, the measurement pinned one rule: **audio t=0 = `recording.created_at` − 15 000 ms**. The residual is −125.5 ms, from a single recording, so Task 11 must re-measure it.
-- The spec now requires the gap-filling flag (§4.2 step 4) and `aw_exporter/audio.py` uses it.
+- The spec now requires the gap-filling flag (§4.2 step 4) and `exporter/audio.py` uses it.
 
 **D2 — Wait for the capture tape (final review, Critical).**
 - The Vexa bot uploads the capture tape during teardown, after it emits `meeting.completed`.
@@ -71,6 +71,11 @@ Risks recorded:
 - a meeting with several sessions exports only the newest (counted in `_export.json`);
 - reading a meeting's recordings gets slower as the single account's total meeting count grows;
 - the measurements Task 11 still owes.
+
+**D5 — Package renamed after review (your request).**
+- The Python package is now `exporter` (was `aw_exporter`): `python -m exporter`, `import exporter`. The plan and this report were updated to match.
+- `aw-exporter` survives only where it names storage or infrastructure: the `aw-exporter/` prefix in the shared `aw-bots` bucket, and the Docker image and test container names.
+- The per-folder READMEs now say what each folder holds; the upstream "Governed by…" boilerplate is gone. The gate only needs a non-empty README.
 
 Smaller deviations are listed in §4, with the reason and cost for each.
 
@@ -156,7 +161,7 @@ Each line: what I decided — why — what it costs if wrong.
 ```bash
 cd integrations/out/aw-notetaker
 /opt/homebrew/bin/python3.11 -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'
-pytest -q && black --check . && ruff check . && mypy aw_exporter     # 178 passed
+pytest -q && black --check . && ruff check . && mypy exporter     # 178 passed
 pytest -m integration -q tests/integration                          # needs Docker
 docker build -t aw-exporter:dev .
 ```

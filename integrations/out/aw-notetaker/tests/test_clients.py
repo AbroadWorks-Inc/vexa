@@ -12,9 +12,9 @@ from typing import Any
 import httpx
 import pytest
 
-from aw_exporter.audio import webm_to_wav
-from aw_exporter.notetaker import Notetaker, NotetakerError
-from aw_exporter.vexa_client import MeetingApi, MeetingApiError
+from exporter.audio import webm_to_wav
+from exporter.notetaker import Notetaker, NotetakerError
+from exporter.vexa_client import MeetingApi, MeetingApiError
 
 
 def test_meeting_api_sends_user_header_and_parses() -> None:

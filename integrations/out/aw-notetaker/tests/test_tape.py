@@ -1,6 +1,6 @@
 """Tests for tape parsing and speech event detection."""
 
-from aw_exporter.tape import TapeEvent, parse_tape, speech_events, names
+from exporter.tape import TapeEvent, parse_tape, speech_events, names
 from tests.builders import frame, header, hint
 
 ORIGIN_MS = 1_000_000  # origin epoch ms

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from aw_exporter.schemas import (
+from exporter.schemas import (
     HostInfo,
     ParticipantInfo,
     ParticipantsFile,
@@ -19,7 +19,7 @@ from aw_exporter.schemas import (
     SpeakerTimelineFile,
     TimelineParticipant,
 )
-from aw_exporter.tape import TapeEvent
+from exporter.tape import TapeEvent
 
 __all__ = ["build_speaker_timeline", "build_participants"]
 

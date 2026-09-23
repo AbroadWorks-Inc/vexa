@@ -20,12 +20,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from aw_exporter import signature
-from aw_exporter.config import Settings
-from aw_exporter.job import Deps
-from aw_exporter.queue import PendingQueue, run_worker
+from exporter import signature
+from exporter.config import Settings
+from exporter.job import Deps
+from exporter.queue import PendingQueue, run_worker
 
-logger = logging.getLogger("aw_exporter")
+logger = logging.getLogger("exporter")
 
 # The fields export_meeting/naming.folder_name need out of data.meeting;
 # an envelope missing any of these is rejected at intake rather than being

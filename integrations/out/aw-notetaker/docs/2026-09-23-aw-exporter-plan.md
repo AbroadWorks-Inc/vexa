@@ -31,7 +31,7 @@ integrations/out/aw-notetaker/
   pyproject.toml                package aw-exporter, deps, tool config
   Dockerfile                    python:3.11-slim + ffmpeg
   docs/                         spec + this plan
-  aw_exporter/
+  exporter/
     __init__.py
     config.py                   Settings.from_env()
     naming.py                   folder_name(meeting) -> str
@@ -58,10 +58,10 @@ integrations/out/aw-notetaker/
 ### Task 1: Baseline the repo gates and scaffold the package
 
 **Files:**
-- Create: `integrations/out/aw-notetaker/pyproject.toml`, `README.md`, `aw_exporter/__init__.py`, `tests/__init__.py`, `tests/test_smoke.py`
+- Create: `integrations/out/aw-notetaker/pyproject.toml`, `README.md`, `exporter/__init__.py`, `tests/__init__.py`, `tests/test_smoke.py`
 
 **Interfaces:**
-- Produces: importable package `aw_exporter` with `__version__ = "0.1.0"`; a venv at `integrations/out/aw-notetaker/.venv` (gitignored by the root `.gitignore` `.venv` rule — verify, else add to a package-local `.gitignore`).
+- Produces: importable package `exporter` with `__version__ = "0.1.0"`; a venv at `integrations/out/aw-notetaker/.venv` (gitignored by the root `.gitignore` `.venv` rule — verify, else add to a package-local `.gitignore`).
 
 - [ ] **Step 1: Record the upstream gate baseline BEFORE adding anything**
 
@@ -105,7 +105,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["aw_exporter*"]
+include = ["exporter*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
@@ -127,7 +127,7 @@ strict = true
 
 - [ ] **Step 3: Package init + smoke test**
 
-`aw_exporter/__init__.py`:
+`exporter/__init__.py`:
 ```python
 """Vexa meeting.completed -> AbroadWorks notetaker hand-off (see docs/)."""
 
@@ -135,11 +135,11 @@ __version__ = "0.1.0"
 ```
 `tests/test_smoke.py`:
 ```python
-import aw_exporter
+import exporter
 
 
 def test_version() -> None:
-    assert aw_exporter.__version__ == "0.1.0"
+    assert exporter.__version__ == "0.1.0"
 ```
 
 - [ ] **Step 4: Create venv, install, run**
@@ -148,7 +148,7 @@ def test_version() -> None:
 cd integrations/out/aw-notetaker
 /opt/homebrew/bin/python3.11 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-pytest -q && black --check . && ruff check . && mypy aw_exporter
+pytest -q && black --check . && ruff check . && mypy exporter
 ```
 Expected: `1 passed`; black/ruff/mypy clean.
 
@@ -203,7 +203,7 @@ If NO candidate is within 250 ms, STOP: the exporter must compute the lag at run
 ### Task 3: Config, folder naming, webhook signature
 
 **Files:**
-- Create: `aw_exporter/config.py`, `aw_exporter/naming.py`, `aw_exporter/signature.py`
+- Create: `exporter/config.py`, `exporter/naming.py`, `exporter/signature.py`
 - Test: `tests/test_naming.py`, `tests/test_signature.py`
 
 **Interfaces:**
@@ -218,7 +218,7 @@ If NO candidate is within 250 ms, STOP: the exporter must compute the lag at run
 ```python
 import pytest
 
-from aw_exporter.naming import folder_name
+from exporter.naming import folder_name
 
 
 def test_meet_example() -> None:
@@ -255,7 +255,7 @@ def test_missing_start_time_raises() -> None:
 import hashlib
 import hmac
 
-from aw_exporter.signature import verify
+from exporter.signature import verify
 
 SECRET = "test-secret"
 BODY = b'{"event_type":"meeting.completed"}'
@@ -309,7 +309,7 @@ def test_header_lookup_is_case_insensitive() -> None:
 
 - [ ] **Step 3: Implement**
 
-`aw_exporter/naming.py`:
+`exporter/naming.py`:
 ```python
 """Export folder name — a pure function of the Vexa meeting row (spec §3)."""
 
@@ -331,7 +331,7 @@ def folder_name(platform: str, native_meeting_id: str, start_time: str) -> str:
     stamp = utc.strftime("%Y%m%dT%H%M%S") + f"{utc.microsecond // 1000:03d}Z"
     return f"{platform}_{_UNSAFE.sub('-', native_meeting_id)}_{stamp}"
 ```
-`aw_exporter/signature.py`:
+`exporter/signature.py`:
 ```python
 """Verify Vexa's webhook signature (meeting_api/webhooks/delivery.py sign_payload)."""
 
@@ -372,7 +372,7 @@ def verify(
     mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
     return hmac.compare_digest(signature, f"sha256={mac.hexdigest()}")
 ```
-`aw_exporter/config.py`:
+`exporter/config.py`:
 ```python
 """Environment -> Settings (spec §4.4). Names only; values come from the deployment."""
 
@@ -429,7 +429,7 @@ class Settings:
 ```
 Add to `tests/test_naming.py` (config coverage lives with naming — both are pure):
 ```python
-from aw_exporter.config import Settings
+from exporter.config import Settings
 
 BASE = {
     "MEETING_API_URL": "http://meeting-api:8080/",
@@ -452,7 +452,7 @@ def test_settings_missing_required() -> None:
         Settings.from_env({k: v for k, v in BASE.items() if k != "VEXA_WEBHOOK_SECRET"})
 ```
 
-- [ ] **Step 4: Run** `pytest -q && black --check . && ruff check . && mypy aw_exporter` → all pass.
+- [ ] **Step 4: Run** `pytest -q && black --check . && ruff check . && mypy exporter` → all pass.
 
 - [ ] **Step 5: Commit** `feat(aw-exporter): folder naming, webhook signature, settings` (body: spec §3, §4.1, §4.4).
 
@@ -461,7 +461,7 @@ def test_settings_missing_required() -> None:
 ### Task 4: Output schemas (mirror of notetaker_common)
 
 **Files:**
-- Create: `aw_exporter/schemas.py`
+- Create: `exporter/schemas.py`
 - Test: `tests/test_attribution.py` (schema section)
 
 **Interfaces:**
@@ -476,7 +476,7 @@ def test_settings_missing_required() -> None:
 
 - [ ] **Step 1: Failing test** — pin the field sets so drift from the worker contract is loud:
 ```python
-from aw_exporter import schemas
+from exporter import schemas
 
 
 def test_field_sets_match_notetaker_contract() -> None:
@@ -499,7 +499,7 @@ def test_field_sets_match_notetaker_contract() -> None:
 ### Task 5: Tape parsing → speaker events
 
 **Files:**
-- Create: `aw_exporter/tape.py`
+- Create: `exporter/tape.py`
 - Modify: `tests/conftest.py` (synthetic tape builders)
 - Test: `tests/test_tape.py`
 
@@ -542,7 +542,7 @@ def hint(t: int, name: str, is_end: bool = False) -> str:
 
 - [ ] **Step 2: Failing tests** (`tests/test_tape.py`):
 ```python
-from aw_exporter.tape import parse_tape, speech_events, names
+from exporter.tape import parse_tape, speech_events, names
 from tests.conftest import frame, header, hint
 
 O = 1_000_000  # origin epoch ms
@@ -729,7 +729,7 @@ def speech_events(tape: Tape, origin_ms: int, rms_threshold: float,
 ### Task 6: Attribution — port of the aw-integration adapter
 
 **Files:**
-- Create: `aw_exporter/attribution.py`
+- Create: `exporter/attribution.py`
 - Test: `tests/test_attribution.py`
 - Reference (read-only, gitignored): `reference/aw-overrides/aw-integration/aw_integration/adapter.py`, `reference/aw-overrides/aw-integration/tests/test_adapter.py`
 
@@ -753,8 +753,8 @@ Port rules (keep the reference docstrings' reasoning as short comments; drop inc
 ```python
 from datetime import datetime, timedelta, timezone
 
-from aw_exporter.attribution import build_participants, build_speaker_timeline
-from aw_exporter.tape import TapeEvent
+from exporter.attribution import build_participants, build_speaker_timeline
+from exporter.tape import TapeEvent
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -812,7 +812,7 @@ def test_participants() -> None:
 ### Task 7: I/O adapters — S3, meeting-api, notetaker, ffmpeg
 
 **Files:**
-- Create: `aw_exporter/storage.py`, `aw_exporter/vexa_client.py`, `aw_exporter/notetaker.py`, `aw_exporter/audio.py`
+- Create: `exporter/storage.py`, `exporter/vexa_client.py`, `exporter/notetaker.py`, `exporter/audio.py`
 - Test: `tests/test_storage.py`, `tests/test_clients.py`
 
 **Interfaces:**
@@ -827,8 +827,8 @@ def test_participants() -> None:
 import httpx
 import pytest
 
-from aw_exporter.notetaker import Notetaker, NotetakerError
-from aw_exporter.vexa_client import MeetingApi, MeetingApiError
+from exporter.notetaker import Notetaker, NotetakerError
+from exporter.vexa_client import MeetingApi, MeetingApiError
 
 
 def test_meeting_api_sends_user_header_and_parses() -> None:
@@ -891,7 +891,7 @@ Plus `test_webm_to_wav` (skip if `shutil.which("ffmpeg") is None`): generate a 1
 ### Task 8: Export job
 
 **Files:**
-- Create: `aw_exporter/job.py`
+- Create: `exporter/job.py`
 - Test: `tests/test_job.py`
 
 **Interfaces:**
@@ -922,7 +922,7 @@ Algorithm (spec §4.2) — `m = envelope["data"]["meeting"]`; `folder = folder_n
 ### Task 9: Durable queue + HTTP intake
 
 **Files:**
-- Create: `aw_exporter/queue.py`, `aw_exporter/app.py`
+- Create: `exporter/queue.py`, `exporter/app.py`
 - Test: `tests/test_queue_app.py`
 
 **Interfaces:**
@@ -933,7 +933,7 @@ Algorithm (spec §4.2) — `m = envelope["data"]["meeting"]`; `folder = folder_n
 
 - [ ] **Step 1: Failing tests** (FastAPI `TestClient`, moto): unsigned → 401; signed `bot.failed` → 200 ignored, nothing queued; signed `meeting.completed` → 202 + pending object exists; S3 put failing (patch `enqueue` to raise) → 503; worker: one pending envelope + fake job success → pending gone; fake job always raising with `max_attempts=2` → after two sweeps the item is under `failed/` and `_export.json.state == "failed"`; restart semantics: a fresh `PendingQueue` over the same bucket sees the still-pending id.
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** `queue.py`, `app.py` (+ `aw_exporter/__main__.py`: `Settings.from_env(os.environ)`, build boto3/httpx clients, `uvicorn.run(create_app(...), host="0.0.0.0", port=8080)`).
+- [ ] **Step 3: Implement** `queue.py`, `app.py` (+ `exporter/__main__.py`: `Settings.from_env(os.environ)`, build boto3/httpx clients, `uvicorn.run(create_app(...), host="0.0.0.0", port=8080)`).
 - [ ] **Step 4: Run** → PASS; black/ruff/mypy.
 - [ ] **Step 5: Commit** `feat(aw-exporter): signed webhook intake + S3-backed durable queue`.
 
@@ -951,11 +951,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml ./
-COPY aw_exporter/ aw_exporter/
+COPY exporter/ exporter/
 RUN pip install --no-cache-dir .
 USER 65534
 EXPOSE 8080
-CMD ["python", "-m", "aw_exporter"]
+CMD ["python", "-m", "exporter"]
 ```
 Record the ffmpeg package's license in `image-licenses.json` if the image-licensing gate requires it (check the gate output; Debian's ffmpeg is GPL-enabled — if the gate refuses GPL in images, STOP and surface).
 - [ ] **Step 2: Build** `docker build -t aw-exporter:dev integrations/out/aw-notetaker` → succeeds; `docker run --rm aw-exporter:dev ffmpeg -version | head -1` prints a version.
@@ -981,7 +981,7 @@ Record the ffmpeg package's license in `image-licenses.json` if the image-licens
 
 - [ ] **Step 1:** Changelog fragment `docs/changelog.d/aw-exporter.md` only if the docs-current gate demands it for this folder (AGENTS.md hot-file rule); otherwise none.
 - [ ] **Step 2:** In the aw-notetaker repo (separate commit there, with approval): `CLAUDE.md` branch convention → `feat/<topic>` / `fix/<topic>` for vexa-fork (observed practice); record the rearchitecture direction and the `development` branch.
-- [ ] **Step 3:** Full check: `pytest -q && black --check . && ruff check . && mypy aw_exporter` in the package; `node scripts/gates.mjs all` vs the baseline.
+- [ ] **Step 3:** Full check: `pytest -q && black --check . && ruff check . && mypy exporter` in the package; `node scripts/gates.mjs all` vs the baseline.
 - [ ] **Step 4:** With explicit user approval only: `git push -u origin feat/aw-rearchitecture` and open a PR into `development` with the observation bundle from Task 11.
 
 ---

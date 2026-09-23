@@ -1,4 +1,4 @@
-"""Tests for aw_exporter.attribution (spec §4.3).
+"""Tests for exporter.attribution (spec §4.3).
 
 Ported from aw-integration/tests/test_adapter.py (AbroadWorks' own Apache-2.0
 fork, not Attendee). `VexaSpeakerEvent(relative_ms=..., event_type=...,
@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from aw_exporter.attribution import build_participants, build_speaker_timeline
-from aw_exporter.schemas import ParticipantsFile, SpeakerEvent, SpeakerTimelineFile
-from aw_exporter.tape import EventType, TapeEvent
+from exporter.attribution import build_participants, build_speaker_timeline
+from exporter.schemas import ParticipantsFile, SpeakerEvent, SpeakerTimelineFile
+from exporter.tape import EventType, TapeEvent
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 

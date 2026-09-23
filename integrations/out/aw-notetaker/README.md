@@ -1,4 +1,4 @@
-# aw-exporter
+# exporter — Vexa meeting → AbroadWorks notetaker hand-off
 
 On Vexa's `meeting.completed` webhook, builds the per-meeting AbroadWorks notetaker folder in
 `aw-chatworks-transcribe` (audio, tape-derived speaker attribution, meeting metadata) and hands it
@@ -19,5 +19,5 @@ Spec: [`docs/2026-09-23-aw-rearchitecture-design.md`](docs/2026-09-23-aw-rearchi
 ```bash
 /opt/homebrew/bin/python3.11 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-pytest -q && black --check . && ruff check . && mypy aw_exporter
+pytest -q && black --check . && ruff check . && mypy exporter
 ```

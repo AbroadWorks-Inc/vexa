@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 
-from aw_exporter.signature import verify
+from exporter.signature import verify
 
 SECRET = "test-secret"
 BODY = b'{"event_type":"meeting.completed"}'

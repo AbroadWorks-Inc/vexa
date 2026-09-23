@@ -1,7 +1,7 @@
 import pytest
 
-from aw_exporter.config import Settings
-from aw_exporter.naming import folder_name
+from exporter.config import Settings
+from exporter.naming import folder_name
 
 
 def test_meet_example() -> None:

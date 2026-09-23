@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from aw_exporter import schemas
+from exporter import schemas
 
 
 def test_field_sets_match_notetaker_contract() -> None:

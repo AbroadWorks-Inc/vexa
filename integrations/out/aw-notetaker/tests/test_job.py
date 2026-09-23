@@ -1,4 +1,4 @@
-"""Tests for aw_exporter.job — the per-meeting export job (spec §4.2-4.3)."""
+"""Tests for exporter.job — the per-meeting export job (spec §4.2-4.3)."""
 
 from __future__ import annotations
 
@@ -15,17 +15,17 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from aw_exporter.config import Settings
-import aw_exporter.job as job_module
-from aw_exporter.job import (
+from exporter.config import Settings
+import exporter.job as job_module
+from exporter.job import (
     Deps,
     ExportResult,
     TapeNotReady,
     export_meeting,
     recording_origin_ms,
 )
-from aw_exporter.queue import PendingQueue, sweep_once
-from aw_exporter.storage import Storage
+from exporter.queue import PendingQueue, sweep_once
+from exporter.storage import Storage
 from tests.builders import frame, header, two_speaker_gmeet_lines, write_silent_wav
 
 VEXA_BUCKET = "aw-bots"
@@ -610,7 +610,7 @@ def test_tape_at_budget_cap_is_marked_capped_but_still_used(
         settings=_settings(tape_max_bytes=int(len(body) / 0.98)),
     )
 
-    with caplog.at_level(logging.WARNING, logger="aw_exporter"):
+    with caplog.at_level(logging.WARNING, logger="exporter"):
         assert export_meeting(_envelope(), deps).state == "handed_off"
 
     assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["tape"] == "capped"
@@ -682,7 +682,7 @@ def test_multiple_audio_recordings_are_counted_and_warned(
     )
     deps = _deps(storage, meeting_api, FakeNotetaker())
 
-    with caplog.at_level(logging.WARNING, logger="aw_exporter"):
+    with caplog.at_level(logging.WARNING, logger="exporter"):
         export_meeting(_envelope(), deps)
 
     assert meeting_api.master_calls == [(7, 31)]
@@ -697,7 +697,7 @@ def test_single_audio_recording_logs_no_multi_session_warning(
     storage_path = _put_master(storage, 33, "uid-33")
     deps = _deps(storage, _api_for(33, storage_path), FakeNotetaker())
 
-    with caplog.at_level(logging.WARNING, logger="aw_exporter"):
+    with caplog.at_level(logging.WARNING, logger="exporter"):
         export_meeting(_envelope(), deps)
 
     assert not any("audio_recordings" in r.getMessage() for r in caplog.records)

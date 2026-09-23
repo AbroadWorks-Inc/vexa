@@ -1,6 +1,6 @@
 """Stub Vexa meeting-api for the compose integration test (task 10).
 
-Serves the two routes `aw_exporter.vexa_client.MeetingApi` needs for this
+Serves the two routes `exporter.vexa_client.MeetingApi` needs for this
 scenario (spec §4.2 steps 2-3): `GET /recordings` and
 `GET /recordings/{id}/master`. Runs via uvicorn on the host; the exporter
 container under test reaches it at `host.docker.internal:<port>`.

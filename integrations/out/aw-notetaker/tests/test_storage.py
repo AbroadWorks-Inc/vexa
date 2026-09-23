@@ -1,4 +1,4 @@
-"""aw_exporter.storage.Storage against moto's mocked S3 (spec §4.2)."""
+"""exporter.storage.Storage against moto's mocked S3 (spec §4.2)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from aw_exporter.storage import Storage
+from exporter.storage import Storage
 
 
 @pytest.fixture

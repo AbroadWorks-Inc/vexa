@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aw-exporter"
+name = "exporter"
 version = "0.1.0"
 description = "Vexa meeting.completed -> AbroadWorks notetaker folder + /process hand-off"
 requires-python = ">=3.11,<3.12"
@@ -28,7 +28,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["aw_exporter*"]
+include = ["exporter*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"

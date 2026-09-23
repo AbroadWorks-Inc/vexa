@@ -1,5 +1,5 @@
-"""Tests for aw_exporter.queue (durable pending queue + sweep worker) and
-aw_exporter.app (signed webhook intake) — spec §4.1."""
+"""Tests for exporter.queue (durable pending queue + sweep worker) and
+exporter.app (signed webhook intake) — spec §4.1."""
 
 from __future__ import annotations
 
@@ -29,15 +29,15 @@ warnings.filterwarnings(
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-import aw_exporter.queue as queue_module  # noqa: E402
-from aw_exporter.app import create_app  # noqa: E402
-from aw_exporter.config import Settings  # noqa: E402
-from aw_exporter.job import Deps, ExportResult  # noqa: E402
-from aw_exporter.naming import folder_name  # noqa: E402
-from aw_exporter.notetaker import Notetaker  # noqa: E402
-from aw_exporter.queue import PendingQueue, run_worker, sweep_once  # noqa: E402
-from aw_exporter.storage import Storage  # noqa: E402
-from aw_exporter.vexa_client import MeetingApi  # noqa: E402
+import exporter.queue as queue_module  # noqa: E402
+from exporter.app import create_app  # noqa: E402
+from exporter.config import Settings  # noqa: E402
+from exporter.job import Deps, ExportResult  # noqa: E402
+from exporter.naming import folder_name  # noqa: E402
+from exporter.notetaker import Notetaker  # noqa: E402
+from exporter.queue import PendingQueue, run_worker, sweep_once  # noqa: E402
+from exporter.storage import Storage  # noqa: E402
+from exporter.vexa_client import MeetingApi  # noqa: E402
 
 WEBHOOK_SECRET = "test-secret"
 VEXA_BUCKET = "aw-bots"
@@ -545,7 +545,7 @@ def test_run_worker_survives_sweep_once_raising(
 def test_caplog_shows_job_failure_and_quarantine(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.INFO, logger="aw_exporter")
+    caplog.set_level(logging.INFO, logger="exporter")
     settings = _settings(max_attempts=1)
     queue = PendingQueue(storage, settings.vexa_bucket)
     queue.enqueue(_envelope())
@@ -563,4 +563,4 @@ def test_caplog_shows_job_failure_and_quarantine(
 
 
 def test_import_main_module_is_safe() -> None:
-    import aw_exporter.__main__  # noqa: F401
+    import exporter.__main__  # noqa: F401

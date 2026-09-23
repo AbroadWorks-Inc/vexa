@@ -37,8 +37,8 @@ import pytest
 import uvicorn
 from botocore.exceptions import ClientError
 
-from aw_exporter.job import recording_origin_ms
-from aw_exporter.naming import folder_name
+from exporter.job import recording_origin_ms
+from exporter.naming import folder_name
 from tests.builders import two_speaker_gmeet_lines
 from tests.integration.stub_meeting_api import create_app as create_meeting_api_app
 from tests.integration.stub_notetaker import create_app as create_notetaker_app

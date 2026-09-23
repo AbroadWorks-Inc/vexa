@@ -20,11 +20,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from aw_exporter.job import Deps, ExportResult, export_meeting
-from aw_exporter.naming import folder_name
-from aw_exporter.storage import Storage
+from exporter.job import Deps, ExportResult, export_meeting
+from exporter.naming import folder_name
+from exporter.storage import Storage
 
-logger = logging.getLogger("aw_exporter")
+logger = logging.getLogger("exporter")
 
 _PENDING_PREFIX = "aw-exporter/pending/"
 _FAILED_PREFIX = "aw-exporter/failed/"

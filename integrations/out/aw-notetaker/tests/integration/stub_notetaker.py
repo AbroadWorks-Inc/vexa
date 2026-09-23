@@ -1,7 +1,7 @@
 """Stub notetaker-worker for the compose integration test (task 10).
 
 Records every `POST /process` body it receives so the test can assert the
-exporter's hand-off request, matching `aw_exporter.notetaker.Notetaker`'s
+exporter's hand-off request, matching `exporter.notetaker.Notetaker`'s
 spec (§4.2 step 7). Runs via uvicorn on the host; the exporter container
 under test reaches it at `host.docker.internal:<port>`.
 """

@@ -1,3 +1,8 @@
-# tests — aw_exporter unit tests (pytest; `-m "not integration"` by default)
+# tests — unit tests
 
-_Governed by `docs/docs/governance/architecture.mdx` (P1–P12). This folder owns one concern; its public surface is its `index`/contract; it may depend only on what the dependency-rules allow._
+One `test_<module>.py` per module in `exporter/`; S3 is faked with moto and HTTP with
+`httpx.MockTransport`, so nothing leaves the machine. `builders.py` makes synthetic capture
+tapes (no real meeting data).
+
+Run from the package folder: `pytest -q`. The Docker-based end-to-end test lives in
+`integration/` and is skipped unless you pass `-m integration`.
