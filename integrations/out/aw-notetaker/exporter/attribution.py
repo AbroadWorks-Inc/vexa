@@ -1,15 +1,16 @@
-"""Tape events -> speaker timeline + participants (spec §4.3).
+"""Speaker-activity events -> speaker timeline + participants (spec §4.3).
 
 Ported from aw-integration's `VexaSessionAdapter` (AbroadWorks' own Apache-2.0
-fork, not Attendee — see AGENTS.md §3.4/§18.2). Operates on `TapeEvent` instead
-of `VexaSpeakerEvent`/Redis streams, and on a resolved `names` list instead of
-`VexaSegment`/`speaker_events` for the participant roster.
+fork, not Attendee — see AGENTS.md §3.4/§18.2). Operates on `ActivityEvent`
+instead of `VexaSpeakerEvent`/Redis streams, and on a resolved `names` list
+instead of `VexaSegment`/`speaker_events` for the participant roster.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
+from exporter.activity import ActivityEvent
 from exporter.schemas import (
     HostInfo,
     ParticipantInfo,
@@ -19,7 +20,6 @@ from exporter.schemas import (
     SpeakerTimelineFile,
     TimelineParticipant,
 )
-from exporter.tape import TapeEvent
 
 __all__ = ["build_speaker_timeline", "build_participants"]
 
@@ -29,7 +29,7 @@ def _slug(name: str) -> str:
 
 
 def _build_dominant_speaker_timeline(
-    ordered_events: list[TapeEvent],
+    ordered_events: list[ActivityEvent],
     origin_ms: int,
     duration_sec: float,
     min_dominant_utterance_ms: int,
@@ -38,7 +38,7 @@ def _build_dominant_speaker_timeline(
 
     notetaker-worker attributes a transcript segment to the LAST timeline event
     at or before the segment's start, which is only correct if each event marks
-    a genuine change of dominant speaker. The tape instead carries one
+    a genuine change of dominant speaker. Speaker activity instead carries one
     START/END pair per audio burst per track, so a stray half-second burst on
     someone else's microphone would otherwise "win" as the most recent change
     and steal the remainder of another speaker's sentence.
@@ -174,7 +174,7 @@ def _intervals_from_points(
 
 
 def build_speaker_timeline(
-    events: list[TapeEvent],
+    events: list[ActivityEvent],
     *,
     platform: str,
     meeting_id: str,

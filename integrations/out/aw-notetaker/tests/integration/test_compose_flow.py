@@ -63,7 +63,9 @@ RECORDING_ID = 2
 SESSION_UID = "sess-1"
 NATIVE_MEETING_ID = "it-synthetic-meet-abcd"
 STORAGE_PATH = f"recordings/{USER_ID}/{RECORDING_ID}/{SESSION_UID}/audio/master.webm"
-TAPE_KEY = f"signal/{USER_ID}/{VEXA_MEETING_ID}/{SESSION_UID}/captured-signal.jsonl"
+ACTIVITY_KEY = (
+    f"signal/{USER_ID}/{VEXA_MEETING_ID}/{SESSION_UID}/speaker-activity.jsonl"
+)
 START_TIME = "2026-09-23T10:00:00.000Z"
 END_TIME = "2026-09-23T10:00:03.000Z"
 RECORDING_CREATED_AT = "2026-09-23T10:00:00.000Z"
@@ -71,7 +73,7 @@ AUDIO_DURATION_S = 3.0
 
 ORIGIN_MS = recording_origin_ms({"created_at": RECORDING_CREATED_AT}, 15000)
 PENDING_KEY = f"aw-exporter/pending/{VEXA_MEETING_ID}.json"
-SEEDED_VEXA_KEYS = {STORAGE_PATH, TAPE_KEY}
+SEEDED_VEXA_KEYS = {STORAGE_PATH, ACTIVITY_KEY}
 
 FOLDER = folder_name("google_meet", NATIVE_MEETING_ID, START_TIME)
 BASE = f"recordings/{FOLDER}/"
@@ -288,11 +290,11 @@ def seeded_s3(s3: S3Client, tmp_path: Path) -> S3Client:
         Body=master_path.read_bytes(),
         ContentType="video/webm",
     )
-    tape_lines = two_speaker_gmeet_lines(ORIGIN_MS)
+    activity_lines = two_speaker_gmeet_lines(ORIGIN_MS)
     s3.put_object(
         Bucket=VEXA_BUCKET,
-        Key=TAPE_KEY,
-        Body=("\n".join(tape_lines) + "\n").encode(),
+        Key=ACTIVITY_KEY,
+        Body=("\n".join(activity_lines) + "\n").encode(),
         ContentType="application/x-ndjson",
     )
     return s3
@@ -393,7 +395,7 @@ def test_compose_flow_hands_off_meeting(
 
     marker = _wait_for_export_marker(seeded_s3, timeout=60)
     assert marker["state"] == "handed_off"
-    assert marker["tape"] == "ok"
+    assert marker["speaker_activity"] == "ok"
     assert marker["audio_recordings"] == 1
 
     keys = _list_keys(seeded_s3, EXPORT_BUCKET, BASE)

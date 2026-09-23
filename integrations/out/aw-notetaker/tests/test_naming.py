@@ -50,14 +50,12 @@ def test_settings_defaults() -> None:
     assert s.debug is False and s.concurrency == 4
     assert s.rms_speech_threshold == 0.026
     assert s.record_chunk_timeslice_ms == 15000
-    assert s.tape_wait_seconds == 120.0
-    assert s.tape_max_bytes == 262144000
+    assert s.activity_wait_seconds == 120.0
 
 
-def test_settings_tape_env_overrides() -> None:
-    s = Settings.from_env({**BASE, "TAPE_WAIT_SECONDS": "30", "TAPE_MAX_BYTES": "1000"})
-    assert s.tape_wait_seconds == 30.0
-    assert s.tape_max_bytes == 1000
+def test_settings_activity_env_overrides() -> None:
+    s = Settings.from_env({**BASE, "ACTIVITY_WAIT_SECONDS": "30"})
+    assert s.activity_wait_seconds == 30.0
 
 
 def test_settings_missing_required() -> None:

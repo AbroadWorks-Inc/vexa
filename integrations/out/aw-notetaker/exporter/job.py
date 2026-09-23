@@ -18,27 +18,25 @@ from pathlib import Path
 from typing import Any, Literal
 
 from exporter import __version__
+from exporter.activity import ActivityEvent, parse_activity, speech_events
+from exporter.activity import names as activity_names
 from exporter.attribution import build_participants, build_speaker_timeline
 from exporter.config import Settings
 from exporter.naming import folder_name, parse_utc
 from exporter.notetaker import Notetaker
 from exporter.storage import Storage
-from exporter.tape import TapeEvent, parse_tape, speech_events
-from exporter.tape import names as tape_names
 from exporter.vexa_client import MeetingApi
 
 logger = logging.getLogger("exporter")
 
 State = Literal["handed_off", "no_audio", "already_done"]
-TapeState = Literal["ok", "missing", "invalid", "capped"]
-
-# A tape this close to the bot's byte budget was (almost certainly) cut off.
-_CAPPED_FRACTION = 0.98
+ActivityState = Literal["ok", "missing", "invalid", "capped"]
 
 
-class TapeNotReady(Exception):
-    """The capture tape is absent but the bot may still be uploading it (it
-    does so in teardown, after `meeting.completed`); retryable (spec §4.2)."""
+class ActivityNotReady(Exception):
+    """`speaker-activity.jsonl` is absent but the bot may still be uploading
+    it (it does so in teardown, after `meeting.completed`, before the debug
+    tape); retryable (spec §4.2)."""
 
 
 @dataclass
@@ -58,7 +56,7 @@ class ExportResult:
 
 
 def recording_origin_ms(recording: Mapping[str, Any], timeslice_ms: int) -> int:
-    """Clock origin for tape alignment (spec §4.3, measured, pinned):
+    """Clock origin for speaker-activity alignment (spec §4.3, measured, pinned):
 
     `origin_epoch = recording.created_at - RECORD_CHUNK_TIMESLICE_MS`.
     """
@@ -119,19 +117,19 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     storage_path = str(master["storage_path"])
     session_uid = storage_path.split("/")[3]
     signal_prefix = f"signal/{user_id}/{vexa_meeting_id}/{session_uid}/"
-    tape_key = signal_prefix + "captured-signal.jsonl"
+    activity_key = signal_prefix + "speaker-activity.jsonl"
 
-    tape_size = storage.size(settings.vexa_bucket, tape_key)
-    if tape_size is None:
+    activity_exists = storage.size(settings.vexa_bucket, activity_key) is not None
+    if not activity_exists:
         end_time = m.get("end_time")
         if end_time:
             deadline = parse_utc(str(end_time)) + timedelta(
-                seconds=settings.tape_wait_seconds
+                seconds=settings.activity_wait_seconds
             )
             if deps.now() < deadline:
-                raise TapeNotReady(
-                    f"tape not ready for vexa_meeting_id={vexa_meeting_id}; "
-                    f"waiting until {deadline.isoformat()}"
+                raise ActivityNotReady(
+                    f"speaker activity not ready for vexa_meeting_id="
+                    f"{vexa_meeting_id}; waiting until {deadline.isoformat()}"
                 )
 
     storage.copy(
@@ -158,40 +156,40 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     )
     host_email = meeting_data.get("organizer_email")
 
-    events: list[TapeEvent] = []
+    events: list[ActivityEvent] = []
     speaker_names: list[str] = []
-    tape_state: TapeState
-    if tape_size is None:
-        tape_state = "missing"
+    activity_state: ActivityState
+    if not activity_exists:
+        activity_state = "missing"
+        logger.error("speaker_activity_missing vexa_meeting_id=%s", vexa_meeting_id)
     else:
         try:
-            tape = parse_tape(storage.iter_lines(settings.vexa_bucket, tape_key))
+            activity = parse_activity(
+                storage.iter_lines(settings.vexa_bucket, activity_key)
+            )
             events = speech_events(
-                tape,
+                activity,
                 origin_ms,
                 settings.rms_speech_threshold,
                 settings.speech_hangover_ms,
             )
-            speaker_names = tape_names(tape)
+            speaker_names = activity_names(activity)
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(
-                "tape invalid vexa_meeting_id=%s error_class=%s; "
+                "speaker activity invalid vexa_meeting_id=%s error_class=%s; "
                 "exporting without attribution",
                 vexa_meeting_id,
                 type(exc).__name__,
             )
             events, speaker_names = [], []
-            tape_state = "invalid"
+            activity_state = "invalid"
         else:
-            tape_state = "ok"
-            if tape_size >= _CAPPED_FRACTION * settings.tape_max_bytes:
-                tape_state = "capped"
+            activity_state = "capped" if activity.capped else "ok"
+            if activity.capped:
                 logger.warning(
-                    "tape capped vexa_meeting_id=%s bytes=%d max=%d; "
+                    "speaker activity capped vexa_meeting_id=%s; "
                     "attribution may stop early",
                     vexa_meeting_id,
-                    tape_size,
-                    settings.tape_max_bytes,
                 )
 
     timeline = build_speaker_timeline(
@@ -255,7 +253,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             "exported_at": finished.isoformat(),
             "elapsed_s": (finished - started).total_seconds(),
             "exporter_version": __version__,
-            "tape": tape_state,
+            "speaker_activity": activity_state,
             "audio_recordings": len(audio_recs),
         },
     )

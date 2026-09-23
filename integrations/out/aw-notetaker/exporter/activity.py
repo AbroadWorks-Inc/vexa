@@ -1,4 +1,8 @@
-"""captured-signal.v1 tape -> speaker START/END events (spec §4.3)."""
+"""speaker-activity.jsonl -> speaker START/END events (spec §4.3).
+
+The bot always writes this file (no audio, just who-spoke-when); there is no
+fallback to the debug capture tape (spec: 2026-09-23-speaker-activity-design.md).
+"""
 
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ class Hint:
 
 
 @dataclass(frozen=True)
-class TapeEvent:
+class ActivityEvent:
     name: str
     relative_ms: int
     event_type: EventType
@@ -35,44 +39,44 @@ class TapeEvent:
 
 
 @dataclass
-class Tape:
+class Activity:
     lane: str
-    sample_rate: int
     started_at: str | None
     frames: list[Frame] = field(default_factory=list)
     hints: list[Hint] = field(default_factory=list)
+    capped: bool = False
 
 
-def parse_tape(lines: Iterable[str]) -> Tape:
-    """Parse captured-signal.v1 tape from JSONL lines.
+def parse_activity(lines: Iterable[str]) -> Activity:
+    """Parse speaker-activity.v1 lines into an Activity.
 
     Skips unparseable lines silently. Raises ValueError if no header found.
+    A header-only file (the bot left before anyone spoke) is a valid, empty
+    Activity — not an error. A `{"type":"capped"}` line sets `capped=True`
+    and ends parsing; nothing after it was written by the bot either.
     """
-    tape: Tape | None = None
+    activity: Activity | None = None
     for line in lines:
         try:
             row: dict[str, Any] = json.loads(line)
         except (ValueError, TypeError):
             continue
-        if row.get("type") == "captured_signal_header":
-            try:
-                sample_rate = int(row.get("sample_rate", 16000))
-            except (ValueError, TypeError):
-                sample_rate = 16000
-            if sample_rate <= 0:
-                sample_rate = 16000
-            tape = Tape(
+        line_type = row.get("type")
+        if line_type == "speaker_activity_header":
+            activity = Activity(
                 lane=str(row.get("lane", "gmeet")),
-                sample_rate=sample_rate,
                 started_at=row.get("started_at"),
             )
             continue
-        if tape is None:
+        if activity is None:
             continue
-        if row.get("type") == "hint":
+        if line_type == "capped":
+            activity.capped = True
+            break
+        if line_type == "hint":
             if row.get("name"):
                 try:
-                    tape.hints.append(
+                    activity.hints.append(
                         Hint(
                             int(row["t"]),
                             str(row["name"]),
@@ -82,74 +86,75 @@ def parse_tape(lines: Iterable[str]) -> Tape:
                 except (KeyError, ValueError, TypeError):
                     continue
             continue
-        if "ts" in row:
+        if line_type is None and "t" in row:
             try:
-                samples = int(row.get("pcm_len", 0))
-                tape.frames.append(
+                activity.frames.append(
                     Frame(
-                        ts=int(row["ts"]),
-                        name=row.get("speakerName") or None,
-                        rms=float(row.get("rms", 0.0)),
-                        duration_ms=int(round(samples * 1000 / tape.sample_rate)),
+                        ts=int(row["t"]),
+                        name=row.get("name") or None,
+                        rms=float(row["rms"]),
+                        duration_ms=int(row["dur_ms"]),
                     )
                 )
             except (KeyError, ValueError, TypeError):
                 continue
-    if tape is None:
-        raise ValueError("tape has no captured_signal_header")
-    return tape
+    if activity is None:
+        raise ValueError("speaker-activity file has no speaker_activity_header")
+    return activity
 
 
-def names(tape: Tape) -> list[str]:
+def names(activity: Activity) -> list[str]:
     """Return distinct named speakers in first-seen order."""
     seen: dict[str, None] = {}
-    for f in tape.frames:
+    for f in activity.frames:
         if f.name:
             seen.setdefault(f.name)
-    for h in tape.hints:
+    for h in activity.hints:
         seen.setdefault(h.name)
     return list(seen)
 
 
 def speech_events(
-    tape: Tape, origin_ms: int, rms_threshold: float, hangover_ms: int
-) -> list[TapeEvent]:
-    """Extract speaker START/END events from tape.
+    activity: Activity, origin_ms: int, rms_threshold: float, hangover_ms: int
+) -> list[ActivityEvent]:
+    """Extract speaker START/END events from activity.
 
     If lane is "mixed", emits point events from hints only (spec §4.3).
     Otherwise analyzes frames using RMS threshold and hangover duration.
     Returns events sorted by relative_ms, then name.
     """
-    if tape.lane == "mixed":
+    if activity.lane == "mixed":
         out = [
-            TapeEvent(
+            ActivityEvent(
                 h.name,
                 h.t - origin_ms,
                 "SPEAKER_END" if h.is_end else "SPEAKER_START",
                 "hint",
             )
-            for h in tape.hints
+            for h in activity.hints
         ]
         return sorted(out, key=lambda e: (e.relative_ms, e.name))
 
-    events: list[TapeEvent] = []
+    events: list[ActivityEvent] = []
     started: dict[str, int] = {}  # name -> start epoch ms
     last_voiced: dict[str, int] = {}  # name -> end of last voiced frame, epoch ms
 
     def close(name: str) -> None:
         events.append(
-            TapeEvent(name, last_voiced[name] - origin_ms, "SPEAKER_END", "audio")
+            ActivityEvent(name, last_voiced[name] - origin_ms, "SPEAKER_END", "audio")
         )
         del started[name]
 
-    for f in sorted(tape.frames, key=lambda fr: fr.ts):
+    for f in sorted(activity.frames, key=lambda fr: fr.ts):
         for name in [n for n in started if f.ts - last_voiced[n] >= hangover_ms]:
             close(name)
         if not f.name or f.rms < rms_threshold:
             continue
         if f.name not in started:
             started[f.name] = f.ts
-            events.append(TapeEvent(f.name, f.ts - origin_ms, "SPEAKER_START", "audio"))
+            events.append(
+                ActivityEvent(f.name, f.ts - origin_ms, "SPEAKER_START", "audio")
+            )
         last_voiced[f.name] = f.ts + f.duration_ms
     for name in list(started):
         close(name)

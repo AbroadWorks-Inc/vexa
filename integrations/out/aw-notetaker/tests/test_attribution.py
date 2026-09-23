@@ -3,7 +3,7 @@
 Ported from aw-integration/tests/test_adapter.py (AbroadWorks' own Apache-2.0
 fork, not Attendee). `VexaSpeakerEvent(relative_ms=..., event_type=...,
 participant_name=..., source="audio"/None/"dom"/"caption")` becomes
-`TapeEvent(name, relative_ms, event_type, "audio"/"hint")` — the 0.12 tape has
+`ActivityEvent(name, relative_ms, event_type, "audio"/"hint")` — the 0.12 tape has
 one hint source per lane, so "dom", "caption" and untagged all collapse onto
 "hint" here. `VexaSessionAdapter.build_speaker_timeline`/`build_participants`
 become the module-level functions of the same name. Expected values are
@@ -17,13 +17,13 @@ from datetime import datetime, timedelta, timezone
 
 from exporter.attribution import build_participants, build_speaker_timeline
 from exporter.schemas import ParticipantsFile, SpeakerEvent, SpeakerTimelineFile
-from exporter.tape import EventType, TapeEvent
+from exporter.activity import ActivityEvent, EventType
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def _tl(
-    events: list[TapeEvent], platform: str = "google_meet", seconds: int = 60
+    events: list[ActivityEvent], platform: str = "google_meet", seconds: int = 60
 ) -> SpeakerTimelineFile:
     return build_speaker_timeline(
         events,
@@ -36,16 +36,16 @@ def _tl(
     )
 
 
-def _audio(name: str, event_type: EventType, relative_ms: int) -> TapeEvent:
+def _audio(name: str, event_type: EventType, relative_ms: int) -> ActivityEvent:
     """A trusted, audio-activity-derived event (paired into intervals)."""
-    return TapeEvent(name, relative_ms, event_type, "audio")
+    return ActivityEvent(name, relative_ms, event_type, "audio")
 
 
-def _hint(name: str, event_type: EventType, relative_ms: int) -> TapeEvent:
+def _hint(name: str, event_type: EventType, relative_ms: int) -> ActivityEvent:
     """A point-in-time claim: the mixed-lane hint source, and the reference's
     untagged/"dom"/"caption" point producers, which all collapse onto "hint"
     here — never paired into an interval."""
-    return TapeEvent(name, relative_ms, event_type, "hint")
+    return ActivityEvent(name, relative_ms, event_type, "hint")
 
 
 def _attribute(timeline: list[SpeakerEvent], segment_start_sec: float) -> str | None:
@@ -67,10 +67,10 @@ def _attribute(timeline: list[SpeakerEvent], segment_start_sec: float) -> str | 
 
 def test_blip_inside_long_turn_does_not_steal_it() -> None:
     ev = [
-        TapeEvent("A", 0, "SPEAKER_START", "audio"),
-        TapeEvent("B", 10_000, "SPEAKER_START", "audio"),
-        TapeEvent("B", 10_500, "SPEAKER_END", "audio"),
-        TapeEvent("A", 25_000, "SPEAKER_END", "audio"),
+        ActivityEvent("A", 0, "SPEAKER_START", "audio"),
+        ActivityEvent("B", 10_000, "SPEAKER_START", "audio"),
+        ActivityEvent("B", 10_500, "SPEAKER_END", "audio"),
+        ActivityEvent("A", 25_000, "SPEAKER_END", "audio"),
     ]
     tl = _tl(ev)
     assert [p.speaker_name for p in tl.speaker_timeline] == ["A"]
@@ -81,12 +81,12 @@ def test_blip_inside_long_turn_does_not_steal_it() -> None:
 
 
 def test_hint_points_zoom_anchor_needs_two_speakers() -> None:
-    one = _tl([TapeEvent("A", 5_000, "SPEAKER_START", "hint")], platform="zoom")
+    one = _tl([ActivityEvent("A", 5_000, "SPEAKER_START", "hint")], platform="zoom")
     assert one.speaker_timeline[0].relative_sec == 5.0
     two = _tl(
         [
-            TapeEvent("A", 5_000, "SPEAKER_START", "hint"),
-            TapeEvent("B", 9_000, "SPEAKER_START", "hint"),
+            ActivityEvent("A", 5_000, "SPEAKER_START", "hint"),
+            ActivityEvent("B", 9_000, "SPEAKER_START", "hint"),
         ],
         platform="zoom",
     )
@@ -96,8 +96,8 @@ def test_hint_points_zoom_anchor_needs_two_speakers() -> None:
 def test_teams_gets_intervals_from_points() -> None:
     tl = _tl(
         [
-            TapeEvent("A", 1_000, "SPEAKER_START", "hint"),
-            TapeEvent("B", 9_000, "SPEAKER_START", "hint"),
+            ActivityEvent("A", 1_000, "SPEAKER_START", "hint"),
+            ActivityEvent("B", 9_000, "SPEAKER_START", "hint"),
         ],
         platform="teams",
         seconds=20,
