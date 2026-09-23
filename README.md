@@ -125,18 +125,20 @@ From the repo root:
 TAG=v0.1.0
 REG=ghcr.io/voyantt-consultancy-services-llp
 
-# bot — two steps: the join environment base, then the bot. amd64 only (like upstream).
-docker build -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev core/meetings/modules/join
+# bot — two steps: the join environment base, then the bot. amd64 only (like upstream); bot pods
+# run on the amd64-only aw-bots-bots Karpenter pool.
+docker build --platform linux/amd64 -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev core/meetings/modules/join
 docker build --platform linux/amd64 -f core/meetings/services/bot/Dockerfile \
   --build-arg VEXA_IMAGE_VERSION=$TAG -t $REG/aw-bots-bot:$TAG .
 
-# meeting-api — context is the repo root
-docker build -f core/meetings/services/meeting-api/Dockerfile -t $REG/aw-bots-meeting-api:$TAG .
+docker push $REG/aw-bots-bot:$TAG
 
-# exporter — context is its own folder
-docker build -t $REG/aw-bots-exporter:$TAG integrations/out/aw-notetaker
-
-docker push $REG/aw-bots-bot:$TAG && docker push $REG/aw-bots-meeting-api:$TAG && docker push $REG/aw-bots-exporter:$TAG
+# meeting-api and the exporter run on the default nodes, which include arm64, so build both
+# architectures (buildx pushes as it builds). meeting-api's context is the repo root.
+docker buildx build --platform linux/amd64,linux/arm64 --push \
+  -f core/meetings/services/meeting-api/Dockerfile -t $REG/aw-bots-meeting-api:$TAG .
+docker buildx build --platform linux/amd64,linux/arm64 --push \
+  -t $REG/aw-bots-exporter:$TAG integrations/out/aw-notetaker
 ```
 
 Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our change adds one small source file and
@@ -173,8 +175,19 @@ live only in Kubernetes Secrets, never in this repo.
 
 ## Deploy on EKS
 
-The deployment files live in the **aw-notetaker** repo, next to the rest of AW's infrastructure
-(`deployment/`), not in this fork. In outline:
+The deployment files live in the **aw-notetaker** repo, next to the rest of AW's infrastructure, not in
+this fork. The step-by-step runbook is `deployment/base/aw-bots/README.md` there. The files:
+
+| aw-notetaker path | What it is |
+|---|---|
+| `deployment/base/aw-bots/values.yaml` | Our Helm values for the upstream chart |
+| `deployment/base/aw-bots/*.yaml.template` | Secret templates (key names and placeholders only) |
+| `deployment/base/aw-bots/bots-nodepool.yaml` | The Karpenter `aw-bots-bots` pool (on-demand, amd64) |
+| `deployment/base/aw-exporter/` | The exporter's Deployment, Service, ServiceAccount, NetworkPolicy and kustomization |
+| `deployment/aws/iam/abroadworks-aw-bots-meeting-api-role/`, `…/abroadworks-aw-exporter-role/` | IAM roles (IRSA) |
+| `deployment/aws/s3-lifecycle/aw-bots-lifecycle.json` | 14-day expiry for the `aw-bots` bucket |
+
+In outline:
 
 1. **Buckets and IAM.** Bucket `aw-bots` gets a 14-day expiry on `recordings/` and `signal/`. It holds
    Vexa's own files; the clean per-meeting folders are in `aw-chatworks-transcribe`, whose existing

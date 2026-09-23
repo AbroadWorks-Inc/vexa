@@ -47,7 +47,7 @@ What we add:
 | D9 | Old folder contract `recordings/{platform}_{event_id}_{job_id}/` is dropped; new name in §3. | agreed |
 | D10 | Portal keeps Google OAuth and pushes plans via `POST /meetings` (not Vexa ICS sync, which needs each user to paste a secret iCal URL). | agreed |
 | D11 | ONE Vexa service account owns every meeting; portal users keep their own Google-login accounts and the portal decides who sees which meeting. Vexa's dedup is per (user, platform, native id) (`bot_spawn/adapters.py:492`), so a single account is what stops shared internal meetings getting one bot per attendee. Its `max_concurrent_bots` is raised with growth. | agreed |
-| D12 | Exporter reads meeting-api **in-cluster** with `X-User-Id` = the webhook's `meeting.user_id` (the header the gateway injects after key auth); meeting-api reachable only from gateway + exporter (NetworkPolicy). | agreed |
+| D12 | Exporter reads meeting-api **in-cluster** with `X-User-Id` = the webhook's `meeting.user_id` (the header the gateway injects after key auth); meeting-api is reachable only from the pods that must call it: the gateway, the exporter, the runtime, agent-api and the bot pods, which upload recordings and signal files through it (NetworkPolicy; the manifest is in the aw-notetaker repo, `deployment/base/aw-exporter/networkpolicy.yaml`). | agreed |
 
 ## 3. Output folder
 
@@ -266,7 +266,7 @@ bot-pod env var, not an exporter one — see §7 and the
   `speaker-activity.jsonl` (§9). The alternative is raising the janitor budget
   (`SIGNAL_TAPE_BUDGET_BYTES`). Switch the tape on per platform or per user only to investigate a
   specific meeting (`_resolve_capture_signal`, `core/identity/services/admin-api`).
-- runtime: `nodeSelector`/`tolerations` → the bots Karpenter NodePool (`ng-bots-133`);
+- runtime: `nodeSelector`/`tolerations` → the bots Karpenter NodePool `aw-bots-bots` (label and taint `workload=aw-bots-bots`; manifest in aw-notetaker `deployment/base/aw-bots/bots-nodepool.yaml`);
   `workloadResources.meetingBot` per §7.1.
 
 ### 7.1 Bot sizing and NodePool (applied once the bot is functional)
