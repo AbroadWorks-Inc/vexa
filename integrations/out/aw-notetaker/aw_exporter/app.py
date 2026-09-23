@@ -82,13 +82,17 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid signature")
         try:
             envelope = json.loads(body)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
             logger.warning("webhook rejected: invalid json")
             raise HTTPException(status_code=400, detail="invalid json") from exc
+        if not isinstance(envelope, dict):
+            logger.warning("webhook rejected: envelope is not an object")
+            raise HTTPException(status_code=400, detail="invalid envelope")
         if envelope.get("event_type") != "meeting.completed":
             return JSONResponse({"status": "ignored"})
-        meeting = (envelope.get("data") or {}).get("meeting") or {}
-        if not _meeting_is_valid(meeting):
+        data = envelope.get("data")
+        meeting = data.get("meeting") if isinstance(data, dict) else None
+        if not isinstance(meeting, dict) or not _meeting_is_valid(meeting):
             logger.warning("webhook rejected: invalid or incomplete data.meeting")
             raise HTTPException(status_code=400, detail="invalid data.meeting")
         try:

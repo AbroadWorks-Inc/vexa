@@ -274,6 +274,37 @@ def test_missing_start_time_returns_400_and_not_queued(storage: Storage) -> None
     assert queue.pending_ids() == []
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"[1, 2]",
+        b'"a string"',
+        b"null",
+        b'{"event_type":"meeting.completed","data":[1]}',
+        b'{"event_type":"meeting.completed","data":"x"}',
+        b'{"event_type":"meeting.completed","data":{"meeting":[1]}}',
+        b'{"event_type":"meeting.completed","data":{"meeting":"x"}}',
+        b"\xff\xfe not utf-8",
+    ],
+)
+def test_signed_non_object_shapes_return_400_not_500(
+    storage: Storage, body: bytes
+) -> None:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    app = create_app(
+        settings,
+        queue,
+        _deps(storage, settings),
+        clock=_fixed_clock,
+        start_worker=False,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post("/hooks/vexa", content=body, headers=_sign(body))
+    assert resp.status_code == 400
+    assert queue.pending_ids() == []
+
+
 def test_healthz_returns_ok(storage: Storage) -> None:
     settings = _settings()
     queue = PendingQueue(storage, settings.vexa_bucket)
