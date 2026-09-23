@@ -107,3 +107,74 @@ def test_upload_file_puts_object_with_content_type(
         Bucket="dst-bucket", Key="recordings/x/audio.wav"
     )
     assert head["ContentType"] == "audio/wav"
+
+
+# ---------------------------------------------------------------------------
+# retention-class tagging (design doc §3/§7) — the export bucket expires
+# objects by the `retention-class` tag; an object written with no `retention`
+# argument stays untagged (the Vexa bucket's pending/failed queue objects).
+# ---------------------------------------------------------------------------
+
+
+def _tags(storage: Storage, bucket: str, key: str) -> dict[str, str]:
+    tag_set = storage._client.get_object_tagging(Bucket=bucket, Key=key)["TagSet"]
+    return {t["Key"]: t["Value"] for t in tag_set}
+
+
+def test_put_bytes_with_retention_tags_the_object(storage: Storage) -> None:
+    storage.put_bytes(
+        "src-bucket", "a.bin", b"hi", "application/octet-stream", retention="audio"
+    )
+    assert _tags(storage, "src-bucket", "a.bin") == {"retention-class": "audio"}
+
+
+def test_put_bytes_without_retention_is_untagged(storage: Storage) -> None:
+    storage.put_bytes("src-bucket", "b.bin", b"hi", "application/octet-stream")
+    assert _tags(storage, "src-bucket", "b.bin") == {}
+
+
+def test_put_json_with_retention_tags_the_object(storage: Storage) -> None:
+    storage.put_json("src-bucket", "m.json", {"a": 1}, retention="metadata")
+    assert _tags(storage, "src-bucket", "m.json") == {"retention-class": "metadata"}
+
+
+def test_put_json_without_retention_is_untagged(storage: Storage) -> None:
+    storage.put_json("src-bucket", "n.json", {"a": 1})
+    assert _tags(storage, "src-bucket", "n.json") == {}
+
+
+def test_upload_file_with_retention_tags_the_object(
+    storage: Storage, tmp_path: Path
+) -> None:
+    src = tmp_path / "audio.wav"
+    src.write_bytes(b"RIFF-wav")
+    storage.upload_file(
+        src, "dst-bucket", "recordings/x/audio.wav", "audio/wav", retention="audio"
+    )
+    assert _tags(storage, "dst-bucket", "recordings/x/audio.wav") == {
+        "retention-class": "audio"
+    }
+
+
+def test_copy_with_retention_replaces_tags(storage: Storage) -> None:
+    storage.put_bytes(
+        "src-bucket", "master.webm", b"webm-bytes", "video/webm", retention="audio"
+    )
+    storage.copy(
+        "src-bucket",
+        "master.webm",
+        "dst-bucket",
+        "x/master.webm",
+        retention="recording-mp4",
+    )
+    # REPLACE, not merge: only the new tag lands, the source's "audio" tag does not
+    # leak across the copy.
+    assert _tags(storage, "dst-bucket", "x/master.webm") == {
+        "retention-class": "recording-mp4"
+    }
+
+
+def test_copy_without_retention_is_untagged(storage: Storage) -> None:
+    storage.put_bytes("src-bucket", "p.json", b"{}", "application/json")
+    storage.copy("src-bucket", "p.json", "dst-bucket", "p.json")
+    assert _tags(storage, "dst-bucket", "p.json") == {}

@@ -15,6 +15,14 @@ Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.m
 `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`, `ACTIVITY_WAIT_SECONDS`,
 `AWS_REGION`. S3 access is via IRSA (no static keys).
 
+## Retention tagging (see spec §3/§7)
+`EXPORT_BUCKET` expires objects by the `retention-class` S3 object tag
+(`exporter/retention.py`): `master.webm` -> `recording-mp4` (30 days), `audio.wav` and
+`EXPORT_DEBUG`'s `signal/*` copies -> `audio` (7 days), every JSON the exporter writes ->
+`metadata` (365 days). Objects the exporter writes into `VEXA_BUCKET`
+(`aw-exporter/pending/`, `failed/`) are never tagged — that bucket has its own prefix
+lifecycle. The exporter's IAM role needs `s3:PutObjectTagging` on `EXPORT_BUCKET`.
+
 ## Dev setup
 
 ```bash

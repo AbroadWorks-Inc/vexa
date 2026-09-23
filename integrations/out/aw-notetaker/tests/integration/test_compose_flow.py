@@ -402,6 +402,18 @@ def test_compose_flow_hands_off_meeting(
     keys = _list_keys(seeded_s3, EXPORT_BUCKET, BASE)
     assert keys == EXPECTED_KEYS
 
+    # retention-class tagging (spec §3/§7): the export bucket's lifecycle rules key
+    # off this tag.
+    def tag_value(key: str) -> str | None:
+        tags = seeded_s3.get_object_tagging(Bucket=EXPORT_BUCKET, Key=key)["TagSet"]
+        by_key = {t["Key"]: t["Value"] for t in tags}
+        return by_key.get("retention-class")
+
+    assert tag_value(BASE + "master.webm") == "recording-mp4"
+    assert tag_value(BASE + "audio.wav") == "audio"
+    assert tag_value(BASE + "meeting.json") == "metadata"
+    assert tag_value(BASE + "_export.json") == "metadata"
+
     assert notetaker_server["calls"] == [
         {
             "meeting_id": f"vexa-{VEXA_MEETING_ID}",

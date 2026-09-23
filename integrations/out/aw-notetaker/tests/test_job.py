@@ -761,17 +761,31 @@ class _SpyStorage(Storage):
         self.get_bytes_keys.append(key)
         return super().get_bytes(bucket, key)
 
-    def put_bytes(self, bucket: str, key: str, data: bytes, content_type: str) -> None:
+    def put_bytes(
+        self,
+        bucket: str,
+        key: str,
+        data: bytes,
+        content_type: str,
+        retention: str | None = None,
+    ) -> None:
         self.put_bytes_keys.append(key)
-        super().put_bytes(bucket, key, data, content_type)
+        super().put_bytes(bucket, key, data, content_type, retention=retention)
 
     def download_file(self, bucket: str, key: str, path: Path) -> None:
         self.downloads.append(key)
         super().download_file(bucket, key, path)
 
-    def upload_file(self, path: Path, bucket: str, key: str, content_type: str) -> None:
+    def upload_file(
+        self,
+        path: Path,
+        bucket: str,
+        key: str,
+        content_type: str,
+        retention: str | None = None,
+    ) -> None:
         self.uploads.append((key, content_type))
-        super().upload_file(path, bucket, key, content_type)
+        super().upload_file(path, bucket, key, content_type, retention=retention)
 
 
 def test_audio_is_streamed_via_files_not_held_as_bytes(storage: Storage) -> None:
@@ -872,6 +886,48 @@ def test_room_name_prefers_data_constructed_meeting_url(
 
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["room_name"] == expected
+
+
+def test_export_tags_every_object_with_its_retention_class(storage: Storage) -> None:
+    """Full export run (spec §3/§7): master.webm -> recording-mp4, audio.wav ->
+    audio, every export-bucket JSON -> metadata, and (EXPORT_DEBUG) signal/*
+    copies -> audio."""
+    storage_path = _put_master(storage, 60, "uid-60")
+    _put_activity(storage, "uid-60", [header(), frame(_origin_ms(), "Ann Lee", 0.2)])
+    storage.put_bytes(
+        VEXA_BUCKET, "signal/7/11367/uid-60/botlog.txt", b"log", "text/plain"
+    )
+    meeting_api = FakeMeetingApi(
+        recordings=[_audio_recording(60)],
+        master={"storage_path": storage_path},
+        transcript={"segments": ["hi"]},
+    )
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, meeting_api, notetaker, settings=_settings(debug=True))
+
+    result = export_meeting(
+        _envelope(data={"name": "x", "transcribe_enabled": True}), deps
+    )
+
+    assert result.state == "handed_off"
+
+    def tag_value(bucket: str, key: str) -> str | None:
+        tags = storage._client.get_object_tagging(Bucket=bucket, Key=key)["TagSet"]
+        by_key = {t["Key"]: t["Value"] for t in tags}
+        return by_key.get("retention-class")
+
+    assert tag_value(EXPORT_BUCKET, BASE + "master.webm") == "recording-mp4"
+    assert tag_value(EXPORT_BUCKET, BASE + "audio.wav") == "audio"
+    for name in (
+        "meeting.json",
+        "recordings.json",
+        "participants.json",
+        "speaker_timeline.json",
+        "live_transcript.json",
+        "_export.json",
+    ):
+        assert tag_value(EXPORT_BUCKET, BASE + name) == "metadata", name
+    assert tag_value(EXPORT_BUCKET, BASE + "signal/botlog.txt") == "audio"
 
 
 def test_export_marker_records_elapsed_wall_time(storage: Storage) -> None:

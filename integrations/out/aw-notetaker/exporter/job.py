@@ -24,6 +24,7 @@ from exporter.attribution import build_participants, build_speaker_timeline
 from exporter.config import Settings
 from exporter.naming import folder_name, parse_utc
 from exporter.notetaker import Notetaker
+from exporter.retention import AUDIO, METADATA, RECORDING_MP4
 from exporter.storage import Storage
 from exporter.vexa_client import MeetingApi
 
@@ -106,6 +107,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             settings.export_bucket,
             base + "_export.json",
             {"state": "no_audio", "audio_recordings": 0},
+            retention=METADATA,
         )
         return ExportResult("no_audio", folder)
     if len(audio_recs) > 1:
@@ -137,7 +139,11 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
                 )
 
     storage.copy(
-        settings.vexa_bucket, storage_path, settings.export_bucket, base + "master.webm"
+        settings.vexa_bucket,
+        storage_path,
+        settings.export_bucket,
+        base + "master.webm",
+        retention=RECORDING_MP4,
     )
     with tempfile.TemporaryDirectory() as tmp_dir:
         webm_path = Path(tmp_dir) / "master.webm"
@@ -146,7 +152,11 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         deps.transcode(webm_path, wav_path)
         wav_duration_s = _wav_duration_s(wav_path)
         storage.upload_file(
-            wav_path, settings.export_bucket, base + "audio.wav", "audio/wav"
+            wav_path,
+            settings.export_bucket,
+            base + "audio.wav",
+            "audio/wav",
+            retention=AUDIO,
         )
 
     origin_ms = recording_origin_ms(rec, settings.record_chunk_timeslice_ms)
@@ -223,22 +233,32 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         settings.export_bucket,
         base + "speaker_timeline.json",
         timeline.model_dump(mode="json"),
+        retention=METADATA,
     )
     storage.put_json(
         settings.export_bucket,
         base + "participants.json",
         participants.model_dump(mode="json"),
+        retention=METADATA,
     )
-    storage.put_json(settings.export_bucket, base + "meeting.json", m)
     storage.put_json(
-        settings.export_bucket, base + "recordings.json", {"recordings": recs}
+        settings.export_bucket, base + "meeting.json", m, retention=METADATA
+    )
+    storage.put_json(
+        settings.export_bucket,
+        base + "recordings.json",
+        {"recordings": recs},
+        retention=METADATA,
     )
 
     if (m.get("data") or {}).get("transcribe_enabled"):
         transcript = deps.meeting_api.transcript(user_id, vexa_meeting_id)
         if transcript is not None:
             storage.put_json(
-                settings.export_bucket, base + "live_transcript.json", transcript
+                settings.export_bucket,
+                base + "live_transcript.json",
+                transcript,
+                retention=METADATA,
             )
 
     if settings.debug:
@@ -249,6 +269,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
                 key,
                 settings.export_bucket,
                 base + "signal/" + basename,
+                retention=AUDIO,
             )
 
     deps.notetaker.process(meeting_id, base, platform)
@@ -267,5 +288,6 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             "speaker_activity_events": len(events),
             "audio_recordings": len(audio_recs),
         },
+        retention=METADATA,
     )
     return ExportResult("handed_off", folder)

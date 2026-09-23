@@ -22,6 +22,7 @@ from typing import Any
 
 from exporter.job import Deps, ExportResult, export_meeting
 from exporter.naming import folder_name
+from exporter.retention import METADATA
 from exporter.storage import Storage
 
 logger = logging.getLogger("exporter")
@@ -176,6 +177,7 @@ async def sweep_once(
                             settings.export_bucket,
                             settings.export_prefix + folder + "/_export.json",
                             body,
+                            retention=METADATA,
                         )
                         logger.error(
                             "quarantine: meeting_id=%s attempts=%s moved to failed/",

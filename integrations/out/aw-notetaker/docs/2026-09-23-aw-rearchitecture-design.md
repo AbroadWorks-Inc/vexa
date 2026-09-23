@@ -64,6 +64,15 @@ s3://aw-chatworks-transcribe/recordings/<platform>_<nativeMeetingId>_<startUTC>/
   signal/                  only when EXPORT_DEBUG=1 (botlog, captured-signal, …)
   _export.json             kept    — exporter marker (state, speaker_activity[_events], audio_recordings, timings); written last
 ```
+- Every object the exporter writes here carries a `retention-class` S3 tag
+  (`exporter/retention.py`) that the bucket's lifecycle rules expire against — an untagged
+  object never expires: `master.webm` → `recording-mp4` (30 days); `audio.wav` and the debug
+  `signal/*` copies → `audio` (7 days, they can contain audio); every JSON (`meeting.json`,
+  `recordings.json`, `participants.json`, `speaker_timeline.json`, `live_transcript.json`,
+  `_export.json` incl. the queue's failure marker) → `metadata` (365 days). `notetaker-worker`'s
+  own `summary.json` gets a fourth class, `summary` (7 years), that the exporter does not write.
+  Objects the exporter writes into the **Vexa** bucket (`aw-exporter/pending/`, `failed/`) are
+  NOT tagged — that bucket has its own prefix lifecycle.
 - `platform` = Vexa's value (`google_meet`, `zoom`, `teams`), passed unchanged to `/process`
   (any non-`jitsi` value takes the worker's bot path).
 - `nativeMeetingId` reduced to `[A-Za-z0-9.-]` (anything else → `-`), so `_` only separates fields.
@@ -288,7 +297,9 @@ Measured on the OLD bot (v0.10.4, 85 meetings): memory 0.48 GiB (bot alone) → 
 - Order-of-magnitude compute: ~3,230 bot-hours × ~0.06 USD per bot-hour (on-demand, well packed)
   ≈ 200 USD/month before packing loss and any warm floor. An estimate to check, not a quote.
 - IAM: meeting-api rw `aw-bots/{recordings,signal}/*`; exporter r `aw-bots/*`, rw
-  `aw-bots/aw-exporter/*`, rw `aw-chatworks-transcribe/recordings/*`. Lifecycle per D5.
+  `aw-bots/aw-exporter/*`, rw `aw-chatworks-transcribe/recordings/*` **plus
+  `s3:PutObjectTagging` on `aw-chatworks-transcribe`** (the exporter tags every object it
+  writes there with its retention class, §3). Lifecycle per D5.
 - Network: exporter → meeting-api (internal), → `notetaker-api.notetaker:8080`; NetworkPolicy per D12.
 - Exporter Deployment: single replica with `strategy: Recreate` — a rolling update would briefly
   run two pods, i.e. two overlapping pending-queue sweepers.

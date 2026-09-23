@@ -343,6 +343,17 @@ def test_enqueue_load_pending_ids_roundtrip(storage: Storage) -> None:
     assert item["last_error"] is None
 
 
+def test_enqueue_writes_untagged_pending_object(storage: Storage) -> None:
+    """Vexa-bucket writes (spec §3/§7) are NOT tagged — that bucket has its own
+    prefix lifecycle."""
+    queue = PendingQueue(storage, VEXA_BUCKET)
+    queue.enqueue(_envelope())
+    tags = storage._client.get_object_tagging(
+        Bucket=VEXA_BUCKET, Key="aw-exporter/pending/11367.json"
+    )["TagSet"]
+    assert tags == []
+
+
 def test_done_deletes_pending(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
@@ -456,6 +467,17 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
     assert marker["error"] == "boom"
     assert marker["attempts"] == 2
     assert marker["vexa_meeting_id"] == 11367
+
+    # retention-class tagging (spec §3/§7): the quarantine marker is exporter-bucket
+    # metadata; the failed/ item stays in the Vexa bucket, untagged.
+    marker_tags = storage._client.get_object_tagging(
+        Bucket=EXPORT_BUCKET, Key=BASE + "_export.json"
+    )["TagSet"]
+    assert {"Key": "retention-class", "Value": "metadata"} in marker_tags
+    failed_tags = storage._client.get_object_tagging(
+        Bucket=VEXA_BUCKET, Key="aw-exporter/failed/11367.json"
+    )["TagSet"]
+    assert failed_tags == []
 
 
 def test_run_worker_exits_when_stop_is_set(storage: Storage) -> None:
