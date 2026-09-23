@@ -93,7 +93,13 @@ replica; per-meeting jobs are independent.
    `_export.json {state:"no_audio"}`, done.
 3. `GET /recordings/<rid>/master?type=audio` → Vexa assembles the master (upstream finalize-on-read)
    and returns `storage_path`; server-side copy `aw-bots/<storage_path>` → `<folder>/master.webm`.
-4. `ffmpeg -i master.webm -ac 1 -ar 16000 -c:a pcm_s16le audio.wav` → upload.
+4. `ffmpeg -nostdin -i master.webm -af aresample=async=1:first_pts=0 -ac 1 -ar 16000 -c:a
+   pcm_s16le audio.wav` → upload. **`-af aresample=async=1:first_pts=0` is mandatory** (not a
+   plain `-i ... -ac 1 -ar 16000` decode): a plain decode drops Opus DTX (discontinuous
+   transmission) gaps, non-linearly compressing the wav timeline — measured on the 2026-09-22
+   recording, a plain decode produced 1901.50 s against a 1935.652 s packet PTS span (220 gaps
+   >0.1 s totalling 37.9 s dropped) — which silently shifts every downstream speaker-interval
+   timestamp computed relative to this wav's t=0. See §4.3 clock origin.
 5. Tape `aw-bots/signal/<user_id>/<meeting_id>/<session_uid>/captured-signal.jsonl` (session uid
    from `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`, `participants.json`.
 6. Write `meeting.json`, `recordings.json`; `live_transcript.json` if the meeting had
@@ -120,29 +126,34 @@ the `captured-signal.v1` tape:
   with `source="audio"` (the trusted, pairable provenance).
 - **mixed lane** (Zoom/Teams — `{type:"hint", t, name, isEnd}`): each hint → a point event
   (`SPEAKER_START`, or `SPEAKER_END` when `isEnd`), `source="hint"` (point-only; not paired).
-- **Clock origin (measured 2026-09-22 — findings, STOP condition hit, no constant pinned):**
-  Step S1 cross-correlated a 50 ms tape-energy envelope (Σ`rms` per bin) against `master.wav`'s
-  50 ms RMS envelope using a mean-centered (Pearson) NCC over ±120 s — a non-centered cosine
-  similarity is dominated by the shared non-zero baseline of two non-negative energy signals
-  and must not be used. Whole-recording pass: weak peak (NCC 0.059, z≈2.3, several near-tied
-  local maxima 40–106 s away) → measured origin 2026-09-22T17:03:06.937Z, residual **−17.1 s to
-  −67.3 s** against every candidate (tape header `started_at`, `meeting.start_time`,
-  `service_provenance.bot_admitted_at`, `recording.created_at` raw and −15,000 ms). A
-  first-180s-only variant (sharper onset, less averaging) gave a materially different peak
-  (NCC 0.062, z≈3.8) at 2026-09-22T17:02:35.087Z, residual −475 ms to −681 ms against the
-  `meeting.start_time`/`bot_admitted_at`/MediaRecorder-start cluster (which agree with each
-  other within ~480 ms) — closer, but still over the 250 ms bar, and the two variants disagree
-  with each other by ~32 s. **No candidate is within 250 ms; `"meeting.start_time` + measured
-  constant" is explicitly not adopted** — no structurally-justified constant emerged, and a
-  constant derived from one recording risks being an artifact of the correlation window used.
-  **The exporter must compute this lag live, per meeting**, via the Step-2 method, using a
-  mean-centered NCC restricted to an onset-focused window (e.g. first 2–3 min) rather than the
-  whole recording or a hard-coded `origin` rule — this changes Task 5. `RMS_SPEECH_THRESHOLD`
-  default: **0.026** (valley between a silence mode ≈0.005 and a speech mode ≈0.108 in the
-  observed rms histogram). Meet frames confirmed to carry `speakerName` (6 distinct named
-  speakers observed; notably including a speaker missing from the transcript-derived
-  `participants.json` due to that meeting's STT degradation — confirms the audio-lane
-  `speakerName` is the correct, transcript-independent dependency for attribution).
+- **Clock origin (re-measured 2026-09-22, fix round 1 — PINNED):** the round-1 measurement was
+  invalidated by a plain-decode artifact: `ffmpeg -i master.webm -ac 1 -ar 16000 ...` drops Opus
+  DTX (discontinuous transmission) gaps, non-linearly compressing the wav timeline (packet PTS
+  span 1935.652 s vs. a plain-decode 1901.50 s wav — 220 gaps >0.1 s totalling 37.9 s dropped),
+  which explained both the weak correlation and the ~32 s disagreement between analysis windows.
+  Re-decoded with the **mandatory** timestamp-faithful filter — `ffmpeg -nostdin -i master.webm
+  -af aresample=async=1:first_pts=0 -ac 1 -ar 16000 -c:a pcm_s16le` (1935.619 s) — and re-ran the
+  same mean-centered (Pearson) NCC over ±120 s, this time spreading each tape frame's `rms` across
+  its own duration (`pcm_len/16000 s`) onto the 50 ms grid instead of dropping it into one bin.
+  Result: whole-recording NCC peak = **0.389, z≈10.4** (second-best only 0.122 — clearly
+  dominant, not near-tied); first-180s-only NCC peak = **0.601, z≈17.9**. **Both windows now
+  agree exactly** (same +35,250 ms lag, well inside the 100 ms agreement bar), resolving the
+  round-1 instability. Measured origin: **2026-09-22T17:02:34.937Z**. Residual against
+  `recording.created_at − 15,000 ms` (the record-chunker's own `MediaRecorder(...,
+  timeslice=15000ms)`; `recording.created_at` is written once chunk_seq=0 finishes uploading,
+  i.e. structurally one full timeslice after `MediaRecorder` start — not a constant fitted to
+  this recording) = **−125.5 ms**, inside the 250 ms bar. **Pinned rule:** `origin_epoch =
+  recording.created_at − RECORD_CHUNK_TIMESLICE_MS` (default 15000; must match the bot's
+  `MediaRecorder` timeslice). This is the only candidate confirmed within 250 ms among the
+  runtime-available fields (tape header `started_at` −35,250 ms; `meeting.start_time` −505 ms;
+  `service_provenance.bot_admitted_at` −531 ms; raw `recording.created_at` +14,875 ms all miss);
+  Task 5 hard-codes this rule rather than computing the lag live per meeting. `RMS_SPEECH_THRESHOLD`
+  default: **0.026** (unchanged — the tape's own rms histogram is unaffected by the wav decode
+  fix; valley between a silence mode ≈0.005 and a speech mode ≈0.108). Meet frames confirmed to
+  carry `speakerName` (6 distinct named speakers observed; notably including a speaker missing
+  from the transcript-derived `participants.json` due to that meeting's STT degradation —
+  confirms the audio-lane `speakerName` is the correct, transcript-independent dependency for
+  attribution).
 
 ### 4.4 Config (names only)
 `MEETING_API_URL`, `VEXA_WEBHOOK_SECRET`, `VEXA_BUCKET` (aw-bots), `EXPORT_BUCKET`
