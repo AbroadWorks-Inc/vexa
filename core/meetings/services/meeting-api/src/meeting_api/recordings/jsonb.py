@@ -188,7 +188,7 @@ SIGNAL_ROOT_PREFIX = f"{_SIGNAL_PREFIX}/"
 # actually left with after every retraction — a fold over the publish stream that every consumer
 # performs and nobody stored, so "what did this meeting say?" could only be answered by re-running
 # it against a redis that no longer exists.
-SIGNAL_TAPE_PARTS = ("captured-signal", "stt", "captions", "csrc", "observations", "botlog", "transcript")
+SIGNAL_TAPE_PARTS = ("captured-signal", "stt", "captions", "csrc", "observations", "botlog", "transcript", "speaker-activity")
 # Not every part is JSONL — the bot log is plain text, and its key must carry its real extension or
 # a curator who downloads it gets a file their tools will try to parse a line at a time as JSON.
 SIGNAL_TAPE_PART_FORMATS = {"botlog": "txt"}

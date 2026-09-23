@@ -21,6 +21,7 @@ from meeting_api.bot_spawn import mint_meeting_token
 from meeting_api.recordings import (
     SIGNAL_PROMOTED_MARKER,
     build_router,
+    signal_tape_key,
     signal_tape_prefix,
     sweep_signal_tapes,
     upload_signal_tape,
@@ -40,6 +41,9 @@ CSRC_TAPE = b'{"type":"csrc","t":1,"csrc":424242,"active":true,"lane":"mixed"}\n
 OBSERVATION_TAPE = (
     b'{"type":"observation","t":1,"source":"csrc","lane":"mixed",'
     b'"observation":{"kind":"csrc-poll-error"}}\n'
+)
+SPEAKER_ACTIVITY_TAPE = (
+    b'{"type":"speaker_start","t":1,"name":"Jacob"}\n{"type":"speaker_stop","t":4,"name":"Jacob"}\n'
 )
 
 
@@ -85,6 +89,15 @@ async def test_signal_tape_lands_in_its_own_keyspace_and_is_not_a_recording():
     assert await repo.list_meeting_recordings(USER) == []
 
 
+def test_signal_tape_key_for_speaker_activity():
+    """speaker-activity.jsonl (the who-spoke-when writer, uploaded independent of the debug tape)
+    is a signal tape part like any other — its key follows the same signal/<owner>/<meeting>/
+    <session>/<part>.<fmt> shape."""
+    key = signal_tape_key(user_id=USER, meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                          part="speaker-activity", media_format="jsonl")
+    assert key == f"signal/{USER}/{MEETING_ID}/{SESSION_UID}/speaker-activity.jsonl"
+
+
 async def test_every_tape_part_shares_one_prefix():
     """The frame tape and its sidecars are ONE fixture — audio, speaker hints, STT round-trips and
     Teams captions, transport transitions and the capture path's own observations together are what
@@ -94,13 +107,15 @@ async def test_every_tape_part_shares_one_prefix():
     repo, storage = _seeded()
     keys = []
     for part, data in (("captured-signal", TAPE), ("stt", STT_TAPE), ("captions", CAPTION_TAPE),
-                       ("csrc", CSRC_TAPE), ("observations", OBSERVATION_TAPE)):
+                       ("csrc", CSRC_TAPE), ("observations", OBSERVATION_TAPE),
+                       ("speaker-activity", SPEAKER_ACTIVITY_TAPE)):
         r = await upload_signal_tape(repo, storage, token_meeting_id=None,
                                      session_uid=SESSION_UID, data=data, part=part)
         keys.append(r["storage_path"])
     assert len({k.rsplit("/", 1)[0] for k in keys}) == 1, keys
     assert sorted(k.rsplit("/", 1)[-1] for k in keys) == [
-        "captions.jsonl", "captured-signal.jsonl", "csrc.jsonl", "observations.jsonl", "stt.jsonl",
+        "captions.jsonl", "captured-signal.jsonl", "csrc.jsonl", "observations.jsonl",
+        "speaker-activity.jsonl", "stt.jsonl",
     ]
 
 
@@ -162,6 +177,19 @@ def test_upload_route_accepts_a_signal_tape(monkeypatch):
     )
     # The user-facing listing stays empty — no phantom recording.
     assert client.get("/recordings", headers={"x-user-id": str(USER)}).json()["recordings"] == []
+
+
+def test_upload_route_accepts_speaker_activity(monkeypatch):
+    """The bot always uploads speaker-activity.jsonl (who-spoke-when, independent of the debug
+    tape) — it must not fall into the unknown-part 422 the closed SIGNAL_TAPE_PARTS tuple gives
+    anything it hasn't listed."""
+    repo, storage = _seeded()
+    r = _post_tape(_client_for(repo, storage), part="speaker-activity", data=SPEAKER_ACTIVITY_TAPE)
+    assert r.status_code == 200, r.text
+    assert r.json()["storage_path"] == (
+        signal_tape_prefix(user_id=USER, meeting_id=MEETING_ID, session_uid=SESSION_UID)
+        + "speaker-activity.jsonl"
+    )
 
 
 def test_upload_route_accepts_the_internal_secret(monkeypatch):
