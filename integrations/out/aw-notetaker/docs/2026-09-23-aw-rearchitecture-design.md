@@ -97,9 +97,10 @@ replica; per-meeting jobs are independent.
    pcm_s16le audio.wav` → upload. **`-af aresample=async=1:first_pts=0` is mandatory** (not a
    plain `-i ... -ac 1 -ar 16000` decode): a plain decode drops Opus DTX (discontinuous
    transmission) gaps, non-linearly compressing the wav timeline — measured on the 2026-09-22
-   recording, a plain decode produced 1901.50 s against a 1935.652 s packet PTS span (220 gaps
-   >0.1 s totalling 37.9 s dropped) — which silently shifts every downstream speaker-interval
-   timestamp computed relative to this wav's t=0. See §4.3 clock origin.
+   recording, a plain decode produced 1901.50 s against a 1935.65 s packet PTS span (the
+   gap-filled decode reproduces 1935.62 s, matching the PTS span; ~34 s dropped across ~220
+   inter-packet gaps) — which silently shifts every downstream speaker-interval timestamp
+   computed relative to this wav's t=0. See §4.3 clock origin.
 5. Tape `aw-bots/signal/<user_id>/<meeting_id>/<session_uid>/captured-signal.jsonl` (session uid
    from `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`, `participants.json`.
 6. Write `meeting.json`, `recordings.json`; `live_transcript.json` if the meeting had
@@ -126,10 +127,11 @@ the `captured-signal.v1` tape:
   with `source="audio"` (the trusted, pairable provenance).
 - **mixed lane** (Zoom/Teams — `{type:"hint", t, name, isEnd}`): each hint → a point event
   (`SPEAKER_START`, or `SPEAKER_END` when `isEnd`), `source="hint"` (point-only; not paired).
-- **Clock origin (re-measured 2026-09-22, fix round 1 — PINNED):** the round-1 measurement was
-  invalidated by a plain-decode artifact: `ffmpeg -i master.webm -ac 1 -ar 16000 ...` drops Opus
-  DTX (discontinuous transmission) gaps, non-linearly compressing the wav timeline (packet PTS
-  span 1935.652 s vs. a plain-decode 1901.50 s wav — 220 gaps >0.1 s totalling 37.9 s dropped),
+- **Clock origin (re-measured 2026-09-22, fix round 1 — PINNED, N=1, see caveat):** the round-1
+  measurement was invalidated by a plain-decode artifact: `ffmpeg -i master.webm -ac 1 -ar 16000
+  ...` drops Opus DTX (discontinuous transmission) gaps, non-linearly compressing the wav
+  timeline (packet PTS span 1935.65 s vs. a plain-decode 1901.50 s wav; the gap-filled decode
+  reproduces 1935.62 s, matching the PTS span — ~34 s dropped across ~220 inter-packet gaps),
   which explained both the weak correlation and the ~32 s disagreement between analysis windows.
   Re-decoded with the **mandatory** timestamp-faithful filter — `ffmpeg -nostdin -i master.webm
   -af aresample=async=1:first_pts=0 -ac 1 -ar 16000 -c:a pcm_s16le` (1935.619 s) — and re-ran the
@@ -147,19 +149,32 @@ the `captured-signal.v1` tape:
   `MediaRecorder` timeslice). This is the only candidate confirmed within 250 ms among the
   runtime-available fields (tape header `started_at` −35,250 ms; `meeting.start_time` −505 ms;
   `service_provenance.bot_admitted_at` −531 ms; raw `recording.created_at` +14,875 ms all miss);
-  Task 5 hard-codes this rule rather than computing the lag live per meeting. `RMS_SPEECH_THRESHOLD`
-  default: **0.026** (unchanged — the tape's own rms histogram is unaffected by the wav decode
-  fix; valley between a silence mode ≈0.005 and a speech mode ≈0.108). Meet frames confirmed to
-  carry `speakerName` (6 distinct named speakers observed; notably including a speaker missing
-  from the transcript-derived `participants.json` due to that meeting's STT degradation —
-  confirms the audio-lane `speakerName` is the correct, transcript-independent dependency for
-  attribution).
+  Task 5 hard-codes this rule rather than computing the lag live per meeting.
+  **Caveat — this is an N=1 measurement, not a validated constant:** the −125.5 ms residual is
+  not pure timeslice offset; it also absorbs chunk-0's upload latency, since
+  `recording.created_at` is stamped when chunk_seq=0 *finishes uploading*, not at the instant
+  `MediaRecorder` reaches the 15,000 ms boundary — the true relationship is `MediaRecorder start
+  + one timeslice + chunk-0 upload latency`. Known failure modes this single recording cannot
+  rule out: (a) **variable upload latency** — a slower or queued chunk-0 upload on a different
+  recording (worse network, backend contention) would widen the residual, since that latency is
+  network-dependent, not fixed; (b) **a changed `MediaRecorder` timeslice** — the rule only holds
+  if `RECORD_CHUNK_TIMESLICE_MS` tracks whatever timeslice the bot is actually configured with; a
+  drift between the two silently reintroduces this exact class of error. **Task 11's live
+  meetings must re-measure this residual on additional recordings before the rule is treated as
+  fixed**; if a wider spread of residuals turns up there, this bullet needs another revision.
+  `RMS_SPEECH_THRESHOLD` default: **0.026** (unchanged — the tape's own rms histogram is
+  unaffected by the wav decode fix; valley between a silence mode ≈0.005 and a speech mode
+  ≈0.108). Meet frames confirmed to carry `speakerName` (6 distinct named speakers observed;
+  notably including a speaker missing from the transcript-derived `participants.json` due to
+  that meeting's STT degradation — confirms the audio-lane `speakerName` is the correct,
+  transcript-independent dependency for attribution).
 
 ### 4.4 Config (names only)
 `MEETING_API_URL`, `VEXA_WEBHOOK_SECRET`, `VEXA_BUCKET` (aw-bots), `EXPORT_BUCKET`
 (aw-chatworks-transcribe), `EXPORT_PREFIX` (recordings/), `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
-`SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `AWS_REGION`. S3 via IRSA (no static keys).
+`SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS` (default 15000),
+`AWS_REGION`. S3 via IRSA (no static keys).
 
 ## 5. Portal → Vexa (aw-notetaker repo; own plan)
 - One Vexa service account (created once by an operator via admin-api); its API key lives in a K8s
