@@ -11,9 +11,9 @@ Read this next to:
 | | |
 |---|---|
 | Tasks done | 1–10 of 12. **11 (live meetings) and 12 (push/PR) wait on you** — §5. |
-| Tests | 178 unit tests pass; black, ruff and mypy (strict) clean. 1 integration test passes against the real image, MinIO and ffmpeg. |
+| Tests | 188 unit tests pass; black, ruff and mypy (strict) clean. 1 integration test passes against the real image, MinIO and ffmpeg. |
 | Repo gates | No new failures from this package. Gates already red before this work: 6 because `uv` isn't installed here, and `gate:readme` on the gitignored `recordings/` and `reference/`. |
-| Core changes | None. Nothing under `core/`, `clients/` or `deploy/` changed. |
+| Core changes | Tasks 1–10: none. The speaker-activity addendum (§7) changed two services under `core/`: the bot (`core/meetings/services/bot` — the writer and its upload) and meeting-api (`core/meetings/services/meeting-api` — the accepted `speaker-activity` signal part). Nothing under `clients/` or `deploy/` changed. |
 | Code | `exporter/` is 1,593 lines across 14 modules. |
 
 What it does, end to end:
@@ -154,7 +154,7 @@ Each line: what I decided — why — what it costs if wrong.
    - **New as of the speaker-activity work (§7 addendum):** the bot and `meeting-api` images must be rebuilt and redeployed from this branch before this test. The currently running images predate the speaker-activity writer/uploader and the accepted `speaker-activity` signal part, so a live meeting today would still exercise the old tape path, not what §7 describes. Run the plan's "Final" live leg (one long Meet call, debug tape OFF) only after that rebuild.
    - It needs the full Vexa compose stack. Its `.env` holds real credentials I'm not allowed to read, so you'd set it up or approve the approach. Settings: `TRANSCRIBE_ENABLED=false`, the system webhook pointing at the exporter, and the stub or real notetaker.
    - Then two people in a Meet meeting, one of them speaking in the first minute, plus one Zoom and one Teams meeting.
-   - It measures: the timing residual on more recordings and on Zoom/Teams, how long after `completed` the tape upload lands, tape MB per minute, and bot memory/CPU for the NodePool sizing.
+   - It measures: the timing residual on more recordings and on Zoom/Teams, how long after `completed` the speaker-activity upload lands (to size `ACTIVITY_WAIT_SECONDS`), speaker-activity MB per hour, the exporter's memory on a long meeting, and bot memory/CPU for the NodePool sizing.
 3. **Push and PR into `development`** once item 1 is settled.
 4. **`aw-notetaker/CLAUDE.md`** (another repo): record the actual branch convention (`feat/`, `fix/`) and `development` as the working branch, if you want that.
 
@@ -163,7 +163,7 @@ Each line: what I decided — why — what it costs if wrong.
 ```bash
 cd integrations/out/aw-notetaker
 /opt/homebrew/bin/python3.11 -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'
-pytest -q && black --check . && ruff check . && mypy exporter     # 178 passed
+pytest -q && black --check . && ruff check . && mypy exporter     # 188 passed
 pytest -m integration -q tests/integration                          # needs Docker
 docker build -t aw-exporter:dev .
 ```
@@ -188,11 +188,13 @@ on only to investigate a specific meeting. There is **no fallback** to the tape:
 `speaker-activity.jsonl` is an alertable incident (the ERROR log `speaker_activity_missing`), but
 the export still completes — the transcript just carries no attribution for that meeting.
 
-**How verified.** Each of the five tasks below was implementer-built, then reviewed independently
+**How verified.** Tasks 1–4 (code) were each implementer-built, then reviewed independently
 (sonnet/opus/haiku reviewers per task, matched to the risk of the file touched); every "Needs
 fixes" review was answered by a fix round and, where the fix was comment/README-only with no
 behaviour change possible, verified by the controller reading the diff rather than a second full
-review pass (Ruling S5). No live meeting yet — see "Pending" below.
+review pass (Ruling S5). Task 5 (docs) had no review seat of its own: it was reviewed inside the
+final whole-change review (Ruling S6), whose findings were fixed in one wave (Ruling F-S1). No live
+meeting yet — see "Pending" below.
 
 **Commits** (`f6d061a0..HEAD`):
 
@@ -211,8 +213,10 @@ review pass (Ruling S5). No live meeting yet — see "Pending" below.
 - **Ruling S1** — the part/file name uses the repo's hyphen convention (`speaker-activity`, like
   `captured-signal`) rather than the `speaker_activity` spelling used in chat. — Cost if wrong: a
   rename.
-- **Ruling S2** — a 1 GiB safety ceiling (not "no cap"), so a runaway bug can't fill the pod disk
-  and kill the recording; about 25× a 3-hour meeting. — Cost if wrong: an env change.
+- **Ruling S2** — a safety ceiling (not "no cap"), so a runaway bug can't fill the pod disk and
+  kill the recording. First set at 1 GiB; the final review lowered the default to 128 MiB (about
+  3× a 3-hour meeting's upper estimate, uploadable inside the 8 s bound in-cluster; Ruling F-S1).
+  — Cost if wrong: an env change.
 - **Ruling S3** — the "frame/hint written after `close()`" gap is closed by only calling `close()`
   after capture has stopped, plus a closed guard making post-close calls no-ops (tested). — Cost
   if wrong: trivial.
@@ -225,6 +229,14 @@ review pass (Ruling S5). No live meeting yet — see "Pending" below.
 - **Ruling S5** — a comment/README-only fix round (no behaviour change possible) is verified by
   the controller reading the diff, instead of a separate re-review seat; used for both the Task 3
   and Task 4 fix rounds. — Cost if wrong: a wording nit.
+- **Ruling S6** — Task 5 (docs only) is reviewed inside the final whole-change review rather than
+  a separate task seat. — Cost if wrong: a doc nit caught one step later.
+- **Ruling F-S1** — the final review's findings are fixed in one wave: the janitor-eviction risk
+  and `capture_signal=false` as a rollout step, present-tense source comments, speaker-activity
+  wording in place of tape wording, a tested frame tap, a byte-accurate ceiling, the 128 MiB
+  default, dedicated `speaker-activity-upload-*` events, named-gmeet-only frames in exporter
+  memory, `_export.json.speaker_activity_events` plus the `speaker_activity_empty` warning, a
+  contract-shaped meeting-api fixture, and the deploy order. — Cost if wrong: an env change.
 
 **Pending:**
 - **Live validation** on one long Meet call with the debug tape OFF (the plan's "Final" section):
@@ -232,4 +244,7 @@ review pass (Ruling S5). No live meeting yet — see "Pending" below.
   call, and the upload landing inside the grace window.
 - **Images must be rebuilt** — the bot image and the `meeting-api` image both predate this work;
   neither the writer/uploader nor the accepted `speaker-activity` signal part exist in what's
-  currently deployed. See §5 item 2.
+  currently deployed. See §5 item 2. **Deploy order: meeting-api → bot → exporter.** A new bot
+  against an old meeting-api gets a 422 on the new part (the file is lost); the new exporter
+  against old bots finds no activity file and has no fallback. Ship `capture_signal=false`
+  (admin-api platform diagnostics) together with the new bot — see parent spec §7 and §9.

@@ -57,12 +57,12 @@ s3://aw-chatworks-transcribe/recordings/<platform>_<nativeMeetingId>_<startUTC>/
   audio.wav                temp    — 16 kHz mono PCM; notetaker-worker deletes it after transcribing
   meeting.json             kept    — Vexa meeting row (webhook data.meeting)
   recordings.json          kept    — Vexa recording index for this meeting
-  participants.json        kept    — names observed speaking (from the capture tape)
+  participants.json        kept    — names observed speaking (from speaker-activity.jsonl)
   speaker_timeline.json    kept    — speaker_timeline points + speaker_intervals (worker's mapper input)
   notes.json, transcript.txt, summary.json[, transcript_en.txt]   — written by notetaker-worker
   live_transcript.json     only if the bot ran with live transcription on
   signal/                  only when EXPORT_DEBUG=1 (botlog, captured-signal, …)
-  _export.json             kept    — exporter marker (state, tape, audio_recordings, timings); written last
+  _export.json             kept    — exporter marker (state, speaker_activity[_events], audio_recordings, timings); written last
 ```
 - `platform` = Vexa's value (`google_meet`, `zoom`, `teams`), passed unchanged to `/process`
   (any non-`jitsi` value takes the worker's bot path).
@@ -115,15 +115,21 @@ replica; per-meeting jobs are independent.
    attribution, never fail the export — the resulting state is recorded in
    `_export.json.speaker_activity`:
    - `ok` — parsed; events used. A header-only file (nobody spoke before the bot left, or the
-     meeting ended before anyone did) is also `ok`, with zero events — not an error.
+     meeting ended before anyone did) is also `ok`, with zero events — not an error; so is a file
+     with a valid header whose other rows partly fail to parse (those rows are skipped, so it
+     yields fewer events). An `ok` file that yields zero events while `audio.wav` is longer than
+     180 s logs the WARNING `speaker_activity_empty vexa_meeting_id=<id> audio_s=<n>` — someone
+     almost certainly spoke, yet the bot recorded nobody.
    - `missing` — still absent after the wait → empty timeline/participants; logged as the ERROR
      `speaker_activity_missing` (§9).
-   - `invalid` — present but unparseable (no header, or every row fails to parse) → empty
-     timeline/participants, warning logged.
+   - `invalid` — present but has no `speaker_activity_header` line, or cannot be read/parsed at
+     all → empty timeline/participants, warning logged.
    - `capped` — parsed and used, but the file itself carries aw-bots' own `{"type":"capped"}`
      marker line (written once, when `VEXA_SPEAKER_ACTIVITY_MAX_BYTES` is reached; nothing after
      it was written), so attribution may stop before the meeting ended; warning logged. This is
      read from the marker, not computed from the file's byte size.
+   `_export.json.speaker_activity_events` records how many speaker events were derived (0 for
+   `missing`/`invalid`), so an empty-but-`ok` export is visible without opening the timeline.
    The timeline's `recording_ended_at` / clip bound is `recording_started_at` + the transcoded
    `audio.wav`'s own duration (not `meeting.end_time`), so intervals never outrun the audio.
    `room_name` = `data.constructed_meeting_url`, else top-level `constructed_meeting_url`, else
@@ -134,7 +140,7 @@ replica; per-meeting jobs are independent.
 7. `POST {NOTETAKER_URL}/process {meeting_id:"vexa-<id>", s3_path:"recordings/<folder>/",
    platform:<platform>, idempotency_key:"vexa-<id>"}`; backoff retry on connect errors/5xx.
 8. `_export.json {state:"handed_off", vexa_meeting_id, exported_at, elapsed_s, exporter_version,
-   tape, audio_recordings}` last; delete pending. `audio_recordings` counts the recordings with
+   speaker_activity, speaker_activity_events, audio_recordings}` last; delete pending. `audio_recordings` counts the recordings with
    an audio media file; when it is > 1 (a multi-session meeting) a warning is logged and only
    the first is exported (see §9).
 
@@ -207,8 +213,10 @@ fallback to the tape (§4.2 step 5, [speaker-activity design](2026-09-23-speaker
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS` (default 15000),
 `ACTIVITY_WAIT_SECONDS` (default 120, replaces `TAPE_WAIT_SECONDS`), `AWS_REGION`. S3 via IRSA
 (no static keys). aw-bots' own safety ceiling for `speaker-activity.jsonl`,
-`VEXA_SPEAKER_ACTIVITY_MAX_BYTES` (default 1 GiB), is a bot-pod env var, not an exporter one —
-see §7 and the [speaker-activity design](2026-09-23-speaker-activity-design.md).
+`VEXA_SPEAKER_ACTIVITY_MAX_BYTES` (default 128 MiB — about 3× the ~40 MB upper estimate for a
+3-hour meeting, and small enough to upload inside the bot's 8 s teardown bound in-cluster), is a
+bot-pod env var, not an exporter one — see §7 and the
+[speaker-activity design](2026-09-23-speaker-activity-design.md).
 
 ## 5. Portal → Vexa (aw-notetaker repo; own plan)
 - One Vexa service account (created once by an operator via admin-api); its API key lives in a K8s
@@ -225,7 +233,8 @@ see §7 and the [speaker-activity design](2026-09-23-speaker-activity-design.md)
 
 ## 6. Testing
 - Unit (pytest): signature (good/bad/stale/missing secret), event filter, folder naming/sanitising,
-  tape → events for both lanes (synthetic tapes — no real participant audio or names in fixtures),
+  speaker-activity → events for both lanes (synthetic speaker-activity files — no real participant
+  audio or names in fixtures),
   ported attribution rules (port the relevant reference tests), idempotency, pending-sweep resume.
 - Integration (compose): MinIO as both buckets, stub `/process`; replay a signed envelope; assert the
   folder byte-for-byte.
@@ -238,10 +247,16 @@ see §7 and the [speaker-activity design](2026-09-23-speaker-activity-design.md)
   `VEXA_SYSTEM_WEBHOOK_URL=http://aw-exporter.<ns>.svc.cluster.local:8080/hooks/vexa`,
   `VEXA_SYSTEM_WEBHOOK_SECRET` (Secret), `VEXA_SYSTEM_WEBHOOK_ALLOW_PRIVATE_HTTP=true`,
   `AUTO_JOIN_LEAD_S` sized to cover node provisioning + bot image pull + browser boot (see risks).
-- admin-api: platform diagnostics `capture_signal=false` — the debug capture tape
-  (`captured-signal.jsonl`) is off by default for every meeting, since naming no longer depends on
-  it (§4.2 step 5, §4.3). Switch it on per platform or per user only to investigate a specific
-  meeting (`_resolve_capture_signal`, `core/identity/services/admin-api`).
+- **Deploy order: meeting-api → bot → exporter.** A new bot against an old meeting-api gets a 422
+  on the `speaker-activity` signal part (the file is lost); the new exporter against old bots finds
+  no `speaker-activity.jsonl` and has no fallback, so every meeting exports `missing`.
+- **Rollout step, in the same change that ships the new bot:** admin-api platform diagnostics
+  `capture_signal=false` — the debug capture tape (`captured-signal.jsonl`) off by default for every
+  meeting, since naming no longer depends on it (§4.2 step 5, §4.3). This is required, not a later
+  nicety: meeting-api's signal janitor evicts whole `signal/<u>/<m>/<s>/` prefixes, which include
+  `speaker-activity.jsonl` (§9). The alternative is raising the janitor budget
+  (`SIGNAL_TAPE_BUDGET_BYTES`). Switch the tape on per platform or per user only to investigate a
+  specific meeting (`_resolve_capture_signal`, `core/identity/services/admin-api`).
 - runtime: `nodeSelector`/`tolerations` → the bots Karpenter NodePool (`ng-bots-133`);
   `workloadResources.meetingBot` per §7.1.
 
@@ -252,8 +267,9 @@ Measured on the OLD bot (v0.10.4, 85 meetings): memory 0.48 GiB (bot alone) → 
 
 - **Per bot (Guaranteed QoS, request = limit):** `cpu: 1`, `memoryMb: 2560`. Memory is a hard OOM
   ceiling, so it carries ~40 % headroom over the 1.82 GiB peak; the chart default 2048 leaves ~11 %.
-  CPU over the limit only throttles. Local disk: ≥ 1 GiB ephemeral for the tape (≤ 250 MB,
-  `DEFAULT_MAX_TAPE_BYTES`) + browser profile.
+  CPU over the limit only throttles. Local disk: ≥ 1 GiB ephemeral for `speaker-activity.jsonl`
+  (≤ 128 MiB) + the debug tape when switched on (≤ 250 MB, `DEFAULT_MAX_TAPE_BYTES`) + browser
+  profile.
 - **Load (assuming the 165k Meet + 29k Zoom minutes are per MONTH):** 194k min ≈ 3,230 bot-hours/month.
   Over ~22 working days × 10 h that is **~15 concurrent bots on average**; top-of-hour clustering
   gives a planning peak of **~45**, burstable to ~60. Load grows with onboarding: NodePool `limits`
@@ -302,12 +318,18 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
   `speaker_activity_missing` (§4.2 step 5). The export still succeeds either way:
   `_export.json.speaker_activity` records `"missing"`, and the timeline/participants come back
   empty rather than failing the job.
+- **The signal janitor can evict `speaker-activity.jsonl`.** meeting-api's janitor
+  (`recordings/signal_janitor.py`: 50 GiB budget, oldest first, minimum age 600 s) deletes whole
+  `signal/<u>/<m>/<s>/` prefixes, and `speaker-activity.jsonl` lives in that prefix. While the debug
+  tape is ON (`capture_signal` defaults ON) only about 200 sessions fit the budget, so a late retry
+  or a backfill can find the file gone and export `missing`. Mitigation: `capture_signal=false` as
+  a rollout step (§7), or a larger `SIGNAL_TAPE_BUDGET_BYTES`.
 - Multi-session meetings (the bot rejoined → several audio recordings) export only one session;
   the count is recorded in `_export.json.audio_recordings` and logged, the other sessions' audio
   is not exported.
 - With one Vexa service account (D11), every meeting's recordings JSONB lives under one user, so
   the recordings load meeting-api does per request grows with the total number of meetings.
 - Task 11 must also measure: the mixed-lane (Zoom/Teams) clock-origin residual (§4.3's rule is
-  measured on Meet only), the tape-upload lag after `meeting.completed` (to size
-  `TAPE_WAIT_SECONDS`), and tape MB/min (to size `VEXA_CAPTURE_SIGNAL_MAX_BYTES` and the bot
-  pods' ephemeral disk).
+  measured on Meet only), the speaker-activity upload lag after `meeting.completed` (to size
+  `ACTIVITY_WAIT_SECONDS`), speaker-activity MB/hour (to check `VEXA_SPEAKER_ACTIVITY_MAX_BYTES`
+  and the bot pods' ephemeral disk), and the exporter's memory on a long meeting.

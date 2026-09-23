@@ -31,7 +31,8 @@ One JSON object per line:
 
 - **No audio samples**, ever.
 - Same clock as the recording: `t` is capture epoch ms, the same domain the tape uses, so the measured origin rule (spec §4.3) still holds.
-- Safety ceiling: `VEXA_SPEAKER_ACTIVITY_MAX_BYTES`, default 1 GiB, about 25× a 3-hour meeting. It exists only so a runaway bug cannot fill the pod's disk and kill the recording. It is never expected to be reached.
+- Safety ceiling: `VEXA_SPEAKER_ACTIVITY_MAX_BYTES`, default 128 MiB (134217728 bytes), counted in UTF-8 bytes. That is about 3× the ~40 MB upper estimate for a 3-hour meeting, and small enough to upload inside the bot's 8 s teardown bound in-cluster. It exists only so a runaway bug cannot fill the pod's disk and kill the recording. It is never expected to be reached.
+- Upload: one attempt at teardown, bounded by an 8 s wall clock, logged as `speaker-activity-uploaded`, `speaker-activity-upload-failed` or `speaker-activity-upload-skipped` (separate from the debug tape's `tape-*` events, so alerting can key on them).
 
 ## Changes
 
@@ -42,8 +43,8 @@ One JSON object per line:
 | `core/meetings/services/bot/src/index.ts` | Always create the writer. At teardown: close it, then upload it **before** the debug tape files (smallest and most important first, inside the SIGTERM grace). |
 | `core/meetings/services/bot/src/signal-upload.ts` | New part `speaker-activity`, uploaded whether or not the debug tape exists. |
 | `core/meetings/services/meeting-api/…/recordings/jsonb.py` | Add `"speaker-activity"` to the accepted signal parts (today unknown parts get 422). |
-| `integrations/out/aw-notetaker/exporter/` | Read `speaker-activity.jsonl` instead of `captured-signal.jsonl`. Wait for it like today's tape wait. States `ok`, `missing` (error log `speaker_activity_missing`), `invalid`, `capped`. The old tape reader is removed. |
-| Deployment (later) | Turn the debug tape off by default (`capture_signal=false` platform setting in admin-api). |
+| `integrations/out/aw-notetaker/exporter/` | Read `speaker-activity.jsonl` instead of `captured-signal.jsonl`. Wait for it (`ACTIVITY_WAIT_SECONDS`). States `ok`, `missing` (error log `speaker_activity_missing`), `invalid`, `capped`; `_export.json.speaker_activity_events` counts the events derived, and an `ok` file with none on audio longer than 180 s logs the warning `speaker_activity_empty`. Only named gmeet-lane frames are kept in memory. The old tape reader is removed. |
+| Deployment (rollout step, with the new bot) | Deploy in the order meeting-api → bot → exporter. Turn the debug tape off by default (`capture_signal=false` platform setting in admin-api) when the new bot ships: meeting-api's signal janitor evicts whole `signal/<u>/<m>/<s>/` prefixes oldest-first (50 GiB budget), which include `speaker-activity.jsonl`, and with the tape on only ~200 sessions fit. The alternative is a larger `SIGNAL_TAPE_BUDGET_BYTES`. |
 
 ## Out of scope
 
