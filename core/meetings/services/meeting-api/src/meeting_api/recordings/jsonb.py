@@ -167,10 +167,11 @@ def master_storage_key(chunk_key: str, media_format: str) -> str:
 _SIGNAL_PREFIX = "signal"
 SIGNAL_ROOT_PREFIX = f"{_SIGNAL_PREFIX}/"
 # The files one bot session leaves: the frame/hint tape, the STT round-trip sidecar, the Teams
-# closed-caption sidecar, the transport (RTP contributing-source) sidecar, and the observations
+# closed-caption sidecar, the transport (RTP contributing-source) sidecar, the observations
 # sidecar (every typed diagnostic the capture path emitted, which used to live only in a pod's
-# log). A CLOSED set — the part name lands in an object key, so it is never caller-shaped (the
-# session_uid in the key is already constrained by find_session).
+# log), and the speaker-activity file (who spoke when, written for every meeting regardless of
+# whether the tape is). A CLOSED set — the part name lands in an object key, so it is never
+# caller-shaped (the session_uid in the key is already constrained by find_session).
 #
 # `stt`, `captions`, `csrc` and `observations` are SIDECARS rather than record types inside the
 # tape because
@@ -188,6 +189,15 @@ SIGNAL_ROOT_PREFIX = f"{_SIGNAL_PREFIX}/"
 # actually left with after every retraction — a fold over the publish stream that every consumer
 # performs and nobody stored, so "what did this meeting say?" could only be answered by re-running
 # it against a redis that no longer exists.
+#
+# `speaker-activity` is the who-spoke-when file the bot writes for EVERY meeting, independent of
+# whether the debug tape is recorded — one line per captured frame (time, channel, display name,
+# loudness, duration) and per active-speaker hint, never audio, which keeps it small (megabytes
+# for hours, against the tape's gigabytes). It is the naming source the downstream exporter reads
+# to attribute a transcript to a speaker. It is its own part rather than a record type inside
+# captured-signal.v1 for the same sealed-contract reason as the sidecars above, and because it
+# must exist when the tape does not: nesting it inside a tape that is off by default would leave
+# every ordinary meeting with no speaker names at all.
 SIGNAL_TAPE_PARTS = ("captured-signal", "stt", "captions", "csrc", "observations", "botlog", "transcript", "speaker-activity")
 # Not every part is JSONL — the bot log is plain text, and its key must carry its real extension or
 # a curator who downloads it gets a file their tools will try to parse a line at a time as JSON.
