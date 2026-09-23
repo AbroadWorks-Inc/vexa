@@ -55,9 +55,12 @@ def parse_tape(lines: Iterable[str]) -> Tape:
         except (ValueError, TypeError):
             continue
         if row.get("type") == "captured_signal_header":
+            sample_rate = int(row.get("sample_rate", 16000))
+            if sample_rate <= 0:
+                sample_rate = 16000
             tape = Tape(
                 lane=str(row.get("lane", "gmeet")),
-                sample_rate=int(row.get("sample_rate", 16000)),
+                sample_rate=sample_rate,
                 started_at=row.get("started_at"),
             )
             continue
@@ -65,20 +68,30 @@ def parse_tape(lines: Iterable[str]) -> Tape:
             continue
         if row.get("type") == "hint":
             if row.get("name"):
-                tape.hints.append(
-                    Hint(int(row["t"]), str(row["name"]), bool(row.get("isEnd", False)))
-                )
+                try:
+                    tape.hints.append(
+                        Hint(
+                            int(row["t"]),
+                            str(row["name"]),
+                            bool(row.get("isEnd", False)),
+                        )
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue
             continue
         if "ts" in row:
-            samples = int(row.get("pcm_len", 0))
-            tape.frames.append(
-                Frame(
-                    ts=int(row["ts"]),
-                    name=row.get("speakerName") or None,
-                    rms=float(row.get("rms", 0.0)),
-                    duration_ms=int(round(samples * 1000 / tape.sample_rate)),
+            try:
+                samples = int(row.get("pcm_len", 0))
+                tape.frames.append(
+                    Frame(
+                        ts=int(row["ts"]),
+                        name=row.get("speakerName") or None,
+                        rms=float(row.get("rms", 0.0)),
+                        duration_ms=int(round(samples * 1000 / tape.sample_rate)),
+                    )
                 )
-            )
+            except (KeyError, ValueError, TypeError):
+                continue
     if tape is None:
         raise ValueError("tape has no captured_signal_header")
     return tape
@@ -100,11 +113,11 @@ def speech_events(
 ) -> list[TapeEvent]:
     """Extract speaker START/END events from tape.
 
-    If tape has hints, emits point events from them (sorted by time, then name).
+    If lane is "mixed", emits point events from hints only (spec §4.3).
     Otherwise analyzes frames using RMS threshold and hangover duration.
     Returns events sorted by relative_ms, then name.
     """
-    if tape.hints:
+    if tape.lane == "mixed":
         out = [
             TapeEvent(
                 h.name,

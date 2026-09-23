@@ -98,3 +98,82 @@ def test_no_header_raises() -> None:
 
     with pytest.raises(ValueError):
         parse_tape([frame(ORIGIN_MS, "A", 0.2)])
+
+
+def test_hint_missing_t_skipped_next_valid_hint_parses() -> None:
+    """Hint without 't' field raises KeyError; should skip and continue."""
+    import json
+
+    bad_hint = json.dumps({"type": "hint", "name": "A", "lane": "mixed"})  # missing 't'
+    good_hint = json.dumps(
+        {"type": "hint", "t": ORIGIN_MS + 100, "name": "B", "lane": "mixed"}
+    )
+    t = parse_tape([header("mixed"), bad_hint, good_hint])
+    assert names(t) == ["B"]
+    events = [ev(e) for e in speech_events(t, ORIGIN_MS, 0.05, 700)]
+    assert ("B", 100, "SPEAKER_START", "hint") in events
+
+
+def test_frame_with_non_numeric_ts_skipped() -> None:
+    """Frame with non-numeric 'ts' raises ValueError; should skip."""
+    import json
+
+    bad_frame = json.dumps(
+        {
+            "ts": "not_a_number",
+            "speakerName": "A",
+            "rms": 0.1,
+            "pcm_len": 4096,
+            "lane": "gmeet",
+        }
+    )
+    good_frame = frame(ORIGIN_MS + 256, "A", 0.2)
+    t = parse_tape([header(), bad_frame, good_frame])
+    assert names(t) == ["A"]
+    events = [ev(e) for e in speech_events(t, ORIGIN_MS, 0.05, 700)]
+    assert ("A", 256, "SPEAKER_START", "audio") in events
+
+
+def test_header_sample_rate_zero_falls_back_to_16000() -> None:
+    """Header with sample_rate 0 should not cause ZeroDivisionError; fall back to 16000."""
+    import json
+
+    bad_header = json.dumps(
+        {"type": "captured_signal_header", "v": 1, "sample_rate": 0, "lane": "gmeet"}
+    )
+    good_frame = frame(ORIGIN_MS, "A", 0.2, samples=4096)
+    t = parse_tape([bad_header, good_frame])
+    assert t.sample_rate == 16000
+    assert t.frames[0].duration_ms == 256  # 4096 / 16000 * 1000
+
+
+def test_gmeet_with_frames_and_stray_hint_ignores_hint() -> None:
+    """gmeet lane should use frame events only, ignoring any hints (spec §4.3)."""
+    t = parse_tape(
+        [
+            header("gmeet"),
+            frame(ORIGIN_MS, "A", 0.2),
+            frame(ORIGIN_MS + 1000, "A", 0.0),
+            hint(ORIGIN_MS + 500, "B"),  # stray hint in gmeet lane
+        ]
+    )
+    events = [ev(e) for e in speech_events(t, ORIGIN_MS, 0.05, 700)]
+    assert ("A", 0, "SPEAKER_START", "audio") in events
+    assert ("A", 256, "SPEAKER_END", "audio") in events
+    assert all(e[3] == "audio" for e in events)  # source is audio, not hint
+    assert not any(e[0] == "B" for e in events)  # no B speaker
+
+
+def test_mixed_lane_with_frames_and_hints_returns_hints_only() -> None:
+    """mixed lane should use hint events only, ignoring frames (spec §4.3)."""
+    t = parse_tape(
+        [
+            header("mixed"),
+            frame(ORIGIN_MS, "A", 0.9),  # high RMS frame in mixed lane
+            hint(ORIGIN_MS + 100, "B"),  # but B is in hints
+        ]
+    )
+    events = [ev(e) for e in speech_events(t, ORIGIN_MS, 0.05, 700)]
+    assert ("B", 100, "SPEAKER_START", "hint") in events
+    assert all(e[3] == "hint" for e in events)  # source is hint only
+    assert not any(e[0] == "A" for e in events)  # no A speaker
