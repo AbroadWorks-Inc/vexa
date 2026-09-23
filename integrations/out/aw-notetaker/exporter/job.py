@@ -29,6 +29,10 @@ from exporter.vexa_client import MeetingApi
 
 logger = logging.getLogger("exporter")
 
+# An `ok` file with no speaker events on audio longer than this is suspect:
+# someone almost certainly spoke, yet the bot recorded nobody.
+EMPTY_ACTIVITY_AUDIO_S = 180.0
+
 State = Literal["handed_off", "no_audio", "already_done"]
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 
@@ -191,6 +195,12 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
                     "attribution may stop early",
                     vexa_meeting_id,
                 )
+            elif not events and wav_duration_s > EMPTY_ACTIVITY_AUDIO_S:
+                logger.warning(
+                    "speaker_activity_empty vexa_meeting_id=%s audio_s=%d",
+                    vexa_meeting_id,
+                    round(wav_duration_s),
+                )
 
     timeline = build_speaker_timeline(
         events,
@@ -254,6 +264,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             "elapsed_s": (finished - started).total_seconds(),
             "exporter_version": __version__,
             "speaker_activity": activity_state,
+            "speaker_activity_events": len(events),
             "audio_recordings": len(audio_recs),
         },
     )

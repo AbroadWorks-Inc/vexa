@@ -187,3 +187,63 @@ def test_mixed_lane_with_frames_and_hints_returns_hints_only() -> None:
     assert ("B", 100, "SPEAKER_START", "hint") in events
     assert all(e[3] == "hint" for e in events)  # source is hint only
     assert not any(e[0] == "A" for e in events)  # no A speaker
+
+
+def test_mixed_lane_frames_are_counted_not_stored() -> None:
+    """speech_events never reads mixed-lane frames, so they are not kept in
+    memory; they are still counted."""
+    a = parse_activity(
+        [
+            header("mixed"),
+            frame(ORIGIN_MS, None, 0.9),
+            frame(ORIGIN_MS + 256, None, 0.9, ch=1),
+            hint(ORIGIN_MS + 10, "A"),
+        ]
+    )
+    assert a.frames == []
+    assert a.frame_count == 2
+    assert [h.name for h in a.hints] == ["A"]
+
+
+def test_gmeet_unnamed_frames_are_counted_not_stored() -> None:
+    a = parse_activity(
+        [
+            header(),
+            frame(ORIGIN_MS, None, 0.9),
+            frame(ORIGIN_MS + 256, "A", 0.2),
+            frame(ORIGIN_MS + 512, None, 0.0),
+        ]
+    )
+    assert [(f.ts, f.name) for f in a.frames] == [(ORIGIN_MS + 256, "A")]
+    assert a.frame_count == 3
+
+
+def test_unparseable_frame_is_not_counted() -> None:
+    bad_frame = json.dumps({"t": ORIGIN_MS, "name": "A", "rms": 0.2})
+    a = parse_activity([header(), bad_frame, frame(ORIGIN_MS + 256, "A", 0.2)])
+    assert a.frame_count == 1
+
+
+def test_unnamed_frames_never_change_gmeet_events() -> None:
+    """Dropping unnamed frames at parse time gives the same events as keeping
+    them: a speaker's END is its last voiced time either way."""
+    named = [
+        frame(ORIGIN_MS, "A", 0.2),
+        frame(ORIGIN_MS + 256, "A", 0.2),
+        frame(ORIGIN_MS + 3000, "B", 0.2),
+        frame(ORIGIN_MS + 3256, "A", 0.2),
+    ]
+    unnamed = [frame(ORIGIN_MS + t, None, 0.9) for t in (100, 900, 1800, 2700, 5000)]
+    with_unnamed = parse_activity([header(), *named, *unnamed])
+    without = parse_activity([header(), *named])
+    assert speech_events(with_unnamed, ORIGIN_MS, 0.05, 700) == speech_events(
+        without, ORIGIN_MS, 0.05, 700
+    )
+
+
+def test_activity_dataclasses_use_slots() -> None:
+    a = parse_activity(
+        [header(), frame(ORIGIN_MS, "A", 0.2), hint(ORIGIN_MS + 10, "B")]
+    )
+    for obj in (a, a.frames[0], a.hints[0], speech_events(a, ORIGIN_MS, 0.05, 700)[0]):
+        assert not hasattr(obj, "__dict__"), type(obj).__name__

@@ -396,6 +396,7 @@ def test_compose_flow_hands_off_meeting(
     marker = _wait_for_export_marker(seeded_s3, timeout=60)
     assert marker["state"] == "handed_off"
     assert marker["speaker_activity"] == "ok"
+    assert marker["speaker_activity_events"] == 4
     assert marker["audio_recordings"] == 1
 
     keys = _list_keys(seeded_s3, EXPORT_BUCKET, BASE)

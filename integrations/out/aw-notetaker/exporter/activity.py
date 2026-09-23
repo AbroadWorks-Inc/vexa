@@ -15,7 +15,7 @@ EventType = Literal["SPEAKER_START", "SPEAKER_END"]
 Source = Literal["audio", "hint"]
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class Frame:
     ts: int
     name: str | None
@@ -23,14 +23,14 @@ class Frame:
     duration_ms: int
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class Hint:
     t: int
     name: str
     is_end: bool
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class ActivityEvent:
     name: str
     relative_ms: int
@@ -38,12 +38,17 @@ class ActivityEvent:
     source: Source
 
 
-@dataclass
+@dataclass(slots=True)
 class Activity:
+    """One parsed file. `frames` holds only what `speech_events` reads — named
+    frames on the gmeet lane; every valid frame line is counted in
+    `frame_count`, so a long meeting's unused frames never sit in memory."""
+
     lane: str
     started_at: str | None
     frames: list[Frame] = field(default_factory=list)
     hints: list[Hint] = field(default_factory=list)
+    frame_count: int = 0
     capped: bool = False
 
 
@@ -88,16 +93,17 @@ def parse_activity(lines: Iterable[str]) -> Activity:
             continue
         if line_type is None and "t" in row:
             try:
-                activity.frames.append(
-                    Frame(
-                        ts=int(row["t"]),
-                        name=row.get("name") or None,
-                        rms=float(row["rms"]),
-                        duration_ms=int(row["dur_ms"]),
-                    )
+                parsed = Frame(
+                    ts=int(row["t"]),
+                    name=row.get("name") or None,
+                    rms=float(row["rms"]),
+                    duration_ms=int(row["dur_ms"]),
                 )
             except (KeyError, ValueError, TypeError):
                 continue
+            activity.frame_count += 1
+            if activity.lane != "mixed" and parsed.name:
+                activity.frames.append(parsed)
     if activity is None:
         raise ValueError("speaker-activity file has no speaker_activity_header")
     return activity

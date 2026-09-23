@@ -409,6 +409,86 @@ def test_captured_signal_present_without_speaker_activity_is_missing_no_fallback
     assert marker["speaker_activity"] == "missing"
 
 
+def test_export_marker_counts_speaker_activity_events(storage: Storage) -> None:
+    storage_path = _put_master(storage, 40, "uid-40")
+    _put_activity(storage, "uid-40", two_speaker_gmeet_lines(_origin_ms()))
+    deps = _deps(storage, _api_for(40, storage_path), FakeNotetaker())
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["speaker_activity"] == "ok"
+    assert marker["speaker_activity_events"] == 4
+
+
+def test_export_marker_counts_zero_events_when_activity_is_missing(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 41, "uid-41")
+    deps = _deps(storage, _api_for(41, storage_path), FakeNotetaker())
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["speaker_activity"] == "missing"
+    assert marker["speaker_activity_events"] == 0
+
+
+def test_ok_activity_with_no_events_on_long_audio_warns_empty(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage_path = _put_master(storage, 42, "uid-42")
+    _put_activity(storage, "uid-42", [header()])
+    deps = _deps(
+        storage,
+        _api_for(42, storage_path),
+        FakeNotetaker(),
+        transcode=_transcode_of(200.0),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["speaker_activity"] == "ok"
+    assert marker["speaker_activity_events"] == 0
+    empty = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "speaker_activity_empty vexa_meeting_id=11367 audio_s=200"
+    ]
+    assert len(empty) == 1 and empty[0].levelno == logging.WARNING
+
+
+@pytest.mark.parametrize(
+    ("lines_of", "audio_s"),
+    [
+        (lambda origin: [header()], 180.0),
+        (two_speaker_gmeet_lines, 200.0),
+    ],
+    ids=["short-audio", "has-events"],
+)
+def test_speaker_activity_empty_is_not_logged_for_short_audio_or_real_events(
+    storage: Storage,
+    caplog: pytest.LogCaptureFixture,
+    lines_of: Callable[[int], list[str]],
+    audio_s: float,
+) -> None:
+    storage_path = _put_master(storage, 43, "uid-43")
+    _put_activity(storage, "uid-43", lines_of(_origin_ms()))
+    deps = _deps(
+        storage,
+        _api_for(43, storage_path),
+        FakeNotetaker(),
+        transcode=_transcode_of(audio_s),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert not any("speaker_activity_empty" in r.getMessage() for r in caplog.records)
+
+
 def test_every_timeline_speaker_id_has_a_matching_participant(
     storage: Storage,
 ) -> None:
