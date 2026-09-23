@@ -432,4 +432,66 @@ else
   echo "  FAIL: an explicit flows.image no longer wins over global.imageTag (#A12)"; fail=1
 fi
 
+# IRSA — optional dedicated ServiceAccount for meeting-api (deploy/helm meetingApi.serviceAccount).
+# Default MUST stay byte-identical to before this feature: still exactly 1 ServiceAccount (the
+# runtime's), no serviceAccountName on meeting-api's Deployment.
+sa_count_default="$(grep -cE '^kind: ServiceAccount' <<< "$RENDER" || true)"
+if [ "$sa_count_default" -eq 1 ]; then
+  echo "  OK: default render still has exactly 1 ServiceAccount (runtime only)"
+else
+  echo "  FAIL: default render ServiceAccount count changed — want 1 got $sa_count_default"; fail=1
+fi
+mapi_deploy_default="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /app.kubernetes.io\/component: meeting-api/' <<< "$RENDER")"
+if grep -q 'serviceAccountName' <<< "$mapi_deploy_default"; then
+  echo "  FAIL: default meeting-api Deployment renders serviceAccountName (should be absent)"; fail=1
+else
+  echo "  OK: default meeting-api Deployment has no serviceAccountName"
+fi
+
+# meetingApi.serviceAccount.create=true renders a SECOND ServiceAccount named for meeting-api,
+# carrying the given annotations (e.g. the IRSA role-arn), and binds it on the Deployment.
+RENDER_MAPI_SA="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set meetingApi.serviceAccount.create=true \
+  --set-string 'meetingApi.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::000000000000:role/test')"
+sa_count_created="$(grep -cE '^kind: ServiceAccount' <<< "$RENDER_MAPI_SA" || true)"
+if [ "$sa_count_created" -eq 2 ]; then
+  echo "  OK: meetingApi.serviceAccount.create=true renders a second ServiceAccount ($sa_count_created)"
+else
+  echo "  FAIL: meetingApi.serviceAccount.create=true — want 2 ServiceAccounts got $sa_count_created"; fail=1
+fi
+sa_docs_created="$(awk 'BEGIN{RS="\n---\n"} /kind: ServiceAccount/' <<< "$RENDER_MAPI_SA")"
+if grep -q 'name: vexa-vexa-meeting-api' <<< "$sa_docs_created"; then
+  echo "  OK: meeting-api ServiceAccount named vexa-vexa-meeting-api"
+else
+  echo "  FAIL: meeting-api ServiceAccount missing expected name"; fail=1
+fi
+if grep -q 'eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/test' <<< "$sa_docs_created"; then
+  echo "  OK: meeting-api ServiceAccount carries the IRSA role-arn annotation"
+else
+  echo "  FAIL: meeting-api ServiceAccount missing the IRSA role-arn annotation"; fail=1
+fi
+mapi_deploy_created="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /app.kubernetes.io\/component: meeting-api/' <<< "$RENDER_MAPI_SA")"
+if grep -q 'serviceAccountName: vexa-vexa-meeting-api' <<< "$mapi_deploy_created"; then
+  echo "  OK: meeting-api Deployment binds the created ServiceAccount"
+else
+  echo "  FAIL: meeting-api Deployment does not bind the created ServiceAccount"; fail=1
+fi
+
+# meetingApi.serviceAccount.name alone (create left false) binds an EXISTING account by name —
+# no new ServiceAccount rendered.
+RENDER_MAPI_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set meetingApi.serviceAccount.name=existing-sa)"
+sa_count_existing="$(grep -cE '^kind: ServiceAccount' <<< "$RENDER_MAPI_EXISTING" || true)"
+if [ "$sa_count_existing" -eq 1 ]; then
+  echo "  OK: meetingApi.serviceAccount.name alone renders no new ServiceAccount ($sa_count_existing)"
+else
+  echo "  FAIL: meetingApi.serviceAccount.name alone — want 1 ServiceAccount (unchanged) got $sa_count_existing"; fail=1
+fi
+mapi_deploy_existing="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /app.kubernetes.io\/component: meeting-api/' <<< "$RENDER_MAPI_EXISTING")"
+if grep -q 'serviceAccountName: existing-sa' <<< "$mapi_deploy_existing"; then
+  echo "  OK: meeting-api Deployment binds the existing ServiceAccount by name"
+else
+  echo "  FAIL: meeting-api Deployment does not bind the existing ServiceAccount name"; fail=1
+fi
+
 [ "$fail" -eq 0 ] && { echo "gate:helm PASS"; exit 0; } || { echo "gate:helm FAIL"; exit 1; }
