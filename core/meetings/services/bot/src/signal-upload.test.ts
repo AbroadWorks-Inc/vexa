@@ -479,6 +479,29 @@ console.log('\n── speaker-activity upload ──');
   check('speaker-activity uploads independently of the tape being off',
     activityOut === 'uploaded' && activityCalls.join(',') === 'speaker-activity');
 }
+{
+  // A capped file overshoots the ceiling by the capped line itself (design: "written even if it
+  // slightly exceeds the ceiling") — the upload guard must not read that overshoot as "too large
+  // to ship": a capped file is exactly the case the exporter most needs to receive.
+  const dir = tmp();
+  const tinyMax = 220;
+  const w = createSpeakerActivityWriter(inv(), { dir, maxBytes: tinyMax });
+  for (let i = 0; i < 50; i++) w.frame(0, Float32Array.of(0.1, -0.1), 1000 + i, 'Ann');
+  await w.close();
+  check('the writer capped (precondition)', w.isCapped());
+  const fileBytes = readFileSync(w.path, 'utf8').length;
+  check('the capped file overshoots its own ceiling (precondition for the guard fix to matter)',
+    fileBytes > tinyMax, `${fileBytes} vs ${tinyMax}`);
+
+  const seen: Array<[TapePart, string, number]> = [];
+  const out = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    maxBytes: tinyMax,
+    upload: async (part, path, size) => { seen.push([part, path, size]); },
+  });
+  check('a capped speaker-activity file still uploads (never misread as missing)',
+    out === 'uploaded' && seen.length === 1 && seen[0][0] === 'speaker-activity', JSON.stringify({ out, seen }));
+}
 
 // ── the real transport, against a loopback receiver ─────────────────────────────────────────────
 console.log('\n── streamed multipart transport ──');
@@ -570,6 +593,42 @@ async function withServer(
   let msg = '';
   await upload('captured-signal', path, 2).catch((e) => { msg = String(e); });
   check('a bad upload URL rejects cleanly', msg.includes('bad recordingUploadUrl'), msg);
+}
+{
+  // The wall-clock bound is independent of req.setTimeout's IDLE semantics: a receiver that
+  // accepts the connection but never responds keeps the socket "active" from the idle timer's
+  // point of view, so only a wall-clock deadline can catch it. The idle timeout here is
+  // deliberately generous — if it fired first, this test would prove nothing about the new bound.
+  const dir = tmp();
+  const path = join(dir, 'wallclock.captured-signal.jsonl');
+  writeFileSync(path, 'x\n');
+  await withServer(() => 0, async (url) => {
+    const upload = streamingTapeUploader(inv({ recordingUploadUrl: url }), url, 5_000, 300);
+    const t0 = Date.now();
+    let msg = '';
+    await upload('captured-signal', path, 2).catch((e) => { msg = String(e); });
+    check('a wall-clock bound rejects a stalled upload even under a generous idle timeout',
+      msg.includes('upload exceeded 300ms wall clock'), msg);
+    check('the wall-clock rejection fires promptly (~300ms, not the 5s idle timeout)',
+      Date.now() - t0 < 1_000, `${Date.now() - t0}ms`);
+  });
+}
+{
+  // uploadSpeakerActivity's own default wiring passes the wall clock through to the real
+  // transport — proven end-to-end against a receiver that accepts the connection but never
+  // answers, with no injected upload spy standing in for the real one.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  await withServer(() => 0, async (url) => {
+    const t0 = Date.now();
+    const out = await uploadSpeakerActivity(w, { inv: inv({ recordingUploadUrl: url }), wallClockMs: 300 });
+    check("uploadSpeakerActivity against a stalled receiver resolves 'failed' within the wall clock",
+      out === 'failed');
+    check('and resolves promptly rather than riding the default 60s idle timeout',
+      Date.now() - t0 < 1_000, `${Date.now() - t0}ms`);
+  });
 }
 
 for (const d of dirs) rmSync(d, { recursive: true, force: true });
