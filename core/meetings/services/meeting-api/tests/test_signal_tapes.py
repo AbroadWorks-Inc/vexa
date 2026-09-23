@@ -43,7 +43,11 @@ OBSERVATION_TAPE = (
     b'"observation":{"kind":"csrc-poll-error"}}\n'
 )
 SPEAKER_ACTIVITY_TAPE = (
-    b'{"type":"speaker_start","t":1,"name":"Jacob"}\n{"type":"speaker_stop","t":4,"name":"Jacob"}\n'
+    b'{"type":"speaker_activity_header","v":1,"session_uid":"conn-abc","platform":"google_meet",'
+    b'"lane":"gmeet","native_meeting_id":"abc-defg-hij","started_at":"2026-01-01T00:00:00.000Z",'
+    b'"image_version":"test"}\n'
+    b'{"t":1,"ch":0,"name":"Speaker Alpha","rms":0.2,"dur_ms":256}\n'
+    b'{"type":"hint","t":4,"name":"Speaker Alpha"}\n'
 )
 
 
