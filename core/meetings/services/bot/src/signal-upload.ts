@@ -26,14 +26,17 @@ import http from 'node:http';
 import https from 'node:https';
 import type { Invocation } from './config.js';
 import { DEFAULT_MAX_TAPE_BYTES, signalEvent, type CaptureSignalRecorder } from './telemetry.js';
+import { resolveMaxActivityBytes, type SpeakerActivityWriter } from './speaker-activity.js';
 
 /** The files one session leaves: the frame/hint tape, the STT round-trip sidecar, the Teams CC
- *  sidecar, the transport (CSRC) sidecar, and the observations sidecar. Mirrors meeting-api's
- *  SIGNAL_TAPE_PARTS (a closed set — the part name lands in an object key server-side). Together
- *  they are the WHOLE captured signal of a meeting, which is the point: a replay that is missing
- *  one of them cannot reproduce the decision the live bot made — nor, without the observations,
- *  what the bot noticed going wrong while it made it. */
-export type TapePart = 'captured-signal' | 'stt' | 'captions' | 'csrc' | 'observations' | 'botlog' | 'transcript';
+ *  sidecar, the transport (CSRC) sidecar, the observations sidecar, and the speaker-activity file.
+ *  Mirrors meeting-api's SIGNAL_TAPE_PARTS (a closed set — the part name lands in an object key
+ *  server-side). The first seven are the WHOLE captured signal of a meeting, which is the point: a
+ *  replay that is missing one of them cannot reproduce the decision the live bot made — nor,
+ *  without the observations, what the bot noticed going wrong while it made it. speaker-activity is
+ *  uploaded on its OWN path (uploadSpeakerActivity below), independent of whether the debug tape
+ *  exists at all — it is a member here only so the server's closed set recognizes the part name. */
+export type TapePart = 'captured-signal' | 'stt' | 'captions' | 'csrc' | 'observations' | 'botlog' | 'transcript' | 'speaker-activity';
 
 /** Deliver ONE tape file. Throws on failure; the caller logs and drops. Injected in tests. */
 export type TapeUploader = (part: TapePart, filePath: string, size: number) => Promise<void>;
@@ -46,6 +49,11 @@ export interface SignalUploadOptions {
   maxBytes?: number;
   /** Bound on one upload. Must stay inside the container's SIGTERM→SIGKILL grace. */
   timeoutMs?: number;
+  /** A wall-clock deadline on top of `timeoutMs`. req.setTimeout is an IDLE timeout — a receiver
+   *  that keeps the socket busy without ever finishing never trips it — so this is the backstop
+   *  that bounds the upload's real elapsed time regardless. Only uploadSpeakerActivity sets a
+   *  default; the debug tape path passes none, so only the idle timeout bounds it. */
+  wallClockMs?: number;
 }
 
 export interface TapeUploadSummary {
@@ -56,6 +64,17 @@ export interface TapeUploadSummary {
 
 /** 60s: long enough for tens of MB on a slow link, short enough to sit inside the stop grace. */
 export const DEFAULT_UPLOAD_TIMEOUT_MS = 60_000;
+
+/** 64 KiB of slack on top of the writer's own ceiling. The writer's `admit` gate deliberately
+ *  writes the capped line even when it slightly exceeds `maxBytes` (speaker-activity.ts), so a
+ *  capped file's on-disk size can sit a little over the ceiling it was capped at — comparing the
+ *  upload guard directly against `maxBytes` would misread that designed overshoot as "too large to
+ *  ship" and skip the exact file the exporter most needs. One capped line is at most a few hundred
+ *  bytes; this is generous margin. */
+export const ACTIVITY_UPLOAD_SLACK_BYTES = 64 * 1024;
+
+/** 8s default wall-clock bound for the speaker-activity upload — see SignalUploadOptions.wallClockMs. */
+export const DEFAULT_ACTIVITY_UPLOAD_WALL_CLOCK_MS = 8_000;
 
 /** The STT round-trip tape the recorder writes beside the frame tape (telemetry.wrapTranscribeWithTap). */
 export function sttTapePath(sessionPath: string): string {
@@ -141,6 +160,55 @@ export async function uploadSignalTapes(
   return summary;
 }
 
+/**
+ * Upload the speaker-activity file — WHO WAS TALKING WHEN, with no audio (design doc
+ * 2026-09-23-speaker-activity-design.md "The file"). Unlike uploadSignalTapes, this file is not
+ * gated on collection being on: the writer is created unconditionally, so the only gates here are
+ * the ones any upload needs — a configured recordingUploadUrl and a non-empty file.
+ *
+ * NEVER throws, NEVER returns a rejected promise — same rule as uploadSignalTapes, and for the
+ * same reason: the teardown `finally` block that calls this already decided the exit code.
+ */
+export async function uploadSpeakerActivity(
+  writer: SpeakerActivityWriter | null,
+  opts: SignalUploadOptions,
+): Promise<'uploaded' | 'failed' | 'skipped'> {
+  if (!writer) return 'skipped';
+
+  const { inv } = opts;
+  const maxBytes = opts.maxBytes ?? resolveMaxActivityBytes();
+  const url = inv.recordingUploadUrl;
+  if (!url) {
+    // Same quiet skip as the tape's own: the local hot-loop path lands here every run.
+    signalEvent('speaker-activity-upload-skipped', { part: 'speaker-activity', reason: 'no recordingUploadUrl in the invocation' });
+    return 'skipped';
+  }
+  const upload = opts.upload
+    ?? streamingTapeUploader(inv, url, opts.timeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS,
+                              opts.wallClockMs ?? DEFAULT_ACTIVITY_UPLOAD_WALL_CLOCK_MS);
+
+  try {
+    const size = await fileSize(writer.path);
+    if (size === null || size === 0) return 'skipped';
+    if (size > maxBytes + ACTIVITY_UPLOAD_SLACK_BYTES) {
+      // SKIP, not truncate — the same rule uploadSignalTapes applies to an oversized tape. The
+      // slack (not just `maxBytes`) is the guard: a capped file overshoots `maxBytes` by design.
+      signalEvent('speaker-activity-upload-skipped', { part: 'speaker-activity', path: writer.path, bytes: size,
+                                                       max_bytes: maxBytes, slack_bytes: ACTIVITY_UPLOAD_SLACK_BYTES,
+                                                       reason: 'larger than the upload size guard' });
+      return 'skipped';
+    }
+    await upload('speaker-activity', writer.path, size);
+    signalEvent('speaker-activity-uploaded', { part: 'speaker-activity', path: writer.path, bytes: size,
+                                               capped: writer.isCapped() });
+    return 'uploaded';
+  } catch (e) {
+    // Dropped, never retried into the meeting path, never rethrown.
+    signalEvent('speaker-activity-upload-failed', { part: 'speaker-activity', path: writer.path, error: String(e) });
+    return 'failed';
+  }
+}
+
 async function fileSize(path: string): Promise<number | null> {
   try {
     const s = await stat(path);
@@ -156,8 +224,14 @@ async function fileSize(path: string): Promise<number | null> {
  *
  * The body is assembled as preamble → file stream → epilogue with an exact Content-Length, so the
  * file is never held in memory and the server sees an ordinary bounded multipart request.
+ *
+ * `wallClockMs`, when set, is a SECOND, independent bound: `timeoutMs` (req.setTimeout) is an
+ * IDLE timeout — it only fires when the socket goes quiet — so a receiver that accepts the
+ * connection and dribbles the response, or an intermediary that keeps resetting the idle clock,
+ * would never trip it at all. The wall clock guarantees SOME upper bound on real elapsed time
+ * regardless. Unset (the debug tape path) ⇒ only the idle timeout applies.
  */
-export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: number): TapeUploader {
+export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: number, wallClockMs?: number): TapeUploader {
   const sessionUid = inv.connectionId ?? '';
   const token = inv.internalSecret ?? '';
   const meetingId = inv.meeting_id ?? 0;
@@ -192,6 +266,10 @@ export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: n
       return;
     }
     const transport = target.protocol === 'https:' ? https : http;
+
+    let wallClockTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearWallClock = (): void => { if (wallClockTimer) clearTimeout(wallClockTimer); };
+
     const req = transport.request(
       {
         protocol: target.protocol,
@@ -209,6 +287,7 @@ export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: n
         // Drain the body either way — an undrained response keeps the socket (and the process) alive
         // past the point the teardown expects to be done.
         res.resume();
+        clearWallClock();
         const status = res.statusCode ?? 0;
         if (status >= 200 && status < 300) resolve();
         else reject(new Error(`upload rejected: HTTP ${status}`));
@@ -219,11 +298,17 @@ export function streamingTapeUploader(inv: Invocation, url: string, timeoutMs: n
     const fail = (e: Error): void => {
       if (settled) return;
       settled = true;
+      clearWallClock();
       req.destroy();
       reject(e);
     };
     req.setTimeout(timeoutMs, () => fail(new Error(`upload timed out after ${timeoutMs}ms`)));
     req.on('error', fail);
+
+    if (wallClockMs !== undefined) {
+      wallClockTimer = setTimeout(() => fail(new Error(`upload exceeded ${wallClockMs}ms wall clock`)), wallClockMs);
+      wallClockTimer.unref?.();
+    }
 
     req.write(preamble);
     const body = createReadStream(filePath);

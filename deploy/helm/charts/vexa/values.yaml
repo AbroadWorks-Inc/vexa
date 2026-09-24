@@ -187,6 +187,12 @@ meetingApi:
   image:
     repository: vexaai/v012-meeting-api
     tag: v012
+  # Optional dedicated ServiceAccount, e.g. for IRSA (AWS IAM Roles for Service Accounts) — lets
+  # meeting-api assume its own AWS IAM role instead of running as the namespace default account.
+  serviceAccount:
+    create: false        # true → the chart creates it
+    name: ""             # empty + create → "<release>-vexa-meeting-api"; set to use an existing account
+    annotations: {}      # e.g. eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<role>
   service:
     type: ClusterIP
     port: 8080
@@ -399,6 +405,10 @@ postgres:
   enabled: true
   image: postgres:17-alpine
   credentialsSecretName: postgres-credentials
+  # true = the Secret named by credentialsSecretName is created outside the chart (keys POSTGRES_DB,
+  # POSTGRES_USER, POSTGRES_PASSWORD) and the chart renders none, so a helm upgrade never rewrites the
+  # database password and database.password is not needed.
+  existingCredentialsSecret: false
   idleInTransactionTimeoutMs: 60000
   service:
     port: 5432

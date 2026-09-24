@@ -27,16 +27,44 @@ LAST_TAG_FILE  := $(ROOT)/deploy/lite/.last-tag
 # A user-defined bridge so the app's INTERNAL services live on the container's own loopback (no host
 # port collisions); only the front doors are published. postgres/minio join the same bridge and the
 # app reaches them by container name. Override HOST_*_PORT to avoid conflicts on a busy host.
-NETWORK         ?= vexa-lite-net
-PG_CONTAINER    ?= vexa-lite-postgres
-MINIO_CONTAINER ?= vexa-lite-minio
-APP_CONTAINER   ?= vexa-lite
+NETWORK         ?= aw-recording-net
+PG_CONTAINER    ?= aw-recording-postgres
+MINIO_CONTAINER ?= aw-recording-minio
+APP_CONTAINER   ?= aw-recording
+PG_VOLUME       ?= aw-recording-pgdata
+MINIO_VOLUME    ?= aw-recording-miniodata
 HOST_GATEWAY_PORT   ?= 8056
 HOST_TERMINAL_PORT  ?= 3001
 HOST_AGENT_PORT     ?= 8100
-MINIO_ACCESS_KEY ?= vexa-access-key
-MINIO_SECRET_KEY ?= vexa-secret-key
-MINIO_BUCKET     ?= vexa
+MINIO_ACCESS_KEY ?= aw-recording-access-key
+MINIO_SECRET_KEY ?= aw-recording-secret-key
+MINIO_BUCKET     ?= aw-recording
+
+# --- Recording export (aw-recording) -----------------------------------------------------------
+# meeting-api only writes to S3-compatible storage, and MinIO's on-disk layout is not plain files.
+# RECORDING_DIR is REQUIRED (absolute host path): a `minio/mc mirror --watch` sidecar copies every
+# object out of the bucket into it as it lands, so recordings are ordinary files where you chose.
+# There is deliberately NO default — `make up` refuses to start without it.
+RECORDING_DIR    ?=
+MIRROR_CONTAINER ?= aw-recording-mirror
+# Docker Hub's minio/minio + minio/mc refuse anonymous pulls (verified 2026-09-22); quay.io serves
+# the same images, multi-arch (amd64 + arm64).
+MINIO_IMAGE      ?= quay.io/minio/minio:latest
+MC_IMAGE         ?= quay.io/minio/mc:latest
+
+# --- Optional live S3 mirror (S3_MIRROR=1) ------------------------------------------------------
+# A SECOND mc sidecar pushes the local bucket to s3://$(S3_BUCKET)/$(S3_PREFIX)/ as objects land.
+# Vexa itself keeps writing to local MinIO exactly as shipped; meeting-api never sees AWS
+# credentials. Why not point meeting-api at the bucket directly: its key layout is hardcoded to
+# recordings/<user_id>/... from the bucket ROOT — the same top-level prefix the production pipeline
+# owns — and it deletes whole recordings/<user_id>/ prefixes. The sidecar reads S3_ENDPOINT /
+# S3_ACCESS_KEY / S3_SECRET_KEY from S3_ENV_FILE (gitignored) inside the container; nothing on the
+# make line, nothing printed.
+S3_MIRROR        ?=
+S3_ENV_FILE      ?= $(ROOT)/.env.local
+S3_BUCKET        ?=
+S3_PREFIX        ?=
+S3_MIRROR_CONTAINER ?= aw-recording-s3-mirror
 
 # --- Local CPU STT (LOCAL_STT=1) ---------------------------------------------------------------
 # Transcription in Vexa is always an external OpenAI-compatible /v1/audio/transcriptions service.
@@ -46,9 +74,9 @@ MINIO_BUCKET     ?= vexa
 # OpenAI id); faster-whisper-server accepts it and serves WHISPER_MODEL. Override for a bigger
 # model (WHISPER_MODEL=Systran/faster-whisper-small.en) or a GPU image.
 LOCAL_STT        ?=
-WHISPER_CONTAINER ?= vexa-lite-whisper
+WHISPER_CONTAINER ?= aw-recording-whisper
 WHISPER_IMAGE    ?= fedirz/faster-whisper-server:latest-cpu
-WHISPER_MODEL    ?= Systran/faster-whisper-tiny.en
+WHISPER_MODEL    ?= Systran/faster-whisper-small.en
 HOST_STT_PORT    ?= 8083
 
 define set_tag
@@ -112,6 +140,19 @@ preflight:
 ## (bot_spawn/env_flags.py), not here — compose's `${VAR:-true}` has no `--env-file` equivalent.
 up: preflight
 	@set -e; \
+	case "$(RECORDING_DIR)" in \
+		/*) mkdir -p "$(RECORDING_DIR)";; \
+		"") echo "ERROR: RECORDING_DIR is required — where recordings land as plain files, e.g. make lite RECORDING_DIR=/abs/path"; exit 1;; \
+		*)  echo "ERROR: RECORDING_DIR must be an ABSOLUTE path (got '$(RECORDING_DIR)')"; exit 1;; \
+	esac; \
+	if [ -z "$(ALLOW_DIRECT_S3)" ] && grep -qE '^(S3_ENDPOINT|S3_ACCESS_KEY|S3_SECRET_KEY)=.+' $(ENV_FILE) 2>/dev/null; then \
+		echo "ERROR: $(ENV_FILE) defines S3_* — meeting-api would write straight into that bucket's recordings/ ROOT (collides with the production layout)."; \
+		echo "       Keep AWS credentials in $(S3_ENV_FILE) and run with S3_MIRROR=1 S3_BUCKET=<bucket> S3_PREFIX=<prefix>, or set ALLOW_DIRECT_S3=1 knowingly."; exit 1; \
+	fi; \
+	if [ -n "$(S3_MIRROR)" ]; then \
+		[ -f "$(S3_ENV_FILE)" ] || { echo "ERROR: S3_MIRROR=1 needs $(S3_ENV_FILE) (S3_ENDPOINT / S3_ACCESS_KEY / S3_SECRET_KEY)"; exit 1; }; \
+		[ -n "$(S3_BUCKET)" ] || { echo "ERROR: S3_MIRROR=1 needs S3_BUCKET=<bucket>"; exit 1; }; \
+	fi; \
 	docker network inspect $(NETWORK) >/dev/null 2>&1 || docker network create $(NETWORK) >/dev/null; \
 	envv() { grep -E "^$$1=" $(ENV_FILE) 2>/dev/null | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$$//; s/[[:space:]]+$$//'; }; \
 	ADMIN_TK=$$(envv ADMIN_TOKEN); \
@@ -132,7 +173,7 @@ up: preflight
 		docker run -d --name $(PG_CONTAINER) --network $(NETWORK) --restart unless-stopped \
 			-e POSTGRES_DB=vexa -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
 			-e TZ=UTC -e PGTZ=UTC \
-			-v vexa-lite-pgdata:/var/lib/postgresql/data \
+			-v $(PG_VOLUME):/var/lib/postgresql/data \
 			postgres:17-alpine -c idle_in_transaction_session_timeout=60000 > /dev/null; \
 		for i in $$(seq 1 24); do docker exec $(PG_CONTAINER) pg_isready -U postgres -d vexa -q 2>/dev/null && break; sleep 2; done; \
 	fi; echo "  ✓ PostgreSQL ready"; \
@@ -141,12 +182,28 @@ up: preflight
 		docker rm -f $(MINIO_CONTAINER) 2>/dev/null || true; \
 		docker run -d --name $(MINIO_CONTAINER) --network $(NETWORK) --restart unless-stopped \
 			-e MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) -e MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
-			-v vexa-lite-miniodata:/data \
-			minio/minio:latest server /data --console-address ":9001" > /dev/null; \
+			-v $(MINIO_VOLUME):/data \
+			$(MINIO_IMAGE) server /data --console-address ":9001" > /dev/null; \
 		sleep 4; \
-		docker run --rm --network $(NETWORK) --entrypoint sh minio/mc:latest -c \
-			"mc alias set vexa http://$(MINIO_CONTAINER):9000 $(MINIO_ACCESS_KEY) $(MINIO_SECRET_KEY) && mc mb --ignore-existing vexa/$(MINIO_BUCKET)" >/dev/null 2>&1 || true; \
+		docker run --rm --network $(NETWORK) --entrypoint sh $(MC_IMAGE) -c \
+			"mc alias set store http://$(MINIO_CONTAINER):9000 $(MINIO_ACCESS_KEY) $(MINIO_SECRET_KEY) && mc mb --ignore-existing store/$(MINIO_BUCKET)" >/dev/null 2>&1 || true; \
 	fi; echo "  ✓ MinIO ready"; \
+	echo "Starting recording mirror ($(MIRROR_CONTAINER) → $(RECORDING_DIR))..."; \
+	docker rm -f $(MIRROR_CONTAINER) 2>/dev/null || true; \
+	docker run -d --name $(MIRROR_CONTAINER) --network $(NETWORK) --restart unless-stopped \
+		-v "$(RECORDING_DIR)":/out \
+		--entrypoint sh $(MC_IMAGE) -c \
+		"mc alias set store http://$(MINIO_CONTAINER):9000 $(MINIO_ACCESS_KEY) $(MINIO_SECRET_KEY) && mc mirror --watch --overwrite store/$(MINIO_BUCKET) /out" > /dev/null; \
+	echo "  ✓ recording mirror ready"; \
+	if [ -n "$(S3_MIRROR)" ]; then \
+		echo "Starting S3 mirror ($(S3_MIRROR_CONTAINER) → s3://$(S3_BUCKET)/$(S3_PREFIX))..."; \
+		docker rm -f $(S3_MIRROR_CONTAINER) 2>/dev/null || true; \
+		docker run -d --name $(S3_MIRROR_CONTAINER) --network $(NETWORK) --restart unless-stopped \
+			--env-file $(S3_ENV_FILE) \
+			--entrypoint sh $(MC_IMAGE) -c \
+			'mc alias set store http://$(MINIO_CONTAINER):9000 $(MINIO_ACCESS_KEY) $(MINIO_SECRET_KEY) && mc alias set aws "$$S3_ENDPOINT" "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY" && mc mirror --watch --overwrite store/$(MINIO_BUCKET) "aws/$(S3_BUCKET)/$(S3_PREFIX)"' > /dev/null; \
+		echo "  ✓ S3 mirror ready"; \
+	fi; \
 	if [ -n "$(LOCAL_STT)" ]; then \
 		echo "Starting local CPU STT ($(WHISPER_CONTAINER), $(WHISPER_MODEL))..."; \
 		if ! docker ps -q -f name=$(WHISPER_CONTAINER) | grep -q .; then \
@@ -191,10 +248,10 @@ test:
 			echo "  ✓ $$NAME (:$$PORT)"; else echo "  ✗ $$NAME not responding (:$$PORT)"; FAIL=1; fi; \
 	done; exit $$FAIL
 
-## down — stop + remove app + sidecars + network (volumes persist; `docker volume rm vexa-lite-pgdata vexa-lite-miniodata` to wipe).
+## down — stop + remove app + sidecars + network (volumes persist; `docker volume rm $(PG_VOLUME) $(MINIO_VOLUME)` to wipe). RECORDING_DIR is never touched.
 down:
 	@echo "Stopping Vexa Lite..."
-	@docker rm -f $(APP_CONTAINER) $(PG_CONTAINER) $(MINIO_CONTAINER) $(WHISPER_CONTAINER) 2>/dev/null || true
+	@docker rm -f $(APP_CONTAINER) $(PG_CONTAINER) $(MINIO_CONTAINER) $(MIRROR_CONTAINER) $(S3_MIRROR_CONTAINER) $(WHISPER_CONTAINER) 2>/dev/null || true
 	@docker network rm $(NETWORK) 2>/dev/null || true
 	@echo "  ✓ Stopped (data volumes kept)"
 

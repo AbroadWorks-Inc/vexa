@@ -27,6 +27,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if or .Values.meetingApi.serviceAccount.create .Values.meetingApi.serviceAccount.name }}
+      # IRSA (or any workload-identity binding): run as a dedicated SA instead of the namespace
+      # default. Same pattern as the runtime's SA (rbac-runtime.yaml / deployment-runtime.yaml).
+      serviceAccountName: {{ .Values.meetingApi.serviceAccount.name | default (include "vexa.componentName" (list . "meeting-api")) }}
+      {{- end }}
       containers:
         - name: meeting-api
           securityContext:

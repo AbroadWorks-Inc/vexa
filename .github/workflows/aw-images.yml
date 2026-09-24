@@ -1,0 +1,224 @@
+name: AW images — build & push
+
+# ────────────────────────────────────────────────────────────────
+# Builds AW Bots' own three images and pushes them to GHCR:
+#
+#   ghcr.io/voyantt-consultancy-services-llp/aw-bots-meeting-api
+#   ghcr.io/voyantt-consultancy-services-llp/aw-bots-bot
+#   ghcr.io/voyantt-consultancy-services-llp/aw-bots-exporter
+#
+# Everything else AW Bots runs is upstream's published vexaai/* images.
+#
+# When it runs, and which tags it pushes:
+#
+#   push to development   -> :<commit sha>            all three images
+#   manual run            -> :<commit sha> + :<tag>   the images you pick, e.g. tag v0.1.1
+#
+# There is no :latest or other moving tag. The deployment (aw-notetaker
+# deployment/base/aw-bots/values.yaml and ../aw-exporter/deployment.yaml) pins an
+# exact tag, so nothing changes in the cluster until someone edits those files and
+# applies them. A moving tag would do the opposite: every new bot Pod pulls its
+# image when a meeting starts, so the bot version could change between meetings
+# without a deploy.
+#
+# linux/amd64 only: both AW Bots node pools are amd64, and upstream builds and
+# tests the bot on amd64 only.
+#
+# Needs the secret GHCR_PAT in THIS repo (AbroadWorks-Inc/vexa) or the AbroadWorks-Inc
+# org: a classic personal access token with write:packages, owned by a member of
+# voyantt-consultancy-services-llp. The talke repo's GHCR_PAT (Voyantt org) is not
+# visible here: secrets are stored per repo/org. The workflow's own GITHUB_TOKEN can't
+# be used, because it can only push to AbroadWorks-Inc's packages. The token's value
+# never appears in this file.
+# ────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [development]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to push as well as the commit sha (e.g. v0.1.1)"
+        required: true
+        type: string
+      images:
+        description: "Which images to build"
+        required: true
+        default: all
+        type: choice
+        options: [all, meeting-api, bot, exporter]
+
+# A newer push to development supersedes a build still running for an older one.
+# Manual runs are never cancelled.
+concurrency:
+  group: aw-images-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+
+env:
+  REG: ghcr.io/voyantt-consultancy-services-llp
+
+jobs:
+  tags:
+    runs-on: ubuntu-latest
+    outputs:
+      suffixes: ${{ steps.t.outputs.suffixes }}
+    steps:
+      - id: t
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          SUFFIXES="${GITHUB_SHA}"
+          if [ -n "${TAG}" ]; then
+            # A tag becomes part of an image reference; refuse anything that isn't a plain tag.
+            if ! printf '%s' "${TAG}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+              echo "::error::tag '${TAG}' is not a valid image tag"; exit 1
+            fi
+            SUFFIXES="${SUFFIXES} ${TAG}"
+          fi
+          echo "suffixes=${SUFFIXES}" >> "$GITHUB_OUTPUT"
+          echo "will push tags: ${SUFFIXES}"
+
+  meeting-api:
+    needs: tags
+    if: ${{ github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'meeting-api' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      - name: Image references
+        id: refs
+        env:
+          SUFFIXES: ${{ needs.tags.outputs.suffixes }}
+        run: |
+          REFS=""
+          for S in ${SUFFIXES}; do REFS="${REFS}${REG}/aw-bots-meeting-api:${S},"; done
+          echo "refs=${REFS%,}" >> "$GITHUB_OUTPUT"
+      # meeting-api's build context is the repo root (its Dockerfile copies shared packages).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: core/meetings/services/meeting-api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.refs.outputs.refs }}
+          cache-from: type=gha,scope=aw-bots-meeting-api
+          cache-to: type=gha,scope=aw-bots-meeting-api,mode=max
+
+  exporter:
+    needs: tags
+    if: ${{ github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'exporter' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/out/aw-notetaker
+    steps:
+      - uses: actions/checkout@v4
+      # The unit tests and checks from the exporter's README, before any image is built. uv installs
+      # the pinned Python and the `dev` dependency group from uv.lock, as the repo's gate:python does.
+      - uses: astral-sh/setup-uv@v5
+      - name: Test and check
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          uv run pytest -q
+          uv run black --check .
+          uv run ruff check .
+          uv run mypy exporter
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      - name: Image references
+        id: refs
+        env:
+          SUFFIXES: ${{ needs.tags.outputs.suffixes }}
+        run: |
+          REFS=""
+          for S in ${SUFFIXES}; do REFS="${REFS}${REG}/aw-bots-exporter:${S},"; done
+          echo "refs=${REFS%,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: integrations/out/aw-notetaker
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.refs.outputs.refs }}
+          cache-from: type=gha,scope=aw-bots-exporter
+          cache-to: type=gha,scope=aw-bots-exporter,mode=max
+
+  # The bot is built FROM a locally built base image (vexa/meet-join-env:dev), which buildx's
+  # docker-container driver can't see, so this job uses the runner's classic docker engine, the
+  # same way upstream's release-images.yml builds vexaai/vexa-bot.
+  bot:
+    needs: tags
+    if: ${{ github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'bot' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk (the bot build needs ~10 GB of layers)
+        uses: jlumbroso/free-disk-space@v1.3.1
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      - name: Build the join-env base (vexa/meet-join-env:dev)
+        run: |
+          DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
+            -f core/meetings/modules/join/Dockerfile.env \
+            -t vexa/meet-join-env:dev \
+            core/meetings/modules/join
+      - name: Build and push the bot
+        env:
+          SUFFIXES: ${{ needs.tags.outputs.suffixes }}
+          # Stamped into the image (it appears in debug-tape headers); the commit sha names the build.
+          VERSION: ${{ inputs.tag || github.sha }}
+        run: |
+          set -euo pipefail
+          TAG_ARGS=()
+          for S in ${SUFFIXES}; do TAG_ARGS+=(-t "${REG}/aw-bots-bot:${S}"); done
+          DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
+            -f core/meetings/services/bot/Dockerfile \
+            --build-arg "VEXA_IMAGE_VERSION=${VERSION}" \
+            "${TAG_ARGS[@]}" \
+            .
+          for S in ${SUFFIXES}; do docker push "${REG}/aw-bots-bot:${S}"; done
+
+  summary:
+    needs: [tags, meeting-api, exporter, bot]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: What was pushed
+        env:
+          SUFFIXES: ${{ needs.tags.outputs.suffixes }}
+          R_API: ${{ needs.meeting-api.result }}
+          R_BOT: ${{ needs.bot.result }}
+          R_EXP: ${{ needs.exporter.result }}
+        run: |
+          {
+            echo "### AW images"
+            echo ""
+            echo "| Image | Result | Tags |"
+            echo "|---|---|---|"
+            echo "| aw-bots-meeting-api | ${R_API} | ${SUFFIXES} |"
+            echo "| aw-bots-bot | ${R_BOT} | ${SUFFIXES} |"
+            echo "| aw-bots-exporter | ${R_EXP} | ${SUFFIXES} |"
+            echo ""
+            echo "Nothing is deployed. To roll a tag out, set it in aw-notetaker"
+            echo "deployment/base/aw-bots/values.yaml (meeting-api, bot) and"
+            echo "deployment/base/aw-exporter/deployment.yaml (exporter), then follow the runbook"
+            echo "(deployment/base/aw-bots/README.md, \"Upgrading our images\")."
+          } >> "$GITHUB_STEP_SUMMARY"
+          for R in "$R_API" "$R_BOT" "$R_EXP"; do
+            if [ "$R" = "failure" ] || [ "$R" = "cancelled" ]; then exit 1; fi
+          done

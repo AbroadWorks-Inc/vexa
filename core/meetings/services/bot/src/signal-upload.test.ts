@@ -23,9 +23,11 @@ import {
   sttTapePath,
   streamingTapeUploader,
   uploadSignalTapes,
+  uploadSpeakerActivity,
   type TapePart,
 } from './signal-upload.js';
 import { createCaptureSignalRecorder, resolveMaxTapeBytes, DEFAULT_MAX_TAPE_BYTES } from './telemetry.js';
+import { createSpeakerActivityWriter } from './speaker-activity.js';
 import type { Invocation } from './config.js';
 import type { CapturedFrame } from './ports.js';
 import type { CsrcRecord, ObservationRecord, TeamsCaptionRecord } from './capture-bridge.js';
@@ -405,6 +407,148 @@ console.log('\n── teardown upload ──');
   check('no upload URL → skipped', out.uploaded.length === 0 && out.failed.length === 0);
 }
 
+// ── speaker-activity upload — independent of the debug tape ────────────────────────────────────
+console.log('\n── speaker-activity upload ──');
+{
+  // The file is non-empty (a header + one frame) → uploads as part 'speaker-activity'.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1, -0.1), 1000, 'Ann');
+  await w.close();
+
+  const seen: Array<[TapePart, string, number]> = [];
+  const out = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async (part, path, size) => { seen.push([part, path, size]); },
+  });
+  check("uploads part 'speaker-activity' with the writer's own path",
+    out === 'uploaded' && seen.length === 1 && seen[0][0] === 'speaker-activity' && seen[0][1] === w.path && seen[0][2] > 0,
+    JSON.stringify({ out, seen }));
+}
+{
+  // No recordingUploadUrl → skipped, same as the tape's own quiet skip.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  let called = false;
+  const out = await uploadSpeakerActivity(w, { inv: inv(), upload: async () => { called = true; } });
+  check('no recordingUploadUrl → skipped, nothing attempted', out === 'skipped' && !called);
+}
+{
+  // A null writer (should never happen — the writer is created unconditionally — but the
+  // function must degrade the same way the tape's does) → skipped.
+  let called = false;
+  const out = await uploadSpeakerActivity(null, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async () => { called = true; },
+  });
+  check('a null writer → skipped, nothing attempted', out === 'skipped' && !called);
+}
+{
+  // A rejecting transport → 'failed', never a thrown/rejected promise.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  let rejected = false;
+  const out = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async () => { throw new Error('object store is down'); },
+  }).catch(() => { rejected = true; return null; });
+  check("a failing upload never rejects, and resolves 'failed'", !rejected && out === 'failed');
+}
+{
+  // Independent of the debug tape: the tape recorder is off (null) and uploads nothing, while the
+  // speaker-activity writer still ships on its own.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  const tapeCalls: TapePart[] = [];
+  const activityCalls: TapePart[] = [];
+  const tapeOut = await uploadSignalTapes(null, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async (p) => { tapeCalls.push(p); },
+  });
+  const activityOut = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    upload: async (p) => { activityCalls.push(p); },
+  });
+  check('the debug tape (recorder null) uploads nothing', tapeCalls.length === 0 && tapeOut.uploaded.length === 0);
+  check('speaker-activity uploads independently of the tape being off',
+    activityOut === 'uploaded' && activityCalls.join(',') === 'speaker-activity');
+}
+{
+  // A capped file overshoots the ceiling by the capped line itself (design: "written even if it
+  // slightly exceeds the ceiling") — the upload guard must not read that overshoot as "too large
+  // to ship": a capped file is exactly the case the exporter most needs to receive.
+  const dir = tmp();
+  const tinyMax = 220;
+  const w = createSpeakerActivityWriter(inv(), { dir, maxBytes: tinyMax });
+  for (let i = 0; i < 50; i++) w.frame(0, Float32Array.of(0.1, -0.1), 1000 + i, 'Ann');
+  await w.close();
+  check('the writer capped (precondition)', w.isCapped());
+  const fileBytes = readFileSync(w.path, 'utf8').length;
+  check('the capped file overshoots its own ceiling (precondition: the upload guard must tolerate that overshoot)',
+    fileBytes > tinyMax, `${fileBytes} vs ${tinyMax}`);
+
+  const seen: Array<[TapePart, string, number]> = [];
+  const out = await uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: 'http://127.0.0.1:1/x' }),
+    maxBytes: tinyMax,
+    upload: async (part, path, size) => { seen.push([part, path, size]); },
+  });
+  check('a capped speaker-activity file still uploads (never misread as missing)',
+    out === 'uploaded' && seen.length === 1 && seen[0][0] === 'speaker-activity', JSON.stringify({ out, seen }));
+}
+
+// ── speaker-activity upload events — its own names, so alerting can key on them ─────────────────
+console.log('\n── speaker-activity upload events ──');
+/** Run `fn` with console.log captured; return the `event` field of every JSON line it printed. */
+const eventsDuring = async (fn: () => Promise<unknown>): Promise<string[]> => {
+  const seen: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]): void => {
+    try {
+      const obj = JSON.parse(String(args[0])) as { event?: unknown };
+      if (typeof obj.event === 'string') seen.push(obj.event);
+    } catch { /* not a signal event */ }
+  };
+  try { await fn(); } finally { console.log = original; }
+  return seen;
+};
+{
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  const url = 'http://127.0.0.1:1/x';
+
+  const ok = await eventsDuring(() => uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: url }), upload: async () => { /* delivered */ } }));
+  const bad = await eventsDuring(() => uploadSpeakerActivity(w, {
+    inv: inv({ recordingUploadUrl: url }), upload: async () => { throw new Error('object store is down'); } }));
+  const noUrl = await eventsDuring(() => uploadSpeakerActivity(w, { inv: inv() }));
+  // The oversize case needs the file to exceed maxBytes + the upload slack; pad it past that.
+  const bigPath = join(dir, 'big.speaker-activity.jsonl');
+  writeFileSync(bigPath, 'x'.repeat(70 * 1024));
+  const oversize = await eventsDuring(() => uploadSpeakerActivity({ ...w, path: bigPath }, {
+    inv: inv({ recordingUploadUrl: url }), maxBytes: 1, upload: async () => { /* never reached */ } }));
+
+  check("a delivered file emits 'speaker_activity_uploaded'",
+    ok.includes('capture_signal.speaker_activity_uploaded'), JSON.stringify(ok));
+  check("a failed upload emits 'speaker_activity_upload_failed'",
+    bad.includes('capture_signal.speaker_activity_upload_failed'), JSON.stringify(bad));
+  check("no upload URL emits 'speaker_activity_upload_skipped'",
+    noUrl.includes('capture_signal.speaker_activity_upload_skipped'), JSON.stringify(noUrl));
+  check("an oversize file emits 'speaker_activity_upload_skipped'",
+    oversize.includes('capture_signal.speaker_activity_upload_skipped'), JSON.stringify(oversize));
+  check('the speaker-activity path never emits a debug-tape (tape_*) event',
+    [...ok, ...bad, ...noUrl, ...oversize].every((e) => !e.startsWith('capture_signal.tape_')),
+    JSON.stringify([...ok, ...bad, ...noUrl, ...oversize]));
+}
+
 // ── the real transport, against a loopback receiver ─────────────────────────────────────────────
 console.log('\n── streamed multipart transport ──');
 
@@ -495,6 +639,42 @@ async function withServer(
   let msg = '';
   await upload('captured-signal', path, 2).catch((e) => { msg = String(e); });
   check('a bad upload URL rejects cleanly', msg.includes('bad recordingUploadUrl'), msg);
+}
+{
+  // The wall-clock bound is independent of req.setTimeout's IDLE semantics: a receiver that
+  // accepts the connection but never responds keeps the socket "active" from the idle timer's
+  // point of view, so only a wall-clock deadline can catch it. The idle timeout here is
+  // deliberately generous — if it fired first, this test would prove nothing about the new bound.
+  const dir = tmp();
+  const path = join(dir, 'wallclock.captured-signal.jsonl');
+  writeFileSync(path, 'x\n');
+  await withServer(() => 0, async (url) => {
+    const upload = streamingTapeUploader(inv({ recordingUploadUrl: url }), url, 5_000, 300);
+    const t0 = Date.now();
+    let msg = '';
+    await upload('captured-signal', path, 2).catch((e) => { msg = String(e); });
+    check('a wall-clock bound rejects a stalled upload even under a generous idle timeout',
+      msg.includes('upload exceeded 300ms wall clock'), msg);
+    check('the wall-clock rejection fires promptly (~300ms, not the 5s idle timeout)',
+      Date.now() - t0 < 1_000, `${Date.now() - t0}ms`);
+  });
+}
+{
+  // uploadSpeakerActivity's own default wiring passes the wall clock through to the real
+  // transport — proven end-to-end against a receiver that accepts the connection but never
+  // answers, with no injected upload spy standing in for the real one.
+  const dir = tmp();
+  const w = createSpeakerActivityWriter(inv(), { dir });
+  w.frame(0, Float32Array.of(0.1), 1000, 'Ann');
+  await w.close();
+  await withServer(() => 0, async (url) => {
+    const t0 = Date.now();
+    const out = await uploadSpeakerActivity(w, { inv: inv({ recordingUploadUrl: url }), wallClockMs: 300 });
+    check("uploadSpeakerActivity against a stalled receiver resolves 'failed' within the wall clock",
+      out === 'failed');
+    check('and resolves promptly rather than riding the default 60s idle timeout',
+      Date.now() - t0 < 1_000, `${Date.now() - t0}ms`);
+  });
 }
 
 for (const d of dirs) rmSync(d, { recursive: true, force: true });
