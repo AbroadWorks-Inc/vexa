@@ -401,6 +401,11 @@ pgbouncer:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 200m, memory: 128Mi }
 
+# Stateful pods (postgres, redis, minio) prefer different nodes (podAntiAffinity, preferred), so a
+# multi-node cluster spreads their volumes. Set false when they are meant to share ONE node: a node
+# autoscaler such as Karpenter treats the preference as a reason to start an extra node.
+statefulAntiAffinity: true
+
 postgres:
   enabled: true
   image: postgres:17-alpine

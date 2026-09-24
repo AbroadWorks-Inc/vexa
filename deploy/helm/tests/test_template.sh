@@ -517,4 +517,23 @@ else
   echo "  FAIL: postgres-credentials references — want >=3 got $pg_refs_existing"; fail=1
 fi
 
+# statefulAntiAffinity (default true) keeps the stateful pods' spread-across-nodes preference;
+# false drops it from postgres, redis and minio, for a deployment that runs them on ONE node (a
+# node autoscaler treats the preference as a reason to start extra nodes).
+stateful_docs() { awk 'BEGIN{RS="\n---\n"} (/kind: StatefulSet/ || /kind: Deployment/) && /app.kubernetes.io\/component: (postgres|redis|minio)/' <<< "$1"; }
+aa_default="$(stateful_docs "$RENDER" | grep -c 'podAntiAffinity:' || true)"
+if [ "$aa_default" -ge 3 ]; then
+  echo "  OK: default render keeps the stateful anti-affinity on postgres, redis, minio ($aa_default)"
+else
+  echo "  FAIL: default stateful anti-affinity — want >=3 got $aa_default"; fail=1
+fi
+RENDER_NO_AA="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set statefulAntiAffinity=false)"
+aa_off="$(stateful_docs "$RENDER_NO_AA" | grep -c 'podAntiAffinity:' || true)"
+if [ "$aa_off" -eq 0 ] && [ -n "$(stateful_docs "$RENDER_NO_AA")" ]; then
+  echo "  OK: statefulAntiAffinity=false drops it from postgres, redis, minio"
+else
+  echo "  FAIL: statefulAntiAffinity=false — want 0 anti-affinity blocks got $aa_off"; fail=1
+fi
+
 [ "$fail" -eq 0 ] && { echo "gate:helm PASS"; exit 0; } || { echo "gate:helm FAIL"; exit 1; }
