@@ -47,7 +47,8 @@ What we add:
 | D9 | Old folder contract `recordings/{platform}_{event_id}_{job_id}/` is dropped; new name in §3. | agreed |
 | D10 | Portal keeps Google OAuth and pushes plans via `POST /meetings` (not Vexa ICS sync, which needs each user to paste a secret iCal URL). | agreed |
 | D11 | ONE Vexa service account owns every meeting; portal users keep their own Google-login accounts and the portal decides who sees which meeting. Vexa's dedup is per (user, platform, native id) (`bot_spawn/adapters.py:492`), so a single account is what stops shared internal meetings getting one bot per attendee. Its `max_concurrent_bots` is raised with growth. | agreed |
-| D12 | Exporter reads meeting-api **in-cluster** with `X-User-Id` = the webhook's `meeting.user_id` (the header the gateway injects after key auth); meeting-api is reachable only from the pods that must call it: the gateway, the exporter, the runtime, agent-api and the bot pods, which upload recordings and signal files through it (NetworkPolicy; the manifest is in the aw-notetaker repo, `deployment/base/aw-exporter/networkpolicy.yaml`). | agreed |
+| D12 | Exporter reads meeting-api **in-cluster** with `X-User-Id` = the webhook's `meeting.user_id` (the header the gateway injects after key auth). meeting-api is on no public ingress. There is **no NetworkPolicy**: the `talke-prod-usw1` cluster doesn't enforce them (VPC CNI network-policy agent off, checked 2026-09-24), so AW Bots follows the existing infra, and any Pod in the cluster can reach meeting-api, Vexa's Redis (no password) and its Postgres. Enforcement is a separate cluster-wide decision (aw-notetaker `CHANGELOG.md`). | agreed |
+| D13 | AW Bots runs on machines of its own: Karpenter pools `aw-bots-services` (the chart's services, Postgres, Redis, exporter; amd64, on-demand) and `aw-bots-meetings` (bot Pods). Postgres/Redis volumes use StorageClass `ebs-sc-gp3` (any zone, expandable). agent-api is off. It shares nothing with the old cloud bot or the portal, so either can be removed without touching the other. | agreed |
 
 ## 3. Output folder
 
@@ -266,7 +267,7 @@ bot-pod env var, not an exporter one — see §7 and the
   `speaker-activity.jsonl` (§9). The alternative is raising the janitor budget
   (`SIGNAL_TAPE_BUDGET_BYTES`). Switch the tape on per platform or per user only to investigate a
   specific meeting (`_resolve_capture_signal`, `core/identity/services/admin-api`).
-- runtime: `nodeSelector`/`tolerations` → the bots Karpenter NodePool `aw-bots-bots` (label and taint `workload=aw-bots-bots`; manifest in aw-notetaker `deployment/base/aw-bots/bots-nodepool.yaml`);
+- runtime: `nodeSelector`/`tolerations` → the bots Karpenter NodePool `aw-bots-meetings` (label and taint `workload=aw-bots-meetings`; manifest in aw-notetaker `deployment/base/aw-bots/nodepools.yaml`); every other chart service → `global.nodeSelector`/`global.tolerations` → the services pool `aw-bots-services` (D13);
   `workloadResources.meetingBot` per §7.1.
 
 ### 7.1 Bot sizing and NodePool (applied once the bot is functional)
@@ -283,24 +284,36 @@ Measured on the OLD bot (v0.10.4, 85 meetings): memory 0.48 GiB (bot alone) → 
   Over ~22 working days × 10 h that is **~15 concurrent bots on average**; top-of-hour clustering
   gives a planning peak of **~45**, burstable to ~60. Load grows with onboarding: NodePool `limits`
   and the service account's `max_concurrent_bots` are the two knobs to raise.
-- **NodePool:** `karpenter.sh/capacity-type: on-demand` only (**never spot**); general-purpose
-  families gen ≥ 6 (m6i/m7i, also c/m for Karpenter's cheapest-fit), sizes 2xlarge–4xlarge. Per
-  bot at 1 vCPU / 2.5 GiB, `m*.2xlarge` fits ~7 bots and `m*.4xlarge` ~15 (CPU-bound), which is
-  cheaper per bot than compute-optimised (`c*.2xlarge` fits ~5, memory-bound). Peak ≈ 3–4 × 4xlarge
-  or 7 × 2xlarge. Check whether the bot image ships arm64 (Graviton is ~20 % cheaper).
+- **NodePool `aw-bots-meetings`:** `karpenter.sh/capacity-type: on-demand` only (**never spot**);
+  amd64 (upstream publishes and tests the bot on amd64 only); families `m6i/m7i/m6a/m7a`, sizes
+  xlarge–4xlarge (`m7a` isn't offered in us-west-1; Karpenter skips it). Per bot at 1 vCPU /
+  2.5 GiB, an xlarge fits ~3 bots, a 2xlarge ~7 and a 4xlarge ~15 (CPU-bound), cheaper per bot than
+  compute-optimised (`c*.2xlarge` fits ~5, memory-bound). Peak ≈ 3–4 × 4xlarge or 7 × 2xlarge.
+- **NodePool `aw-bots-services` (D13):** one on-demand amd64 xlarge, always on, for the chart's
+  services, Postgres, Redis and the exporter (≈1.8 CPU / 4.2 GiB requested). gateway, admin-api,
+  meeting-api and terminal keep the chart's 2 copies each: both copies share the one machine, so
+  they cover a crashed copy and gap-free upgrades, not the loss of the machine. Postgres, Redis,
+  runtime and exporter are single copies in any case.
 - **Never evict a live bot:** bot Pods carry labels only (`runtime_kernel/k8s_backend.py:196`), so
   `karpenter.sh/do-not-disrupt` cannot be set without patching core. Use
   `disruption.consolidationPolicy: WhenEmpty` and `expireAfter: Never` on the bots NodePool (nodes
   leave only when empty); revisit a pod-annotation patch only if the empty-node waste proves costly.
-- **Cold start:** bot image cached on node storage from S3 (the transcriber pattern) and/or a small
-  warm floor during business hours — a deployment task after the bot is functional.
-- Order-of-magnitude compute: ~3,230 bot-hours × ~0.06 USD per bot-hour (on-demand, well packed)
-  ≈ 200 USD/month before packing loss and any warm floor. An estimate to check, not a quote.
+- **Cold start:** each new meetings node downloads the bot image (1.76 GB compressed, 3.6–4.6 GB
+  unpacked). Options: a prebaked node image (AMI) with the bot image already inside (the
+  transcriber's pattern, `talke/deployment/base/transcriber`), and/or a small warm floor during
+  business hours — a deployment task after the bot is functional.
+- **Cost (estimate, us-west-1 on-demand list prices 2026-09-24):** services node m6a.xlarge
+  $0.2016/h ≈ **$147/month**, 24×7 (the only off-hours cost). Meetings pool ≈ 3,600 bot-hours
+  (3,230 + the 5-minute early join) at $0.054–0.067 per bot-hour fully packed, divided by an
+  assumed 50–85 % packing (no live bot is ever repacked) ≈ **$250–420/month, likely ~$320**. Disks
+  and S3 ≈ $10–15. **Total ≈ $400–600/month, likely ~$480.** Scales with meeting-hours; if the
+  194k minutes are per year, the meetings line is ~12× smaller. An estimate to check against the
+  live test, not a quote. Runbook: aw-notetaker `deployment/base/aw-bots/README.md` "Cost".
 - IAM: meeting-api rw `aw-bots/{recordings,signal}/*`; exporter r `aw-bots/*`, rw
   `aw-bots/aw-exporter/*`, rw `aw-chatworks-transcribe/recordings/*` **plus
   `s3:PutObjectTagging` on `aw-chatworks-transcribe`** (the exporter tags every object it
   writes there with its retention class, §3). Lifecycle per D5.
-- Network: exporter → meeting-api (internal), → `notetaker-api.notetaker:8080`; NetworkPolicy per D12.
+- Network: exporter → meeting-api (internal), → `notetaker-api.notetaker:8080`; no NetworkPolicy (D12).
 - Exporter Deployment: single replica with `strategy: Recreate` — a rolling update would briefly
   run two pods, i.e. two overlapping pending-queue sweepers.
 - Alerting + recovery: alert on intake 401/400 responses — Vexa's webhook delivery drops non-429
@@ -321,7 +334,9 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
 - **Memory sizing is from the old bot** — re-measured on 0.12 before §7.1 values are locked.
 - **Clock alignment** of tape vs master (S1 measures it).
 - **Speaker names with transcription off** — seen only on a transcription-on tape; verified early.
-- meeting-api trusting `X-User-Id` makes network isolation load-bearing (D12).
+- meeting-api trusts `X-User-Id` and the cluster enforces no network isolation (D12): any Pod in
+  the cluster could act as the service account. Closed only by cluster-wide NetworkPolicy
+  enforcement.
 - Mixed-lane hint density for Zoom/Teams untested here — validated live.
 - One service account serialises spawns through Vexa's per-user advisory lock (held for the
   create transaction only) — measured at a top-of-hour burst during live validation.

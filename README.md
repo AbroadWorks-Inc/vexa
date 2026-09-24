@@ -57,6 +57,8 @@ Everything else is upstream Vexa, unchanged.
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
 | **Exporter.** A new small service. | `integrations/out/aw-notetaker/` | Turns each finished meeting into the folder the AW notetaker pipeline reads, and hands it over. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
+| **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
+| **Image workflow.** Builds and pushes our three images to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
 The design and the reasoning behind each decision live in
@@ -110,8 +112,8 @@ One Helm install runs all of these. Each service is its own Docker image.
 | runtime (starts bot pods) | `vexaai/v012-runtime` | upstream |
 | **bot** | built from this repo | **ours** (writes `speaker-activity.jsonl`) |
 | terminal (web console) | `vexaai/v012-terminal` | upstream |
-| agent-api, dashboard, flows | `vexaai/*` | upstream (optional for us) |
-| postgres, redis | chart defaults | upstream |
+| agent-api, dashboard, flows | `vexaai/*` | upstream; all three **off** for us (we don't use Vexa's AI agents) |
+| postgres, redis (Valkey) | chart defaults, inside the same install | upstream; Vexa's own database and message bus, separate from the notetaker's |
 | **exporter** | built from `integrations/out/aw-notetaker` | **ours**, deployed next to the chart |
 
 Our images go to GHCR, under the names `ghcr.io/voyantt-consultancy-services-llp/aw-bots-meeting-api`,
@@ -119,26 +121,39 @@ Our images go to GHCR, under the names `ghcr.io/voyantt-consultancy-services-llp
 
 ### Build our images
 
-From the repo root:
+**Normally CI builds them**: `.github/workflows/aw-images.yml` ("AW images — build & push").
+
+| Trigger | Tags pushed |
+|---|---|
+| Push to `development` | `:<commit sha>` for all three images |
+| Manual run (Actions → Run workflow: branch, tag e.g. `v0.1.1`, `all` or one image) | `:<commit sha>` and `:<tag>` |
+
+There is no `:latest`: the deployment pins exact tags, so a new image reaches the cluster only when
+the tag is changed in aw-notetaker and applied (its runbook, "Upgrading our images"). The workflow
+needs the secret `GHCR_PAT` in this repo (`AbroadWorks-Inc/vexa`): a classic personal access token with `write:packages`, owned by a member of `voyantt-consultancy-services-llp`. The talke repo's secret of the same name lives in the Voyantt org and is not visible here.
+The exporter's tests and checks run before its image is built.
+
+**By hand**, from the repo root. **Every image is built for `linux/amd64`**: both AW Bots machine pools are
+amd64 (Intel/AMD), because upstream publishes and tests the bot on amd64 only. An Apple Silicon Mac
+is arm64, so a build without `--platform linux/amd64` produces an image the cluster can't run
+(`exec format error`).
 
 ```bash
 TAG=v0.1.0
 REG=ghcr.io/voyantt-consultancy-services-llp
 
-# bot — two steps: the join environment base, then the bot. amd64 only (like upstream); bot pods
-# run on the amd64-only aw-bots-bots Karpenter pool.
+# bot — two steps: the join environment base, then the bot.
 docker build --platform linux/amd64 -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev core/meetings/modules/join
 docker build --platform linux/amd64 -f core/meetings/services/bot/Dockerfile \
   --build-arg VEXA_IMAGE_VERSION=$TAG -t $REG/aw-bots-bot:$TAG .
-
 docker push $REG/aw-bots-bot:$TAG
 
-# meeting-api and the exporter run on the default nodes, which include arm64, so build both
-# architectures (buildx pushes as it builds). meeting-api's context is the repo root.
-docker buildx build --platform linux/amd64,linux/arm64 --push \
-  -f core/meetings/services/meeting-api/Dockerfile -t $REG/aw-bots-meeting-api:$TAG .
-docker buildx build --platform linux/amd64,linux/arm64 --push \
-  -t $REG/aw-bots-exporter:$TAG integrations/out/aw-notetaker
+# meeting-api (context: the repo root) and the exporter.
+docker build --platform linux/amd64 -f core/meetings/services/meeting-api/Dockerfile \
+  -t $REG/aw-bots-meeting-api:$TAG .
+docker build --platform linux/amd64 -t $REG/aw-bots-exporter:$TAG integrations/out/aw-notetaker
+docker push $REG/aw-bots-meeting-api:$TAG
+docker push $REG/aw-bots-exporter:$TAG
 ```
 
 Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our change adds one small source file and
@@ -158,7 +173,11 @@ Every setting lives in configuration, not code:
 | meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
 | "Meeting finished" webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (+ `…_ALLOW_PRIVATE_HTTP=true`) | the exporter's in-cluster URL |
 | How early the bot joins | `AUTO_JOIN_LEAD_S` | measured from cold starts |
-| Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the bots NodePool |
+| Services on Karpenter | Helm `global.nodeSelector` / `global.tolerations` | the `aw-bots-services` NodePool |
+| Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the `aw-bots-meetings` NodePool |
+| Postgres / Redis disks | Helm `postgres.persistence.storageClassName`, `redis.persistence.storageClassName` | `ebs-sc-gp3` (any zone, expandable) |
+| Vexa's AI agents | Helm `agentApi.enabled` | `false` |
+| Postgres password | Helm `postgres.existingCredentialsSecret` → pre-created Secret `postgres-credentials` | `true` (the chart then creates no Secret at all) |
 | Bot size | Helm `runtime.workloadResources.meetingBot` | 1 CPU / 2560 MiB |
 | Our images | Helm `meetingApi.image.*`, `runtime.browserImage` | our GHCR tags |
 | Debug tape off | admin-api platform setting `capture_signal=false` | off (turn on only to debug a meeting) |
@@ -182,8 +201,8 @@ this fork. The step-by-step runbook is `deployment/base/aw-bots/README.md` there
 |---|---|
 | `deployment/base/aw-bots/values.yaml` | Our Helm values for the upstream chart |
 | `deployment/base/aw-bots/*.yaml.template` | Secret templates (key names and placeholders only) |
-| `deployment/base/aw-bots/bots-nodepool.yaml` | The Karpenter `aw-bots-bots` pool (on-demand, amd64) |
-| `deployment/base/aw-exporter/` | The exporter's Deployment, Service, ServiceAccount, NetworkPolicy and kustomization |
+| `deployment/base/aw-bots/nodepools.yaml` | AW Bots' two Karpenter pools: `aw-bots-services` and `aw-bots-meetings`, both amd64 and on-demand |
+| `deployment/base/aw-exporter/` | The exporter's Deployment, Service, ServiceAccount and kustomization |
 | `deployment/aws/iam/abroadworks-aw-bots-meeting-api-role/`, `…/abroadworks-aw-exporter-role/` | IAM roles (IRSA) |
 | `deployment/aws/s3-lifecycle/aw-bots-lifecycle.json` | 14-day expiry for the `aw-bots` bucket |
 
@@ -195,9 +214,11 @@ In outline:
    - meeting-api reads and writes `aw-bots`. The role attaches through `meetingApi.serviceAccount`.
    - The exporter reads `aw-bots` and writes `aw-chatworks-transcribe`, including
      `s3:PutObjectTagging`.
-2. **Karpenter NodePool for bots.** **On-demand only** (never spot: a reclaimed node kills the
-   meeting). amd64 general-purpose instances. Nodes are removed only when empty, so a live bot is
-   never evicted.
+2. **Two Karpenter NodePools of AW Bots' own**, so it shares no machines with anything else in the
+   cluster: `aw-bots-services` (one node for the chart's services, Postgres, Redis and the
+   exporter) and `aw-bots-meetings` (bot pods). Both amd64 and **on-demand only** (never spot: a
+   reclaimed node kills the meeting). Nodes are removed only when empty, so a live bot is never
+   evicted.
 3. **Install AW Bots.** `helm upgrade --install aw-bots deploy/helm/charts/vexa -n aw-bots -f <our values file>`.
    The values file lives in aw-notetaker; it sets the table above and points at our images.
 4. **Deploy the exporter** from its manifests: one replica, `strategy: Recreate`.
