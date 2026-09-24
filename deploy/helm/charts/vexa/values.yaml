@@ -405,6 +405,10 @@ postgres:
   enabled: true
   image: postgres:17-alpine
   credentialsSecretName: postgres-credentials
+  # true = the Secret named by credentialsSecretName is created outside the chart (keys POSTGRES_DB,
+  # POSTGRES_USER, POSTGRES_PASSWORD) and the chart renders none, so a helm upgrade never rewrites the
+  # database password and database.password is not needed.
+  existingCredentialsSecret: false
   idleInTransactionTimeoutMs: 60000
   service:
     port: 5432

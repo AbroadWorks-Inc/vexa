@@ -494,4 +494,27 @@ else
   echo "  FAIL: meeting-api Deployment does not bind the existing ServiceAccount name"; fail=1
 fi
 
+# postgres.existingCredentialsSecret=true: the in-cluster Postgres reads a PRE-CREATED Secret, so the
+# chart renders no postgres-credentials Secret of its own (a helm upgrade then never rewrites the
+# database password) while every consumer still references the Secret by name. Default: rendered.
+pg_secret_docs() { awk 'BEGIN{RS="\n---\n"} /kind: Secret/ && /name: postgres-credentials/' <<< "$1"; }
+if [ -n "$(pg_secret_docs "$RENDER")" ]; then
+  echo "  OK: default render still creates the postgres-credentials Secret"
+else
+  echo "  FAIL: default render lost the postgres-credentials Secret"; fail=1
+fi
+RENDER_PG_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set postgres.existingCredentialsSecret=true)"
+if [ -z "$(pg_secret_docs "$RENDER_PG_EXISTING")" ]; then
+  echo "  OK: postgres.existingCredentialsSecret=true renders no postgres-credentials Secret"
+else
+  echo "  FAIL: postgres.existingCredentialsSecret=true still renders a postgres-credentials Secret"; fail=1
+fi
+pg_refs_existing="$(grep -cE 'name: "?postgres-credentials"?$' <<< "$RENDER_PG_EXISTING" || true)"
+if [ "$pg_refs_existing" -ge 3 ]; then
+  echo "  OK: postgres, admin-api and meeting-api still reference postgres-credentials ($pg_refs_existing)"
+else
+  echo "  FAIL: postgres-credentials references — want >=3 got $pg_refs_existing"; fail=1
+fi
+
 [ "$fail" -eq 0 ] && { echo "gate:helm PASS"; exit 0; } || { echo "gate:helm FAIL"; exit 1; }
