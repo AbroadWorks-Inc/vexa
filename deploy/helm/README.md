@@ -53,6 +53,7 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 | `secrets.*` | placeholders | `adminApiToken`, `internalApiSecret`, `transcriptionServiceToken`, `dispatchSigningKey`, `nextauthSecret`, `anthropic*`. Or set `secrets.existingSecretName` (must carry `ADMIN_API_TOKEN`, `INTERNAL_API_SECRET`, `TRANSCRIPTION_SERVICE_TOKEN`, `VEXA_DISPATCH_SIGNING_KEY`, `NEXTAUTH_SECRET`). |
 | `postgres.enabled` / `redis.enabled` / `minio.enabled` | `true` | Flip to `false` to use managed backing; then set `database.*` / `redisConfig.*` and a pre-existing `postgres.credentialsSecretName`. |
 | `postgres.existingCredentialsSecret` | `false` | `true` keeps the in-cluster Postgres but reads its password from a pre-created `postgres.credentialsSecretName` Secret (`POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`); the chart renders none, so an upgrade never rewrites it. |
+| `statefulAntiAffinity` | `true` | postgres, redis and minio prefer different nodes. `false` drops that preference when they are meant to share one node (Karpenter otherwise starts an extra node for it). |
 | `pgbouncer.enabled` | `false` | Transaction pooler for managed Postgres with a fixed slot budget. |
 | `terminal.enabled` | `true` | The web UI. Set `terminal.publicUrl` (NEXTAUTH_URL/TERMINAL_URL) when fronted by ingress; add OAuth via `terminal.extraEnv`. |
 | `ingress.enabled` | `false` | Fronts the **terminal** by default; set `host`/`className`/`tls`. Add a second path to `gateway` to also expose the raw API. |
