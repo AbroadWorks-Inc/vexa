@@ -25,8 +25,9 @@ lifecycle. The exporter's IAM role needs `s3:PutObjectTagging` on `EXPORT_BUCKET
 
 ## Dev setup
 
+With [`uv`](https://docs.astral.sh/uv/) (what the repo's `gate:python` runs; it installs the `dev`
+dependency group by itself):
+
 ```bash
-/opt/homebrew/bin/python3.11 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'
-pytest -q && black --check . && ruff check . && mypy exporter
+uv run pytest -q && uv run black --check . && uv run ruff check . && uv run mypy exporter
 ```

@@ -256,8 +256,8 @@ write one. A single release of all three at once has no ordering issue.
 |---|---|
 | Bot | `cd core/meetings/services/bot && npm test` (and `npx tsc --noEmit -p .`) |
 | meeting-api | `cd core/meetings/services/meeting-api && uv run pytest` |
-| Exporter | `cd integrations/out/aw-notetaker && pytest -q && black --check . && ruff check . && mypy exporter` |
-| Exporter end-to-end (Docker, MinIO) | `pytest -m integration -q tests/integration` |
+| Exporter | `cd integrations/out/aw-notetaker && uv run pytest -q && uv run black --check . && uv run ruff check . && uv run mypy exporter` |
+| Exporter end-to-end (Docker, MinIO) | `uv run pytest -m integration -q tests/integration` (from `integrations/out/aw-notetaker`) |
 | Repo checks (the full suite) | `pnpm install && node scripts/gates.mjs all` |
 
 **Before you push.** `git push` runs a pre-push hook (`.githooks/pre-push`) with 13 fast static
