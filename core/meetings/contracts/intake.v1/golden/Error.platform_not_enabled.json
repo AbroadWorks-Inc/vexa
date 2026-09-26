@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "platform_not_enabled",
+    "message": "this host is blocked (ENTRY_BLOCKED_HOSTS)"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "no_live_bot",
+    "message": "no bot is currently in this meeting"
+  }
+}

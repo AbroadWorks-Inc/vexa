@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "start: naive timestamps are not allowed (an explicit UTC offset is required)"
+  }
+}

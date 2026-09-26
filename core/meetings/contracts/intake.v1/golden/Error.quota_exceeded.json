@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "quota_exceeded",
+    "message": "the account's webhook subscription quota (20) is full"
+  }
+}

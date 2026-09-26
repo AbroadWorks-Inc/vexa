@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "meeting_not_found",
+    "message": "no meeting with this id is visible to user"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "forbidden",
+    "message": "the key's scope does not permit this route"
+  }
+}

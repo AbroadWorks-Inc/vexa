@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "unavailable",
+    "message": "database unavailable; retry with backoff"
+  }
+}

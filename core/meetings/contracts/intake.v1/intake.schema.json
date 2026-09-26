@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/intake.v1",
+  "title": "intake.v1",
+  "description": "The DRAFT contract for the intake surface (§2, task A4): request bodies for PUT /v2/entries and POST /v2/entries/remove, the shared success Reply envelope (§2.4, ten results), the Meeting object every reply/read/webhook renders (meeting_api.intake.projection.project_meeting), the EntryState row GET /v2/entries returns, and the Error envelope (§2.5). UNSEALED — not yet in contracts.seal.json; sealed in task A8 once the routes are built against it. `start`/`end`/timestamp-shaped fields intentionally use a loose ISO-8601 `pattern`, not `format: date-time`, so a NAIVE timestamp (no offset) still conforms at the schema layer — rejecting it is validation.py's own step 2 (§2, validation order), kept distinct from the schema step so the two produce the SAME invalid_request code from two different, testable causes.",
+  "$defs": {
+    "Entry": {
+      "description": "PUT /v2/entries request body (§2.2). start/end are required unless join_now is true (§2.2: 'Instant join is decided by this flag only, never by the external_id').",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["external_id", "user", "meeting_url"],
+      "if": {
+        "properties": { "join_now": { "const": true } },
+        "required": ["join_now"]
+      },
+      "then": {},
+      "else": { "required": ["start", "end"] },
+      "properties": {
+        "external_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "The sender's own id, any format; aw-bots never parses it. Unique per (account, user)."
+        },
+        "user": {
+          "type": "string",
+          "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+          "description": "Lower-cased by aw-bots (validation.py step 9)."
+        },
+        "meeting_url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One link, chosen by the sender. Parsed by aw-bots elsewhere; unknown -> unrecognized_link (not a schema-level check)."
+        },
+        "start": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})?$",
+          "description": "ISO 8601; offset required by validation.py step 2, not by this pattern."
+        },
+        "end": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})?$",
+          "description": "Must be after start (validation.py step 5, not a schema-level check)."
+        },
+        "time_zone": { "type": ["string", "null"], "description": "IANA name; display only." },
+        "title": { "type": ["string", "null"], "maxLength": 512 },
+        "attendees": {
+          "type": ["array", "null"],
+          "maxItems": 100,
+          "items": { "type": "string", "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$" },
+          "description": "Lower-cased by aw-bots (validation.py step 9)."
+        },
+        "series_id": { "type": ["string", "null"], "maxLength": 255 },
+        "join_now": { "type": "boolean" },
+        "metadata": {
+          "type": ["object", "null"],
+          "description": "<= 16384 bytes of canonical JSON; the byte-size check is validation.py step 4, not a schema-level check (JSON Schema has no serialized-byte-length keyword)."
+        }
+      }
+    },
+    "Remove": {
+      "description": "POST /v2/entries/remove request body (§2.3).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["external_id", "user"],
+      "properties": {
+        "external_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "user": {
+          "type": "string",
+          "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+          "description": "Lower-cased by aw-bots."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "description": "cancelled | declined | deleted | moved_out_of_window | not_eligible, or free text. Recorded and sent in the webhook."
+        }
+      }
+    },
+    "ReplyEntry": {
+      "description": "The small `entry` block inside Reply (§2.4) — NOT the full EntryState row.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["external_id", "user", "state"],
+      "properties": {
+        "external_id": { "type": "string" },
+        "user": { "type": "string" },
+        "state": { "type": "string", "description": "'active' | 'removed' — this entry's own state after the operation." }
+      }
+    },
+    "Outcome": {
+      "description": "Meeting.outcome (§2.4) — null until the meeting ends with no bot, or a scheduled entry is superseded. kind/detail are intake-owned; not the lifecycle.v1 BotStatus/CompletionReason vocabulary.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "detail", "message", "at"],
+      "properties": {
+        "kind": { "type": "string" },
+        "detail": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] },
+        "at": { "type": ["string", "null"] }
+      }
+    },
+    "Export": {
+      "description": "Meeting.export (§2.4) — null until the exporter reports a result.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "s3_path", "error", "at"],
+      "properties": {
+        "state": { "type": "string" },
+        "s3_path": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] },
+        "at": { "type": ["string", "null"] }
+      }
+    },
+    "MeetingEntryRef": {
+      "description": "One item of Meeting.entries (§2.4) — active entries only (meeting_api.intake.projection._entry).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["external_id", "user", "attendees", "series_id", "metadata"],
+      "properties": {
+        "external_id": { "type": ["string", "null"] },
+        "user": { "type": ["string", "null"] },
+        "attendees": { "type": ["array", "null"], "items": { "type": "string" } },
+        "series_id": { "type": ["string", "null"] },
+        "metadata": { "type": ["object", "null"] }
+      }
+    },
+    "Meeting": {
+      "description": "The §2.4 meeting object — exactly the 16 keys meeting_api.intake.projection.project_meeting renders, in this order. Every reply, read and webhook ships a meeting through this one shape.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "status", "completion_reason", "failure_stage", "outcome", "platform", "room",
+        "meeting_url", "title", "start", "end", "time_zone", "bot_joins_at", "entries",
+        "export", "sequence"
+      ],
+      "properties": {
+        "id": { "type": "string", "description": "str(meetings.uuid) — never the integer row id." },
+        "status": { "type": ["string", "null"] },
+        "completion_reason": { "type": ["string", "null"] },
+        "failure_stage": { "type": ["string", "null"] },
+        "outcome": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Outcome" }] },
+        "platform": { "type": ["string", "null"] },
+        "room": { "type": ["string", "null"] },
+        "meeting_url": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "start": { "type": ["string", "null"] },
+        "end": { "type": ["string", "null"] },
+        "time_zone": { "type": ["string", "null"] },
+        "bot_joins_at": { "type": ["string", "null"] },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/MeetingEntryRef" } },
+        "export": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Export" }] },
+        "sequence": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Reply": {
+      "description": "Every successful call (§2.4): HTTP 200. `result` is one of the ten outcomes; `meeting` is always the full projection (project_meeting never returns null).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "previous_meeting_id", "entry", "meeting"],
+      "properties": {
+        "result": {
+          "enum": [
+            "created", "joined_existing", "updated", "unchanged", "not_changed_live",
+            "not_changed_finished", "removed", "entry_removed", "bot_stopping", "already_removed"
+          ]
+        },
+        "previous_meeting_id": {
+          "type": ["string", "null"],
+          "description": "Set only for 'updated' when the entry moved off a meeting."
+        },
+        "entry": { "$ref": "#/$defs/ReplyEntry" },
+        "meeting": { "$ref": "#/$defs/Meeting" }
+      }
+    },
+    "EntryState": {
+      "description": "GET /v2/entries row (§2.1): the entry's own §2.2 fields, plus content_hash and state, so a sender can diff its view against aw-bots'.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "external_id", "user", "meeting_url", "start", "end", "time_zone", "title",
+        "attendees", "series_id", "join_now", "metadata", "content_hash", "state"
+      ],
+      "properties": {
+        "external_id": { "type": "string" },
+        "user": { "type": "string" },
+        "meeting_url": { "type": "string" },
+        "start": { "type": "string" },
+        "end": { "type": ["string", "null"] },
+        "time_zone": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "attendees": { "type": "array", "items": { "type": "string" } },
+        "series_id": { "type": ["string", "null"] },
+        "join_now": { "type": "boolean" },
+        "metadata": { "type": ["object", "null"] },
+        "content_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "state": { "type": "string", "description": "'active' | 'removed' | 'closed' (meeting_entries.state)." }
+      }
+    },
+    "Error": {
+      "description": "Every error (§2.5). The gateway uses the same shape for /v2 auth and rate errors. `message` never echoes `metadata` or the URL query string (validation.py never builds one from either).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_request", "unrecognized_link", "platform_not_enabled", "too_far_ahead",
+                "already_ended", "unauthorized", "forbidden", "entry_not_found",
+                "meeting_not_found", "meeting_not_finished", "no_live_bot", "rate_limited",
+                "quota_exceeded", "unavailable"
+              ]
+            },
+            "message": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

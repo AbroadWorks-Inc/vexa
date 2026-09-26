@@ -1,0 +1,44 @@
+{
+  "result": "not_changed_finished",
+  "previous_meeting_id": null,
+  "entry": {
+    "external_id": "google:3n5kq8example",
+    "user": "a@abroadworks.com",
+    "state": "active"
+  },
+  "meeting": {
+    "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+    "status": "completed",
+    "completion_reason": "stopped",
+    "failure_stage": null,
+    "outcome": null,
+    "platform": "google_meet",
+    "room": "kxo-misr-avz",
+    "meeting_url": "https://meet.google.com/kxo-misr-avz",
+    "title": "Weekly sync",
+    "start": "2026-09-29T09:00:00Z",
+    "end": "2026-09-29T09:30:00Z",
+    "time_zone": "Asia/Kolkata",
+    "bot_joins_at": "2026-09-29T08:55:00Z",
+    "entries": [
+      {
+        "external_id": "google:3n5kq8example",
+        "user": "a@abroadworks.com",
+        "attendees": [
+          "a@abroadworks.com",
+          "b@abroadworks.com",
+          "c@client.com"
+        ],
+        "series_id": null,
+        "metadata": null
+      }
+    ],
+    "export": {
+      "state": "done",
+      "s3_path": "s3://aw-chatworks-transcribe/recordings/google_meet_kxo-misr-avz_20260929T090000Z/",
+      "error": null,
+      "at": "2026-09-29T09:45:00Z"
+    },
+    "sequence": 8
+  }
+}
