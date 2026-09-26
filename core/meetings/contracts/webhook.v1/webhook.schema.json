@@ -5,14 +5,23 @@
   "description": "The outbound webhook wire shape: the delivery envelope POSTed to a subscriber's URL, plus the signed-header scheme that authenticates it. Derived from the parent meeting-api's real envelope (webhook_delivery.build_envelope) + header builder (build_headers). Both the system hooks (billing/analytics) and per-client hooks (user-configured webhook_url) share this shape.",
   "$defs": {
     "EventType": {
-      "description": "The webhook event types this contract delivers. meeting.* mirror the meeting FSM (lifecycle.v1); recording.* / transcription.* are post-meeting artifacts.",
+      "description": "The webhook event types this contract delivers. meeting.* mirror the meeting FSM (lifecycle.v1) plus the intake.v1 entry lifecycle (scheduled/updated/removed/waiting_for_room/not_sent); recording.* / transcription.* are post-meeting artifacts; export.* is the exporter's handoff result; webhook.test is an on-demand subscriber test send; bot.retry is reserved for the lobby-timeout retry, not yet emitted.",
       "enum": [
         "meeting.started",
         "meeting.status_change",
         "meeting.completed",
+        "meeting.scheduled",
+        "meeting.updated",
+        "meeting.removed",
+        "meeting.waiting_for_room",
+        "meeting.not_sent",
         "bot.failed",
+        "bot.retry",
         "recording.ready",
-        "transcription.ready"
+        "transcription.ready",
+        "export.handed_off",
+        "export.failed",
+        "webhook.test"
       ]
     },
     "Envelope": {
@@ -56,6 +65,11 @@
           "type": "string",
           "pattern": "^[0-9]+$",
           "description": "unix seconds the signature was computed at (replay window)"
+        },
+        "X-Webhook-Signature-Previous": {
+          "type": "string",
+          "pattern": "^sha256=[0-9a-f]{64}$",
+          "description": "sha256=<hmac under the OLD secret> — present only during the 24h window after a rotate-secret call; a receiver accepts a match on either signature header"
         },
         "Authorization": {
           "type": "string",

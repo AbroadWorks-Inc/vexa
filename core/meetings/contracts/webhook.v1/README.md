@@ -34,10 +34,17 @@ this shape.
 - **`Envelope`** — `event_id · event_type · api_version · created_at · data`. The body POSTed is
   `JSON.stringify(Envelope)`. `data` is event-type-specific (for `meeting.*`: `{ meeting, status_change? }`).
 - **`EventType`** — the delivered event vocabulary (`meeting.started · meeting.status_change ·
-  meeting.completed · bot.failed · recording.ready · transcription.ready`).
+  meeting.completed · meeting.scheduled · meeting.updated · meeting.removed ·
+  meeting.waiting_for_room · meeting.not_sent · bot.failed · bot.retry · recording.ready ·
+  transcription.ready · export.handed_off · export.failed · webhook.test`). The `meeting.scheduled
+  / .updated / .removed / .waiting_for_room / .not_sent` and `export.*` / `webhook.test` values are
+  the intake.v1 (§2.7) additions; `bot.retry` is reserved for the lobby-timeout retry and not yet
+  emitted by any producer.
 - **`SignatureHeaders`** — the headers a verifier recomputes. The signature is
   `sha256=<hmac_sha256(secret, "<X-Webhook-Timestamp>." + raw_body)>` — **timestamp-then-payload**,
   bounding replay. `Authorization: Bearer <secret>` rides alongside for legacy back-compat.
+  `X-Webhook-Signature-Previous` carries the same shape computed under the OLD secret; present only
+  during the 24h window after `rotate-secret`, and a receiver accepts a match on either header.
 
 ## Deliberately **not** in this contract
 - **The secret never crosses the wire.** Only the HMAC of `ts.payload` does. Verification is symmetric:
