@@ -17,10 +17,10 @@ parent keeps the ORM classes only as a legacy READ fallback guarded by
 `to_regclass('public.recordings') IS NOT NULL`, so omitting the tables is safe.
 """
 from sqlalchemy import (
-    Column, String, Text, Integer, DateTime, Float,
+    BigInteger, Boolean, Column, String, Text, Integer, DateTime, Float, LargeBinary,
     ForeignKey, Index, UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, ARRAY
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY, UUID
 from sqlalchemy.sql import func, text
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
@@ -102,6 +102,11 @@ class Meeting(Base):
     __tablename__ = "meetings"
 
     id = Column(Integer, primary_key=True, index=True)
+    # §1.2 — every meeting's stable external identity (intake/webhook payloads key off this, not
+    # the internal `id`). `index=True` gives it a named index (`ix_meetings_uuid`) so the
+    # CONCURRENTLY build on a live DB (MIGRATION-0008) converges by name with `ensure_schema`.
+    uuid = Column(UUID(as_uuid=True), nullable=False, unique=True, index=True,
+                  server_default=text("gen_random_uuid()"))
     user_id = Column(Integer, nullable=False, index=True)
     platform = Column(String(100), nullable=False)
     platform_specific_id = Column(String(255), index=True, nullable=True)
@@ -149,22 +154,36 @@ class Meeting(Base):
                    "'scheduled', 'stopping'))"),
               text("meeting_event_time(data, start_time, created_at)"),
               "id"),
-        # ROB1/ROB2 DB-level backstop (mirror of meeting-api's sessions/models.py): at most ONE
-        # ACTIVE (non-terminal) meeting per (user, platform, native_meeting_id). Unique PARTIAL
-        # index — terminal rows (completed/failed) are NOT covered, so a user can re-meet the same
-        # native id once the prior run ends and continue_meeting can reopen a terminal row. The
-        # in-txn pg_advisory_xact_lock in create_meeting_guarded serializes same-process spawns;
-        # this index backstops the cross-process race → IntegrityError → DuplicateMeeting.
+        # ROB1/ROB2 DB-level backstop (mirror of meeting-api's sessions/models.py; §1.2): at most
+        # ONE LIVE meeting per (user, platform, native_meeting_id) — a partial unique index over the
+        # bot-lifecycle statuses only. A user's meeting_entries can hold many `scheduled` occurrences
+        # for one link (recurring series), so the dedup key can no longer cover 'scheduled' the way
+        # `uq_meeting_active_user_platform_native` used to — only a row the bot has actually spawned
+        # for is live. The in-txn pg_advisory_xact_lock in create_meeting_guarded serializes
+        # same-process spawns; this index backstops the cross-process race → IntegrityError →
+        # DuplicateMeeting.
         #
-        # ⚠ PROD ROLLOUT: this CREATE UNIQUE INDEX FAILS on a table that already holds duplicate
-        # active rows, and _sync_indexes swallows that failure silently. The index must be built
-        # out-of-band on prod (dedup + CREATE UNIQUE INDEX CONCURRENTLY) BEFORE this change deploys
-        # — see schema/MIGRATION-0002-meeting-active-dedup-index.md.
+        # `ensure_schema` matches indexes BY NAME and never alters one in place, so swapping the old
+        # dedup index for this one is a manual runbook (CONCURRENTLY, before the deploy) —
+        # see schema/MIGRATION-0008-meeting-live-dedup-index.md.
         Index(
-            "uq_meeting_active_user_platform_native",
+            "uq_meeting_live_user_platform_native",
             "user_id", "platform", "platform_specific_id",
             unique=True,
-            postgresql_where=text("status NOT IN ('completed', 'failed')"),
+            postgresql_where=text(
+                "status IN ('requested', 'joining', 'awaiting_admission', 'needs_help', "
+                "'active', 'stopping')"
+            ),
+        ),
+        # §1.2 — the scheduler's due query: only meetings still `scheduled`, ordered by the same
+        # `meeting_event_time()` wrapper the event-order indexes use (MIGRATION-0005), restricted to
+        # rows the scheduler still cares about so it never walks history.
+        # ⚠ PROD ROLLOUT: build CONCURRENTLY out-of-band before deploying — see
+        # schema/MIGRATION-0008-meeting-live-dedup-index.md.
+        Index(
+            "ix_meeting_scheduled_due",
+            text("meeting_event_time(data, start_time, created_at)"),
+            postgresql_where=text("status = 'scheduled'"),
         ),
     )
 
@@ -207,3 +226,156 @@ class MeetingSession(Base):
     __table_args__ = (
         UniqueConstraint("meeting_id", "session_uid", name="_meeting_session_uc"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# meeting intake + webhooks (§1.2) — ours, no upstream parent
+# --------------------------------------------------------------------------- #
+class MeetingEntry(Base):
+    """One calendar/manual occurrence bound to a `meetings` row (§1.2). Many entries can point at
+    the same `meeting_id` (a recurring series); `content_hash` lets intake detect a no-op re-push."""
+    __tablename__ = "meeting_entries"
+
+    id = Column(BigInteger, primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    source_user = Column(Text, nullable=False)
+    external_id = Column(String(255), nullable=False)
+    meeting_id = Column(Integer, ForeignKey("meetings.id", ondelete="RESTRICT"),
+                         nullable=False, index=True)
+    meeting_url = Column(Text, nullable=False)
+    platform = Column(String(100), nullable=False)
+    native_meeting_id = Column(String(255), nullable=False)
+    title = Column(String(512), nullable=True)
+    start_at = Column(DateTime(timezone=True), nullable=False)
+    end_at = Column(DateTime(timezone=True), nullable=True)
+    time_zone = Column(Text, nullable=True)
+    series_id = Column(String(255), nullable=True)
+    attendees = Column(ARRAY(Text), nullable=True)
+    join_now = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    metadata_ = Column("metadata", JSONB, nullable=True)
+    content_hash = Column(String(64), nullable=False)
+    state = Column(String(16), nullable=False)  # 'active' | 'removed' | 'closed'
+    removed_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    removed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "source_user", "external_id",
+                          name="uq_meeting_entries_user_source_external"),
+        Index("ix_meeting_entries_user_platform_native_state",
+              "user_id", "platform", "native_meeting_id", "state"),
+        Index("ix_meeting_entries_attendees_gin", "attendees", postgresql_using="gin"),
+        Index("ix_meeting_entries_active_user", "user_id",
+              postgresql_where=text("state = 'active'")),
+    )
+
+
+class MeetingAwState(Base):
+    """AW-owned per-meeting state that doesn't belong in upstream's `meetings.data` blob (§1.2):
+    the scheduled window, outcome/error reporting, and export tracking — one row per meeting."""
+    __tablename__ = "meeting_aw_state"
+
+    meeting_id = Column(Integer, ForeignKey("meetings.id", ondelete="CASCADE"), primary_key=True)
+    scheduled_end_at = Column(DateTime(timezone=True), nullable=True)
+    time_zone = Column(Text, nullable=True)
+    event_seq = Column(BigInteger, nullable=False, server_default="0")
+    outcome_kind = Column(Text, nullable=True)
+    outcome_detail = Column(Text, nullable=True)
+    outcome_message = Column(Text, nullable=True)
+    outcome_at = Column(DateTime(timezone=True), nullable=True)
+    last_error_code = Column(Text, nullable=True)
+    last_error_message = Column(Text, nullable=True)
+    waiting_for_room_sent_at = Column(DateTime(timezone=True), nullable=True)
+    export_state = Column(Text, nullable=True)
+    export_s3_path = Column(Text, nullable=True)
+    export_error = Column(Text, nullable=True)
+    export_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class WebhookSubscription(Base):
+    """A user's webhook target (§1.2). `secret_enc`/`enc_key_id` are the encrypted-at-rest signing
+    secret; `previous_*` carries the prior secret through a rotation window so both signatures
+    validate until `previous_secret_expires_at`."""
+    __tablename__ = "webhook_subscriptions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = Column(Integer, nullable=False, index=True)
+    url = Column(Text, nullable=False)
+    secret_enc = Column(LargeBinary, nullable=False)
+    enc_key_id = Column(String(64), nullable=False)
+    secret_last4 = Column(String(4), nullable=False)
+    previous_secret_enc = Column(LargeBinary, nullable=True)
+    previous_enc_key_id = Column(String(64), nullable=True)
+    previous_secret_expires_at = Column(DateTime(timezone=True), nullable=True)
+    events = Column(ARRAY(Text), nullable=False, server_default=text("'{}'::text[]"))
+    active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class WebhookOutbox(Base):
+    """The durable record of every webhook-worthy event (§1.2), written once in the same
+    transaction as the state change it describes. `payload_text` is the exact bytes later sent —
+    deliveries never re-serialize. `meeting_id` is null only for the synthetic `webhook.test` event."""
+    __tablename__ = "webhook_outbox"
+
+    event_id = Column(String(80), primary_key=True)
+    meeting_id = Column(Integer, ForeignKey("meetings.id", ondelete="CASCADE"), nullable=True)
+    event_type = Column(String(64), nullable=False)
+    sequence = Column(BigInteger, nullable=False)
+    payload_text = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    published_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_webhook_outbox_unpublished", "created_at",
+              postgresql_where=text("published_at IS NULL")),
+    )
+
+
+class WebhookDelivery(Base):
+    """One row per (event, subscription) — the delivery state machine (§1.2). `next_attempt_at` +
+    `lease_until` drive the retry worker's claim; `state` is the current position in that machine."""
+    __tablename__ = "webhook_deliveries"
+
+    id = Column(BigInteger, primary_key=True)
+    event_id = Column(String(80), ForeignKey("webhook_outbox.event_id", ondelete="CASCADE"),
+                       nullable=False)
+    subscription_id = Column(UUID(as_uuid=True), nullable=False)
+    user_id = Column(Integer, nullable=False)
+    state = Column(String(16), nullable=False)  # 'pending'|'sending'|'delivered'|'failed'|'dead'|'cancelled'
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at = Column(DateTime(timezone=True), nullable=False)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    last_status_code = Column(Integer, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "subscription_id",
+                          name="uq_webhook_deliveries_event_subscription"),
+        Index("ix_webhook_deliveries_due", "next_attempt_at",
+              postgresql_where=text("state IN ('pending','sending')")),
+        Index("ix_webhook_deliveries_subscription_created_at", "subscription_id", "created_at"),
+    )
+
+
+class WebhookDeliveryAttempt(Base):
+    """The delivery log (§1.2) — one row per attempt, kept even after the delivery reaches a
+    terminal state, so a subscriber dispute has the full HTTP history to point to."""
+    __tablename__ = "webhook_delivery_attempts"
+
+    id = Column(BigInteger, primary_key=True)
+    delivery_id = Column(BigInteger, ForeignKey("webhook_deliveries.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    attempt = Column(Integer, nullable=False)
+    outcome = Column(String(16), nullable=False)
+    status_code = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)

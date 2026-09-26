@@ -25,5 +25,9 @@ package = false
 testpaths = ["tests"]
 # `tests` is on the path so the relocated collector tests import their in-package api.v1 oracle
 # (`collector_contracts`) — the same helper the standalone collector tests used.
-pythonpath = ["src", "tests"]
+# `admin_api`'s src is ALSO on the path (same wiring style as gateway/services/conformance's
+# pythonpath) for the intake schema mirror + real-Postgres tests (§1.2): they drive the SHIPPED
+# `admin_api.schema.sync.ensure_schema` / `admin_api.schema.models` — the DB source-of-truth — over
+# the PRE-ALLOWED `meeting_api → admin_api` edge (scripts/check-isolation-py.mjs ALLOWED_EDGES).
+pythonpath = ["src", "tests", "../../../identity/services/admin-api/src"]
 asyncio_mode = "auto"
