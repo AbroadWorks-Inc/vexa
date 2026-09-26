@@ -158,7 +158,7 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
             # A bare room would make meet.jit.si/daily and video.corp/daily collide on every
             # (platform, native_meeting_id) key: duplicate checks, calendar adoption, MCP
             # idempotency. meet.jit.si keeps the bare room (canonical, unambiguous).
-            return ("jitsi", room if host == "meet.jit.si" else f"{room}@{host}")
+            return ("jitsi", room.lower() if host == "meet.jit.si" else f"{room.lower()}@{host}")
         return None
 
     # Bare numeric id → assume Zoom
