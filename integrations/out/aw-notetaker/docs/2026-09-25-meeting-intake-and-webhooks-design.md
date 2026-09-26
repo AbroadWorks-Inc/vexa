@@ -1,7 +1,7 @@
 # AW Bots: meeting intake and webhooks (design)
 
 - **Date:** 2026-09-25
-- **Status:** draft for owner review — **revised 2026-09-25 after a code check** (see the revision log below).
+- **Status:** **final for build** (revision V10, 2026-09-26). Every claim re-checked against `development` and `feat/aw-bots-deployment` on 2026-09-25/26 and corrected after the implementation check (V10 below). Implementation plan: `2026-09-26-meeting-intake-plan.md`.
 - **Scope:** handoff §6 A (`aw-notetaker/docs/handoffs/2026-09-24-aw-bots-handoff.md`): how any calendar or app sends meetings to aw-bots, and how aw-bots reports every result back.
 - **Repos touched:** aw-bots (this repo: meeting-api, admin-api, gateway route table, exporter) and aw-notetaker (calendar-dispatcher, notetaker-postgres, portal).
 
@@ -13,6 +13,10 @@
 - **V4 — a meeting already under way was dropped.** With the due window `[start − lead, start + grace]`, an entry whose start is past but end ahead (calendar connected mid-meeting) ended `not_sent` at once. Now: due until `end` (R6, §8.3).
 - **V5 — seals and gates were missing.** The DB schema (`schema.seal.json`, gate `db-schema`), the contracts (`contracts.seal.json`, gate `contract-version`, incl. the webhook `EventType` enum) and the architecture model (P23) are all sealed; each change needs its seal step and its review lane (§8.9).
 - **V6 — citations corrected**: live statuses (`bot_spawn/auto_join.py:133-136`, not `lifecycle/machine.py`), `NO_ORG` (`admin_api/app/events.py:45`; admin-api lives under `core/identity/`), the gateway file path, auto-join env lines, the drain interval line, the calendar-sync range, Jitsi ids on `meet.jit.si`, portal lines and in-cluster hosts.
+- **V10 — corrected 2026-09-26 after the implementation check** (about 160 citations re-checked). V9 was reverted on `development` (`60b358b7`) and **restored by owner decision the same day**; V10 builds on V9.
+  - *Claims corrected:* the index-swap runbook is `MIGRATION-0008`, since 0001–0007 exist (§8.1, §10.4, §11.2); nothing in aw-bots exposes `/metrics` today (§8.11); only admin-api's model carries the "swallows a failed unique index" comment (§8.1, §14.5); a two-value `X-Webhook-Signature` breaks sealed `webhook.v1`, so the old signature rides its own optional header (§7.4, §8.9); `DISPATCH_PLATFORMS` would drop Jitsi for aw-bots users, so their path runs before it (§9.2); the exporter's internal write is the export result only (§8.10); §5.1, §9.3 and §10.1 name the per-consumer keys of §8.10; §14 no longer says nothing is changed (items 1 and 6 are).
+  - *Owner decisions:* every event is written to a `webhook_outbox` table in the same transaction as the change, and deliveries reference it (§8.1, §8.6); `DELETE /v2/meetings/{id}` is the per-meeting erasure path — upstream's artifact deletion plus our rows — and nothing in this design deletes from `aw-chatworks-transcribe`; the bot and the exporter delete no meeting data (§5.1, §8.7, §8.11); dependencies at the canonical §10A.2 pins (§8.8); `POST /bots` claims by the R1 `join_now` rule (§8.3); alerts are a Prometheus rule group and the services are scraped through pod annotations (§8.11); a quota refusal is `quota_exceeded`, distinct from `rate_limited` (§5.5).
+  - *Made explicit:* a meeting whose last entry moved elsewhere ends `cancelled_by_calendar` / `entry_moved` (§3); upstream planned-edit routes refuse entry-managed meetings with `managed_by_entries`, and the foreign keys say why (§8.1, §8.4); the entry-write limit is one Redis counter per account across gateway replicas, the entry quota an index-only count (§8.11); the gateway answers `/v2` auth and rate errors in the §5.5 shape (§5.5); `DELETE /v2/meetings/{id}` refuses a meeting that is not finished (§5.5, §8.11); `webhook.test` has its own path through meeting-api (§8.6).
 - **V9 — production grade, no shortcuts (2026-09-26):** one named API key per consuming system, revoked and rotated by name (§8.10; the two identical `portal` tokens are both revoked, not guessed at); the exporter stops impersonating the account with a bare `X-User-Id` header and gets its own key, and the bot's internal callback secret is enforced (§8.10); our meeting state lives in a typed side table owned by the intake module, not in the `data` JSON blob (§8.1); the webhook sender is a Redis Stream consumer group and the new sweeps use the existing single-flight lock, so two meeting-api replicas never double-send or double-sweep (§8.6); the portal is a real webhook subscriber pushing to browsers over SSE, not a v1 poller (§10.1); encryption keys carry an id so they can be rotated (§7.2); limits, metrics, alerts, retention and the scale envelope are stated (§8.11); the intake module has a sealed contract of its own (§8.9).
 - **V8 — owner answers (2026-09-26):** visibility stays as today (owner **or invited attendee**) through a new `attendees` entry field (§5.2, §10.3); webhook secrets are supplied by the receiving system and stored **encrypted at rest** (§7.2, O5); Zoom is numeric links only, which is all our portal produces (O3 closed); worker, key scopes and calendar sync checked live (O1, O2, O7 closed); CHANGELOG and handoff updated (O6, O8 closed).
 - **V7 — `event_id` defined** for the new events (today's is per bot run, `lifecycle/webhook.py:67-80`), the stop payload corrected, the exporter's internal call routed past the gateway, the portal's v1 refresh made polling, and the existing `data.metadata` / annotate machinery noted.
@@ -108,7 +112,7 @@ Portal ──instant join / stop / read meetings──────────�
 
 | `outcome.kind` | Set when | `status` / `completion_reason` |
 |---|---|---|
-| `cancelled_by_calendar` | last entry removed (R5, R8); `detail` = the remove `reason` | live → `completed` (or `failed`) / `stopped`; planned → `failed` / `stopped` |
+| `cancelled_by_calendar` | last entry removed (R5, R8); `detail` = the remove `reason`, or `entry_moved` when the last entry moved to another meeting (new time or link, §6.9) | live → `completed` (or `failed`) / `stopped`; planned → `failed` / `stopped` |
 | `not_sent` | `end` passed with no bot (R6); `detail` = `ended_before_sent`, `account_limit`, `spawn_error` or `room_busy` | `failed` / absent (no bot ran, so no stage either) |
 | `merged_into_live` | R2 exception; `detail` = the UUID it merged into | `failed` / absent |
 
@@ -123,7 +127,7 @@ Portal ──instant join / stop / read meetings──────────�
 | **aw-bots meeting service** (gateway, admin-api, meeting-api, runtime) | Accepts entries, applies R1–R8, sends bots (scheduler), runs them, sends webhooks, serves meeting reads | Entries and meetings from 30 days ahead to all history; webhook subscriptions and delivery log | Read a calendar; know anything about the portal |
 | **Calendar module** (`calendar-dispatcher`) | Reads each connected user's Google calendar every 60 s; applies the eligibility rules; sends entries and removals | Users' calendar tokens; what it last sent per (user, event) | Send or stop a bot directly |
 | **Portal** | Sign-in, connect calendar, meeting list and detail, instant join, stop bot, webhook receiver | Nothing about meetings of its own | Read calendars; talk to bots |
-| **Exporter** (part of aw-bots) | On `meeting.completed`: builds the S3 folder, calls `/process`, reports the export result to meeting-api | Its S3 queue | Transcribe |
+| **Exporter** (part of aw-bots) | On `meeting.completed`: builds the S3 folder, calls `/process`, reports the export result to meeting-api | Its S3 queue | Transcribe; delete meeting data (§8.7) |
 
 ---
 
@@ -140,10 +144,11 @@ The new routes sit under `/v2` so upstream Vexa's `/meetings`, `/bots` and `/tra
 | `GET /v2/meetings/{id}` | portal, any client | One meeting by UUID | `tx` |
 | `GET /v2/meetings` | portal, any client | List meetings. Filters: `user`, `from`, `to`, `status`, `external_id`; cursor paging | `tx` |
 | `POST /v2/meetings/{id}/stop` | portal ("stop bot") | Stop the bot in that one meeting now | `bot` |
+| `DELETE /v2/meetings/{id}` | portal, any client | Erase one **finished** meeting's artifacts and our rows for it (§8.11) | `tx` |
 | `/v2/webhooks…` | client admin | Manage webhook subscriptions (§7.2) | `bot` |
 
-- **Auth:** the account's API key, exactly as today (runbook step 8; AbroadWorks' key is in Secret `aw-bots-portal-api-key`, namespace `notetaker`). The gateway adds `x-user-id` (`gateway/app.py:412`).
-- **Route table:** new rows in `core/meetings/routes.v1.json`. The account key must carry both `bot` and `tx` (see open item O2).
+- **Auth:** an API key of the account, one per consuming system (§8.10: `aw-bots-key-calendar-dispatcher`, `aw-bots-key-portal`, `aw-bots-key-exporter`). The gateway checks the scope and adds `x-user-id` (`gateway/app.py:383-384, 412`).
+- **Route table:** new rows in `core/meetings/routes.v1.json` (and `core/identity/routes.v1.json` for `/v2/webhooks…`), each with the scope above.
 
 ### 5.2 Entry fields (`PUT /v2/entries`)
 
@@ -224,10 +229,14 @@ Every error has the body `{ "error": { "code": "...", "message": "..." } }`.
 | 400 | `too_far_ahead` | `start` > now + `ENTRY_MAX_DAYS_AHEAD` | send again later |
 | 400 | `already_ended` | `end` ≤ now (and not `join_now`) | drop it |
 | 401 / 403 | `unauthorized` / `forbidden` | bad key / missing scope | fix config |
-| 429 | `rate_limited` | the account's write limit (§8.11) was hit; `Retry-After` is set | back off, then resend |
+| 429 | `rate_limited` | the account's entry-write rate (§8.11) was hit; `Retry-After` is set | back off, then resend |
+| 429 | `quota_exceeded` | a standing account quota is full: active entries, or webhook subscriptions (§8.11); no `Retry-After` | stop; remove entries or ask for a higher quota |
+| 409 | `meeting_not_finished` | `DELETE /v2/meetings/{id}` on a meeting that is scheduled or live | remove its entries or stop it first |
 | 404 | `entry_not_found` | remove of an entry never sent | drop it |
 | 404 | `meeting_not_found` | unknown UUID | — |
 | 503 | `unavailable` | database/Redis down | retry with backoff |
+
+- 401, 403 and 429 `rate_limited` are answered by the gateway before meeting-api is reached; for `/v2` paths the gateway uses this body shape too, so a client parses one shape.
 
 ---
 
@@ -346,7 +355,7 @@ Same request as §6.2.
 - **Send:** `PUT /v2/entries`, same `external_id`, new `meeting_url`.
 - **Reply:**
   - `updated`: the meeting moves to the new room.
-  - Or, if the new room matches an existing meeting (R1), `updated` with a new `meeting.id` and `previous_meeting_id` set. The old meeting is removed if no entries remain on it.
+  - Or, if the new room matches an existing meeting (R1), `updated` with a new `meeting.id` and `previous_meeting_id` set. The old meeting is removed if no entries remain on it (outcome `cancelled_by_calendar`, detail `entry_moved`).
 
 ### 6.10 Title changed
 
@@ -427,12 +436,12 @@ For example, a call between an AbroadWorks user and a user of another client.
 
 | Method + path | Does |
 |---|---|
-| `POST /v2/webhooks` `{url, secret?, events, description}` | Add a subscriber. The receiving system normally supplies the URL and the shared secret it will verify with (the standard arrangement); if `secret` is omitted, aw-bots generates one and returns it **once** in `{id, secret}`. `events: []` means all events. |
+| `POST /v2/webhooks` `{url, secret?, events, description}` | Add a subscriber. The receiving system normally supplies the URL and the shared secret it will verify with (the standard arrangement); if `secret` is omitted, aw-bots generates one and returns it **once** in `{id, secret}`. `events: []` means all events; each listed event must be a `webhook.v1` `EventType`. At most 20 per account (`quota_exceeded`, §8.11). |
 | `GET /v2/webhooks` | List (secrets never shown; `secret_last4` only) |
 | `PATCH /v2/webhooks/{id}` `{url?, events?, active?, description?}` | Change |
 | `DELETE /v2/webhooks/{id}` | Remove |
-| `POST /v2/webhooks/{id}/rotate-secret` `{secret?}` | New secret (supplied or generated, shown once). The old one keeps being accepted for 24 h (both signatures are sent, §7.4). |
-| `POST /v2/webhooks/{id}/test` | Sends a `webhook.test` event now |
+| `POST /v2/webhooks/{id}/rotate-secret` `{secret?}` | New secret (supplied or generated, shown once). The old one keeps being accepted for 24 h (its signature is sent in its own header, §7.4). |
+| `POST /v2/webhooks/{id}/test` | Sends a `webhook.test` event to that one subscriber now (admin-api asks meeting-api's internal test route, §8.6) |
 | `GET /v2/webhooks/{id}/deliveries?limit=&before=` | The delivery log (§7.5) |
 
 - **URL check:** on save and again on every send, by the existing SSRF guard (`webhooks/ssrf.py:149-261`).
@@ -460,6 +469,7 @@ Every event carries the full meeting object (as in §5.4) with `id` (UUID), `ent
 - `completion_reason` stays the sealed set (`lifecycle/machine.py:37-49`: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded`). Ours is the additive `outcome` block (§3).
 - **New event types touch a sealed enum.** `event_type` is `$ref EventType` in `contracts/webhook.v1/webhook.schema.json`; adding `meeting.scheduled`, `meeting.updated`, `meeting.removed`, `meeting.waiting_for_room`, `meeting.not_sent`, `export.*`, `bot.retry` and `webhook.test` changes the sealed schema (§8.9). `data` is open (`additionalProperties` not locked), so adding `uuid`, `entries`, `outcome`, `sequence` to the meeting object is back-compatible.
 - **Transcription is not an aw-bots event.** aw-bots' job ends at `export.handed_off`.
+- **Erasure sends no event.** `DELETE /v2/meetings/{id}` answers the caller; there is no `meeting.deleted` (§8.11).
 
 **Envelope:**
 
@@ -476,7 +486,7 @@ Every event carries the full meeting object (as in §5.4) with `id` (UUID), `ent
 }
 ```
 
-- `event_id` is unique per event and stays the same across retries. Receivers dedupe on it. Today's id is `sha256(connection_id | event_type | new_status)` (`lifecycle/webhook.py:67-80`), which needs a bot run; the new events have none, so **every** event's id becomes `evt_` + `sha256(meeting uuid | event_type | sequence)`, computed under the same row lock that increments `sequence`.
+- `event_id` is unique per event and stays the same across retries. Receivers dedupe on it. Today's id is `sha256(connection_id | event_type | new_status)` (`lifecycle/webhook.py:67-80`), which needs a bot run; the new events have none, so **every** event's id becomes `evt_` + `sha256(meeting uuid | event_type | sequence)`, computed under the same row lock that increments `sequence` and stored, with the full envelope, in `webhook_outbox` in the same transaction as the change (§8.6). A retry or a replay sends those stored bytes; nothing is rebuilt.
 - `sequence` goes up by one with every event of that meeting. Receivers ignore an event whose `sequence` is lower than one they have already applied, because deliveries can arrive out of order after retries.
 
 ### 7.4 Signing
@@ -484,7 +494,7 @@ Every event carries the full meeting object (as in §5.4) with `id` (UUID), `ent
 This is the same scheme the exporter already verifies (`webhooks/delivery.py:73-99`, `exporter/signature.py:18-38`), so there is one scheme across aw-bots.
 - `X-Webhook-Timestamp: <unix seconds>`
 - `X-Webhook-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>." + raw body)>`
-- During the 24 h after a rotation: `sha256=<new>,sha256=<old>`. A receiver accepts either.
+- During the 24 h after a rotation, also `X-Webhook-Signature-Previous: sha256=<hex HMAC-SHA256(old secret, same input)>`. A receiver accepts a match on either header. (`X-Webhook-Signature` stays exactly one value: sealed `webhook.v1` `SignatureHeaders` pins `^sha256=[0-9a-f]{64}$`, and the exporter compares the whole header; the new header is an optional, additive property of `SignatureHeaders`, §8.9.)
 - A receiver rejects a timestamp more than 300 s off.
 - **No `Authorization: Bearer <secret>` header** on subscription deliveries. The legacy sender adds one (`delivery.py:80-99`); it isn't needed and it exposes the secret itself.
 
@@ -493,8 +503,8 @@ This is the same scheme the exporter already verifies (`webhooks/delivery.py:73-
 - **Timeout** 10 s.
 - **Retried on:** 5xx, 429, timeout or connection error. The schedule is 1 min, 5 min, 30 min, 2 h (Vexa's existing backoff, `webhooks/retry.py:56-58`); after the last attempt the delivery is marked `dead`.
 - **Other 4xx:** `failed`, not retried.
-- The queue item stores the **subscription id, not the secret**. The existing queue stores the secret in Redis (`retry.py:95-106`).
-- **Log:** table `webhook_deliveries`, one row **per attempt**: `event_id`, `event_type`, `meeting_id` (UUID), `attempt`, `outcome`, `status_code`, `error`, `created_at`. Kept 30 days. The existing ledger keeps only first attempts, 100 per user, in Redis (`webhooks/ledger.py:32-111`).
+- The stream item stores only `event_id`, `subscription_id`, `attempt` and `not_before`: never the secret (the existing queue stores it in Redis, `retry.py:95-106`) and never the payload, which is read from `webhook_outbox` (§8.6).
+- **Log:** table `webhook_deliveries`, one row **per attempt**: `event_id` (FK → `webhook_outbox`), `subscription_id`, `event_type`, `meeting_id` (UUID), `attempt`, `outcome` (`delivered`/`retrying`/`failed`/`dead`), `status_code`, `error`, `created_at`. Kept 30 days. The existing ledger keeps only first attempts, 100 per user, in Redis (`webhooks/ledger.py:32-111`).
 
 ---
 
@@ -526,15 +536,29 @@ admin-api owns the schema. `ensure_schema` creates missing tables, columns and i
 | `created_at`, `updated_at`, `removed_at` | timestamptz | |
 
   - Unique on (`user_id`, `source_user`, `external_id`).
-  - Indexes on (`meeting_id`), (`user_id`, `platform`, `native_meeting_id`, `state`) and a GIN index on `attendees` for the `user=` filter.
-- **New tables `webhook_subscriptions`** (`id` uuid, `user_id`, `url`, `secret_enc`, `secret_last4`, `previous_secret_enc`, `previous_secret_expires_at`, `events` text[], `active`, `description`, timestamps; `*_enc` = AES-256-GCM, §7.2) **and `webhook_deliveries`** (§7.5).
+  - Indexes on (`meeting_id`), (`user_id`, `platform`, `native_meeting_id`, `state`), a GIN index on `attendees` for the `user=` filter, and a partial index `(user_id) WHERE state = 'active'` for the entry quota (§8.11).
+  - **Foreign keys:** `meeting_entries.meeting_id` is `ON DELETE RESTRICT` (an entry-managed meeting is never hard-deleted, §8.4); `meeting_aw_state.meeting_id` and `webhook_outbox.meeting_id` are `ON DELETE CASCADE`, and `webhook_deliveries.event_id` cascades from `webhook_outbox`, so upstream's planned-row delete of an entry-less meeting keeps working.
+- **New tables `webhook_subscriptions`** (`id` uuid, `user_id`, `url`, `secret_enc` + `enc_key_id`, `secret_last4`, `previous_secret_enc` + `previous_enc_key_id`, `previous_secret_expires_at`, `events` text[], `active`, `description`, timestamps; `*_enc` = AES-256-GCM, §7.2) **and `webhook_deliveries`** (§7.5).
+- **New table `webhook_outbox`** — the durable record of every event (§8.6):
+
+| Column | Type | Notes |
+|---|---|---|
+| `event_id` | text PK | `evt_` + sha256(meeting uuid \| event_type \| sequence), §7.3 |
+| `meeting_id` | int FK → meetings.id, null | null only for `webhook.test` |
+| `event_type` | text | a `webhook.v1` `EventType` |
+| `sequence` | bigint | the meeting's `sequence` for this event |
+| `payload` | jsonb | the full envelope, exactly as sent |
+| `created_at` | timestamptz | |
+| `published_at` | timestamptz null | set once its stream items are added |
+
+  - Written in the **same transaction** as the state change it describes. Index `(created_at) WHERE published_at IS NULL` for the repair sweep.
 - **The one-live-bot-per-room index (R2):**
   - Add `uq_meeting_live_user_platform_native` on `meetings (user_id, platform, platform_specific_id)` `WHERE status IN ('requested','joining','awaiting_admission','needs_help','active','stopping')`.
   - Drop `uq_meeting_active_user_platform_native`, which today covers every non-finished status including `scheduled` (`sessions/models.py:111-116`).
-  - `ensure_schema` matches by name and won't alter an existing index, so this is a **manual step on the live database**, like MIGRATION-0002: create the new index `CONCURRENTLY`, then drop the old one `CONCURRENTLY`. It gets a `MIGRATION-0003-…md` next to `admin_api/schema/MIGRATION-0002-meeting-active-dedup-index.md`.
+  - `ensure_schema` matches by name and won't alter an existing index, so this is a **manual step on the live database**, like MIGRATION-0002: create the new index `CONCURRENTLY`, then drop the old one `CONCURRENTLY`. It gets `admin_api/schema/MIGRATION-0008-meeting-live-dedup-index.md` (0001–0007 are taken; corrected 2026-09-26), in the style of `MIGRATION-0002-meeting-active-dedup-index.md`. The same runbook adds `meetings.uuid` and its unique index, and the due-sweep index, `CONCURRENTLY` before the deploy, so `ensure_schema` finds them present and takes no lock on the live table.
   - Order: new index first, then deploy the new code, then drop the old one.
-  - **Everything that assumes one non-finished row per room must change or be checked in the same change**, because the old index was what made that assumption true: the claim-in-place branch (`bot_spawn/adapters.py:533-556`, §8.3), the auto-join live-sibling guard (`auto_join.py:246-279`, §8.3), the spawn dedup list at `bot_spawn/adapters.py:485` (which omits `needs_help` and `stopping` and relied on the index to catch them — it becomes the full live set), and Vexa's own calendar-sync adoption (`calendar_sync/service.py:572-578`, unused here, O7). Upstream's `POST /meetings` keeps its 409 on any non-finished row for the link because that check is in code (`collector/adapters.py:1234-1244`), not the index; the Vexa terminal therefore cannot plan a second occurrence on a room that already has one, which is acceptable.
-  - Both model copies carry comments saying `_sync_indexes` swallows a failed unique index (`admin_api/schema/models.py:160-162`, `sessions/models.py:105`); in fact `sync.py:93-142` raises `SchemaInvariantError` and admin-api does not start. The migration must therefore run **before** the deploy, not be left for `ensure_schema` to retry.
+  - **Everything that assumes one non-finished row per room must change or be checked in the same change**, because the old index was what made that assumption true: the claim-in-place branch (`bot_spawn/adapters.py:533-556`; auto-join passes the row id and `POST /bots` claims by the R1 `join_now` rule, §8.3), the auto-join live-sibling guard (`auto_join.py:246-279`, §8.3), the spawn dedup list at `bot_spawn/adapters.py:485` (which omits `needs_help` and `stopping` and relied on the index to catch them — it becomes the full live set), and Vexa's own calendar-sync adoption (`calendar_sync/service.py:572-578`, unused here, O7). Upstream's `POST /meetings` keeps its 409 on any non-finished row for the link because that check is in code (`collector/adapters.py:1234-1244`), not the index; the Vexa terminal therefore cannot plan a second occurrence on a room that already has one, which is acceptable.
+  - admin-api's model says `_sync_indexes` swallows a failed unique index (`admin_api/schema/models.py:160-162`; corrected 2026-09-26: meeting-api's copy carries no such comment); in fact `sync.py:93-142` raises `SchemaInvariantError` and admin-api does not start. The comment is corrected in the same change. The migration must therefore run **before** the deploy, not be left for `ensure_schema` to retry.
 - **Meeting times:** `data.scheduled_at` stays the join time that auto-join reads (upstream's field). It is set to the earliest start of the meeting's active entries.
 - **New table `meeting_aw_state`** — everything this design adds to a meeting, as typed columns, 1:1 with `meetings` and owned by the intake module. Upstream's `meetings` table gains only `uuid`, which keeps upstream merges small and keeps our state indexable instead of buried in the `data` JSON blob:
 
@@ -554,7 +578,7 @@ admin-api owns the schema. `ensure_schema` creates missing tables, columns and i
 
 ### 8.2 Entry handling (new module `meeting_api/intake/`)
 
-The module talks to storage through one narrow interface (`IntakeStore`: find entry, list room meetings, attach, create, remove, recompute, bump sequence) with an in-memory fake beside the real adapter, the way `collector/fakes.py` and `bot_spawn/fakes.py` already work, so every row of §6 is a unit test and the real adapter is proven once against Postgres (§11.2). It calls the existing spawn service and the existing stop path; it does not duplicate either.
+The module talks to storage through one narrow interface (`IntakeStore`: find entry, list room meetings, attach, create, remove, recompute, emit — which bumps `sequence` and writes the `webhook_outbox` row in the caller's transaction) with an in-memory fake beside the real adapter, the way `collector/fakes.py` and `bot_spawn/fakes.py` already work, so every row of §6 is a unit test and the real adapter is proven once against Postgres (§11.2). It calls the existing spawn service and the existing stop path; it does not duplicate either.
 
 **`PUT /v2/entries`**, under a Postgres advisory lock on (account, platform, room):
 1. Validate the fields and parse the link.
@@ -563,7 +587,7 @@ The module talks to storage through one narrow interface (`IntakeStore`: find en
 4. Otherwise, match R1: a non-finished meeting in the account with the same room and an overlapping time.
    - Match found → attach the entry.
    - No match → create a meeting (`status='scheduled'`, `data.auto_join=true`).
-5. If the entry left a meeting that has no active entries left, that meeting is removed (R8).
+5. If the entry left a meeting that has no active entries left, that meeting is removed (R8; outcome detail `entry_moved`). When the entry moves between rooms, both rooms' locks are taken, always in sorted order, so two opposite moves cannot deadlock.
 6. Recompute each affected meeting's start and end from its entries (R1).
 7. Emit the webhooks and reply.
 
@@ -577,13 +601,13 @@ The module talks to storage through one narrow interface (`IntakeStore`: find en
 
 ### 8.3 Auto-join (`bot_spawn/auto_join.py`)
 
-- **Spawn the exact meeting.** Today the spawn path (`bot_spawn/adapters.py:459-573`, `create_meeting_guarded`) claims the **newest** `idle`/`scheduled` row for the room (`:533-556`). With many scheduled rows per room, that would be the wrong one (a standup two weeks out). Auto-join passes the row id and the spawn claims exactly that row.
+- **Spawn the exact meeting.** Today the spawn path (`bot_spawn/adapters.py:459-573`, `create_meeting_guarded`) claims the **newest** `idle`/`scheduled` row for the room (`:533-556`). With many scheduled rows per room, that would be the wrong one (a standup two weeks out). Auto-join passes the row id and the spawn claims exactly that row. Upstream `POST /bots` has no row id: it claims by the R1 `join_now` rule (the earliest non-finished row on the room with `end > now` and `start ≤ now + JOIN_NOW_ADOPT_AHEAD_S`), else inserts a new row — never a future occurrence.
 - **Due window (R6):** `[scheduled_at − lead, scheduled_end_at]` for meetings that have entries; `AUTO_JOIN_GRACE_S` no longer bounds them (`auto_join.py:118`). Rows without entries (planned through Vexa's own routes) keep today's window.
 - **Room busy (R2):** today a live sibling gives `skipped_live` with a retry time (`auto_join.py:246-279`). New:
   - if the sibling is an open-ended `join_now` meeting, merge into it (R2 exception) instead of waiting;
   - otherwise send `meeting.waiting_for_room` once and keep the meeting due until its `scheduled_end_at`.
 - **Not sent (R6):** a new step in the same sweep. A `scheduled` meeting whose `scheduled_end_at` has passed becomes `failed` with outcome `not_sent` (detail = the last `auto_join_error`, or `ended_before_sent`) and webhook `meeting.not_sent`.
-- Settings unchanged: sweep 30 s (`AUTO_JOIN_SWEEP_INTERVAL_S`, `__main__.py:542`), lead 300 s (ours; code default `DEFAULT_LEAD_S = 120` at `auto_join.py:63`, read at `__main__.py:545`), backoff 300 s (`:547`). Grace (`:546`, hard-coded 600) still applies to entry-less rows only.
+- Settings unchanged: sweep 30 s (`AUTO_JOIN_SWEEP_INTERVAL_S`, `__main__.py:542`), lead 300 s (ours; code default `DEFAULT_LEAD_S = 120` at `auto_join.py:63`, read at `__main__.py:545`), backoff 300 s (`:547`). Grace (`AUTO_JOIN_GRACE_S`, `:546`, default 600) still applies to entry-less rows only.
 
 ### 8.4 Room-code lookups
 
@@ -597,6 +621,7 @@ Today these routes pick the **newest** row for a room (full list in §13.2). Onc
 
 - The bot's own status callbacks are keyed by session (`POST /bots/internal/callback/lifecycle` → `connection_id` = `session_uid`, `app.py:409-546`), and recordings by session too (`recordings/router.py:182-266`). Neither changes.
 - Vexa's own dashboard (the terminal) uses the room-code edit routes. For a room with several scheduled meetings, it gets the `ambiguous_room` error rather than a wrong edit.
+- **Entry-managed meetings are edited only through `/v2/entries`.** Upstream's planned-edit routes (`PATCH`/`DELETE /meetings/{id}`, their native-keyed forms, `PUT …/intent`) answer `409` with `{"detail": "this meeting is managed through /v2/entries", "code": "managed_by_entries"}` for a meeting that has entries. Otherwise a direct edit would be undone by the next entry recomputation, and a hard delete would orphan its entries. Descriptions (`annotate`), reads and `POST …/share` stay open.
 
 ### 8.5 Stopping one meeting
 
@@ -612,10 +637,11 @@ A user stop overrides the bot's reason with `stopped` (`lifecycle/machine.py:56-
 - **On every event**, meeting-api:
   1. loads the account's active subscriptions from admin-api `GET /internal/users/{id}/webhook-subscriptions` (cached 30 s) — the same `ADMIN_API_URL` + `INTERNAL_API_SECRET` edge auto-join already uses for bot context (`__main__.py:771-795`);
   2. filters them by event;
-  3. appends one delivery item per subscriber (event id, subscription id, attempt) to a Redis Stream `aw:webhook-deliveries`, in the same transaction boundary as the state change (outbox: the item is written after commit by the same request, and a 60-second sweep re-enqueues any event whose `webhook_deliveries` row is missing, so a crash between commit and enqueue loses nothing);
-  4. **sender workers** read the stream through a **consumer group**, one consumer per meeting-api replica (there are two today, and the count may grow). A claimed item that is not acknowledged within 60 s is reclaimed with `XAUTOCLAIM`, so a replica dying mid-send only delays that delivery. Each attempt signs, posts with a 10 s timeout, writes its `webhook_deliveries` row and either acknowledges or schedules the retry (§7.5) by re-adding the item with a `not_before`. The legacy 5 s drain tick (`_webhook_drain_loop`, `__main__.py:417-443`) keeps serving the system URL and is not reused.
+  3. **outbox:** the event row is already in `webhook_outbox`, committed with the state change (§8.1). After commit the same request adds one item per matching subscriber (`event_id`, `subscription_id`, `attempt`, `not_before`) to the Redis Stream `aw:webhook-deliveries` and sets `published_at`. A 60-second **repair sweep** publishes every row with `published_at IS NULL` older than 60 s, so a crash between commit and publish loses nothing. A crash after some items were added but before `published_at` was set publishes that event again: receivers already dedupe on `event_id` (at-least-once, §7.3). Subscriptions are read at publish time, so a subscriber added later never receives older events;
+  4. **sender workers** read the stream through a **consumer group** (`aw-senders`, consumer name = pod name), one consumer per meeting-api replica (there are two today, and the count may grow). A claimed item that is not acknowledged within 60 s is reclaimed with `XAUTOCLAIM`, so a replica dying mid-send only delays that delivery. Each attempt reads the payload from `webhook_outbox`, signs those bytes, posts with a 10 s timeout, writes its `webhook_deliveries` row and either acknowledges or schedules the retry (§7.5) by re-adding the item with a `not_before`. The legacy 5 s drain tick (`_webhook_drain_loop`, `__main__.py:417-443`) keeps serving the system URL and is not reused.
   5. The two new sweeps — not-sent (§8.3) and outbox repair — run under the existing per-loop single-flight advisory lock (`sweeps/single_flight.py`, used by every sweep in `__main__.py:280-288`), so two replicas never run one sweep twice.
 - **Ordering:** at-least-once, not in-order. Receivers order by `sequence` per meeting and dedupe on `event_id` (§7.3); the sender never serialises on a slow subscriber.
+- **`webhook.test`:** admin-api calls meeting-api `POST /internal/webhooks/test` (`INTERNAL_API_SECRET`), which writes an outbox row with `meeting_id` null and publishes it to that one subscription at once; it is not replayed by the sweep.
 - **SSRF:** the existing guard, plus the allow-list (§7.2).
 - **`sequence`:** `meeting_aw_state.event_seq`, increased under the same row lock as the change.
 
@@ -630,6 +656,7 @@ A user stop overrides the bot's reason with `stopped` (`lifecycle/machine.py:56-
 - **New, after `/process`:** `POST /internal/meetings/{id}/export` to meeting-api, with `{state: "handed_off" | "failed", s3_path, error?}`. The exporter calls this internal route directly in-cluster with `Authorization: Bearer <INTERNAL_API_SECRET>`, the auth `/internal/recordings/upload` uses (`recordings/router.py:241-252`); `/internal/*` is not in the gateway route table and the gateway refuses undeclared routes (`gateway/app.py:372-382`). Its **reads** (`GET /recordings`, meeting detail) move to the gateway with the exporter's own key (§8.10). meeting-api stores the result in `meeting_aw_state.export_*` (shown in the meeting object as `export`) and emits `export.handed_off` / `export.failed`.
 - The `idempotency_key` stays the meeting UUID: one processing per meeting. A `continue_meeting` rerun (`find_latest`, `bot_spawn/adapters.py:140-156`) would be deduped by the worker for 24 h; we don't use that route.
 - The portal reads transcripts from `export.s3_path`.
+- **The exporter deletes no meeting data**, and neither does the bot (it has no S3 delete code). The exporter writes the export folder and never deletes from `aw-chatworks-transcribe`; its IAM role grants no `s3:DeleteObject` there (`deployment/aws/iam/abroadworks-aw-exporter-role/permissions-policy.json`). Its only deletes are its own queue markers under `aw-bots/aw-exporter/` (a finished job removes its `pending/` marker, a failed one moves it to `failed/`; `exporter/queue.py:107, 113`), unchanged by this design. No IAM change.
 
 ### 8.8 Settings (all new ones in `values.yaml`, never in code)
 
@@ -642,7 +669,11 @@ A user stop overrides the bot's reason with `stopped` (`lifecycle/machine.py:56-
 | `WEBHOOK_DELIVERY_RETENTION_DAYS` | 30 | admin-api |
 | `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | Helm Secret key ring + active id (§7.2) | meeting-api, admin-api |
 | `INTAKE_RATE_LIMIT_PER_MIN` | 600 writes per account (§8.11) | gateway |
+| `INTAKE_MAX_ACTIVE_ENTRIES` | 100000 per account (§8.11) | meeting-api |
+| `WEBHOOK_MAX_SUBSCRIPTIONS` | 20 per account (§8.11) | admin-api |
 | `VEXA_JITSI_HOSTS` | add `meet.abroadworks.com` (handoff §6 B13) | meeting-api |
+
+**Dependencies** (owner decision 2026-09-26, the canonical §10A.2 pins): `cryptography==42.0.5` (AES-256-GCM, §7.2) and `prometheus-client==0.19.0` (§8.11) in meeting-api and admin-api (`pyproject.toml` and the Dockerfile `uv pip install` line). Portal: `ioredis` (§10.1), a Node dependency outside §10A.2 like `pg`, recorded in aw-notetaker `CHANGELOG.md`. Nothing else is added.
 
 ### 8.9 Seals and gates (`node scripts/gates.mjs all`, also on pre-push)
 
@@ -650,9 +681,9 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 
 | Sealed artefact | What this design changes | Step |
 |---|---|---|
-| `schema.seal.json` (gate `db-schema`: every table + column of both model copies) | `meetings.uuid`; tables `meeting_entries`, `webhook_subscriptions`, `webhook_deliveries` | `pnpm seal:schema`, `lane:schema` review. Note the index swap itself is not in the seal (columns only) but the new index name is in both models. |
-| `contracts.seal.json` (gate `contract-version`) | `webhook.v1`: new `EventType` values (§7.3). `lifecycle.v1`: **untouched** by design (§3 "Reasons") | Back-compatible → `pnpm seal:contracts` in a `lane:contract` PR; the gate's own rule is that a breaking change needs `webhook.v2` instead — adding enum values is treated as back-compatible here because the existing golden files still validate, and that call is made in the PR |
-| `architecture.calm.json` / `architecture.seal.json` (P23) | new module `meeting_api/intake/`, new flows calendar-dispatcher → gateway, meeting-api → subscribers, exporter → meeting-api | update the model in the same change, `pnpm seal:arch` |
+| `schema.seal.json` (gate `db-schema`: every table + column of both model copies) | `meetings.uuid`; tables `meeting_entries`, `meeting_aw_state`, `webhook_subscriptions`, `webhook_deliveries`, `webhook_outbox` | `pnpm seal:schema`, `lane:schema` review. Note the index swap itself is not in the seal (columns only) but the new index name is in both models. |
+| `contracts.seal.json` (gate `contract-version`) | `webhook.v1`: new `EventType` values (§7.3) and the optional `X-Webhook-Signature-Previous` in `SignatureHeaders` (§7.4). New `intake.v1` (below). `lifecycle.v1`: **untouched** by design (§3 "Reasons") | Back-compatible → `pnpm seal:contracts` in a `lane:contract` PR; the gate's own rule is that a breaking change needs `webhook.v2` instead — adding enum values and an optional header is treated as back-compatible here because every existing golden file still validates, and that call is made in the PR |
+| `architecture.calm.json` / `architecture.seal.json` (P23) | new module `meeting_api/intake/`, new flows calendar-dispatcher → gateway, portal → gateway, meeting-api → subscribers, admin-api → meeting-api (`webhook.test`), exporter → gateway (reads) and exporter → meeting-api (export result) | update the model in the same change, `pnpm seal:arch` |
 
 `contract-conformance` also drives the golden webhook examples against real responses, so the enriched meeting projection (§8.7) needs its golden files regenerated, not hand-edited.
 
@@ -670,31 +701,35 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 
 - **Rotation** (no downtime): mint the new token with the same name and `expires_in` 365 d → update the Secret → roll the Deployment → revoke the old token by id. `expires_at` is monitored (§8.11) so a key never lapses unnoticed.
 - **Today's state, corrected:** user 1 holds two tokens, ids 1 and 2, both named `portal`, neither used. They cannot be told apart, so **both are revoked** and the three tokens above are minted; the existing Secret `aw-bots-portal-api-key` is replaced by `aw-bots-key-portal`.
-- **The exporter stops impersonating the account.** Today it calls meeting-api directly with a bare `X-User-Id: 1` header (rearchitecture D12), which any pod in the cluster could also do, since the cluster enforces no NetworkPolicy. It now goes through the gateway with its own key for reads, and uses `INTERNAL_API_SECRET` only for the two internal writes (recording upload, export result). Direct `X-User-Id` access is then not used by anything of ours.
+- **The exporter stops impersonating the account.** Today it calls meeting-api directly with a bare `X-User-Id: 1` header (rearchitecture D12), which any pod in the cluster could also do, since the cluster enforces no NetworkPolicy. It now goes through the gateway with its own key for reads (`GET /recordings`, `/recordings/{id}/master`, the transcript; all already in the route table under `bot`/`tx`), and uses `INTERNAL_API_SECRET` only for its one internal write, the export result (§8.7). Direct `X-User-Id` access is then not used by anything of ours.
 - **The bot's lifecycle callback secret is enforced.** `POST /bots/internal/callback/lifecycle` accepts any caller today (§14.1, `meeting_api/app.py:932-938`) although the bot sends `x-internal-secret` (`services/bot/src/adapters/lifecycle-http.ts:68`). This design adds an internal write route of its own, so the callback check is in scope: meeting-api compares the header with `INTERNAL_API_SECRET` in constant time and rejects a mismatch with 401. This is a real fix at the producer, not a workaround.
 - **The dispatcher and the portal never hold each other's key**, and no key is ever logged, echoed in an error body or written to a meeting row.
 
 ### 8.11 Limits, observability, retention and scale
 
-**Limits (per account, enforced at the gateway; 429 `rate_limited` with `Retry-After`):**
+**Limits (per account).** A rate says "slow down" and a quota says "stop", so they answer differently (§5.5):
 
-| Limit | Value | Why |
-|---|---|---|
-| entry writes (`PUT` + remove) | 600 / min | a full resync of 6 000 entries takes 10 min at this rate; a runaway client cannot starve the bots |
-| active entries | 100 000 | ~7 000 users × 14 days; raise per client |
-| webhook subscriptions | 20 | fan-out cost is events × subscribers |
-| `metadata` per entry | 16 KB | matches upstream's annotate bound |
+| Limit | Value | Enforced by | Refusal | Why |
+|---|---|---|---|---|
+| entry writes (`PUT` + remove) | 600 / min (`INTAKE_RATE_LIMIT_PER_MIN`) | gateway, one counter per account in Redis (the gateway's `REDIS_URL`), so the limit holds whatever the replica count; the existing per-process token bucket (`gateway/ratelimit.py`) stays the general DoS guard | 429 `rate_limited` + `Retry-After` | a full resync of 6 000 entries takes 10 min at this rate; a runaway client cannot starve the bots |
+| active entries | 100 000 (`INTAKE_MAX_ACTIVE_ENTRIES`) | meeting-api, checked only when a write adds an active entry, by an index-only count on the partial index (§8.1); concurrent writers on different rooms can overshoot by at most their number | 429 `quota_exceeded` | ~7 000 users × 14 days; raised per client |
+| webhook subscriptions | 20 (`WEBHOOK_MAX_SUBSCRIPTIONS`) | admin-api | 429 `quota_exceeded` | fan-out cost is events × subscribers |
+| `metadata` per entry | 16 KB | meeting-api | 400 `invalid_request` | matches upstream's annotate bound |
 
-**Metrics** (Prometheus, the exporter already exposes `/metrics`; meeting-api and admin-api gain the same), every one labelled by `user_id` (account):
-`aw_intake_requests_total{route,result}`, `aw_intake_request_seconds`, `aw_meetings_by_status` (gauge), `aw_meetings_not_sent_total{detail}`, `aw_autojoin_lag_seconds` (bot sent minus `scheduled_at − lead`; the number that says whether bots are on time), `aw_webhook_deliveries_total{event_type,outcome}`, `aw_webhook_delivery_seconds`, `aw_webhook_stream_pending` (gauge), `aw_export_total{state}`, `aw_api_token_expires_seconds{name}`. The calendar module adds `aw_calendar_read_total{outcome}`, `aw_calendar_entries_sent_total{result}` and `aw_calendar_cycle_seconds`.
+**Metrics** (Prometheus). No aw-bots service exposes `/metrics` today (corrected 2026-09-26); meeting-api and admin-api gain one, off the gateway's route table so it is never public. `aw_export_total` is counted in meeting-api at the export-result route, so the exporter needs no metrics code. Every metric is labelled by `user_id` (account):
+`aw_intake_requests_total{route,result}`, `aw_intake_request_seconds`, `aw_meetings_by_status` (gauge over the non-terminal statuses only, refreshed by the not-sent sweep; terminal totals come from the counters, so no query ever counts history), `aw_meetings_not_sent_total{detail}`, `aw_autojoin_lag_seconds` (bot sent minus `scheduled_at − lead`; the number that says whether bots are on time), `aw_webhook_deliveries_total{event_type,outcome}`, `aw_webhook_delivery_seconds`, `aw_webhook_stream_pending` (gauge), `aw_export_total{state}`, `aw_api_token_expires_seconds{name}`. The calendar module adds `aw_calendar_read_total{outcome}`, `aw_calendar_entries_sent_total{result}` and `aw_calendar_cycle_seconds`.
 
 **Logs:** structured JSON; every line about a meeting carries `meeting_uuid`, `external_id`, `user` and `account`; never a token, secret, URL query string or transcript text.
 
-**Alerts:** `not_sent` above 1 % of meetings over 1 h; any `dead` delivery; stream pending above 1 000 for 5 min; auto-join lag p95 above 60 s; calendar read failures for one user above 30 min; a token expiring within 30 d; the not-sent or outbox sweep not run for 5 min.
+**Scraping:** the cluster runs plain `prom/prometheus` v2.47.0 (no operator; talke `deployment/monitoring-stack/`), discovering pods by `kubernetes_sd` and the `prometheus.io/scrape`, `prometheus.io/port`, `prometheus.io/path` annotations. The chart gets per-service pod annotations (`meetingApi.podAnnotations`, `adminApi.podAnnotations`, empty by default; `global.podAnnotations` would mark every pod, including ones with no `/metrics`, as a target), and our `values.yaml` sets them for meeting-api and admin-api. Each sweep also sets `aw_sweep_last_run_timestamp_seconds{sweep}` so a stalled sweep is visible.
+
+**Alerts** (one rule group `aw-bots` in the format of talke's `serverFiles.alerting_rules.yml`, kept in aw-notetaker `deployment/base/aw-bots/alerts.yml`; no `PrometheusRule` objects): `not_sent` above 1 % of meetings over 1 h; any `dead` delivery; stream pending above 1 000 for 5 min; auto-join lag p95 above 60 s; calendar read failures for one user above 30 min; a token expiring within 30 d; the not-sent or outbox sweep not run for 5 min; an outbox row unpublished for more than 5 min.
 
 **Retention and deletion:**
-- Meetings, entries and `meeting_aw_state` are kept as history. `DELETE /v2/meetings/{id}` performs upstream's artifact deletion (transcript rows, recordings) and additionally deletes that meeting's entries and delivery rows; the terminal meeting row remains as lifecycle evidence, as upstream documents. This is the per-meeting erasure path for a data-subject request; the S3 recording folder is deleted by the same call through the exporter's `export_s3_path`.
-- `webhook_deliveries` rows are pruned after `WEBHOOK_DELIVERY_RETENTION_DAYS` (30) by a daily admin-api sweep.
+- Meetings, entries and `meeting_aw_state` are kept as history.
+- **`DELETE /v2/meetings/{id}`** is the per-meeting erasure path (owner decision 2026-09-26). It works only on a **finished** meeting (else 409 `meeting_not_finished`: a scheduled meeting is cancelled by removing its entries, a live one by stopping it, R8). It runs upstream's completed-artifact deletion (`collector/app.py:588-628`: meeting-api's own raw recording objects in bucket `aw-bots` under `recordings/<user>/<recording>/`, then the transcript rows) and deletes that meeting's `meeting_entries`, `webhook_deliveries` and `webhook_outbox` rows. The terminal meeting row and `meeting_aw_state` remain as lifecycle evidence, as upstream documents. It sends no webhook.
+- **Nothing in this design deletes from `aw-chatworks-transcribe`.** The export folder under `recordings/` stays under that bucket's existing lifecycle rules and the portal's existing deletion path; the exporter and the bot delete no meeting data (§8.7). No IAM change.
+- `webhook_deliveries` rows, then published `webhook_outbox` rows with no remaining delivery, are pruned after `WEBHOOK_DELIVERY_RETENTION_DAYS` (30) by a daily admin-api sweep under a single-flight lock. An unpublished outbox row is never pruned (it alerts instead).
 - The calendar module's `aw_entries` rows are deleted once their `end_at` passes (§9.3); it holds nothing else about a meeting.
 
 **Scale envelope** (the numbers the design is sized for; each is a table lookup or a counter, none is a scan):
@@ -706,7 +741,7 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 | full resync (6-hourly) | 4 200 writes in 7 min | 42 000 writes in 70 min, paced by the limit |
 | Google reads per day (60 s poll) | 144 000 | 1.44 M — above the default 1 M/day project quota, so at that size push notifications become the trigger and the poll drops to a 10-minute safety net (`POLL_INTERVAL_SECONDS`), which the code already supports (`POST /webhooks/google-calendar`) |
 | due sweep | one indexed query per 30 s | same |
-| webhook events per day (≈ 8 / meeting × ≈ 300 meetings) | 2 400 × subscribers | 24 000 × subscribers |
+| webhook events per day (≈ 8 / meeting × ≈ 300 meetings) | 2 400 outbox rows; 2 400 × subscribers deliveries | 24 000 outbox rows; 24 000 × subscribers deliveries |
 
 ---
 
@@ -724,6 +759,7 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 - For `aw-bots` users:
   - the window is `AW_BOTS_HORIZON_DAYS` (14) instead of `CALENDAR_HORIZON_MINUTES` (1440);
   - `recurringEventId` is read for `series_id`; it isn't read today;
+  - the cycle hands an `aw-bots` user's events to the aw-bots path **before** the `DISPATCH_PLATFORMS` filter (`main.py:1427, 1454-1456`, applied at `:1865`; the live manifest sets `meet,zoom,teams`), which keeps governing the old path only — otherwise Jitsi events would be dropped (corrected 2026-09-26). aw-bots decides what it accepts (`unrecognized_link`, `platform_not_enabled`);
   - Jitsi links (`meet.abroadworks.com`, `meet.jit.si`) are detected; today detection covers Meet, Zoom and Teams only (`calendar_client.py:563-569`). Meet is found only through `hangoutLink` (`:563`); Zoom and Teams are scanned from `conferenceData.entryPoints[].uri`, `location` and `description`. Jitsi detection scans the same three fields for the configured hosts.
 
 ### 9.3 Sending
@@ -740,7 +776,7 @@ This work trips three sealed artefacts; each has its own step and review lane, a
   - 5xx or timeout: retried with backoff (60 s doubling to 1 h, as the read backoff, `main.py:241-273`).
 - **Replaced for `aw-bots` users:** the publish (`main.py:876`), the cancel (`main.py:1007-1009`), liveness (`main.py:821, 1310`), `_duplicate_bot` (`main.py:325-370`) and `_complete_finished_meetings`. aw-bots does all of that now.
 - The calendar module **doesn't write `tracked_meetings`** for `aw-bots` users; the portal reads their meetings from aw-bots (§10.3).
-- **Auth:** the account's API key from Secret `aw-bots-portal-api-key` (namespace `notetaker`, key `VEXA_API_KEY`; the same namespace as calendar-dispatcher; nothing references it yet), plus setting `AW_BOTS_BASE_URL` = `http://aw-bots-vexa-gateway.aw-bots.svc.cluster.local:8000` (`deployment/base/aw-bots/README.md:663-664`), header `X-API-Key`.
+- **Auth:** the calendar module's own key (§8.10) from Secret `aw-bots-key-calendar-dispatcher` (namespace `notetaker`, key `VEXA_API_KEY`), plus setting `AW_BOTS_BASE_URL` = `http://aw-bots-vexa-gateway.aw-bots.svc.cluster.local:8000` (`deployment/base/aw-bots/README.md:663-664`), header `X-API-Key`.
 - **`meeting_key.py`:** not used on this path. aw-bots parses and matches links itself (R1). `meeting_key.py` stays the canonicaliser for the old path. This is a change of responsibility and gets a CHANGELOG line.
 
 ---
@@ -749,12 +785,12 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 
 ### 10.1 Portal (for `aw-bots` users)
 
-- **Instant join:** the server route (`portal/src/app/api/dispatch/route.ts:96-189`, today `POST {DISPATCHER_BASE_URL}/dispatch` with `X-Dispatch-Token` at `:132-145`) calls `PUT /v2/entries` with `join_now` (§6.2) instead. Settings: `AW_BOTS_BASE_URL`, and the API key from Secret `aw-bots-portal-api-key`.
+- **Instant join:** the server route (`portal/src/app/api/dispatch/route.ts:96-189`, today `POST {DISPATCHER_BASE_URL}/dispatch` with `X-Dispatch-Token` at `:132-145`) calls `PUT /v2/entries` with `join_now` (§6.2) instead. Settings: `AW_BOTS_BASE_URL`, and the portal's own key (§8.10) from Secret `aw-bots-key-portal`.
 - **Lists and detail:** `GET /v2/meetings?user=<signed-in email>&from=&to=` instead of the `tracked_meetings` queries (dashboard `meetings.ts:159-164`, `:195-200`; paged/count/search around `:659`, `:825`, `:910`, `:959`; detail `meeting-detail.ts:79-105`; all on `TENANT_FILTER`, `meetings.ts:103`).
 - **Transcript and audio:** from `meeting.export.s3_path` instead of `s3PrefixFor` = `recordings/{platform}_{event_id}_{job_id}/` (`meetings.ts:283-289`). Under that prefix the portal reads `notes.json`, `participants.json`, `transcript.txt` and `full_session.m4a` (fallback `.wav`) (`lib/s3.ts:47-70, 194-220, 406-454`); the exporter's folder holds the same files, so only the prefix source changes. Note the list/detail pages derive `platform` from the URL with a `"meet"` fallback (`lib/platform.ts:50-64`); with aw-bots the object's `platform` is authoritative.
 - **Join progress:** `GET /v2/meetings/{id}` every 2.5 s (the current cadence, `JOIN_POLL_INTERVAL_MS`, `join-progress.ts:54`; 90 s timeout at `:63`), instead of the SQL + S3 probes of `audio_chunks/` and `lobby_state.json` (`join-state.ts:133-184`).
 - **Stop bot:** `POST /v2/meetings/{id}/stop`.
-- **Refresh — the portal is a real subscriber with a push channel.** `POST /api/webhooks/aw-bots` verifies the signature (§7.4), dedupes on `event_id` (a 24 h Redis set), and publishes the event on `notetaker-redis` (already in the namespace) channel `aw:meeting:<uuid>`. Open pages hold one `EventSource` on `GET /api/meetings/stream?ids=…` (Server-Sent Events, backed by a Redis subscription per portal replica), so a lobby admission or a completed export appears on the page within a second, with no polling. If the stream drops, the page falls back to `GET /v2/meetings/{id}` every 30 s until it reconnects; join progress uses the same stream and keeps its 2.5 s poll only as that fallback. The portal stores nothing about meetings: Redis holds the dedupe set and the pub/sub fan-out, both ephemeral; aw-bots remains the record.
+- **Refresh — the portal is a real subscriber with a push channel.** `POST /api/webhooks/aw-bots` verifies the signature (§7.4; either header, with the secret it supplied when it subscribed, Secret `aw-bots-portal-webhook`), dedupes on `event_id` (a 24 h Redis set), and publishes the event on `notetaker-redis` (already in the namespace) channel `aw:meeting:<uuid>`. Open pages hold one `EventSource` on `GET /api/meetings/stream?ids=…` (Server-Sent Events, backed by a Redis subscription per portal replica, through `ioredis`; the stream only carries meetings the signed-in user can see, §10.3), so a lobby admission or a completed export appears on the page within a second, with no polling. If the stream drops, the page falls back to `GET /v2/meetings/{id}` every 30 s until it reconnects; join progress uses the same stream and keeps its 2.5 s poll only as that fallback. The portal stores nothing about meetings: Redis holds the dedupe set and the pub/sub fan-out, both ephemeral; aw-bots remains the record.
 
 ### 10.2 Jitsi cutover switch (handoff §6 A1)
 
@@ -769,12 +805,13 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 ### 10.4 Rollout order
 
 1. **aw-bots.** Build and deploy:
-   - create the new index;
-   - deploy;
-   - drop the old index;
+   - MIGRATION-0008 step 1: `meetings.uuid`, the new live index and the due-sweep index, `CONCURRENTLY`;
+   - add the webhook key ring to `aw-bots-secrets`; deploy (meeting-api → bot → exporter);
+   - MIGRATION-0008 step 3: drop the old index `CONCURRENTLY`;
    - revoke tokens 1 and 2; mint the three named keys and their Secrets (§8.10);
+   - load `alerts.yml` into the cluster's Prometheus (§8.11);
    - create the portal's webhook subscription.
-2. **Calendar module + portal.** Deploy with every user on `old`; nothing changes for anyone.
+2. **Calendar module + portal.** notetaker-postgres migration `0011`, then deploy with every user on `old`; nothing changes for anyone.
 3. **Pilot.** Set the owner's connection to `aw-bots`, then run the live tests (§11.3).
 4. **Everyone else.** Move all users to `aw-bots`.
 5. **Jitsi cutover** (§10.2), then retire the old bot (handoff §6 item 16).
@@ -791,18 +828,19 @@ Every row of §6. In addition:
 - R6 `not_sent` for each detail, and a late entry (start past, end ahead) gets a bot at once;
 - R7 while live / finished; a `removed` entry re-sent is re-activated (`created` / `joined_existing`);
 - the sealed `completion_reason` is never given a value outside the ten, and `outcome` is set for each kind;
-- two sender consumers on one stream deliver each item once; an unacknowledged item is reclaimed; the outbox sweep re-enqueues a committed event with no delivery row;
-- the lifecycle callback rejects a wrong `x-internal-secret`; the intake routes reject a key without the scope; the rate limit answers 429 with `Retry-After`;
+- two sender consumers on one stream deliver each item once; an unacknowledged item is reclaimed; the repair sweep publishes a committed outbox row with `published_at` null older than 60 s and leaves younger ones; a retry sends the stored payload bytes unchanged; the outbox row and the state change commit or roll back together;
+- the lifecycle callback rejects a wrong `x-internal-secret`; the intake routes reject a key without the scope; the rate limit answers 429 `rate_limited` with `Retry-After`; the entry and subscription quotas answer 429 `quota_exceeded` without it;
+- `DELETE /v2/meetings/{id}`: 409 `meeting_not_finished` while scheduled or live; on a finished meeting it removes our rows and runs upstream's artifact deletion; no code path in the exporter or the bot deletes from `aw-chatworks-transcribe`;
 - encryption: a row written under key A is readable after B becomes active, and re-encrypted under B on read;
 - remove → the last-entry stop;
 - the room-code resolver for each route kind in §8.4;
 - auto-join spawns the exact row;
-- webhook signing incl. rotation, retries, `dead`, the log, `sequence`, the SSRF allow-list;
+- webhook signing incl. rotation (`X-Webhook-Signature-Previous` for 24 h, then gone), retries, `dead`, the log, `sequence`, the SSRF allow-list;
 - the exporter uses the UUID.
 
 ### 11.2 Against real Postgres
 
-The index swap (MIGRATION-0003 steps), and two scheduled rows plus one live row on the same room. The sqlite fakes can't prove unique partial indexes or advisory locks.
+The index swap (MIGRATION-0008 steps), and two scheduled rows plus one live row on the same room; two racing `PUT`s for one room make one meeting; two opposite room moves don't deadlock; the outbox commits with its change. The in-memory fakes can't prove unique partial indexes, advisory locks or transactions. They run against a throwaway `postgres:17` container through `MEETING_API_TEST_DATABASE_URL`, and are skipped without it.
 
 ### 11.3 Live, with the owner's account on `aw-bots`
 
@@ -820,7 +858,7 @@ The index swap (MIGRATION-0003 steps), and two scheduled rows plus one live row 
 - Hash-based sending; ended vs vanished; the `events().get` confirmation gives each of the four reasons and sends nothing on a partial read;
 - rejected vs retried;
 - full resync;
-- the `old`/`aw-bots` switch leaves `old` users byte-for-byte unchanged (the existing 519 tests stay green).
+- the `old`/`aw-bots` switch leaves `old` users byte-for-byte unchanged (the existing 524 tests stay green; 519 when this was first written).
 
 ---
 
@@ -835,7 +873,15 @@ The index swap (MIGRATION-0003 steps), and two scheduled rows plus one live row 
 | O5 | **Closed 2026-09-26:** encrypted at rest, secret supplied by the receiving system or generated (§7.2). | — |
 | O6 | **Closed 2026-09-26:** recorded in aw-notetaker `CHANGELOG.md` (Unreleased → "Design decisions — AW Bots meeting intake"). | — |
 | O7 | **Closed 2026-09-26** (live): `users.data.calendar_connections` for user 1 is an empty array and there is no singular `ics_url`; only `calendar_bot_name` is set. Vexa's calendar sync therefore never runs, and its old-index assumption (`calendar_sync/service.py:572-674`) is inert. We never intend to use it: one service account, ten-feed cap, no declined-event filter. | — |
-| O8 | **Closed 2026-09-26:** owner confirmed the design's version; the handoff §4 and §6 A lines carry a "superseded" note, and the CHANGELOG records it (with O6). **All open items are now closed.** | — |
+| O8 | **Closed 2026-09-26:** owner confirmed the design's version; the handoff §4 and §6 A lines carry a "superseded" note, and the CHANGELOG records it (with O6). | — |
+| O9 | **Closed 2026-09-26 (V10):** events are stored in `webhook_outbox` with the change; deliveries reference it (§8.1, §8.6). | — |
+| O10 | **Closed 2026-09-26 (V10):** `DELETE /v2/meetings/{id}` — finished meetings only; upstream artifact deletion plus our rows; no event; nothing deleted in `aw-chatworks-transcribe` (§8.11). | — |
+| O11 | **Closed 2026-09-26 (V10):** `cryptography==42.0.5`, `prometheus-client==0.19.0` (§10A.2 pins); portal `ioredis` (§8.8). Note for a later decision: `cryptography` 42.0.5's wheels bundle an OpenSSL that 43.0.1 and 44.0.1 patched; raising the pin is a §10A.2 deviation for the owner. | — |
+| O12 | **Closed 2026-09-26 (V10):** `POST /bots` claims by the R1 `join_now` rule (§8.3). | — |
+| O13 | **Closed 2026-09-26 (V10):** alerts as a rule group in `deployment/base/aw-bots/alerts.yml`; scraping by pod annotations (§8.11). | — |
+| O14 | **Closed 2026-09-26 (V10):** quotas answer `quota_exceeded`, rates `rate_limited` (§5.5). | — |
+| O15 | **Closed 2026-09-26 (V10):** the old signature during a rotation rides `X-Webhook-Signature-Previous` (§7.4). | — |
+| O16 | **Closed 2026-09-26 (V10):** aw-bots users bypass `DISPATCH_PLATFORMS` (§9.2). **All open items are now closed.** | — |
 
 ---
 
@@ -859,7 +905,9 @@ The index swap (MIGRATION-0003 steps), and two scheduled rows plus one live row 
 - **Webhooks:** one system URL + one per-user URL, snapshotted at spawn; signing `X-Webhook-Signature` HMAC-SHA256 over `ts.body` plus `Authorization: Bearer <secret>`; retries 60/300/1800/7200 s (`retry.py:56`, max age 86 400 s at `:58`); non-429 4xx never retried (`delivery.py:170-178`); only `meeting.completed` on by default (`delivery.py:32`); ledger first attempt only (`webhooks/*`, `bot_spawn/service.py:706-711`; `app.py:798-812` is the one `record` caller). `event_id` = `sha256(connection_id|event_type|new_status)` (`lifecycle/webhook.py:67-80`).
 - **Gateway:** `core/gateway/services/gateway/src/gateway/app.py` — strips authority headers (`:408-410`), sets `x-user-id` (`:412`), any-of scope check (`:383-384`), undeclared routes refused (`:372-382`).
 - **Tests:** meeting-api has no sqlite; fakes are in-memory (`bot_spawn/fakes.py`, `collector/fakes.py`) plus fakeredis; one real-Postgres test runs only with `MEETING_API_TEST_DATABASE_URL` (`tests/test_single_flight.py:205-218`). §11.2 uses that hook.
-- **Exporter:** `vexa-<n>` from the integer id (`exporter/job.py:98-100`); folder `<platform>_<room>_<start>` (`exporter/naming.py:19-24`).
+- **Exporter:** `vexa-<n>` from the integer id (`exporter/job.py:98-100`); folder `<platform>_<room>_<start>` (`exporter/naming.py:19-24`); its only S3 deletes are its queue markers (`exporter/queue.py:107, 113`), and its role has no `s3:DeleteObject` on `aw-chatworks-transcribe`. The bot has no S3 delete code.
+- **Upstream `DELETE /meetings/{id}`** (`collector/app.py:588-628`): a planned row is deleted; a finished meeting gets artifact deletion (its recording objects in `aw-bots` first, then transcripts; the row is kept); a live one gets 409.
+- **Signing contract:** `webhook.v1` `SignatureHeaders` pins `X-Webhook-Signature` to `^sha256=[0-9a-f]{64}$`; `exporter/signature.py:37-38` compares the whole header.
 
 ### 13.2 Room-code lookups today (all pick the newest row)
 
@@ -886,11 +934,11 @@ The index swap (MIGRATION-0003 steps), and two scheduled rows plus one live row 
 
 ## 14. Found while checking, not part of this work
 
-These are listed for a separate decision. None is changed by this design.
+These are listed for a separate decision. Items 1 and 6 are fixed by this design (§8.10, §8.1; corrected 2026-09-26); the rest are not changed.
 
 1. The bot's lifecycle callback sends `x-internal-secret`, but meeting-api doesn't check it (`meeting_api/app.py:932-938`).
 2. `PUT /meetings/{p}/{n}/intent` never checks the status, so it can overwrite a row the bot owns (`collector/adapters.py:1117-1162`).
 3. `PUT /user/webhook` doesn't validate the URL when it's saved; the SSRF guard runs only at send time (`admin_api/app/main.py:633-649`).
 4. `needs_human_help` appears in some status lists (`auto_join.py:135`, `collector/app.py:246`), but the state machine emits only `needs_help`. At `collector/app.py:246` (`_NON_PLANNED_STATUSES`) the misspelling means `GET /meetings?exclude_planned=true` hides rows in `needs_help`.
-5. The comments at `admin_api/schema/models.py:160-162` and `sessions/models.py:105` say a failed unique index is swallowed; `admin_api/schema/sync.py:93-142` raises and stops admin-api.
+5. The comment at `admin_api/schema/models.py:160-162` says a failed unique index is swallowed (meeting-api's copy has no such comment); `admin_api/schema/sync.py:93-142` raises and stops admin-api.
 6. The spawn dedup at `bot_spawn/adapters.py:485` omits `needs_help` and `stopping`; only the unique index stops a second spawn during those.
