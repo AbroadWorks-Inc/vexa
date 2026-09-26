@@ -10,6 +10,49 @@
       "token": "Column(String(255), unique=True, index=True, nullable=False)",
       "user_id": "Column(Integer, ForeignKey('users.id'), nullable=False, index=True)"
     },
+    "meeting_aw_state": {
+      "event_seq": "Column(BigInteger, nullable=False, server_default='0')",
+      "export_at": "Column(DateTime(timezone=True), nullable=True)",
+      "export_error": "Column(Text, nullable=True)",
+      "export_s3_path": "Column(Text, nullable=True)",
+      "export_state": "Column(Text, nullable=True)",
+      "last_error_code": "Column(Text, nullable=True)",
+      "last_error_message": "Column(Text, nullable=True)",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id', ondelete='CASCADE'), primary_key=True)",
+      "outcome_at": "Column(DateTime(timezone=True), nullable=True)",
+      "outcome_detail": "Column(Text, nullable=True)",
+      "outcome_kind": "Column(Text, nullable=True)",
+      "outcome_message": "Column(Text, nullable=True)",
+      "scheduled_end_at": "Column(DateTime(timezone=True), nullable=True)",
+      "time_zone": "Column(Text, nullable=True)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "waiting_for_room_sent_at": "Column(DateTime(timezone=True), nullable=True)"
+    },
+    "meeting_entries": {
+      "attendees": "Column(ARRAY(Text), nullable=True)",
+      "closed_at": "Column(DateTime(timezone=True), nullable=True)",
+      "content_hash": "Column(String(64), nullable=False)",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "end_at": "Column(DateTime(timezone=True), nullable=True)",
+      "external_id": "Column(String(255), nullable=False)",
+      "id": "Column(BigInteger, primary_key=True)",
+      "join_now": "Column(Boolean, nullable=False, default=False, server_default=text('false'))",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id', ondelete='RESTRICT'), nullable=False, index=True)",
+      "meeting_url": "Column(Text, nullable=False)",
+      "metadata_": "Column('metadata', JSONB, nullable=True)",
+      "native_meeting_id": "Column(String(255), nullable=False)",
+      "platform": "Column(String(100), nullable=False)",
+      "removed_at": "Column(DateTime(timezone=True), nullable=True)",
+      "removed_reason": "Column(Text, nullable=True)",
+      "series_id": "Column(String(255), nullable=True)",
+      "source_user": "Column(Text, nullable=False)",
+      "start_at": "Column(DateTime(timezone=True), nullable=False)",
+      "state": "Column(String(16), nullable=False)",
+      "time_zone": "Column(Text, nullable=True)",
+      "title": "Column(String(512), nullable=True)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "user_id": "Column(Integer, nullable=False)"
+    },
     "meeting_sessions": {
       "id": "Column(Integer, primary_key=True, index=True)",
       "meeting_id": "Column(Integer, ForeignKey('meetings.id'), nullable=False, index=True)",
@@ -27,7 +70,8 @@
       "start_time": "Column(DateTime, nullable=True)",
       "status": "Column(String(50), nullable=False, default='requested', index=True)",
       "updated_at": "Column(DateTime, server_default=func.now(), onupdate=func.now())",
-      "user_id": "Column(Integer, nullable=False, index=True)"
+      "user_id": "Column(Integer, nullable=False, index=True)",
+      "uuid": "Column(UUID(as_uuid=True), nullable=False, unique=True, index=True, server_default=text('gen_random_uuid()'))"
     },
     "platform_settings": {
       "key": "Column(String(64), primary_key=True)",
@@ -54,9 +98,101 @@
       "image_url": "Column(Text)",
       "max_concurrent_bots": "Column(Integer, nullable=False, server_default='3', default=3)",
       "name": "Column(String(100))"
+    },
+    "webhook_deliveries": {
+      "attempts": "Column(Integer, nullable=False, default=0, server_default='0')",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "event_id": "Column(String(80), ForeignKey('webhook_outbox.event_id', ondelete='CASCADE'), nullable=False)",
+      "id": "Column(BigInteger, primary_key=True)",
+      "last_error": "Column(Text, nullable=True)",
+      "last_status_code": "Column(Integer, nullable=True)",
+      "lease_until": "Column(DateTime(timezone=True), nullable=True)",
+      "next_attempt_at": "Column(DateTime(timezone=True), nullable=False)",
+      "state": "Column(String(16), nullable=False)",
+      "subscription_id": "Column(UUID(as_uuid=True), nullable=False)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "user_id": "Column(Integer, nullable=False)"
+    },
+    "webhook_delivery_attempts": {
+      "attempt": "Column(Integer, nullable=False)",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now(), index=True)",
+      "delivery_id": "Column(BigInteger, ForeignKey('webhook_deliveries.id', ondelete='CASCADE'), nullable=False, index=True)",
+      "duration_ms": "Column(Integer, nullable=True)",
+      "error": "Column(Text, nullable=True)",
+      "id": "Column(BigInteger, primary_key=True)",
+      "outcome": "Column(String(16), nullable=False)",
+      "status_code": "Column(Integer, nullable=True)"
+    },
+    "webhook_outbox": {
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "event_id": "Column(String(80), primary_key=True)",
+      "event_type": "Column(String(64), nullable=False)",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id', ondelete='CASCADE'), nullable=True)",
+      "payload_text": "Column(Text, nullable=False)",
+      "published_at": "Column(DateTime(timezone=True), nullable=True)",
+      "sequence": "Column(BigInteger, nullable=False)"
+    },
+    "webhook_subscriptions": {
+      "active": "Column(Boolean, nullable=False, default=True, server_default=text('true'))",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "description": "Column(Text, nullable=True)",
+      "enc_key_id": "Column(String(64), nullable=False)",
+      "events": "Column(ARRAY(Text), nullable=False, server_default=text(\"'{}'::text[]\"))",
+      "id": "Column(UUID(as_uuid=True), primary_key=True, server_default=text('gen_random_uuid()'))",
+      "previous_enc_key_id": "Column(String(64), nullable=True)",
+      "previous_secret_enc": "Column(LargeBinary, nullable=True)",
+      "previous_secret_expires_at": "Column(DateTime(timezone=True), nullable=True)",
+      "secret_enc": "Column(LargeBinary, nullable=False)",
+      "secret_last4": "Column(String(4), nullable=False)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "url": "Column(Text, nullable=False)",
+      "user_id": "Column(Integer, nullable=False, index=True)"
     }
   },
   "core/meetings/services/meeting-api/src/meeting_api/sessions/models.py": {
+    "meeting_aw_state": {
+      "event_seq": "Column(BigInteger, nullable=False, server_default='0')",
+      "export_at": "Column(DateTime(timezone=True), nullable=True)",
+      "export_error": "Column(Text, nullable=True)",
+      "export_s3_path": "Column(Text, nullable=True)",
+      "export_state": "Column(Text, nullable=True)",
+      "last_error_code": "Column(Text, nullable=True)",
+      "last_error_message": "Column(Text, nullable=True)",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id', ondelete='CASCADE'), primary_key=True)",
+      "outcome_at": "Column(DateTime(timezone=True), nullable=True)",
+      "outcome_detail": "Column(Text, nullable=True)",
+      "outcome_kind": "Column(Text, nullable=True)",
+      "outcome_message": "Column(Text, nullable=True)",
+      "scheduled_end_at": "Column(DateTime(timezone=True), nullable=True)",
+      "time_zone": "Column(Text, nullable=True)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "waiting_for_room_sent_at": "Column(DateTime(timezone=True), nullable=True)"
+    },
+    "meeting_entries": {
+      "attendees": "Column(ARRAY(Text), nullable=True)",
+      "closed_at": "Column(DateTime(timezone=True), nullable=True)",
+      "content_hash": "Column(String(64), nullable=False)",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "end_at": "Column(DateTime(timezone=True), nullable=True)",
+      "external_id": "Column(String(255), nullable=False)",
+      "id": "Column(BigInteger, primary_key=True)",
+      "join_now": "Column(Boolean, nullable=False, default=False, server_default=text('false'))",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id', ondelete='RESTRICT'), nullable=False, index=True)",
+      "meeting_url": "Column(Text, nullable=False)",
+      "metadata_": "Column('metadata', JSONB, nullable=True)",
+      "native_meeting_id": "Column(String(255), nullable=False)",
+      "platform": "Column(String(100), nullable=False)",
+      "removed_at": "Column(DateTime(timezone=True), nullable=True)",
+      "removed_reason": "Column(Text, nullable=True)",
+      "series_id": "Column(String(255), nullable=True)",
+      "source_user": "Column(Text, nullable=False)",
+      "start_at": "Column(DateTime(timezone=True), nullable=False)",
+      "state": "Column(String(16), nullable=False)",
+      "time_zone": "Column(Text, nullable=True)",
+      "title": "Column(String(512), nullable=True)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "user_id": "Column(Integer, nullable=False)"
+    },
     "meeting_sessions": {
       "id": "Column(Integer, primary_key=True, index=True)",
       "meeting_id": "Column(Integer, ForeignKey('meetings.id'), nullable=False, index=True)",
@@ -74,7 +210,8 @@
       "start_time": "Column(DateTime, nullable=True)",
       "status": "Column(String(50), nullable=False, default='requested', index=True)",
       "updated_at": "Column(DateTime, server_default=func.now(), onupdate=func.now())",
-      "user_id": "Column(Integer, nullable=False, index=True)"
+      "user_id": "Column(Integer, nullable=False, index=True)",
+      "uuid": "Column(UUID(as_uuid=True), nullable=False, unique=True, index=True, server_default=text('gen_random_uuid()'))"
     },
     "transcriptions": {
       "created_at": "Column(DateTime, default=datetime.utcnow)",
@@ -87,6 +224,55 @@
       "speaker": "Column(String(255), nullable=True)",
       "start_time": "Column(Float, nullable=False)",
       "text": "Column(Text, nullable=False)"
+    },
+    "webhook_deliveries": {
+      "attempts": "Column(Integer, nullable=False, default=0, server_default='0')",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "event_id": "Column(String(80), ForeignKey('webhook_outbox.event_id', ondelete='CASCADE'), nullable=False)",
+      "id": "Column(BigInteger, primary_key=True)",
+      "last_error": "Column(Text, nullable=True)",
+      "last_status_code": "Column(Integer, nullable=True)",
+      "lease_until": "Column(DateTime(timezone=True), nullable=True)",
+      "next_attempt_at": "Column(DateTime(timezone=True), nullable=False)",
+      "state": "Column(String(16), nullable=False)",
+      "subscription_id": "Column(UUID(as_uuid=True), nullable=False)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "user_id": "Column(Integer, nullable=False)"
+    },
+    "webhook_delivery_attempts": {
+      "attempt": "Column(Integer, nullable=False)",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now(), index=True)",
+      "delivery_id": "Column(BigInteger, ForeignKey('webhook_deliveries.id', ondelete='CASCADE'), nullable=False, index=True)",
+      "duration_ms": "Column(Integer, nullable=True)",
+      "error": "Column(Text, nullable=True)",
+      "id": "Column(BigInteger, primary_key=True)",
+      "outcome": "Column(String(16), nullable=False)",
+      "status_code": "Column(Integer, nullable=True)"
+    },
+    "webhook_outbox": {
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "event_id": "Column(String(80), primary_key=True)",
+      "event_type": "Column(String(64), nullable=False)",
+      "meeting_id": "Column(Integer, ForeignKey('meetings.id', ondelete='CASCADE'), nullable=True)",
+      "payload_text": "Column(Text, nullable=False)",
+      "published_at": "Column(DateTime(timezone=True), nullable=True)",
+      "sequence": "Column(BigInteger, nullable=False)"
+    },
+    "webhook_subscriptions": {
+      "active": "Column(Boolean, nullable=False, default=True, server_default=text('true'))",
+      "created_at": "Column(DateTime(timezone=True), server_default=func.now())",
+      "description": "Column(Text, nullable=True)",
+      "enc_key_id": "Column(String(64), nullable=False)",
+      "events": "Column(ARRAY(Text), nullable=False, server_default=text(\"'{}'::text[]\"))",
+      "id": "Column(UUID(as_uuid=True), primary_key=True, server_default=text('gen_random_uuid()'))",
+      "previous_enc_key_id": "Column(String(64), nullable=True)",
+      "previous_secret_enc": "Column(LargeBinary, nullable=True)",
+      "previous_secret_expires_at": "Column(DateTime(timezone=True), nullable=True)",
+      "secret_enc": "Column(LargeBinary, nullable=False)",
+      "secret_last4": "Column(String(4), nullable=False)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
+      "url": "Column(Text, nullable=False)",
+      "user_id": "Column(Integer, nullable=False, index=True)"
     }
   }
 }
