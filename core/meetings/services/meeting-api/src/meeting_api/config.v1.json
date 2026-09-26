@@ -557,6 +557,34 @@
    "targets": []
   },
   {
+   "key": "ENTRY_MAX_DAYS_AHEAD",
+   "class": "defaulted",
+   "default": "30",
+   "description": "intake (§1.1 R3): PUT /v2/entries refuses an entry starting more than this many days ahead with too_far_ahead",
+   "targets": []
+  },
+  {
+   "key": "JOIN_NOW_ADOPT_AHEAD_S",
+   "class": "defaulted",
+   "default": "3600",
+   "description": "intake (§1.1 R1): a join_now entry adopts the earliest non-finished meeting on its link that hasn't ended and starts within this many seconds",
+   "targets": []
+  },
+  {
+   "key": "ENTRY_BLOCKED_HOSTS",
+   "class": "defaulted",
+   "default": "meet.abroadworks.com",
+   "description": "intake (§1.3): comma-separated meeting-link hostnames refused with platform_not_enabled; empty ⇒ none refused",
+   "targets": []
+  },
+  {
+   "key": "INTAKE_MAX_ACTIVE_ENTRIES",
+   "class": "defaulted",
+   "default": "100000",
+   "description": "intake (§1.13): per-account quota of active entries (entries of unfinished meetings); a write that would add one past it is refused with 429 quota_exceeded",
+   "targets": []
+  },
+  {
    "key": "CALENDAR_SYNC_INTERVAL_S",
    "class": "defaulted",
    "default": "300",

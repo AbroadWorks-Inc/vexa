@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
@@ -50,6 +49,7 @@ from .rules import (
     is_rerun,
     meeting_start,
 )
+from .settings import auto_join_lead_s
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -124,14 +124,6 @@ def row_mapping(row: Any) -> dict[str, Any]:
     }
 
 
-def _lead_s() -> int:
-    """``AUTO_JOIN_LEAD_S``, read exactly as the auto-join sweep's entrypoint reads it."""
-    # Imported at call time so bot_spawn can import this module without an import cycle.
-    from ..bot_spawn.auto_join import DEFAULT_LEAD_S
-
-    return int(float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))))
-
-
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -195,7 +187,7 @@ async def _insert_outbox(
             row_mapping(meeting),
             row_mapping(aw),
             [row_mapping(e) for e in entries],
-            lead_s=_lead_s(),
+            lead_s=auto_join_lead_s(),
         )
     }
     if change is not None:

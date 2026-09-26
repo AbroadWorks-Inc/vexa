@@ -1,0 +1,554 @@
+"""The entry service (§1.3): the behaviour of ``PUT /v2/entries`` and ``POST /v2/entries/remove``.
+
+Every write runs under the link lock of the entry's meeting link (both links, sorted, when an
+update changes it), through ``IntakeStore.room_lock``. The entry is read under the lock; if its link
+isn't one the lock covers, the transaction ends without writing and the service starts again once
+with the entry's link added. A remove or a re-run doesn't know the link before reading, so it
+first reads without a link lock. Events are published after the transaction commits; spawns and
+stops run after that, each through its own port.
+
+``PUT`` (§1.3 steps 1–9):
+  1. validate (``parse_entry``) and parse the link: unknown → ``unrecognized_link``, a host in
+     ``ENTRY_BLOCKED_HOSTS`` → ``platform_not_enabled``;
+  2. an active or closed entry with the same ``content_hash`` → ``unchanged``, nothing written;
+  3. a new entry, or a ``removed`` one coming back, takes the R1 path: it joins the meeting R1
+     matches (``joined_existing``) or gets a new ``scheduled`` meeting (``created``). A ``closed``
+     entry, or one waiting to re-run on a finished meeting, does the same only if the update
+     points to a new future time (R7); otherwise → ``not_changed_finished``;
+  4. an entry of a live meeting is stored and the meeting is left as it is (``not_changed_live``);
+  5. an entry of a scheduled meeting stays on it while it still overlaps the meeting's other
+     entries; otherwise it joins the meeting R1 matches on its link, or the meeting follows it when
+     it was the meeting's only entry, or it gets a new meeting (``updated``, with
+     ``previous_meeting_id`` when it left a meeting). A meeting left with no entries is removed
+     (R8, detail ``entry_moved``); one left with others is re-planned;
+  6. a ``join_now`` entry whose meeting is still ``scheduled`` after the commit is spawned on
+     that exact row: ``sent`` keeps the result, ``already_live`` → ``joined_existing``, a failure
+     ends the meeting ``not_sent`` with the typed code and exact message.
+Only a write that adds an active entry checks the quota (429 ``quota_exceeded``).
+
+``remove``: the entry becomes ``removed``. Others remain → the meeting is re-planned
+(``entry_removed``). It was the last one → a scheduled meeting ends ``failed`` with
+``completion_reason: "stopped"`` and outcome ``cancelled_by_calendar`` (``removed``, R8); a live
+one is stopped with that outcome (``bot_stopping``, R5). The status change is conditional, so a
+meeting that went live meanwhile takes the live branch.
+
+``merge_into_live`` is R2's exception and ``rerun_entries`` R7's re-run at finish; both are called
+by the scheduler and the status writer's callers, not by a route.
+
+Events: ``meeting.scheduled`` for a meeting an entry created, ``meeting.updated`` when a
+meeting's time, link, title or entries change, ``meeting.removed`` (R8, R2), and
+``meeting.not_sent`` for a failed instant join.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Optional, Sequence
+from urllib.parse import urlparse
+
+from ..collector.meeting_link import parse_meeting_url
+from .ports import (
+    EntryView,
+    EventPublisher,
+    IntakeStore,
+    IntakeTx,
+    MeetingView,
+    Room,
+    SpawnOutcome,
+    SpawnPort,
+    StopPort,
+)
+from .rules import (
+    FINISHED_STATUSES,
+    is_future_move,
+    is_live,
+    join_now_target,
+    match_entry,
+    overlaps,
+    recompute,
+)
+from .settings import IntakeSettings
+from .status import Outcome, StatusConflict
+from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
+
+__all__ = ["IntakeService"]
+
+#: The sealed ``lifecycle.v1`` reason a removed meeting ends with (R5, R8).
+STOPPED = "stopped"
+CANCELLED_BY_CALENDAR = "cancelled_by_calendar"
+ENTRY_MOVED = "entry_moved"
+ENTRY_MOVED_MESSAGE = "last entry moved to another meeting"
+
+
+def _removed_message(reason: Optional[str]) -> str:
+    return f"last entry removed: {reason}" if reason else "last entry removed"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@dataclass
+class _Work:
+    """One locked transaction's writes: the events to publish after it commits and the live
+    meetings to stop after that."""
+
+    tx: IntakeTx
+    events: list[str] = field(default_factory=list)
+    stops: list[tuple[int, Outcome]] = field(default_factory=list)
+
+    async def event(self, meeting_id: int, event_type: str) -> None:
+        written = await self.tx.event(meeting_id, event_type)
+        self.events.append(written.event_id)
+
+    async def status(self, meeting_id: int, to_status: str, **kwargs: Any) -> None:
+        written = await self.tx.status(meeting_id, to_status, **kwargs)
+        self.events.append(written.event_id)
+
+    async def stop_after_commit(self, meeting_id: int, outcome: Outcome) -> None:
+        """R5: the meeting lost its last entry while live; its bot is stopped after the commit."""
+        await self.event(meeting_id, "meeting.updated")
+        self.stops.append((meeting_id, outcome))
+
+
+@dataclass(frozen=True)
+class _Done:
+    result: str
+    meeting: MeetingView
+    previous: Optional[str] = None
+    spawn: bool = False
+
+
+class IntakeService:
+    def __init__(
+        self,
+        store: IntakeStore,
+        spawn: SpawnPort,
+        stop: StopPort,
+        publisher: EventPublisher,
+        settings: IntakeSettings,
+        *,
+        clock: Callable[[], datetime] = _utcnow,
+    ) -> None:
+        self._store = store
+        self._spawn = spawn
+        self._stop = stop
+        self._publisher = publisher
+        self._settings = settings
+        self._clock = clock
+
+    # ── routes ──────────────────────────────────────────────────────────────────────────────
+
+    async def put_entry(self, user_id: int, body: Any) -> dict[str, Any]:
+        now = self._clock()
+        entry = parse_entry(body, now=now, max_days_ahead=self._settings.max_days_ahead)
+        room = self._room(entry.meeting_url)
+
+        async def read(tx: IntakeTx) -> Optional[EntryView]:
+            return await tx.find_entry(user_id, entry.user, entry.external_id)
+
+        async def body_(w: _Work, existing: Optional[EntryView]) -> _Done:
+            return await self._put(w, user_id, entry, room, existing, now)
+
+        done = await self._locked(user_id, frozenset({room}), read, body_, restarts=1)
+        assert done is not None
+        if done.spawn:
+            done = await self._spawn_now(user_id, done)
+        return self._reply(done, entry.user, entry.external_id)
+
+    async def remove_entry(self, user_id: int, body: Any) -> dict[str, Any]:
+        req = parse_remove(body)
+
+        async def read(tx: IntakeTx) -> Optional[EntryView]:
+            return await tx.find_entry(user_id, req.user, req.external_id)
+
+        async def body_(w: _Work, existing: Optional[EntryView]) -> _Done:
+            return await self._remove(w, req, existing)
+
+        done = await self._locked(user_id, frozenset(), read, body_, restarts=2)
+        assert done is not None
+        return self._reply(done, req.user, req.external_id)
+
+    # ── scheduler / status-writer callers ───────────────────────────────────────────────────
+
+    async def merge_into_live(
+        self, user_id: int, due_meeting_id: int, live_meeting_id: int
+    ) -> bool:
+        """R2's exception: the due meeting's entries move onto the open-ended live meeting on its
+        link, which takes the due meeting's title if it has none; the due meeting ends ``failed``
+        with outcome ``merged_into_live`` (``meeting.removed``). Returns whether it merged: the
+        rows are re-checked under the link lock, and nothing is written unless the due meeting
+        is still ``scheduled`` and the other is live, open-ended and on the same link.
+        """
+        due = await self._read(user_id, due_meeting_id)
+        room = due.room
+        async with self._store.room_lock(user_id, [room]) as tx:
+            w = _Work(tx)
+            due = await tx.meeting(due_meeting_id)
+            live = await tx.meeting(live_meeting_id)
+            if (
+                due.status != "scheduled"
+                or due.room != room
+                or not is_live(live.status)
+                or live.end is not None
+                or live.room != room
+                or live.user_id != user_id
+            ):
+                return False
+            await tx.move_active_entries(due.id, live.id)
+            if live.title is None and due.title is not None:
+                await tx.set_title(live.id, due.title)
+            await w.status(
+                due.id,
+                "failed",
+                expected_from={"scheduled"},
+                outcome=Outcome(
+                    "merged_into_live",
+                    live.uuid,
+                    f"merged into live meeting {live.uuid}",
+                ),
+                event_type="meeting.removed",
+            )
+            await w.event(live.id, "meeting.updated")
+        await self._publisher.publish(w.events)
+        return True
+
+    async def rerun_entries(self, user_id: int, entry_ids: Sequence[int]) -> None:
+        """R7: each entry a finished meeting kept active (a future, non-overlapping time) becomes
+        a meeting of its own, by the R1 path. An entry no longer waiting on a finished meeting is
+        left alone."""
+        for entry_id in entry_ids:
+
+            async def read(tx: IntakeTx, i: int = entry_id) -> Optional[EntryView]:
+                return await tx.entry(i)
+
+            async def body_(w: _Work, existing: Optional[EntryView]) -> Optional[_Done]:
+                if existing is None or existing.state != "active":
+                    return None
+                finished = await w.tx.meeting(existing.meeting_id)
+                if finished.status not in FINISHED_STATUSES:
+                    return None
+                return await self._attach(
+                    w,
+                    user_id,
+                    existing.as_entry_in(),
+                    existing.room,
+                    self._clock(),
+                    previous=finished,
+                )
+
+            await self._locked(user_id, frozenset(), read, body_, restarts=2)
+
+    # ── the locked unit of work ─────────────────────────────────────────────────────────────
+
+    async def _locked(
+        self,
+        user_id: int,
+        base: frozenset[Room],
+        read: Callable[[IntakeTx], Awaitable[Optional[EntryView]]],
+        body: Callable[[_Work, Optional[EntryView]], Awaitable[Optional[_Done]]],
+        *,
+        restarts: int,
+    ) -> Optional[_Done]:
+        rooms = base
+        for _ in range(restarts + 1):
+            async with self._store.room_lock(user_id, sorted(rooms)) as tx:
+                existing = await read(tx)
+                if existing is not None and existing.room not in rooms:
+                    rooms = base | {existing.room}
+                    continue
+                work = _Work(tx)
+                done = await body(work, existing)
+                break
+        else:
+            raise IntakeError(
+                "unavailable",
+                "the entry's meeting link changed during the request; retry",
+            )
+        if work.events:
+            await self._publisher.publish(work.events)
+        for meeting_id, outcome in work.stops:
+            await self._stop.stop_live(user_id, meeting_id, outcome=outcome)
+        if work.stops and done is not None:
+            done = replace(done, meeting=await self._read(user_id, done.meeting.id))
+        return done
+
+    async def _read(self, user_id: int, meeting_id: int) -> MeetingView:
+        async with self._store.room_lock(user_id, ()) as tx:
+            return await tx.meeting(meeting_id)
+
+    # ── PUT ─────────────────────────────────────────────────────────────────────────────────
+
+    async def _put(
+        self,
+        w: _Work,
+        user_id: int,
+        entry: EntryIn,
+        room: Room,
+        existing: Optional[EntryView],
+        now: datetime,
+    ) -> _Done:
+        tx = w.tx
+        if existing is None:
+            await self._check_quota(tx, user_id)
+            return await self._attach(w, user_id, entry, room, now, previous=None)
+        old = await tx.meeting(existing.meeting_id)
+        if existing.state != "removed" and existing.content_hash == entry.content_hash:
+            return _Done("unchanged", old)
+        if existing.state == "removed":
+            await self._check_quota(tx, user_id)
+            return await self._attach(w, user_id, entry, room, now, previous=old)
+        if existing.state == "closed" or old.status in FINISHED_STATUSES:
+            if not is_future_move(entry, old, now=now):
+                return _Done("not_changed_finished", old)
+            if existing.state == "closed":
+                await self._check_quota(tx, user_id)
+            return await self._attach(w, user_id, entry, room, now, previous=old)
+        if old.status != "scheduled":
+            await tx.save_entry(user_id, entry, room, old.id)
+            return _Done("not_changed_live", await tx.meeting(old.id))
+        return await self._move(w, user_id, entry, room, existing, old, now)
+
+    async def _attach(
+        self,
+        w: _Work,
+        user_id: int,
+        entry: EntryIn,
+        room: Room,
+        now: datetime,
+        *,
+        previous: Optional[MeetingView],
+    ) -> _Done:
+        """The R1 path: join the meeting R1 matches on the link, or create one."""
+        target = self._target(entry, await w.tx.room_meetings(user_id, room), now)
+        if target is None:
+            meeting_id = await self._create(w, user_id, entry, room)
+            result = "created"
+        else:
+            await self._join(w, user_id, entry, room, target)
+            meeting_id, result = target.id, "joined_existing"
+        final = await w.tx.meeting(meeting_id)
+        moved_from = previous.uuid if previous and previous.id != final.id else None
+        spawn = entry.join_now and final.status == "scheduled"
+        return _Done(result, final, moved_from, spawn)
+
+    async def _move(
+        self,
+        w: _Work,
+        user_id: int,
+        entry: EntryIn,
+        room: Room,
+        existing: EntryView,
+        old: MeetingView,
+        now: datetime,
+    ) -> _Done:
+        """An active entry of a scheduled meeting changed (§1.3 step 5)."""
+        tx = w.tx
+        others = [e for e in await tx.active_entries(old.id) if e.id != existing.id]
+        if others and room == old.room:
+            kept = recompute(others)
+            if overlaps(entry.start, entry.end, kept.start, kept.end):
+                return await self._update_in_place(w, user_id, entry, room, old)
+        candidates = [
+            m for m in await tx.room_meetings(user_id, room) if m.id != old.id
+        ]
+        target = self._target(entry, candidates, now)
+        if target is None and not others:
+            return await self._update_in_place(w, user_id, entry, room, old)
+        if target is None:
+            meeting_id = await self._create(w, user_id, entry, room)
+        else:
+            await self._join(w, user_id, entry, room, target)
+            meeting_id = target.id
+        if others:
+            await self._replan(tx, old.id, old.room)
+            await w.event(old.id, "meeting.updated")
+        else:
+            await self._end_planned(
+                w, old, Outcome(CANCELLED_BY_CALENDAR, ENTRY_MOVED, ENTRY_MOVED_MESSAGE)
+            )
+        final = await tx.meeting(meeting_id)
+        return _Done(
+            "updated", final, old.uuid, entry.join_now and final.status == "scheduled"
+        )
+
+    async def _update_in_place(
+        self, w: _Work, user_id: int, entry: EntryIn, room: Room, meeting: MeetingView
+    ) -> _Done:
+        """The entry stays on its meeting, which is re-planned (onto the entry's link when it was
+        the only entry and the link changed)."""
+        await w.tx.save_entry(user_id, entry, room, meeting.id)
+        await self._replan(w.tx, meeting.id, room)
+        await w.event(meeting.id, "meeting.updated")
+        final = await w.tx.meeting(meeting.id)
+        return _Done(
+            "updated", final, None, entry.join_now and final.status == "scheduled"
+        )
+
+    async def _create(self, w: _Work, user_id: int, entry: EntryIn, room: Room) -> int:
+        meeting = await w.tx.create_meeting(
+            user_id, room, recompute([entry]), join_now=entry.join_now
+        )
+        await w.tx.save_entry(user_id, entry, room, meeting.id)
+        await w.event(meeting.id, "meeting.scheduled")
+        return meeting.id
+
+    async def _join(
+        self, w: _Work, user_id: int, entry: EntryIn, room: Room, target: MeetingView
+    ) -> None:
+        """Attach the entry; a live meeting's time is never recomputed (R1)."""
+        await w.tx.save_entry(user_id, entry, room, target.id)
+        if target.status == "scheduled":
+            await self._replan(w.tx, target.id, target.room)
+        await w.event(target.id, "meeting.updated")
+
+    def _target(
+        self, entry: EntryIn, candidates: Sequence[MeetingView], now: datetime
+    ) -> Optional[MeetingView]:
+        if entry.join_now:
+            return join_now_target(
+                candidates, now=now, adopt_ahead_s=self._settings.join_now_adopt_ahead_s
+            )
+        return match_entry(entry, candidates, now=now, lead_s=self._settings.lead_s)
+
+    async def _spawn_now(self, user_id: int, done: _Done) -> _Done:
+        """§1.3 ``join_now``: spawn the exact row after the commit."""
+        outcome = await self._spawn.spawn_exact(user_id, done.meeting.id)
+        result = done.result
+        if outcome.result == "already_live":
+            result = "joined_existing"
+        elif outcome.result == "failed" and not await self._not_sent(
+            user_id, done.meeting, outcome
+        ):
+            result = "joined_existing"
+        return replace(
+            done, result=result, meeting=await self._read(user_id, done.meeting.id)
+        )
+
+    async def _not_sent(
+        self, user_id: int, meeting: MeetingView, outcome: SpawnOutcome
+    ) -> bool:
+        """End the meeting ``not_sent`` with the spawn's typed code and message. ``False`` when
+        it is no longer ``scheduled`` (the scheduler sent a bot meanwhile)."""
+        async with self._store.room_lock(user_id, [meeting.room]) as tx:
+            w = _Work(tx)
+            try:
+                await w.status(
+                    meeting.id,
+                    "failed",
+                    expected_from={"scheduled"},
+                    outcome=Outcome("not_sent", outcome.code, outcome.message),
+                    change_reason=outcome.code,
+                    event_type="meeting.not_sent",
+                )
+            except StatusConflict:
+                return False
+        await self._publisher.publish(w.events)
+        return True
+
+    async def _check_quota(self, tx: IntakeTx, user_id: int) -> None:
+        limit = self._settings.max_active_entries
+        count = await tx.count_active_entries(user_id)
+        if count >= limit:
+            raise IntakeError(
+                "quota_exceeded", f"active entry quota reached ({count} of {limit})"
+            )
+
+    def _room(self, meeting_url: str) -> Room:
+        parsed = parse_meeting_url(meeting_url)
+        if parsed is None:
+            raise IntakeError(
+                "unrecognized_link",
+                "meeting_url is not a meeting link aw-bots recognises",
+            )
+        host = (urlparse(meeting_url.strip()).hostname or "").lower()
+        if host in self._settings.blocked_hosts:
+            raise IntakeError(
+                "platform_not_enabled", f"meeting links on {host} are not enabled"
+            )
+        return Room(*parsed)
+
+    # ── remove ──────────────────────────────────────────────────────────────────────────────
+
+    async def _remove(
+        self, w: _Work, req: RemoveIn, existing: Optional[EntryView]
+    ) -> _Done:
+        if existing is None:
+            raise IntakeError(
+                "entry_not_found", "no entry with this external_id for this user"
+            )
+        tx = w.tx
+        meeting = await tx.meeting(existing.meeting_id)
+        if existing.state != "active":
+            return _Done("already_removed", meeting)
+        await tx.mark_entry_removed(existing.id, req.reason)
+        if meeting.status in FINISHED_STATUSES:
+            return _Done("removed", await tx.meeting(meeting.id))
+        if await tx.active_entries(meeting.id):
+            if meeting.status == "scheduled":
+                await self._replan(tx, meeting.id, meeting.room)
+            await w.event(meeting.id, "meeting.updated")
+            return _Done("entry_removed", await tx.meeting(meeting.id))
+        outcome = Outcome(
+            CANCELLED_BY_CALENDAR, req.reason, _removed_message(req.reason)
+        )
+        if meeting.status == "scheduled":
+            ended = await self._end_planned(w, meeting, outcome)
+        else:
+            await w.stop_after_commit(meeting.id, outcome)
+            ended = "stopping"
+        result = "bot_stopping" if ended == "stopping" else "removed"
+        return _Done(result, await tx.meeting(meeting.id))
+
+    # ── shared ──────────────────────────────────────────────────────────────────────────────
+
+    async def _replan(self, tx: IntakeTx, meeting_id: int, room: Room) -> None:
+        await tx.apply_plan(
+            meeting_id, room, recompute(await tx.active_entries(meeting_id))
+        )
+
+    async def _end_planned(
+        self, w: _Work, meeting: MeetingView, outcome: Outcome
+    ) -> str:
+        """R8: a scheduled meeting with no entries left ends ``failed``, ``stopped``, with the
+        outcome (``meeting.removed``). Conditional: ``"removed"``; ``"stopping"`` when it went
+        live meanwhile (its bot is stopped after the commit, R5); ``"finished"`` when it ended
+        meanwhile."""
+        try:
+            await w.status(
+                meeting.id,
+                "failed",
+                expected_from={"scheduled"},
+                data_patch={"completion_reason": STOPPED},
+                outcome=outcome,
+                change_reason=STOPPED,
+                event_type="meeting.removed",
+            )
+            return "removed"
+        except StatusConflict:
+            current = await w.tx.meeting(meeting.id)
+            if is_live(current.status):
+                await w.stop_after_commit(meeting.id, outcome)
+                return "stopping"
+            return "finished"
+
+    def _reply(self, done: _Done, user: str, external_id: str) -> dict[str, Any]:
+        entry = next(
+            (
+                e
+                for e in done.meeting.entries
+                if (e.source_user, e.external_id) == (user, external_id)
+            ),
+            None,
+        )
+        return {
+            "result": done.result,
+            "previous_meeting_id": done.previous,
+            "entry": {
+                "external_id": external_id,
+                "user": user,
+                "state": entry.state if entry is not None else None,
+            },
+            "meeting": done.meeting.project(lead_s=self._settings.lead_s),
+        }

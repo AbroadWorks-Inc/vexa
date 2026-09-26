@@ -1,4 +1,5 @@
-"""intake — the meeting projection, request validation and the status writer (§2, §2.4, §1.1, §1.4).
+"""intake — entry handling, the meeting projection, request validation and the status writer
+(§1.1, §1.3, §1.4, §2, §2.4).
 
 Front door (P6): import from here, never a deep module path.
 
@@ -17,11 +18,30 @@ Public surface:
     closing on a finished status → one ``webhook_outbox`` row, all in the caller's transaction.
     ``StatusConflict``, ``Outcome``, ``WrittenEvent``, ``derive_event_id_v2`` and ``row_mapping``
     (an ORM row as the column-name mapping ``project_meeting`` reads) come with it.
+  * ``IntakeService(store, spawn, stop, publisher, settings)`` — ``service.py``. The behaviour of
+    ``PUT /v2/entries`` (``put_entry``) and ``POST /v2/entries/remove`` (``remove_entry``) under
+    the link locks, plus R2's ``merge_into_live`` and R7's ``rerun_entries`` (§1.3). It reaches
+    storage, spawning, stopping and publishing only through the ports in ``ports.py``
+    (``IntakeStore``/``IntakeTx``, ``SpawnPort``, ``StopPort``, ``EventPublisher``); the
+    in-memory fakes are in ``fakes.py``. ``IntakeSettings.from_env()`` — ``settings.py``.
 """
 
 from __future__ import annotations
 
+from .ports import (
+    EntryView,
+    EventPublisher,
+    IntakeStore,
+    IntakeTx,
+    MeetingView,
+    Room,
+    SpawnOutcome,
+    SpawnPort,
+    StopPort,
+)
 from .projection import project_meeting
+from .service import IntakeService
+from .settings import IntakeSettings
 from .status import (
     Outcome,
     StatusConflict,
@@ -34,6 +54,17 @@ from .status import (
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
 __all__ = [
+    "IntakeService",
+    "IntakeSettings",
+    "IntakeStore",
+    "IntakeTx",
+    "EntryView",
+    "MeetingView",
+    "Room",
+    "SpawnOutcome",
+    "SpawnPort",
+    "StopPort",
+    "EventPublisher",
     "project_meeting",
     "EntryIn",
     "RemoveIn",
