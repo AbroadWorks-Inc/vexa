@@ -111,3 +111,26 @@ async def fake_redis():
     finally:
         await client.flushall()
         await client.aclose()
+
+
+# --- real Postgres (intake/webhook schema, §1.2) ---------------------------------------
+
+@pytest.fixture()
+async def intake_pg_engine():
+    """An async engine on ``MEETING_API_TEST_DATABASE_URL`` with every admin-api table dropped
+    before and after the test. The caller builds whatever schema it needs (``ensure_schema`` or a
+    migration). SQLAlchemy/asyncpg are imported here, not at module load, so the offline suite never
+    needs them — see ``test_intake_pg_schema.py``'s docstring for the ephemeral install."""
+    import os
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from admin_api.schema import models as admin_models
+
+    eng = create_async_engine(os.environ["MEETING_API_TEST_DATABASE_URL"])
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    yield eng
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    await eng.dispose()

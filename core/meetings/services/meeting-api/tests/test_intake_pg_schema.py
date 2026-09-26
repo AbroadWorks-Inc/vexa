@@ -45,13 +45,11 @@ pytest.importorskip("asyncpg", reason="see this module's docstring")
 from sqlalchemy import inspect, text  # noqa: E402
 from sqlalchemy.dialects import postgresql  # noqa: E402
 from sqlalchemy.exc import IntegrityError  # noqa: E402
-from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 from sqlalchemy.schema import CreateTable  # noqa: E402
 
 from admin_api.schema import models as admin_models  # noqa: E402
 from admin_api.schema import sync as admin_sync  # noqa: E402
 
-DB_URL = os.environ.get("MEETING_API_TEST_DATABASE_URL", "")
 MIGRATION_DOC = (
     Path(admin_models.__file__).parent / "MIGRATION-0008-meeting-live-dedup-index.md"
 )
@@ -141,17 +139,6 @@ GROUP BY user_id, platform, platform_specific_id
 HAVING count(*) > 1;"""
 
 
-@pytest.fixture()
-async def engine():
-    eng = create_async_engine(DB_URL)
-    async with eng.begin() as conn:
-        await conn.run_sync(admin_models.Base.metadata.drop_all)
-    yield eng
-    async with eng.begin() as conn:
-        await conn.run_sync(admin_models.Base.metadata.drop_all)
-    await eng.dispose()
-
-
 async def _table_names(conn) -> set[str]:
     return set(
         await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
@@ -208,9 +195,9 @@ def test_migration_doc_contains_every_step_verbatim(step):
 # ── ensure_schema on an empty DB ─────────────────────────────────────────────────────────────
 
 
-async def test_ensure_schema_converges_cleanly_on_an_empty_db(engine):
-    await admin_sync.ensure_schema(engine, admin_models.Base)
-    async with engine.begin() as conn:
+async def test_ensure_schema_converges_cleanly_on_an_empty_db(intake_pg_engine):
+    await admin_sync.ensure_schema(intake_pg_engine, admin_models.Base)
+    async with intake_pg_engine.begin() as conn:
         names = await _table_names(conn)
     for name in (
         "meetings",
@@ -223,7 +210,7 @@ async def test_ensure_schema_converges_cleanly_on_an_empty_db(engine):
     ):
         assert name in names
 
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         row = (
             await conn.execute(
                 text(
@@ -238,9 +225,11 @@ async def test_ensure_schema_converges_cleanly_on_an_empty_db(engine):
 # ── live-only dedup: two scheduled + one active is fine; a second active raises ─────────────
 
 
-async def test_two_scheduled_rows_are_fine_but_a_second_live_row_raises(engine):
-    await admin_sync.ensure_schema(engine, admin_models.Base)
-    async with engine.begin() as conn:
+async def test_two_scheduled_rows_are_fine_but_a_second_live_row_raises(
+    intake_pg_engine,
+):
+    await admin_sync.ensure_schema(intake_pg_engine, admin_models.Base)
+    async with intake_pg_engine.begin() as conn:
         await conn.execute(
             text(
                 "INSERT INTO meetings (user_id, platform, platform_specific_id, status) VALUES "
@@ -261,7 +250,7 @@ async def test_two_scheduled_rows_are_fine_but_a_second_live_row_raises(engine):
         )
 
     with pytest.raises(IntegrityError):
-        async with engine.begin() as conn:
+        async with intake_pg_engine.begin() as conn:
             await conn.execute(
                 text(
                     "INSERT INTO meetings (user_id, platform, platform_specific_id, status) VALUES "
@@ -273,9 +262,9 @@ async def test_two_scheduled_rows_are_fine_but_a_second_live_row_raises(engine):
 # ── RESTRICT on an entry-managed meeting; CASCADE on an entry-less one ──────────────────────
 
 
-async def test_restrict_blocks_delete_when_a_meeting_entry_exists(engine):
-    await admin_sync.ensure_schema(engine, admin_models.Base)
-    async with engine.begin() as conn:
+async def test_restrict_blocks_delete_when_a_meeting_entry_exists(intake_pg_engine):
+    await admin_sync.ensure_schema(intake_pg_engine, admin_models.Base)
+    async with intake_pg_engine.begin() as conn:
         meeting_id = (
             await conn.execute(
                 text(
@@ -295,15 +284,15 @@ async def test_restrict_blocks_delete_when_a_meeting_entry_exists(engine):
         )
 
     with pytest.raises(IntegrityError):
-        async with engine.begin() as conn:
+        async with intake_pg_engine.begin() as conn:
             await conn.execute(
                 text("DELETE FROM meetings WHERE id = :id"), {"id": meeting_id}
             )
 
 
-async def test_cascade_removes_aw_state_when_the_meeting_is_deleted(engine):
-    await admin_sync.ensure_schema(engine, admin_models.Base)
-    async with engine.begin() as conn:
+async def test_cascade_removes_aw_state_when_the_meeting_is_deleted(intake_pg_engine):
+    await admin_sync.ensure_schema(intake_pg_engine, admin_models.Base)
+    async with intake_pg_engine.begin() as conn:
         meeting_id = (
             await conn.execute(
                 text(
@@ -317,12 +306,12 @@ async def test_cascade_removes_aw_state_when_the_meeting_is_deleted(engine):
             {"meeting_id": meeting_id},
         )
 
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         await conn.execute(
             text("DELETE FROM meetings WHERE id = :id"), {"id": meeting_id}
         )
 
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         remaining = (
             await conn.execute(
                 text("SELECT count(*) FROM meeting_aw_state WHERE meeting_id = :id"),
@@ -335,9 +324,9 @@ async def test_cascade_removes_aw_state_when_the_meeting_is_deleted(engine):
 # ── EXPLAIN uses the due index ───────────────────────────────────────────────────────────────
 
 
-async def test_explain_due_query_uses_the_scheduled_due_index(engine):
-    await admin_sync.ensure_schema(engine, admin_models.Base)
-    async with engine.begin() as conn:
+async def test_explain_due_query_uses_the_scheduled_due_index(intake_pg_engine):
+    await admin_sync.ensure_schema(intake_pg_engine, admin_models.Base)
+    async with intake_pg_engine.begin() as conn:
         await conn.execute(
             text(
                 "INSERT INTO meetings (user_id, platform, status, start_time) VALUES "
@@ -364,15 +353,15 @@ async def test_explain_due_query_uses_the_scheduled_due_index(engine):
 # ── MIGRATION-0008 applied to a dirty (old-shape, populated) DB ─────────────────────────────
 
 
-async def test_migration_0008_applied_to_a_dirty_db(engine):
-    async with engine.begin() as conn:
+async def test_migration_0008_applied_to_a_dirty_db(intake_pg_engine):
+    async with intake_pg_engine.begin() as conn:
         await conn.execute(text(OLD_MEETINGS_TABLE_SQL))
         await conn.execute(text(OLD_DEDUP_INDEX_SQL))
         # meeting_event_time() is already live in prod (MIGRATION-0005) — simulate that here with
         # the SAME function admin-api's own convergence creates (no local re-authoring of the SQL).
         await conn.execute(text(admin_sync._MEETING_EVENT_TIME_FN))
 
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         for i in range(3):
             await conn.execute(
                 text(
@@ -383,42 +372,42 @@ async def test_migration_0008_applied_to_a_dirty_db(engine):
             )
 
     # Pre-check: no link has two live rows (expected zero on this fixture).
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         dup_rows = (await conn.execute(text(PRECHECK_SQL))).all()
     assert dup_rows == []
 
     # Step 1.1 — the six new tables.
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         for cls in NEW_TABLE_CLASSES:
             sql = str(CreateTable(cls.__table__).compile(dialect=postgresql.dialect()))
             await conn.execute(text(sql))
 
     # Step 1.2 — add the column (nullable).
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         await conn.execute(text(STEP_1_2_ADD_UUID))
 
     # Step 1.3 — the backfill DO block issues its own internal COMMIT per batch, which Postgres
     # only allows outside an explicit transaction block (autocommit, like the doc itself notes).
-    await _run_autocommit(engine, STEP_1_3_BACKFILL)
+    await _run_autocommit(intake_pg_engine, STEP_1_3_BACKFILL)
 
     # Step 1.4 — default new rows going forward.
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         await conn.execute(text(STEP_1_4_SET_DEFAULT))
 
     # Step 1.5, 1.7, 1.8 — CONCURRENTLY builds (autocommit, one statement per connection use).
-    await _run_autocommit(engine, STEP_1_5_UUID_INDEX)
-    await _run_autocommit(engine, STEP_1_7_LIVE_DEDUP_INDEX)
-    await _run_autocommit(engine, STEP_1_8_DUE_INDEX)
+    await _run_autocommit(intake_pg_engine, STEP_1_5_UUID_INDEX)
+    await _run_autocommit(intake_pg_engine, STEP_1_7_LIVE_DEDUP_INDEX)
+    await _run_autocommit(intake_pg_engine, STEP_1_8_DUE_INDEX)
 
     # Step 1.6 — NOT NULL via a validated CHECK constraint.
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         for stmt in STEP_1_6_NOT_NULL:
             await conn.execute(text(stmt))
 
     # Step 3 — drop the old index (post-deploy, but nothing here depends on a real deploy step).
-    await _run_autocommit(engine, STEP_3_DROP_OLD_INDEX)
+    await _run_autocommit(intake_pg_engine, STEP_3_DROP_OLD_INDEX)
 
-    async with engine.begin() as conn:
+    async with intake_pg_engine.begin() as conn:
         uuids = [
             r[0] for r in (await conn.execute(text("SELECT uuid FROM meetings"))).all()
         ]
