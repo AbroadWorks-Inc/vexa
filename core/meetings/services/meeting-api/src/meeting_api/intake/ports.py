@@ -235,6 +235,13 @@ class IntakeTx(Protocol):
 
     async def set_title(self, meeting_id: int, title: Optional[str]) -> None: ...
 
+    async def record_spawn_error(
+        self, meeting_id: int, code: Optional[str], message: Optional[str]
+    ) -> None:
+        """Store a spawn failure on ``meeting_aw_state`` (``last_error_code``,
+        ``last_error_message``) without changing the meeting's status."""
+        ...
+
     async def move_active_entries(
         self, from_meeting_id: int, to_meeting_id: int
     ) -> None: ...
@@ -249,6 +256,7 @@ class IntakeTx(Protocol):
         outcome: Optional[Outcome] = None,
         change_reason: Optional[str] = None,
         event_type: Optional[str] = None,
+        event_data: Optional[Mapping[str, Any]] = None,
     ) -> WrittenEvent:
         """``write_status`` in this transaction (§1.4)."""
         ...

@@ -1,11 +1,12 @@
 """The entry service (§1.3): the behaviour of ``PUT /v2/entries`` and ``POST /v2/entries/remove``.
 
-Every write runs under the link lock of the entry's meeting link (both links, sorted, when an
-update changes it), through ``IntakeStore.room_lock``. The entry is read under the lock; if its link
-isn't one the lock covers, the transaction ends without writing and the service starts again once
-with the entry's link added. A remove or a re-run doesn't know the link before reading, so it
-first reads without a link lock. Events are published after the transaction commits; spawns and
-stops run after that, each through its own port.
+Every write runs under the link locks of the entry's link and of its meeting's link (they differ
+after a link change while live), plus the new link on an update, all sorted, through
+``IntakeStore.room_lock``. The entry is read under the lock; if a link it needs isn't covered, the
+transaction ends without writing and the service starts again once with those links added. A
+remove or a re-run doesn't know the links before reading, so it first reads without a link lock.
+Events are published after the transaction commits (a failed publish is logged: the outbox holds
+them); stops and spawns run after that, each through its own port.
 
 ``PUT`` (§1.3 steps 1–9):
   1. validate (``parse_entry``) and parse the link: unknown → ``unrecognized_link``, a host in
@@ -23,14 +24,18 @@ stops run after that, each through its own port.
      (R8, detail ``entry_moved``); one left with others is re-planned;
   6. a ``join_now`` entry whose meeting is still ``scheduled`` after the commit is spawned on
      that exact row: ``sent`` keeps the result, ``already_live`` → ``joined_existing``, a failure
-     ends the meeting ``not_sent`` with the typed code and exact message.
+     ends the meeting ``not_sent`` with the typed code and exact message. When other active
+     entries share the meeting (it was adopted), only the pasted entry is removed (reason
+     ``not_sent``), the failure is recorded on the meeting, which stays ``scheduled`` with its
+     time back to the remaining entries (``joined_existing``, Ruling R12).
 Only a write that adds an active entry checks the quota (429 ``quota_exceeded``).
 
 ``remove``: the entry becomes ``removed``. Others remain → the meeting is re-planned
 (``entry_removed``). It was the last one → a scheduled meeting ends ``failed`` with
 ``completion_reason: "stopped"`` and outcome ``cancelled_by_calendar`` (``removed``, R8); a live
 one is stopped with that outcome (``bot_stopping``, R5). The status change is conditional, so a
-meeting that went live meanwhile takes the live branch.
+meeting that went live meanwhile takes the live branch. When the meeting has already finished,
+only the entry goes (``entry_removed``) and the finished meeting is left as history.
 
 ``merge_into_live`` is R2's exception and ``rerun_entries`` R7's re-run at finish; both are called
 by the scheduler and the status writer's callers, not by a route.
@@ -48,6 +53,7 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 from urllib.parse import urlparse
 
 from ..collector.meeting_link import parse_meeting_url
+from ..obs import log_event
 from .ports import (
     EntryView,
     EventPublisher,
@@ -79,6 +85,15 @@ STOPPED = "stopped"
 CANCELLED_BY_CALENDAR = "cancelled_by_calendar"
 ENTRY_MOVED = "entry_moved"
 ENTRY_MOVED_MESSAGE = "last entry moved to another meeting"
+
+
+#: The remove reply for each way ``_end_planned`` / the live branch ends (§2.4): the meeting was
+#: removed; its bot is leaving; or it had already finished, so only the entry went.
+_REMOVE_RESULT = {
+    "removed": "removed",
+    "stopping": "bot_stopping",
+    "finished": "entry_removed",
+}
 
 
 def _removed_message(reason: Optional[str]) -> str:
@@ -154,7 +169,7 @@ class IntakeService:
         done = await self._locked(user_id, frozenset({room}), read, body_, restarts=1)
         assert done is not None
         if done.spawn:
-            done = await self._spawn_now(user_id, done)
+            done = await self._spawn_now(user_id, done, entry)
         return self._reply(done, entry.user, entry.external_id)
 
     async def remove_entry(self, user_id: int, body: Any) -> dict[str, Any]:
@@ -189,6 +204,7 @@ class IntakeService:
             live = await tx.meeting(live_meeting_id)
             if (
                 due.status != "scheduled"
+                or due.user_id != user_id
                 or due.room != room
                 or not is_live(live.status)
                 or live.end is not None
@@ -209,9 +225,10 @@ class IntakeService:
                     f"merged into live meeting {live.uuid}",
                 ),
                 event_type="meeting.removed",
+                event_data={"merged_into": live.uuid},
             )
             await w.event(live.id, "meeting.updated")
-        await self._publisher.publish(w.events)
+        await self._publish(w.events)
         return True
 
     async def rerun_entries(self, user_id: int, entry_ids: Sequence[int]) -> None:
@@ -255,9 +272,12 @@ class IntakeService:
         for _ in range(restarts + 1):
             async with self._store.room_lock(user_id, sorted(rooms)) as tx:
                 existing = await read(tx)
-                if existing is not None and existing.room not in rooms:
-                    rooms = base | {existing.room}
-                    continue
+                if existing is not None:
+                    meeting = await tx.meeting(existing.meeting_id)
+                    needed = {existing.room, meeting.room}
+                    if not needed <= rooms:
+                        rooms = base | needed
+                        continue
                 work = _Work(tx)
                 done = await body(work, existing)
                 break
@@ -266,13 +286,29 @@ class IntakeService:
                 "unavailable",
                 "the entry's meeting link changed during the request; retry",
             )
-        if work.events:
-            await self._publisher.publish(work.events)
+        await self._publish(work.events)
         for meeting_id, outcome in work.stops:
             await self._stop.stop_live(user_id, meeting_id, outcome=outcome)
         if work.stops and done is not None:
             done = replace(done, meeting=await self._read(user_id, done.meeting.id))
         return done
+
+    async def _publish(self, event_ids: Sequence[str]) -> None:
+        """Hand committed events to the publisher. A failure is logged and doesn't fail the
+        request: the events are in the outbox, and the publisher picks up unpublished rows.
+        """
+        if not event_ids:
+            return
+        try:
+            await self._publisher.publish(event_ids)
+        except Exception as exc:
+            log_event(
+                "intake_publish_failed",
+                audience="operator",
+                level="warning",
+                span="meetings.intake",
+                fields={"events": len(event_ids), "error": type(exc).__name__},
+            )
 
     async def _read(self, user_id: int, meeting_id: int) -> MeetingView:
         async with self._store.room_lock(user_id, ()) as tx:
@@ -412,40 +448,60 @@ class IntakeService:
             )
         return match_entry(entry, candidates, now=now, lead_s=self._settings.lead_s)
 
-    async def _spawn_now(self, user_id: int, done: _Done) -> _Done:
+    async def _spawn_now(self, user_id: int, done: _Done, entry: EntryIn) -> _Done:
         """§1.3 ``join_now``: spawn the exact row after the commit."""
         outcome = await self._spawn.spawn_exact(user_id, done.meeting.id)
         result = done.result
         if outcome.result == "already_live":
             result = "joined_existing"
-        elif outcome.result == "failed" and not await self._not_sent(
-            user_id, done.meeting, outcome
-        ):
-            result = "joined_existing"
+        elif outcome.result == "failed":
+            result = await self._spawn_failed(user_id, done, entry, outcome)
         return replace(
             done, result=result, meeting=await self._read(user_id, done.meeting.id)
         )
 
-    async def _not_sent(
-        self, user_id: int, meeting: MeetingView, outcome: SpawnOutcome
-    ) -> bool:
-        """End the meeting ``not_sent`` with the spawn's typed code and message. ``False`` when
-        it is no longer ``scheduled`` (the scheduler sent a bot meanwhile)."""
+    async def _spawn_failed(
+        self, user_id: int, done: _Done, entry: EntryIn, outcome: SpawnOutcome
+    ) -> str:
+        """A real spawn failure for a ``join_now`` entry. The meeting ends ``not_sent`` with the
+        typed code and exact message, unless other active entries share it (an adopted meeting,
+        Ruling R12): then only the pasted entry goes (``removed``, reason ``not_sent``), the
+        failure is recorded on the meeting, its time returns to the remaining entries, and it
+        stays ``scheduled`` for them (``joined_existing``). A meeting that is no longer
+        ``scheduled`` got its bot from the scheduler meanwhile (``joined_existing``)."""
+        meeting = done.meeting
         async with self._store.room_lock(user_id, [meeting.room]) as tx:
             w = _Work(tx)
-            try:
-                await w.status(
-                    meeting.id,
-                    "failed",
-                    expected_from={"scheduled"},
-                    outcome=Outcome("not_sent", outcome.code, outcome.message),
-                    change_reason=outcome.code,
-                    event_type="meeting.not_sent",
-                )
-            except StatusConflict:
-                return False
-        await self._publisher.publish(w.events)
-        return True
+            mine = await tx.find_entry(user_id, entry.user, entry.external_id)
+            others = [
+                e
+                for e in await tx.active_entries(meeting.id)
+                if mine is None or e.id != mine.id
+            ]
+            current = await tx.meeting(meeting.id)
+            if current.status != "scheduled":
+                return "joined_existing"
+            if others and mine is not None:
+                await tx.mark_entry_removed(mine.id, "not_sent")
+                await tx.record_spawn_error(meeting.id, outcome.code, outcome.message)
+                await self._replan(tx, meeting.id, current.room)
+                await w.event(meeting.id, "meeting.updated")
+                result = "joined_existing"
+            else:
+                try:
+                    await w.status(
+                        meeting.id,
+                        "failed",
+                        expected_from={"scheduled"},
+                        outcome=Outcome("not_sent", outcome.code, outcome.message),
+                        change_reason=outcome.code,
+                        event_type="meeting.not_sent",
+                    )
+                except StatusConflict:
+                    return "joined_existing"
+                result = done.result
+        await self._publish(w.events)
+        return result
 
     async def _check_quota(self, tx: IntakeTx, user_id: int) -> None:
         limit = self._settings.max_active_entries
@@ -462,7 +518,7 @@ class IntakeService:
                 "unrecognized_link",
                 "meeting_url is not a meeting link aw-bots recognises",
             )
-        host = (urlparse(meeting_url.strip()).hostname or "").lower()
+        host = (urlparse(meeting_url.strip()).hostname or "").lower().rstrip(".")
         if host in self._settings.blocked_hosts:
             raise IntakeError(
                 "platform_not_enabled", f"meeting links on {host} are not enabled"
@@ -484,7 +540,7 @@ class IntakeService:
             return _Done("already_removed", meeting)
         await tx.mark_entry_removed(existing.id, req.reason)
         if meeting.status in FINISHED_STATUSES:
-            return _Done("removed", await tx.meeting(meeting.id))
+            return _Done("entry_removed", await tx.meeting(meeting.id))
         if await tx.active_entries(meeting.id):
             if meeting.status == "scheduled":
                 await self._replan(tx, meeting.id, meeting.room)
@@ -498,8 +554,7 @@ class IntakeService:
         else:
             await w.stop_after_commit(meeting.id, outcome)
             ended = "stopping"
-        result = "bot_stopping" if ended == "stopping" else "removed"
-        return _Done(result, await tx.meeting(meeting.id))
+        return _Done(_REMOVE_RESULT[ended], await tx.meeting(meeting.id))
 
     # ── shared ──────────────────────────────────────────────────────────────────────────────
 

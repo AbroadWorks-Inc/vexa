@@ -527,6 +527,35 @@ async def test_fake_event_type_override(orm):
     )
 
 
+async def test_fake_event_data_rides_next_to_meeting_and_change(orm):
+    db = RecordingSession(orm, _meeting(orm, status="scheduled"), _aw(orm))
+    await write_status(
+        db,
+        11,
+        "failed",
+        expected_from={"scheduled"},
+        event_type="meeting.removed",
+        event_data={"merged_into": "0b1c2d3e-0000-4000-8000-000000000001"},
+    )
+    (row,) = db.outbox()
+    data = json.loads(row.payload_text)["data"]
+    assert set(data) == {"meeting", "change", "merged_into"}
+    assert data["merged_into"] == "0b1c2d3e-0000-4000-8000-000000000001"
+    assert data["change"]["to"] == "failed"
+    _webhook_schema_conforms(json.loads(row.payload_text))
+
+
+@pytest.mark.parametrize("key", ["meeting", "change"])
+async def test_fake_event_data_never_replaces_meeting_or_change(orm, key):
+    meeting = _meeting(orm, status="scheduled")
+    db = RecordingSession(orm, meeting, _aw(orm))
+    with pytest.raises(ValueError):
+        await write_status(
+            db, 11, "failed", expected_from={"scheduled"}, event_data={key: "x"}
+        )
+    assert db.added == [] and meeting.status == "scheduled"
+
+
 async def test_fake_write_event_without_change(orm):
     meeting = _meeting(orm, status="scheduled")
     aw = _aw(orm, event_seq=2)
@@ -925,3 +954,24 @@ async def test_pg_aw_state_is_not_locked_while_the_meeting_row_is_contended(pg_s
 
     written = await asyncio.wait_for(task, 10)
     assert written.sequence == 1
+
+
+@pg
+async def test_pg_event_data_is_stored_in_the_payload(pg_schema):
+    meeting_id = await _seed_meeting(
+        pg_schema, status="scheduled", scheduled_at=_now() + timedelta(hours=1)
+    )
+    async with _sessions(pg_schema)() as db, db.begin():
+        await write_status(
+            db,
+            meeting_id,
+            "failed",
+            expected_from={"scheduled"},
+            event_type="meeting.removed",
+            event_data={"merged_into": "0b1c2d3e-0000-4000-8000-000000000001"},
+        )
+    (row,) = (await _snapshot(pg_schema, meeting_id))["outbox"]
+    envelope = json.loads(row.payload_text)
+    assert _canonical(envelope) == row.payload_text
+    assert envelope["data"]["merged_into"] == "0b1c2d3e-0000-4000-8000-000000000001"
+    assert set(envelope["data"]) == {"meeting", "change", "merged_into"}

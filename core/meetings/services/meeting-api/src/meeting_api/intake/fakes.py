@@ -48,6 +48,7 @@ from .status import (
     Outcome,
     StatusConflict,
     WrittenEvent,
+    check_event_data,
     derive_event_id_v2,
 )
 from .validation import EntryIn
@@ -70,6 +71,7 @@ class RecordedEvent:
     sequence: int
     change: Optional[dict[str, Any]]
     meeting: dict[str, Any]
+    event_data: Optional[dict[str, Any]] = None
 
 
 class InMemoryIntakeStore:
@@ -169,6 +171,8 @@ class InMemoryIntakeStore:
             "outcome_detail": None,
             "outcome_message": None,
             "outcome_at": None,
+            "last_error_code": None,
+            "last_error_message": None,
         }
         if plan is not None:
             self.apply_plan(meeting_id, room, plan)
@@ -234,7 +238,9 @@ class InMemoryIntakeStore:
         outcome: Optional[Outcome] = None,
         change_reason: Optional[str] = None,
         event_type: Optional[str] = None,
+        event_data: Optional[Mapping[str, Any]] = None,
     ) -> WrittenEvent:
+        check_event_data(event_data)
         now = self._clock()
         row = self.meetings.get(meeting_id)
         if row is None or row["status"] not in expected_from:
@@ -272,7 +278,7 @@ class InMemoryIntakeStore:
             "at": iso_utc(now.replace(microsecond=0)),
         }
         written = self.write_event(
-            meeting_id, event_type or STATUS_CHANGE_EVENT, change
+            meeting_id, event_type or STATUS_CHANGE_EVENT, change, event_data=event_data
         )
         return WrittenEvent(written.event_id, written.sequence, tuple(rerun))
 
@@ -281,6 +287,8 @@ class InMemoryIntakeStore:
         meeting_id: int,
         event_type: str,
         change: Optional[Mapping[str, Any]] = None,
+        *,
+        event_data: Optional[Mapping[str, Any]] = None,
     ) -> WrittenEvent:
         if meeting_id not in self.meetings:
             raise LookupError(f"meeting {meeting_id} not found")
@@ -297,6 +305,7 @@ class InMemoryIntakeStore:
                 sequence=sequence,
                 change=dict(change) if change is not None else None,
                 meeting=view.project(lead_s=self._lead_s),
+                event_data=dict(event_data) if event_data is not None else None,
             )
         )
         return WrittenEvent(event_id, sequence, ())
@@ -366,6 +375,15 @@ class _FakeTx:
         row = self._s.meetings[meeting_id]
         self._s.meetings[meeting_id] = {**row, "data": {**row["data"], "title": title}}
 
+    async def record_spawn_error(
+        self, meeting_id: int, code: Optional[str], message: Optional[str]
+    ) -> None:
+        self._s.aw[meeting_id] = {
+            **self._s.aw[meeting_id],
+            "last_error_code": code,
+            "last_error_message": message,
+        }
+
     async def move_active_entries(
         self, from_meeting_id: int, to_meeting_id: int
     ) -> None:
@@ -382,6 +400,7 @@ class _FakeTx:
         outcome: Optional[Outcome] = None,
         change_reason: Optional[str] = None,
         event_type: Optional[str] = None,
+        event_data: Optional[Mapping[str, Any]] = None,
     ) -> WrittenEvent:
         return self._s.write_status(
             meeting_id,
@@ -391,6 +410,7 @@ class _FakeTx:
             outcome=outcome,
             change_reason=change_reason,
             event_type=event_type,
+            event_data=event_data,
         )
 
     async def event(

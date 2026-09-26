@@ -18,6 +18,8 @@ writing nothing, if the status isn't expected), writes the status and data patch
 entries on `completed`/`failed` (returning a future, non-overlapping entry's id for re-run, R7), and
 inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelope that gets sent.
 `write_event(db, meeting_id, event_type, change)` records a non-status event the same way.
+`write_status(..., event_data=...)` adds keys to the envelope's `data` next to `meeting` and
+`change` (`merged_into` on a merge's `meeting.removed`, §2.7), never replacing those two.
 
 `rules.py` holds the R1 matching rules and the meeting windows (§1.1, R7, R10), pure: `overlaps`
 (half-open, a missing end is unbounded), `meeting_start`, `meeting_window`, `match_entry`,
@@ -31,7 +33,8 @@ an entry to the meeting R1 matches or creates one, keeps a live meeting as it is
 (`not_changed_live`), treats a finished meeting as history unless the entry points to a new future
 time, removes a meeting that lost its last entry (R8) or stops its bot when live (R5), and checks
 the active-entry quota only when a write adds an entry. Events are published after the commit;
-a `join_now` entry's meeting is then spawned on that exact row. `merge_into_live` (R2's exception)
+a `join_now` entry's meeting is then spawned on that exact row (a failure ends it `not_sent`,
+unless it was adopted with other entries on it: then only the pasted entry goes, Ruling R12). `merge_into_live` (R2's exception)
 and `rerun_entries` (R7) are for the scheduler and the status writer's callers. The service reaches
 storage, spawn, stop and publishing only through `ports.py` (`IntakeStore`/`IntakeTx`,
 `SpawnPort`, `StopPort`, `EventPublisher`); `fakes.py` holds the in-memory implementations.

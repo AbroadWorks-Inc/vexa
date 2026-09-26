@@ -11,11 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from intake_builders import A, B, GMEET, GMEET_OTHER, ZOOM, make_harness
+from intake_builders import A, B, GMEET, GMEET_OTHER, ZOOM, make_harness, ts
 from meeting_api.intake import IntakeError
 from meeting_api.intake.ports import Room, SpawnOutcome
+from meeting_api.intake.rules import Plan
 from meeting_api.intake.settings import IntakeSettings
-from meeting_api.intake.status import Outcome
 
 GROOM = Room("google_meet", "kxo-misr-avz")
 GROOM_OTHER = Room("google_meet", "abc-defg-hij")
@@ -223,7 +223,8 @@ async def test_a_link_that_keeps_changing_is_unavailable_and_writes_nothing():
     assert (err.value.code, err.value.http_status) == ("unavailable", 503)
     assert h.store.lock_log[locks:] == [
         (1, (GROOM_OTHER,)),
-        (1, (GROOM_OTHER, Room("google_meet", "zzz-zzzz-zzb"))),
+        # the entry's new link and its meeting's link
+        (1, (GROOM_OTHER, GROOM, Room("google_meet", "zzz-zzzz-zzb"))),
     ]
     assert h.events(mark) == []
 
@@ -343,6 +344,9 @@ async def test_merge_into_live_moves_entries_onto_the_open_ended_meeting():
     ]
     assert (kept.status, kept.title) == ("requested", "Weekly sync")
     assert h.events(mark) == [(due, "meeting.removed"), (live, "meeting.updated")]
+    removed = h.store.events[-2]
+    assert removed.event_data == {"merged_into": live}
+    assert h.store.events[-1].event_data is None
     assert h.published()[-2:] == [e.event_id for e in h.store.events[-2:]]
 
 
@@ -515,10 +519,272 @@ def test_every_intake_setting_is_declared_in_config_v1():
     assert "AUTO_JOIN_LEAD_S" in declared
 
 
-def test_outcome_messages_are_fixed_strings():
-    from meeting_api.intake import service
+# ── R12: an adopted meeting's failed instant join ────────────────────────────────────────────
 
-    assert service.ENTRY_MOVED_MESSAGE == "last entry moved to another meeting"
-    assert service._removed_message("cancelled") == "last entry removed: cancelled"
-    assert service._removed_message(None) == "last entry removed"
-    assert Outcome("cancelled_by_calendar", None, "last entry removed").detail is None
+ACCOUNT_LIMIT = SpawnOutcome("failed", "account_limit", "bot limit reached (45 of 45)")
+
+
+async def test_join_now_adopting_a_shared_meeting_keeps_it_when_the_spawn_fails():
+    h = make_harness("2026-09-29T09:00:00Z", spawn_failure=ACCOUNT_LIMIT)
+    uuid = (await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T10:30:00Z"))[
+        "meeting"
+    ]["id"]
+    h.clock.set("2026-09-29T09:45:00Z")
+    mark = h.mark()
+    reply = await h.instant("manual:1", GMEET)
+    m = reply["meeting"]
+    assert (reply["result"], m["id"], reply["entry"]["state"]) == (
+        "joined_existing",
+        uuid,
+        "removed",
+    )
+    assert (m["status"], m["outcome"], m["completion_reason"]) == (
+        "scheduled",
+        None,
+        None,
+    )
+    assert (m["start"], m["end"]) == ("2026-09-29T10:00:00Z", "2026-09-29T10:30:00Z")
+    assert [e["external_id"] for e in m["entries"]] == ["google:3n5kq8example"]
+    aw = h.meeting(uuid).aw
+    assert (aw["last_error_code"], aw["last_error_message"]) == (
+        "account_limit",
+        "bot limit reached (45 of 45)",
+    )
+    assert h.store.find_entry(1, A, "manual:1").removed_reason == "not_sent"
+    assert h.events(mark) == [(uuid, "meeting.updated"), (uuid, "meeting.updated")]
+    assert h.published()[-1] == h.store.events[-1].event_id
+    assert h.spawn.calls == [(1, h.meeting_id(uuid))]
+
+
+async def test_join_now_adopting_an_entry_less_meeting_ends_it_not_sent():
+    h = make_harness("2026-09-29T09:45:00Z", spawn_failure=ACCOUNT_LIMIT)
+    planned = h.store.seed_meeting(
+        1,
+        GROOM,
+        status="scheduled",
+        plan=Plan(ts("2026-09-29T10:00:00Z"), None, "Planned upstream", None, GMEET),
+    )
+    uuid = h.store.meetings[planned]["uuid"]
+    reply = await h.instant("manual:1", GMEET)
+    m = reply["meeting"]
+    assert (reply["result"], m["id"], m["status"]) == (
+        "joined_existing",
+        uuid,
+        "failed",
+    )
+    assert m["outcome"] == {
+        "kind": "not_sent",
+        "detail": "account_limit",
+        "message": "bot limit reached (45 of 45)",
+        "at": "2026-09-29T09:45:00Z",
+    }
+    assert reply["entry"]["state"] == "closed"
+    assert h.events() == [(uuid, "meeting.updated"), (uuid, "meeting.not_sent")]
+
+
+# ── the meeting's link is locked too ─────────────────────────────────────────────────────────
+
+
+async def _live_with_link_changed(h, **fields) -> str:
+    uuid = (await h.put())["meeting"]["id"]  # on GROOM
+    h.clock.set("2026-09-29T09:01:00Z")
+    h.set_status(uuid, "active")
+    held = await h.put(meeting_url=GMEET_OTHER, **fields)
+    assert held["result"] == "not_changed_live"
+    assert h.store.find_entry(1, A, "google:3n5kq8example").room == GROOM_OTHER
+    return uuid
+
+
+async def test_remove_after_a_link_change_while_live_locks_the_meeting_link():
+    h = make_harness()
+    uuid = await _live_with_link_changed(h)
+    locks = len(h.store.lock_log)
+    reply = await h.remove(reason="cancelled")
+    # discovery read; then the entry's link AND its live meeting's link; then the reply's read
+    assert h.store.lock_log[locks:] == [(1, ()), (1, (GROOM_OTHER, GROOM)), (1, ())]
+    assert (reply["result"], reply["meeting"]["status"]) == ("bot_stopping", "stopping")
+    assert [c[1] for c in h.stop.calls] == [h.meeting_id(uuid)]
+
+
+async def test_finish_after_a_link_change_while_live_reruns_on_the_new_link():
+    h = make_harness()
+    uuid = await _live_with_link_changed(
+        h, start="2026-09-29T15:00:00Z", end="2026-09-29T15:30:00Z"
+    )
+    h.clock.set("2026-09-29T09:20:00Z")
+    written = h.set_status(uuid, "completed")
+    locks = len(h.store.lock_log)
+    await h.service.rerun_entries(1, written.rerun_entry_ids)
+    assert h.store.lock_log[locks:] == [(1, ()), (1, (GROOM_OTHER, GROOM))]
+    moved = h.store.find_entry(1, A, "google:3n5kq8example")
+    new = h.store.view(moved.meeting_id)
+    assert (new.uuid != uuid, new.room, new.status) == (True, GROOM_OTHER, "scheduled")
+
+
+async def test_a_link_change_while_live_then_the_same_time_is_closed_at_finish():
+    h = make_harness()
+    uuid = await _live_with_link_changed(h)
+    h.clock.set("2026-09-29T09:20:00Z")
+    written = h.set_status(uuid, "completed")
+    assert written.rerun_entry_ids == ()
+    assert h.store.find_entry(1, A, "google:3n5kq8example").state == "closed"
+    again = await h.remove(reason="cancelled")
+    assert again["result"] == "already_removed"
+
+
+# ── shared invites (`_move`) ─────────────────────────────────────────────────────────────────
+
+
+async def test_title_change_on_a_shared_meeting_stays_on_it():
+    h = make_harness()
+    uuid = (await h.put(title="Sync"))["meeting"]["id"]
+    await h.put(user=B, title="Sync")
+    mark = h.mark()
+    reply = await h.put(title="Sync (agenda)")
+    assert (reply["result"], reply["meeting"]["id"], reply["previous_meeting_id"]) == (
+        "updated",
+        uuid,
+        None,
+    )
+    assert [e["user"] for e in reply["meeting"]["entries"]] == [A, B]
+    assert h.events(mark) == [(uuid, "meeting.updated")]
+    assert len(h.store.meetings) == 1
+
+
+async def test_one_of_two_entries_moving_away_replans_the_old_meeting():
+    h = make_harness()
+    uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
+        "meeting"
+    ]["id"]
+    await h.put(user=B, start="2026-09-29T09:30:00Z", end="2026-09-29T10:30:00Z")
+    assert h.meeting(uuid).project(lead_s=300)["end"] == "2026-09-29T10:30:00Z"
+    mark = h.mark()
+    reply = await h.put(
+        user=B, start="2026-09-29T14:00:00Z", end="2026-09-29T15:00:00Z"
+    )
+    new = reply["meeting"]["id"]
+    assert (reply["result"], reply["previous_meeting_id"]) == ("updated", uuid)
+    assert new != uuid and [e["user"] for e in reply["meeting"]["entries"]] == [B]
+    old = h.meeting(uuid).project(lead_s=300)
+    assert (old["status"], old["start"], old["end"]) == (
+        "scheduled",
+        "2026-09-29T09:00:00Z",
+        "2026-09-29T10:00:00Z",
+    )
+    assert [e["user"] for e in old["entries"]] == [A]
+    assert h.events(mark) == [(new, "meeting.scheduled"), (uuid, "meeting.updated")]
+
+
+def _race_on_removal(h, status: str):
+    """The meeting's status changes to ``status`` between intake's read and its conditional
+    ``failed`` write — as a lifecycle callback holding no link lock would do."""
+    original = h.store.write_status
+    fired: list[int] = []
+
+    def racing(meeting_id, to_status, **kwargs):
+        if not fired and to_status == "failed":
+            fired.append(meeting_id)
+            h.store.meetings[meeting_id] = {
+                **h.store.meetings[meeting_id],
+                "status": status,
+            }
+        return original(meeting_id, to_status, **kwargs)
+
+    h.store.write_status = racing  # type: ignore[method-assign]
+
+
+async def test_last_entry_removed_as_the_meeting_goes_live_stops_the_bot():
+    h = make_harness()
+    uuid = (await h.put())["meeting"]["id"]
+    _race_on_removal(h, "active")
+    mark = h.mark()
+    reply = await h.remove(reason="cancelled")
+    assert (reply["result"], reply["meeting"]["status"]) == ("bot_stopping", "stopping")
+    assert reply["meeting"]["outcome"]["kind"] == "cancelled_by_calendar"
+    assert reply["meeting"]["completion_reason"] is None
+    assert [c[1] for c in h.stop.calls] == [h.meeting_id(uuid)]
+    assert h.events(mark) == [
+        (uuid, "meeting.updated"),
+        (uuid, "meeting.status_change"),
+    ]
+
+
+async def test_last_entry_removed_as_the_meeting_finishes_is_entry_removed():
+    h = make_harness()
+    uuid = (await h.put())["meeting"]["id"]
+    _race_on_removal(h, "completed")
+    mark = h.mark()
+    reply = await h.remove(reason="cancelled")
+    assert (reply["result"], reply["entry"]["state"]) == ("entry_removed", "removed")
+    assert (reply["meeting"]["status"], reply["meeting"]["outcome"]) == (
+        "completed",
+        None,
+    )
+    assert reply["meeting"]["id"] == uuid
+    assert h.events(mark) == [] and h.stop.calls == []
+
+
+async def test_removing_an_entry_waiting_to_rerun_is_entry_removed():
+    h = make_harness()
+    uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
+        "meeting"
+    ]["id"]
+    h.clock.set("2026-09-29T09:00:00Z")
+    h.set_status(uuid, "active")
+    await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
+    h.clock.set("2026-09-29T09:30:00Z")
+    assert h.set_status(uuid, "completed").rerun_entry_ids
+    mark = h.mark()
+    reply = await h.remove(reason="cancelled")
+    assert (reply["result"], reply["entry"]["state"], reply["meeting"]["status"]) == (
+        "entry_removed",
+        "removed",
+        "completed",
+    )
+    assert h.events(mark) == []
+
+
+# ── minors ───────────────────────────────────────────────────────────────────────────────────
+
+
+async def test_merge_into_live_refuses_another_accounts_meeting():
+    h = make_harness("2026-09-29T09:00:00Z")
+    live = (await h.instant("manual:1", GMEET))["meeting"]["id"]
+    other = (
+        await h.put(user_id=2, start="2026-09-29T11:00:00Z", end="2026-09-29T11:30:00Z")
+    )["meeting"]["id"]
+    mark = h.mark()
+    assert (
+        await h.service.merge_into_live(1, h.meeting_id(other), h.meeting_id(live))
+        is False
+    )
+    assert h.meeting(other).status == "scheduled" and h.events(mark) == []
+
+
+async def test_a_publish_failure_does_not_skip_the_stop():
+    h = make_harness()
+    uuid = (await h.put())["meeting"]["id"]
+    h.clock.set("2026-09-29T09:01:00Z")
+    h.set_status(uuid, "active")
+
+    async def down(event_ids):
+        raise ConnectionError("publisher unavailable")
+
+    h.publisher.publish = down  # type: ignore[method-assign]
+    reply = await h.remove(reason="cancelled")
+    assert (reply["result"], reply["meeting"]["status"]) == ("bot_stopping", "stopping")
+    assert [c[1] for c in h.stop.calls] == [h.meeting_id(uuid)]
+    # the events stay in the outbox for the publisher to pick up
+    assert h.store.events[-2].event_type == "meeting.updated"
+
+
+async def test_a_blocked_host_with_a_trailing_dot_is_blocked():
+    h = make_harness()
+    for url in (
+        "https://meet.abroadworks.com./Deal4711",
+        "https://MEET.abroadworks.com/Deal",
+    ):
+        with pytest.raises(IntakeError) as err:
+            await h.put(meeting_url=url)
+        assert err.value.code == "platform_not_enabled"
+    assert h.store.meetings == {}

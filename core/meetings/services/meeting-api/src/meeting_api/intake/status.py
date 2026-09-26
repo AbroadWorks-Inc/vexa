@@ -60,6 +60,7 @@ __all__ = [
     "Outcome",
     "StatusConflict",
     "WrittenEvent",
+    "check_event_data",
     "derive_event_id_v2",
     "row_mapping",
     "write_event",
@@ -104,6 +105,13 @@ def derive_event_id_v2(meeting_uuid: str, event_type: str, sequence: int) -> str
     the same id across every redelivery, and every event of a meeting gets its own."""
     key = f"{meeting_uuid}|{event_type}|{sequence}"
     return "evt_" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def check_event_data(event_data: Optional[Mapping[str, Any]]) -> None:
+    """Extra envelope ``data`` keys never replace the meeting projection or the change."""
+    reserved = set(event_data or ()) & {"meeting", "change"}
+    if reserved:
+        raise ValueError(f"event_data may not set {sorted(reserved)}")
 
 
 def row_mapping(row: Any) -> dict[str, Any]:
@@ -177,6 +185,7 @@ async def _insert_outbox(
     change: Optional[Mapping[str, Any]],
     *,
     now: datetime,
+    event_data: Optional[Mapping[str, Any]] = None,
 ) -> str:
     from ..sessions.models import WebhookOutbox
 
@@ -192,6 +201,7 @@ async def _insert_outbox(
     }
     if change is not None:
         data["change"] = dict(change)
+    data.update(event_data or {})
     envelope = {
         "event_id": event_id,
         "event_type": event_type,
@@ -223,11 +233,15 @@ async def write_status(
     outcome: Optional[Outcome] = None,
     change_reason: Optional[str] = None,
     event_type: Optional[str] = None,
+    event_data: Optional[Mapping[str, Any]] = None,
 ) -> WrittenEvent:
     """Move meeting ``meeting_id`` to ``to_status`` if it is currently in ``expected_from`` and
     record the event (§1.4 steps 1–5). Raises ``StatusConflict`` otherwise, having written
     nothing. The event type is ``event_type`` or ``meeting.status_change``; its ``change`` is
-    ``{from, to, reason, at}``."""
+    ``{from, to, reason, at}``. ``event_data`` adds keys to the envelope's ``data`` next to
+    ``meeting`` and ``change`` (``merged_into``, §2.7); it may not name either of those.
+    """
+    check_event_data(event_data)
     now = _now()
     meeting = await _lock_meeting(db, meeting_id)
     if meeting is None or meeting.status not in expected_from:
@@ -279,6 +293,7 @@ async def write_status(
         event_type or STATUS_CHANGE_EVENT,
         change,
         now=now,
+        event_data=event_data,
     )
     return WrittenEvent(event_id, int(aw.event_seq), tuple(rerun))
 
