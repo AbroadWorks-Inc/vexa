@@ -13,6 +13,7 @@
 - **V4 — a meeting already under way was dropped.** With the due window `[start − lead, start + grace]`, an entry whose start is past but end ahead (calendar connected mid-meeting) ended `not_sent` at once. Now: due until `end` (R6, §8.3).
 - **V5 — seals and gates were missing.** The DB schema (`schema.seal.json`, gate `db-schema`), the contracts (`contracts.seal.json`, gate `contract-version`, incl. the webhook `EventType` enum) and the architecture model (P23) are all sealed; each change needs its seal step and its review lane (§8.9).
 - **V6 — citations corrected**: live statuses (`bot_spawn/auto_join.py:133-136`, not `lifecycle/machine.py`), `NO_ORG` (`admin_api/app/events.py:45`; admin-api lives under `core/identity/`), the gateway file path, auto-join env lines, the drain interval line, the calendar-sync range, Jitsi ids on `meet.jit.si`, portal lines and in-cluster hosts.
+- **V8 — owner answers (2026-09-26):** visibility stays as today (owner **or invited attendee**) through a new `attendees` entry field (§5.2, §10.3); webhook secrets are supplied by the receiving system and stored **encrypted at rest** (§7.2, O5); Zoom is numeric links only, which is all our portal produces (O3 closed); worker, key scopes and calendar sync checked live (O1, O2, O7 closed); CHANGELOG and handoff updated (O6, O8 closed).
 - **V7 — `event_id` defined** for the new events (today's is per bot run, `lifecycle/webhook.py:67-80`), the stop payload corrected, the exporter's internal call routed past the gateway, the portal's v1 refresh made polling, and the existing `data.metadata` / annotate machinery noted.
 
 ---
@@ -154,6 +155,7 @@ The new routes sit under `/v2` so upstream Vexa's `/meetings`, `/bots` and `/tra
 | `end` | ISO 8601 UTC | yes, unless `join_now` | Must be after `start`. |
 | `time_zone` | IANA name | no | Host's zone, for display only (`Asia/Kolkata`). Never used to compute times. |
 | `title` | string ≤ 512 | no | |
+| `attendees` | list of emails ≤ 100 | no | Who was invited, as the calendar lists them (`attendees[].email`, lower-cased). Used only for visibility (§10.3): `GET /v2/meetings?user=` matches a meeting when the user is an entry's `user` **or** in an entry's `attendees`. |
 | `series_id` | string ≤ 255 | no | Groups occurrences of one recurring event (Google `recurringEventId`). Display and filtering only. aw-bots never computes occurrences. |
 | `join_now` | bool | no, default `false` | Instant join: the bot is sent at once. `start` = now; `end` is open until the bot finishes. |
 | `metadata` | object ≤ 16 KB | no | The client's own data, stored on the **entry** and echoed in every webhook. Not read by aw-bots. Distinct from the meeting's `data.metadata`, which `POST /meetings/{id}/annotate` writes (64 keys / 16 KB, `collector/adapters.py:1405-1467`) and `GET /meetings?metadata=` filters on (`collector/app.py:261-283`); that machinery stays as it is. |
@@ -188,7 +190,7 @@ The new routes sit under `/v2` so upstream Vexa's `/meetings`, `/bots` and `/tra
     "time_zone": "Asia/Kolkata",
     "bot_joins_at": "2026-09-29T08:55:00Z",
     "entries": [
-      { "external_id": "google:3n5kq8example", "user": "a@abroadworks.com", "series_id": null, "metadata": null }
+      { "external_id": "google:3n5kq8example", "user": "a@abroadworks.com", "attendees": ["a@abroadworks.com", "b@abroadworks.com", "c@client.com"], "series_id": null, "metadata": null }
     ],
     "export": null,
     "sequence": 1
@@ -249,7 +251,8 @@ Users in the examples: `a@abroadworks.com`, `b@abroadworks.com`. Times are UTC; 
   "start": "2026-09-29T09:00:00Z",
   "end": "2026-09-29T09:30:00Z",
   "time_zone": "Asia/Kolkata",
-  "title": "Weekly sync"
+  "title": "Weekly sync",
+  "attendees": ["a@abroadworks.com", "b@abroadworks.com", "c@client.com"]
 }
 ```
 - **Reply:** `result: "created"`, the meeting as in §5.4. The calendar module stores `meeting.id`.
@@ -422,18 +425,19 @@ For example, a call between an AbroadWorks user and a user of another client.
 
 | Method + path | Does |
 |---|---|
-| `POST /v2/webhooks` `{url, events, description}` | Add a subscriber. Returns `{id, secret}`; the secret is shown **once**. `events: []` means all events. |
+| `POST /v2/webhooks` `{url, secret?, events, description}` | Add a subscriber. The receiving system normally supplies the URL and the shared secret it will verify with (the standard arrangement); if `secret` is omitted, aw-bots generates one and returns it **once** in `{id, secret}`. `events: []` means all events. |
 | `GET /v2/webhooks` | List (secrets never shown; `secret_last4` only) |
 | `PATCH /v2/webhooks/{id}` `{url?, events?, active?, description?}` | Change |
 | `DELETE /v2/webhooks/{id}` | Remove |
-| `POST /v2/webhooks/{id}/rotate-secret` | New secret, shown once. The old one keeps being accepted for 24 h (both signatures are sent, §7.4). |
+| `POST /v2/webhooks/{id}/rotate-secret` `{secret?}` | New secret (supplied or generated, shown once). The old one keeps being accepted for 24 h (both signatures are sent, §7.4). |
 | `POST /v2/webhooks/{id}/test` | Sends a `webhook.test` event now |
 | `GET /v2/webhooks/{id}/deliveries?limit=&before=` | The delivery log (§7.5) |
 
 - **URL check:** on save and again on every send, by the existing SSRF guard (`webhooks/ssrf.py:149-261`).
   - The guard blocks private IPs, and the portal is reached inside the cluster. So a setting `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (for example `portal.notetaker.svc.cluster.local`) lets named in-cluster hosts through.
   - Nothing else private is allowed.
-- For AbroadWorks, the portal is the first subscriber.
+- **Secrets are encrypted at rest.** `webhook_subscriptions.secret` and `previous_secret` hold AES-256-GCM ciphertext under a key from the Helm Secret (`WEBHOOK_SECRET_ENC_KEY`), the same scheme `notetaker_postgres.crypto` uses for calendar tokens; decrypted only in the sender at signing time, never returned by any route (`secret_last4` is stored separately). Today's per-user `users.data.webhook_secret` is plain text; it is left as it is because nothing of ours uses it.
+- For AbroadWorks, the portal is the first subscriber once it has a push channel (§10.1).
 
 ### 7.3 Events
 
@@ -512,6 +516,7 @@ admin-api owns the schema. `ensure_schema` creates missing tables, columns and i
 | `title` | text null | |
 | `start_at`, `end_at` | timestamptz (end null for `join_now`) | |
 | `time_zone`, `series_id` | text null | |
+| `attendees` | text[] null | lower-cased emails, for visibility only |
 | `join_now` | bool | |
 | `metadata` | jsonb null | |
 | `state` | text | `active` / `removed` |
@@ -519,8 +524,8 @@ admin-api owns the schema. `ensure_schema` creates missing tables, columns and i
 | `created_at`, `updated_at`, `removed_at` | timestamptz | |
 
   - Unique on (`user_id`, `source_user`, `external_id`).
-  - Indexes on (`meeting_id`) and (`user_id`, `platform`, `native_meeting_id`, `state`).
-- **New tables `webhook_subscriptions`** (`id` uuid, `user_id`, `url`, `secret`, `previous_secret`, `previous_secret_expires_at`, `events` text[], `active`, `description`, timestamps) **and `webhook_deliveries`** (§7.5).
+  - Indexes on (`meeting_id`), (`user_id`, `platform`, `native_meeting_id`, `state`) and a GIN index on `attendees` for the `user=` filter.
+- **New tables `webhook_subscriptions`** (`id` uuid, `user_id`, `url`, `secret_enc`, `secret_last4`, `previous_secret_enc`, `previous_secret_expires_at`, `events` text[], `active`, `description`, timestamps; `*_enc` = AES-256-GCM, §7.2) **and `webhook_deliveries`** (§7.5).
 - **The one-live-bot-per-room index (R2):**
   - Add `uq_meeting_live_user_platform_native` on `meetings (user_id, platform, platform_specific_id)` `WHERE status IN ('requested','joining','awaiting_admission','needs_help','active','stopping')`.
   - Drop `uq_meeting_active_user_platform_native`, which today covers every non-finished status including `scheduled` (`sessions/models.py:111-116`).
@@ -614,6 +619,7 @@ A user stop overrides the bot's reason with `stopped` (`lifecycle/machine.py:56-
 | `ENTRY_BLOCKED_HOSTS` | `meet.abroadworks.com` (until the Jitsi cutover, §10.2) | meeting-api |
 | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` | `portal.notetaker.svc.cluster.local` (Service `portal`, namespace `notetaker`, port 80 → 3000, `portal/ui-k8s/service.yaml`) | meeting-api, admin-api |
 | `WEBHOOK_DELIVERY_RETENTION_DAYS` | 30 | admin-api |
+| `WEBHOOK_SECRET_ENC_KEY` | Helm Secret, 32 bytes base64 (§7.2) | meeting-api, admin-api |
 | `VEXA_JITSI_HOSTS` | add `meet.abroadworks.com` (handoff §6 B13) | meeting-api |
 
 ### 8.9 Seals and gates (`node scripts/gates.mjs all`, also on pre-push)
@@ -650,7 +656,7 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 
 - **New table `aw_entries`** (migration `0011`), primary key (`owner_email`, `event_id`): `meeting_uuid`, `sent_hash` (hash of the fields sent), `state` (`synced` / `rejected` / `error`), `last_error`, `attempts`, `next_attempt_at`, `last_seen_at`, `end_at`, `updated_at`.
 - **Each cycle, per `aw-bots` user:**
-  - **Event in the read**, and its hash differs from `sent_hash` (or it's new): `PUT /v2/entries`, then store `meeting_uuid` and `sent_hash`.
+  - **Event in the read**, and its hash differs from `sent_hash` (or it's new): `PUT /v2/entries` (with `attendees` from `attendees[].email`, the same list `tracked_meetings.attendee_emails` holds today), then store `meeting_uuid` and `sent_hash`.
   - **Row not in the read, and its `end_at` has passed:** the meeting simply ended. Delete the local row and **send nothing**.
   - **Row not in the read, its `end_at` still ahead, and not seen for 5 min** (the same grace as `_reconcile_cancellations`, `main.py:890-940`, `_CANCEL_GRACE` at `:285`): one `events().get(calendarId="primary", eventId=…)` to name the reason — `status == "cancelled"` → `cancelled`; the user's own attendee entry `responseStatus == "declined"` → `declined`; 404/410 → `deleted`; the event still exists with a start beyond the horizon → `moved_out_of_window`; the event still exists in the window → it was a partial read, send nothing. Then `POST /v2/entries/remove` with that reason, and delete the local row. Today's path never looks and calls everything a cancellation; with a 14-day window a move beyond the horizon is common, and it must not show as "cancelled" in the portal.
   - **Google push notifications** (`POST /webhooks/google-calendar`, `main.py:2425`, using `calendar_connections.watch_*`) keep working for `aw-bots` users as a trigger for an immediate read of that user; the no-grace cancel path `_apply_webhook_cancellations` (`:943-983`) is not used for them — every removal goes through the confirmed vanish rule above.
@@ -684,7 +690,7 @@ This work trips three sealed artefacts; each has its own step and review lane, a
 
 ### 10.3 Who sees a meeting
 
-A user sees a meeting when they are the `user` of one of its entries, meaning it's on their own connected calendar or they started it. That's a change from today's rule (owner or listed attendee, `meetings.ts:103`): an attendee who hasn't connected a calendar no longer sees it.
+**Unchanged from today** (`TENANT_FILTER`, `meetings.ts:103`: owner **or** listed attendee). A user sees a meeting when they are the `user` of one of its entries (their own connected calendar, or they pasted the link) **or** their email is in an entry's `attendees`. So an invited colleague who never connected a calendar still sees the meeting and its transcript, exactly as now, and as Fireflies does when a meeting is shared with its participants. `GET /v2/meetings?user=` applies both conditions; the portal never filters on its own.
 
 ### 10.4 Rollout order
 
@@ -744,14 +750,14 @@ The index swap (MIGRATION-0003 steps), and two scheduled rows plus one live row 
 
 | # | Item | Needs |
 |---|---|---|
-| O1 | `notetaker-worker` `/process` must accept a UUID `meeting_id` (today `vexa-<n>`). The canonical contract types it as a free string (`§4`, `meeting_id: str`, idempotency by `meeting_id`/`idempotency_key`), so only the worker's implementation can object. The worker is in the talke repo; Jitsi compatibility must hold (CLAUDE.md hard constraint 2). | code check in talke |
-| O2 | The account's API key must carry both `bot` and `tx` scopes (gateway scope check is any-of per route, `gateway/app.py:383-384`; `/bots/*` = `bot`, `/meetings/*` and `/transcripts/*` = `tx` in `core/meetings/routes.v1.json`). | check user 1's key |
-| O3 | Zoom vanity links `zoom.us/my/<name>`: the calendar module understands them (`meeting_key.py`), but aw-bots' parser needs digits (`meeting_link.py:103-105`), so they would be `unrecognized_link`. Whether the bot can join them is untested. | decide: support or reject |
+| O1 | **Closed 2026-09-26.** `notetaker-worker` accepts any string: `ProcessRequest.meeting_id: str` (`talke/deployment/base/notetaker/worker/notetaker_worker.py:70`), used only as the in-memory job key, in logs and in `notes.json`; no format check anywhere. Jitsi is untouched. | — |
+| O2 | **Closed 2026-09-26** (live, `api_tokens` on the aw-bots Postgres): user 1 has two tokens, ids 1 and 2, both named `portal`, both `{bot,tx}`, neither used yet. Only one is in Secret `aw-bots-portal-api-key`; the other is a dangling mint from step 8 running twice and should be revoked once the portal is wired (its id is found by `last_used_at`). | revoke the unused token later |
+| O3 | **Closed 2026-09-26.** Our Zoom links are `https://abroadworks.zoom.us/j/<11 digits>?pwd=…` (the portal generates them), which aw-bots parses. Only vanity `zoom.us/my/<name>` links are refused (`unrecognized_link`), and we don't use them. | — |
 | O4 | Jitsi room names keep their case in aw-bots (`meeting_link.py:152-161`). If Jitsi treats `Standup` and `standup` as one room, R1 must compare lower-cased. | check on `meet.abroadworks.com` |
-| O5 | Webhook secrets are stored in the database as today's per-user secret is. Encrypt the column at rest? | owner |
-| O6 | Record in `CHANGELOG.md`: calendar reading **stays in calendar-dispatcher** (reverses handoff §4, "moves into the portal"); `meeting_key.py` isn't used on the aw-bots path. | with the implementation |
-| O7 | Vexa's own calendar sync assumes the old index (`calendar_sync/service.py:572-674`, `by_native` adoption). It is not used, but user 1 has calendar settings (`PUT /user/calendar` set the bot name). Confirm no ICS feed is configured, so the sync never runs. | check user 1 |
-| O8 | Handoff §4 (2026-09-25 lines) says calendar reading "moves into the portal" and recommends sending a series once for aw-bots to expand; this design keeps reading in `calendar-dispatcher` and sends one entry per occurrence. Both go in `CHANGELOG.md` (with O6) and the handoff lines get a "superseded by this design" note. | owner confirms, then edit handoff |
+| O5 | **Closed 2026-09-26:** encrypted at rest, secret supplied by the receiving system or generated (§7.2). | — |
+| O6 | **Closed 2026-09-26:** recorded in aw-notetaker `CHANGELOG.md` (Unreleased → "Design decisions — AW Bots meeting intake"). | — |
+| O7 | **Closed 2026-09-26** (live): `users.data.calendar_connections` for user 1 is an empty array and there is no singular `ics_url`; only `calendar_bot_name` is set. Vexa's calendar sync therefore never runs, and its old-index assumption (`calendar_sync/service.py:572-674`) is inert. We never intend to use it: one service account, ten-feed cap, no declined-event filter. | — |
+| O8 | **Closed 2026-09-26:** owner confirmed the design's version; the handoff §4 and §6 A lines carry a "superseded" note, and the CHANGELOG records it (with O6). Still open: **O4** (Jitsi room-name case). | — |
 
 ---
 
