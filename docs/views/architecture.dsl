@@ -27,6 +27,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   contract service-authority.v1
   contract transcript.v1
   contract webhook.v1
+  contract intake.v1
   service transcription
   data-asset segments-stream [writers: bot]
   data-asset tc-stream [writers: meeting-api]

@@ -601,6 +601,18 @@
    ]
   },
   {
+   "unique-id": "intake.v1",
+   "node-type": "contract",
+   "name": "intake.v1",
+   "description": "intake.v1 — draft contract for /v2 entry intake: entries, removals, replies, the meeting object and errors (meetings)",
+   "metadata": [
+    {
+     "path": "core/meetings/contracts/intake.v1",
+     "domain": "meetings"
+    }
+   ]
+  },
+  {
    "unique-id": "invocation.v1",
    "node-type": "contract",
    "name": "invocation.v1",
@@ -1419,6 +1431,7 @@
       "service-authority.v1",
       "transcript.v1",
       "webhook.v1",
+      "intake.v1",
       "transcription",
       "segments-stream",
       "tc-stream",
