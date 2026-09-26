@@ -5,9 +5,9 @@
 #
 # Build context: the v0.12 carve root (compose `context: ../..`). Wider than the other three
 # services because meeting_api validates AT THE SEAM (P8): it loads the sealed invocation.v1 /
-# lifecycle.v1 / webhook.v1 / runtime.v1 / schedule.v1 schemas BY PATH at import (walking up from
-# the module to find `meetings/contracts/...` and `runtime/contracts/...`), so those frozen
-# contract files must be vendored into the image alongside src/.
+# lifecycle.v1 / webhook.v1 / runtime.v1 / schedule.v1 schemas, plus the DRAFT intake.v1 schema,
+# BY PATH at import (walking up from the module to find `meetings/contracts/...` and
+# `runtime/contracts/...`), so those contract files must be vendored into the image alongside src/.
 FROM python:3.12-slim
 
 # uv via PyPI (ghcr.io is unreachable in this build env) — pinned for deterministic resolves.
@@ -41,6 +41,7 @@ COPY core/meetings/services/meeting-api/src ./src
 COPY core/meetings/contracts/invocation.v1/invocation.schema.json   ./meetings/contracts/invocation.v1/invocation.schema.json
 COPY core/meetings/contracts/lifecycle.v1/lifecycle.schema.json     ./meetings/contracts/lifecycle.v1/lifecycle.schema.json
 COPY core/meetings/contracts/webhook.v1/webhook.schema.json         ./meetings/contracts/webhook.v1/webhook.schema.json
+COPY core/meetings/contracts/intake.v1/intake.schema.json           ./meetings/contracts/intake.v1/intake.schema.json
 COPY core/runtime/contracts/runtime.v1/runtime.schema.json          ./runtime/contracts/runtime.v1/runtime.schema.json
 COPY core/runtime/contracts/schedule.v1/schedule.schema.json        ./runtime/contracts/schedule.v1/schedule.schema.json
 
