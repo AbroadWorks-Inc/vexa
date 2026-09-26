@@ -133,10 +133,10 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
         # Jitsi: the canonical public deployment, plus (for a deliberately pasted link) the common
         # self-hosted conventions — a host containing "jitsi", or a bare ``meet.*`` host (jitsi's
         # own recommended naming). Known platforms are matched ABOVE, so this only fires for
-        # unclaimed hosts. The room is the path's single segment, kept EXACTLY as it appears in
-        # the URL (case + percent-encoding preserved) — the native id is embedded back into the
-        # construct-URL template and the DELETE path param, so it must stay URL-safe; decoding
-        # here would corrupt rooms with encoded characters. Callers keep the raw URL alongside
+        # unclaimed hosts. The room is the path's single segment, with case folded to lower-case
+        # and percent-encoding preserved — the native id is embedded back into the construct-URL
+        # template and the DELETE path param, so it must stay URL-safe; decoding here would
+        # corrupt rooms with encoded characters. Callers keep the raw URL alongside
         # (``meeting_url``) so a self-hosted room joins on ITS deployment, not the template's.
         is_jitsi_host = (
             host == "meet.jit.si"
