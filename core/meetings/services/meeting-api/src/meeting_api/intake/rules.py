@@ -1,0 +1,226 @@
+"""The R1 matching rules and the meeting windows (§1.1, R7, R10) — pure: no storage, no clock.
+
+This module is the one home of the window and overlap logic. The entry service decides with it
+which meeting an entry belongs to, and the status writer (``status.py``) decides with it which
+entries of a finished meeting re-run.
+
+  * ``overlaps`` — half-open intervals: ``a_start < b_end and a_end > b_start``; a missing end is
+    unbounded. Back-to-back times (15:00 end, 15:00 start) don't overlap.
+  * ``meeting_start`` — ``data.scheduled_at``, else ``start_time``, else ``created_at`` (the
+    ``meeting_event_time()`` order).
+  * ``meeting_window`` — a meeting's stored time; an open-ended live meeting's window is
+    ``[start, now]``, and an open-ended meeting that isn't live yet is unbounded.
+  * ``match_entry`` — R1: the non-finished meeting whose window overlaps the entry. An open-ended
+    live meeting matches only an entry already started or due (``start <= now + lead``).
+  * ``join_now_target`` — R1 ``join_now``: the earliest non-finished meeting with ``end > now``
+    and ``start <= now + adopt_ahead``. A live meeting counts as not ended however long it runs
+    past its planned end: its bot is in the call now, and a pasted link never gets a second bot.
+  * ``recompute`` — a meeting's plan from its active entries: earliest start, latest end (none if
+    any entry is open-ended), and the first title, time zone and link in start order.
+  * ``finished_window`` / ``is_rerun`` — R10: a finished meeting's window is ``[meeting start,
+    finish)``, the end clamped to be no earlier than the start. An entry re-runs when it doesn't
+    overlap that window, starts after the meeting start and starts after the finish.
+  * ``is_future_move`` — R7 after the finish: the same rule with ``now`` as the finish. The
+    meeting finished at or before ``now``, so for an entry starting after ``now`` both windows
+    give the same answer.
+
+Every tie between candidate meetings goes to the earliest start, then the lowest id.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence, TypeVar
+
+__all__ = [
+    "FINISHED_STATUSES",
+    "Plan",
+    "as_utc",
+    "finished_window",
+    "is_future_move",
+    "is_live",
+    "is_rerun",
+    "join_now_target",
+    "match_entry",
+    "meeting_start",
+    "meeting_window",
+    "overlaps",
+    "recompute",
+]
+
+FINISHED_STATUSES = frozenset({"completed", "failed"})
+
+
+class Timed(Protocol):
+    """An entry's time, from a request (``EntryIn``) or storage (``EntryView``)."""
+
+    @property
+    def start(self) -> datetime: ...
+
+    @property
+    def end(self) -> Optional[datetime]: ...
+
+
+class Planned(Timed, Protocol):
+    @property
+    def title(self) -> Optional[str]: ...
+
+    @property
+    def time_zone(self) -> Optional[str]: ...
+
+    @property
+    def meeting_url(self) -> str: ...
+
+
+class MeetingLike(Protocol):
+    @property
+    def id(self) -> int: ...
+
+    @property
+    def status(self) -> str: ...
+
+    @property
+    def start(self) -> Optional[datetime]: ...
+
+    @property
+    def end(self) -> Optional[datetime]: ...
+
+
+_M = TypeVar("_M", bound=MeetingLike)
+
+
+@dataclass(frozen=True)
+class Plan:
+    """A meeting's time, title, time zone and link, as its active entries give them."""
+
+    start: datetime
+    end: Optional[datetime]
+    title: Optional[str]
+    time_zone: Optional[str]
+    meeting_url: str
+
+
+def as_utc(value: Any) -> Optional[datetime]:
+    """A datetime or ISO-8601 string as an aware UTC datetime (naive means UTC), or ``None``."""
+    if value is None or value == "":
+        return None
+    dt = (
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if isinstance(value, str)
+        else value
+    )
+    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def is_live(status: Optional[str]) -> bool:
+    """A bot has been sent and hasn't finished (``bot_spawn.auto_join.LIVE_STATUSES``)."""
+    # Imported at call time so bot_spawn can import the intake package without an import cycle.
+    from ..bot_spawn.auto_join import LIVE_STATUSES
+
+    return status in LIVE_STATUSES
+
+
+def overlaps(
+    a_start: datetime,
+    a_end: Optional[datetime],
+    b_start: datetime,
+    b_end: Optional[datetime],
+) -> bool:
+    """``[a_start, a_end)`` and ``[b_start, b_end)`` share an instant; ``None`` is unbounded."""
+    return (b_end is None or a_start < b_end) and (a_end is None or a_end > b_start)
+
+
+def meeting_start(
+    data: Optional[Mapping[str, Any]], start_time: Any, created_at: Any
+) -> Optional[datetime]:
+    """``data.scheduled_at``, else ``start_time``, else ``created_at``, as aware UTC."""
+    scheduled_at = data.get("scheduled_at") if isinstance(data, Mapping) else None
+    return as_utc(scheduled_at) or as_utc(start_time) or as_utc(created_at)
+
+
+def meeting_window(
+    m: MeetingLike, *, now: datetime
+) -> tuple[datetime, Optional[datetime]]:
+    """The time R1 compares an entry against (see the module docstring)."""
+    start = m.start or now
+    if m.end is None and is_live(m.status):
+        return start, now
+    return start, m.end
+
+
+def _earliest(candidates: Iterable[_M], *, now: datetime) -> Optional[_M]:
+    return min(candidates, key=lambda m: (m.start or now, m.id), default=None)
+
+
+def match_entry(
+    entry: Timed, candidates: Sequence[_M], *, now: datetime, lead_s: float
+) -> Optional[_M]:
+    """R1: the non-finished candidate the entry overlaps, or ``None`` for a new meeting."""
+
+    def hit(m: _M) -> bool:
+        start, end = meeting_window(m, now=now)
+        if m.end is None and is_live(m.status):
+            due = entry.start <= now + timedelta(seconds=lead_s)
+            return due and (entry.end is None or entry.end > start)
+        return overlaps(entry.start, entry.end, start, end)
+
+    return _earliest(
+        (m for m in candidates if m.status not in FINISHED_STATUSES and hit(m)), now=now
+    )
+
+
+def join_now_target(
+    candidates: Sequence[_M], *, now: datetime, adopt_ahead_s: float
+) -> Optional[_M]:
+    """R1 ``join_now``: the meeting a pasted link adopts, or ``None`` for a new open-ended one."""
+    horizon = now + timedelta(seconds=adopt_ahead_s)
+
+    def adoptable(m: _M) -> bool:
+        if m.status in FINISHED_STATUSES or (m.start or now) > horizon:
+            return False
+        return is_live(m.status) or m.end is None or m.end > now
+
+    return _earliest((m for m in candidates if adoptable(m)), now=now)
+
+
+def recompute(entries: Sequence[Planned]) -> Plan:
+    """The plan of a meeting holding ``entries`` (at least one)."""
+    if not entries:
+        raise ValueError("a meeting's plan needs at least one entry")
+    ordered = sorted(entries, key=lambda e: e.start)
+    ends = [e.end for e in ordered]
+    return Plan(
+        start=ordered[0].start,
+        end=None if any(end is None for end in ends) else max(e for e in ends if e),
+        title=next((e.title for e in ordered if e.title is not None), None),
+        time_zone=next((e.time_zone for e in ordered if e.time_zone is not None), None),
+        meeting_url=ordered[0].meeting_url,
+    )
+
+
+def finished_window(
+    start: Optional[datetime], *, finish: datetime
+) -> tuple[datetime, datetime]:
+    """R10: ``[start, finish)``, the end clamped to be no earlier than the start."""
+    begin = start or finish
+    return begin, max(finish, begin)
+
+
+def is_rerun(
+    start: Optional[datetime],
+    end: Optional[datetime],
+    window: tuple[datetime, datetime],
+    *,
+    finish: datetime,
+) -> bool:
+    """R7/R10: no overlap with the finished window, after the meeting start, after the finish."""
+    if start is None:
+        return False
+    return not overlaps(start, end, *window) and start > window[0] and start > finish
+
+
+def is_future_move(entry: Timed, finished: MeetingLike, *, now: datetime) -> bool:
+    """R7: an update to a finished meeting's entry that points to a new future time."""
+    window = finished_window(finished.start, finish=now)
+    return is_rerun(entry.start, entry.end, window, finish=now)

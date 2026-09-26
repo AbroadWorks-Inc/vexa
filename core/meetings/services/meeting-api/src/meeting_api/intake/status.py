@@ -23,7 +23,9 @@ meeting start is ``data.scheduled_at``, else ``start_time``, else ``created_at``
 start. An active entry re-runs when all three hold: its ``[start_at, end_at)`` (unbounded without
 an ``end_at``) doesn't overlap that window (half-open, as R1's), its ``start_at`` is after the
 meeting start (an entry that isn't belongs to this meeting), and its ``start_at`` is after the
-finish instant. Every other active entry is closed. The comparison uses the full-precision finish
+finish instant. Every other active entry is closed. The window and the rule are ``rules.py``'s
+``meeting_start``, ``finished_window`` and ``is_rerun``, the one definition the entry service
+uses too. The comparison uses the full-precision finish
 instant; only the stored and displayed stamps (``closed_at``, ``outcome_at``, ``change.at``,
 ``created_at``) are whole seconds.
 
@@ -41,6 +43,13 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
 
 from .projection import iso_utc, project_meeting
+from .rules import (
+    FINISHED_STATUSES,
+    as_utc,
+    finished_window,
+    is_rerun,
+    meeting_start,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,10 +67,7 @@ __all__ = [
 ]
 
 API_VERSION = "2026-09-25"
-FINISHED_STATUSES = frozenset({"completed", "failed"})
 STATUS_CHANGE_EVENT = "meeting.status_change"
-
-_UNBOUNDED = datetime.max.replace(tzinfo=timezone.utc)
 
 
 class StatusConflict(Exception):
@@ -116,49 +122,6 @@ def row_mapping(row: Any) -> dict[str, Any]:
         for prop in state.mapper.column_attrs
         if prop.key in loaded
     }
-
-
-def _overlaps(
-    a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime
-) -> bool:
-    """Half-open interval overlap: ``[a_start, a_end)`` and ``[b_start, b_end)`` share an instant."""
-    return a_start < b_end and a_end > b_start
-
-
-def _as_utc(value: Any) -> Optional[datetime]:
-    """A datetime or ISO-8601 string as an aware UTC datetime (naive means UTC), or ``None``."""
-    if value is None or value == "":
-        return None
-    dt = (
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if isinstance(value, str)
-        else value
-    )
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def _finished_window(meeting: Any, *, finish: datetime) -> tuple[datetime, datetime]:
-    """``[meeting start, finish)``, the end clamped to be no earlier than the start (R10)."""
-    data = meeting.data if isinstance(meeting.data, dict) else {}
-    start = (
-        _as_utc(data.get("scheduled_at"))
-        or _as_utc(meeting.start_time)
-        or _as_utc(meeting.created_at)
-        or finish
-    )
-    return start, max(finish, start)
-
-
-def _is_rerun(
-    entry: Any, window: tuple[datetime, datetime], *, finish: datetime
-) -> bool:
-    """R7/R10: the entry doesn't overlap the finished window, starts after the meeting start and
-    starts after the finish."""
-    start = _as_utc(entry.start_at)
-    if start is None:
-        return False
-    end = _as_utc(entry.end_at) or _UNBOUNDED
-    return not _overlaps(start, end, *window) and start > window[0] and start > finish
 
 
 def _lead_s() -> int:
@@ -297,11 +260,14 @@ async def write_status(
     entries = await _entries(db, meeting_id)
     rerun: list[int] = []
     if to_status in FINISHED_STATUSES:
-        window = _finished_window(meeting, finish=now)
+        start = meeting_start(meeting.data, meeting.start_time, meeting.created_at)
+        window = finished_window(start, finish=now)
         for entry in entries:
             if entry.state != "active":
                 continue
-            if _is_rerun(entry, window, finish=now):
+            if is_rerun(
+                as_utc(entry.start_at), as_utc(entry.end_at), window, finish=now
+            ):
                 rerun.append(int(entry.id))
             else:
                 entry.state = "closed"

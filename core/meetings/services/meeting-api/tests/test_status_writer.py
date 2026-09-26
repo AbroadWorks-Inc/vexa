@@ -35,7 +35,7 @@ from meeting_api.intake import (
     write_event,
     write_status,
 )
-from meeting_api.intake.status import _overlaps
+from meeting_api.intake.rules import overlaps
 from meeting_api.lifecycle.webhook import derive_event_id
 
 UTC = timezone.utc
@@ -95,10 +95,10 @@ def test_legacy_event_id_is_unchanged():
 def test_overlap_is_half_open():
     t = datetime(2026, 9, 29, 15, 0, tzinfo=UTC)
     h = timedelta(hours=1)
-    assert _overlaps(t, t + h, t + h / 2, t + 2 * h)
-    assert not _overlaps(t, t + h, t + h, t + 2 * h)  # back-to-back
-    assert not _overlaps(t + h, t + 2 * h, t, t + h)
-    assert _overlaps(t, t + 3 * h, t + h, t + 2 * h)  # contained
+    assert overlaps(t, t + h, t + h / 2, t + 2 * h)
+    assert not overlaps(t, t + h, t + h, t + 2 * h)  # back-to-back
+    assert not overlaps(t + h, t + 2 * h, t, t + h)
+    assert overlaps(t, t + 3 * h, t + h, t + 2 * h)  # contained
 
 
 # ── recording fake session ───────────────────────────────────────────────────────────────────

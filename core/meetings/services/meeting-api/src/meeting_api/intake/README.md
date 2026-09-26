@@ -19,8 +19,14 @@ entries on `completed`/`failed` (returning a future, non-overlapping entry's id 
 inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelope that gets sent.
 `write_event(db, meeting_id, event_type, change)` records a non-status event the same way.
 
+`rules.py` holds the R1 matching rules and the meeting windows (§1.1, R7, R10), pure: `overlaps`
+(half-open, a missing end is unbounded), `meeting_start`, `meeting_window`, `match_entry`,
+`join_now_target`, `recompute`, and `finished_window` / `is_rerun` / `is_future_move`. It is the one
+definition of these windows; the status writer's re-run rule uses it.
+
 ## Front door
 - `project_meeting` — `projection.py`.
 - `parse_entry`, `parse_remove`, `EntryIn`, `RemoveIn`, `IntakeError` — `validation.py`.
 - `write_status`, `write_event`, `StatusConflict`, `Outcome`, `WrittenEvent`, `derive_event_id_v2`,
   `row_mapping` — `status.py`.
+- The matching rules — `rules.py` (used inside the package).
