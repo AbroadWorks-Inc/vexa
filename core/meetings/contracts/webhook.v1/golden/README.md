@@ -6,3 +6,5 @@ Wire-shape fixtures, one per `$def`/case. Filename `<Shape>.<case>.json`; the pr
 - `Envelope.meeting-completed.json` — a `meeting.completed` delivery (per-client hook, terminal success).
 - `Envelope.bot-failed.json` — a `bot.failed` delivery carrying the `status_change` block (terminal failure).
 - `SignatureHeaders.signed.json` — the signed headers a verifier recomputes (`sha256=<hmac(ts.payload)>`).
+- `SignatureHeaders.rotated.json` — both `X-Webhook-Signature` and the optional
+  `X-Webhook-Signature-Previous` present (the 24h post-rotation window, §2.7).
