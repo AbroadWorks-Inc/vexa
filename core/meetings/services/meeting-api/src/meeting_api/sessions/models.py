@@ -196,7 +196,7 @@ class MeetingSession(Base):
 # --------------------------------------------------------------------------- #
 # meeting intake + webhooks (§1.2) — mirror of admin_api.schema.models; SSOT there.
 # --------------------------------------------------------------------------- #
-class MeetingEntry(Base):
+class MeetingEntry(Base):  # type: ignore[valid-type,misc]
     """One calendar/manual occurrence bound to a `meetings` row (§1.2). Many entries can point at
     the same `meeting_id` (a recurring series); `content_hash` lets intake detect a no-op re-push."""
     __tablename__ = "meeting_entries"
@@ -237,7 +237,7 @@ class MeetingEntry(Base):
     )
 
 
-class MeetingAwState(Base):
+class MeetingAwState(Base):  # type: ignore[valid-type,misc]
     """AW-owned per-meeting state that doesn't belong in upstream's `meetings.data` blob (§1.2):
     the scheduled window, outcome/error reporting, and export tracking — one row per meeting."""
     __tablename__ = "meeting_aw_state"
@@ -260,7 +260,7 @@ class MeetingAwState(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class WebhookSubscription(Base):
+class WebhookSubscription(Base):  # type: ignore[valid-type,misc]
     """A user's webhook target (§1.2). `secret_enc`/`enc_key_id` are the encrypted-at-rest signing
     secret; `previous_*` carries the prior secret through a rotation window so both signatures
     validate until `previous_secret_expires_at`."""
@@ -282,7 +282,7 @@ class WebhookSubscription(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class WebhookOutbox(Base):
+class WebhookOutbox(Base):  # type: ignore[valid-type,misc]
     """The durable record of every webhook-worthy event (§1.2), written once in the same
     transaction as the state change it describes. `payload_text` is the exact bytes later sent —
     deliveries never re-serialize. `meeting_id` is null only for the synthetic `webhook.test` event."""
@@ -302,7 +302,7 @@ class WebhookOutbox(Base):
     )
 
 
-class WebhookDelivery(Base):
+class WebhookDelivery(Base):  # type: ignore[valid-type,misc]
     """One row per (event, subscription) — the delivery state machine (§1.2). `next_attempt_at` +
     `lease_until` drive the retry worker's claim; `state` is the current position in that machine."""
     __tablename__ = "webhook_deliveries"
@@ -330,7 +330,7 @@ class WebhookDelivery(Base):
     )
 
 
-class WebhookDeliveryAttempt(Base):
+class WebhookDeliveryAttempt(Base):  # type: ignore[valid-type,misc]
     """The delivery log (§1.2) — one row per attempt, kept even after the delivery reaches a
     terminal state, so a subscriber dispute has the full HTTP history to point to."""
     __tablename__ = "webhook_delivery_attempts"

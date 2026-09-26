@@ -4,9 +4,11 @@
 added to the SSOT model (`schema/models.py`) + the meeting-api mirror
 (`meeting-api/.../sessions/models.py`). On an **existing** prod/staging DB the `meetings` changes
 are an **out-of-band ops step that MUST precede the deploy** — see "Production rollout" below.
-Fresh/empty DBs (tests, new envs) converge cleanly via `ensure_schema` and need no manual step; the
-six new tables likewise build cleanly on any DB via `ensure_schema`'s additive `create_all`, they
-are only listed here so the runbook can be run as one pass.
+This is not a "should": for `meetings.uuid` specifically, deploying first turns `ensure_schema`'s
+additive column sync into an in-band, ACCESS-EXCLUSIVE-locking full-table rewrite — see "Deploy-order
+hazard" under Step 2. Fresh/empty DBs (tests, new envs) converge cleanly via `ensure_schema` and need
+no manual step; the six new tables likewise build cleanly on any DB via `ensure_schema`'s additive
+`create_all`, they are only listed here so the runbook can be run as one pass.
 
 ## Why
 
@@ -280,12 +282,40 @@ With `meetings.uuid`, the two new `meetings` indexes, and the six new tables alr
 committed, admin-api's boot `ensure_schema` finds all of it in the existing-table/-column/-index
 sets (matched by name) and no-ops on every one of them.
 
-**Deploy-order hazard.** The OLD index (`uq_meeting_active_user_platform_native`, predicate `status
-NOT IN ('completed', 'failed')`) is still present through step 1 and 2 — it is a SUPERSET
-constraint that also blocks a second `'scheduled'` row per link. A recurring series therefore
-cannot get its second `scheduled` occurrence until the OLD index is gone (step 3). Do not treat
-step 3 as optional cleanup: intake's multi-occurrence write path is only truly unblocked once it
-runs.
+**Deploy-order hazard 1 — `meetings.uuid` is a HARD requirement, not a nice-to-have.** If admin-api
+with `Meeting.uuid` in its model boots against a `meetings` table that does not yet have the column
+(i.e. step 1.2 was skipped), `ensure_schema` → `_sync_columns` (`sync.py:66-90`) does not fail —
+it does not even notice anything is wrong. `_sync_columns` sees `uuid` missing from
+`existing_cols`, computes `nullable = " NOT NULL"` (the model declares `nullable=False`) and
+`default = _col_default_sql(col)` (non-empty: the model's `server_default=text("gen_random_uuid()")`
+has a `.text` attribute, so `_col_default_sql` returns `" DEFAULT gen_random_uuid()"` — the
+`if not col.nullable and not default:` fallback-default branch is never reached, since `default` is
+already truthy), and issues, in-band, inside `ensure_schema`'s own transaction:
+
+```sql
+ALTER TABLE "meetings" ADD COLUMN "uuid" UUID NOT NULL DEFAULT gen_random_uuid();
+```
+
+`gen_random_uuid()` is **VOLATILE** (a fresh value per row, unlike a constant or `IMMUTABLE`
+default), so Postgres cannot short-circuit this as a metadata-only change (the fast path that
+applies to a constant default since PG 11) — it must rewrite every existing row to compute and
+store the value, and it does that rewrite while holding `meetings` under **`ACCESS EXCLUSIVE`**
+for the statement's whole duration: every read and write against the hot spawn table blocks until
+it finishes. And unlike the index swap (a failed unique `CREATE INDEX` raises
+`SchemaInvariantError` out of `_sync_indexes` and admin-api refuses to boot — loud, page-worthy,
+`/health` never answers), nothing here fails closed: the `ALTER TABLE` has no uniqueness or
+data-dependent failure mode, so on a large populated table it simply **succeeds**, slowly, after
+locking out every other session for as long as the rewrite takes. The failure mode is a silent
+production incident (a blocked table, not a crash-and-alert), which is strictly worse to discover
+than a boot-time raise. Step 1.2 (nullable `ADD COLUMN`, no default yet) must always run before this
+deploy — there is no in-band fallback that makes skipping it safe.
+
+**Deploy-order hazard 2 — the OLD dedup index.** The OLD index
+(`uq_meeting_active_user_platform_native`, predicate `status NOT IN ('completed', 'failed')`) is
+still present through step 1 and 2 — it is a SUPERSET constraint that also blocks a second
+`'scheduled'` row per link. A recurring series therefore cannot get its second `scheduled`
+occurrence until the OLD index is gone (step 3). Do not treat step 3 as optional cleanup: intake's
+multi-occurrence write path is only truly unblocked once it runs.
 
 ## Step 3 — drop the old index, without locking writes
 
