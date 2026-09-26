@@ -3,7 +3,8 @@
 `project_meeting(meeting, aw, entries, *, lead_s)` renders one aw-bots `meeting` object — the
 exact §2.4 shape every reply, read and webhook uses. Pure: no DB, no clock, no network; every
 value comes from the `meetings` row, the `meeting_aw_state` row (or `None`), and the meeting's
-active `meeting_entries` rows, all passed in as mappings.
+`meeting_entries` rows, all passed in as mappings. A finished (`completed`/`failed`) meeting lists
+its closed entries, any other meeting its active ones; removed entries are never listed (R9).
 
 `parse_entry(body, *, now, max_days_ahead)` / `parse_remove(body)` turn a `PUT /v2/entries` /
 `POST /v2/entries/remove` body into a normalised `EntryIn` / `RemoveIn`, or raise `IntakeError`

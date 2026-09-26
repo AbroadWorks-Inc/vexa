@@ -9,8 +9,7 @@ through ``write_event``. Both run inside the CALLER's transaction and never comm
   2. write the status and the optional ``data`` patch (a shallow merge into ``meetings.data``);
   3. lock ``meeting_aw_state`` (created if missing), set the outcome if given, ``event_seq += 1``;
   4. on a finished status (``completed`` / ``failed``), close the active entries, except an entry
-     whose stored time is in the future and doesn't overlap the finished meeting: it stays active
-     and its id comes back in ``rerun_entry_ids`` for automatic re-run (R7);
+     that re-runs (R7, R10, below): it stays active and its id comes back in ``rerun_entry_ids``;
   5. insert the event into ``webhook_outbox``: the §2.7 envelope around the one meeting projection
      (``project_meeting``), serialised once; the stored ``payload_text`` is the exact body sent.
 
@@ -18,11 +17,15 @@ Lock order (§1.4): the caller takes the link's advisory lock first, then ``writ
 meeting row, then ``meeting_aw_state``. ``meeting_aw_state`` is always reached through its meeting
 row's lock, which is why creating a missing row here cannot race another writer.
 
-The finished meeting's window, for step 4, is ``[start, end)``: ``start`` is ``data.scheduled_at``
-(else ``start_time``, else ``created_at`` — the ``meeting_event_time()`` order), ``end`` is
-``meeting_aw_state.scheduled_end_at``, or the finish instant for an open-ended meeting. An entry is
-"in the future" when its ``start_at`` is after the finish instant; an entry with no ``end_at`` is
-unbounded. Overlap is half-open, as R1's: back-to-back intervals don't overlap.
+The finished meeting's window (R10) is what actually happened: ``[meeting start, finish)``. The
+meeting start is ``data.scheduled_at``, else ``start_time``, else ``created_at`` (the
+``meeting_event_time()`` order); the end is the finish instant, clamped to be no earlier than the
+start. An active entry re-runs when all three hold: its ``[start_at, end_at)`` (unbounded without
+an ``end_at``) doesn't overlap that window (half-open, as R1's), its ``start_at`` is after the
+meeting start (an entry that isn't belongs to this meeting), and its ``start_at`` is after the
+finish instant. Every other active entry is closed. The comparison uses the full-precision finish
+instant; only the stored and displayed stamps (``closed_at``, ``outcome_at``, ``change.at``,
+``created_at``) are whole seconds.
 
 SQLAlchemy and the ORM models are imported inside the functions that touch the database, the way
 ``collector/adapters.py`` does, so the pure helpers here import without SQLAlchemy installed.
@@ -37,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
 
-from .projection import _iso_utc, project_meeting
+from .projection import iso_utc, project_meeting
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,26 +137,28 @@ def _as_utc(value: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _finished_window(
-    meeting: Any, aw: Any, *, now: datetime
-) -> tuple[datetime, datetime]:
+def _finished_window(meeting: Any, *, finish: datetime) -> tuple[datetime, datetime]:
+    """``[meeting start, finish)``, the end clamped to be no earlier than the start (R10)."""
     data = meeting.data if isinstance(meeting.data, dict) else {}
     start = (
         _as_utc(data.get("scheduled_at"))
         or _as_utc(meeting.start_time)
         or _as_utc(meeting.created_at)
-        or now
+        or finish
     )
-    end = _as_utc(aw.scheduled_end_at) or now
-    return start, end
+    return start, max(finish, start)
 
 
-def _is_rerun(entry: Any, window: tuple[datetime, datetime], *, now: datetime) -> bool:
+def _is_rerun(
+    entry: Any, window: tuple[datetime, datetime], *, finish: datetime
+) -> bool:
+    """R7/R10: the entry doesn't overlap the finished window, starts after the meeting start and
+    starts after the finish."""
     start = _as_utc(entry.start_at)
-    if start is None or start <= now:
+    if start is None:
         return False
     end = _as_utc(entry.end_at) or _UNBOUNDED
-    return not _overlaps(start, end, *window)
+    return not _overlaps(start, end, *window) and start > window[0] and start > finish
 
 
 def _lead_s() -> int:
@@ -165,7 +170,13 @@ def _lead_s() -> int:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(timezone.utc)
+
+
+def _stamp(instant: datetime) -> datetime:
+    """The whole-second form stored and displayed (``closed_at``, ``outcome_at``, ``change.at``,
+    ``created_at``)."""
+    return instant.replace(microsecond=0)
 
 
 async def _lock_meeting(db: AsyncSession, meeting_id: int) -> Any:
@@ -230,7 +241,7 @@ async def _insert_outbox(
         "event_id": event_id,
         "event_type": event_type,
         "api_version": API_VERSION,
-        "created_at": _iso_utc(now),
+        "created_at": iso_utc(_stamp(now)),
         "data": data,
     }
     db.add(
@@ -240,7 +251,7 @@ async def _insert_outbox(
             event_type=event_type,
             sequence=sequence,
             payload_text=json.dumps(envelope, separators=(",", ":"), sort_keys=True),
-            created_at=now,
+            created_at=_stamp(now),
         )
     )
     await db.flush()
@@ -280,27 +291,27 @@ async def write_status(
         aw.outcome_kind = outcome.kind
         aw.outcome_detail = outcome.detail
         aw.outcome_message = outcome.message
-        aw.outcome_at = now
+        aw.outcome_at = _stamp(now)
     aw.event_seq = int(aw.event_seq or 0) + 1
 
     entries = await _entries(db, meeting_id)
     rerun: list[int] = []
     if to_status in FINISHED_STATUSES:
-        window = _finished_window(meeting, aw, now=now)
+        window = _finished_window(meeting, finish=now)
         for entry in entries:
             if entry.state != "active":
                 continue
-            if _is_rerun(entry, window, now=now):
+            if _is_rerun(entry, window, finish=now):
                 rerun.append(int(entry.id))
             else:
                 entry.state = "closed"
-                entry.closed_at = now
+                entry.closed_at = _stamp(now)
 
     change = {
         "from": from_status,
         "to": to_status,
         "reason": change_reason,
-        "at": _iso_utc(now),
+        "at": iso_utc(_stamp(now)),
     }
     event_id = await _insert_outbox(
         db,

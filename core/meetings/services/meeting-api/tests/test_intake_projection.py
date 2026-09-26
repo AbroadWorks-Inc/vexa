@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from meeting_api.intake.projection import project_meeting
 
 UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
@@ -277,20 +279,42 @@ def _all_values(obj) -> list:
     return values
 
 
-# ── entries: active only ──────────────────────────────────────────────────────────────────────
+# ── entries: active on a live/scheduled meeting, closed on a finished one (R9) ───────────────
 
 
-def test_entries_only_active_are_rendered():
-    active = _entry(external_id="google:active-1")
-    removed = _entry(external_id="google:removed-1", state="removed")
-    closed = _entry(external_id="google:closed-1", state="closed")
-    result = _project(aw=_aw(), entries=[active, removed, closed])
+def _three_entries() -> list[dict]:
+    return [
+        _entry(external_id="google:active-1"),
+        _entry(external_id="google:removed-1", state="removed"),
+        _entry(external_id="google:closed-1", state="closed"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["scheduled", "requested", "joining", "awaiting_admission", "active", "stopping"],
+)
+def test_entries_of_an_unfinished_meeting_are_its_active_ones(status):
+    result = _project(
+        meeting=_meeting(status=status), aw=_aw(), entries=_three_entries()
+    )
     assert [e["external_id"] for e in result["entries"]] == ["google:active-1"]
 
 
-def test_entries_empty_when_none_active():
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_entries_of_a_finished_meeting_are_its_closed_ones(status):
+    """A finished meeting lists who it was for (its closed entries); an entry still active on it
+    is waiting to re-run elsewhere (R7) and isn't listed."""
+    result = _project(
+        meeting=_meeting(status=status), aw=_aw(), entries=_three_entries()
+    )
+    assert [e["external_id"] for e in result["entries"]] == ["google:closed-1"]
+
+
+@pytest.mark.parametrize("status", ["scheduled", "completed"])
+def test_removed_entries_are_never_listed(status):
     removed = _entry(state="removed")
-    result = _project(aw=_aw(), entries=[removed])
+    result = _project(meeting=_meeting(status=status), aw=_aw(), entries=[removed])
     assert result["entries"] == []
 
 

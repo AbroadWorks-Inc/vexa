@@ -25,10 +25,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Sequence
 
-__all__ = ["project_meeting"]
+__all__ = ["iso_utc", "project_meeting"]
+
+_FINISHED_STATUSES = frozenset({"completed", "failed"})
 
 
-def _iso_utc(value: Any) -> Optional[str]:
+def iso_utc(value: Any) -> Optional[str]:
     """A datetime or an ISO-8601 string → a UTC ISO-8601 string with a trailing ``Z``.
 
     Mirrors ``bot_spawn/adapters.py``'s ``_iso_utc`` (naive means UTC), extended to also accept an
@@ -61,8 +63,8 @@ def _bot_joins_at(
     if meeting.get("status") == "scheduled" and scheduled_at:
         dt = datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
         dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        return _iso_utc(dt - timedelta(seconds=lead_s))
-    return _iso_utc(data.get("auto_join_last_attempt"))
+        return iso_utc(dt - timedelta(seconds=lead_s))
+    return iso_utc(data.get("auto_join_last_attempt"))
 
 
 def _outcome(aw: Optional[Mapping[str, Any]]) -> Optional[dict]:
@@ -72,7 +74,7 @@ def _outcome(aw: Optional[Mapping[str, Any]]) -> Optional[dict]:
         "kind": aw.get("outcome_kind"),
         "detail": aw.get("outcome_detail"),
         "message": aw.get("outcome_message"),
-        "at": _iso_utc(aw.get("outcome_at")),
+        "at": iso_utc(aw.get("outcome_at")),
     }
 
 
@@ -83,7 +85,7 @@ def _export(aw: Optional[Mapping[str, Any]]) -> Optional[dict]:
         "state": aw.get("export_state"),
         "s3_path": aw.get("export_s3_path"),
         "error": aw.get("export_error"),
-        "at": _iso_utc(aw.get("export_at")),
+        "at": iso_utc(aw.get("export_at")),
     }
 
 
@@ -117,6 +119,9 @@ def project_meeting(
     below, never a verbatim copy of ``data`` or ``aw``.
     """
     data = _data_of(meeting)
+    # R9: a finished meeting lists who it was for (its closed entries); any other meeting lists its
+    # active ones. Removed entries are never listed.
+    listed_state = "closed" if meeting.get("status") in _FINISHED_STATUSES else "active"
     return {
         "id": str(meeting["uuid"]),
         "status": meeting.get("status"),
@@ -127,12 +132,12 @@ def project_meeting(
         "room": meeting.get("platform_specific_id"),
         "meeting_url": data.get("constructed_meeting_url"),
         "title": data.get("title"),
-        "start": _iso_utc(data.get("scheduled_at"))
-        or _iso_utc(meeting.get("start_time")),
-        "end": _iso_utc(aw.get("scheduled_end_at")) if aw is not None else None,
+        "start": iso_utc(data.get("scheduled_at"))
+        or iso_utc(meeting.get("start_time")),
+        "end": iso_utc(aw.get("scheduled_end_at")) if aw is not None else None,
         "time_zone": aw.get("time_zone") if aw is not None else None,
         "bot_joins_at": _bot_joins_at(meeting, data, lead_s=lead_s),
-        "entries": [_entry(e) for e in entries if e.get("state") == "active"],
+        "entries": [_entry(e) for e in entries if e.get("state") == listed_state],
         "export": _export(aw),
         "sequence": aw.get("event_seq", 0) if aw is not None else 0,
     }

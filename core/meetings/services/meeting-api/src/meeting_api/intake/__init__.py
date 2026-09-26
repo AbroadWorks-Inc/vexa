@@ -5,8 +5,9 @@ Front door (P6): import from here, never a deep module path.
 Public surface:
   * ``project_meeting(meeting, aw, entries, *, lead_s)`` — ``projection.py``. Pure: renders one
     aw-bots ``meeting`` object (§2.4) from a ``meetings`` row mapping, a ``meeting_aw_state`` row
-    mapping (or ``None``), and the meeting's active ``meeting_entries`` row mappings. Every reply,
-    read and webhook that ships a meeting goes through this one function.
+    mapping (or ``None``), and the meeting's ``meeting_entries`` row mappings; it lists the closed
+    entries of a finished meeting and the active entries of any other (R9). Every reply, read and
+    webhook that ships a meeting goes through this one function.
   * ``parse_entry(body, *, now, max_days_ahead)`` / ``parse_remove(body)`` — ``validation.py``.
     The ONLY way a `PUT /v2/entries` / `POST /v2/entries/remove` body becomes a typed, normalised
     ``EntryIn`` / ``RemoveIn``, or raises ``IntakeError`` (§2.5).
