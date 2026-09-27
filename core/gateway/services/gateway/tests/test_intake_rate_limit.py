@@ -431,3 +431,136 @@ def test_a_downstream_answer_on_v2_is_forwarded_untouched(status, body):
     r = _remove(client)
     assert r.status_code == status
     assert json.loads(r.content) == body
+
+
+# ── every gateway-originated /v2 error ───────────────────────────────────────────────────────────
+
+
+class RaisingDownstream(CountingDownstream):
+    def __init__(self, exc: Exception):
+        super().__init__()
+        self._exc = exc
+
+    async def request(self, method, url, *, headers=None, params=None, content=None):
+        raise self._exc
+
+
+def test_identity_secret_unset_is_503_unavailable_on_v2_and_detail_elsewhere(
+    monkeypatch,
+):
+    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET", raising=False)
+    client, downstream = _gateway(None)
+
+    r = client.get("/v2/meetings", headers=AUTH)
+    assert r.status_code == 503
+    assert r.json() == {
+        "error": {
+            "code": "unavailable",
+            "message": "GATEWAY_IDENTITY_SECRET is not configured",
+        }
+    }
+
+    r = client.get("/meetings", headers=AUTH)
+    assert r.status_code == 503
+    assert r.json() == {"detail": "GATEWAY_IDENTITY_SECRET is not configured"}
+    assert downstream.calls == 0
+
+
+@pytest.mark.parametrize(
+    "method,url",
+    [
+        ("GET", "/v2/meetings/a%00b"),
+        ("DELETE", "/v2/meetings/a%00b"),
+        ("POST", "/v2/meetings/a%00b/stop"),
+        ("POST", "/v2/meetings/a%00b/export"),
+        ("PATCH", "/v2/webhooks/a%00b"),
+        ("POST", "/v2/webhooks/a%00b/test"),
+    ],
+)
+def test_a_bad_path_parameter_on_v2_is_400_invalid_request(method, url):
+    client, downstream = _gateway(None)
+    r = client.request(method, url, headers=AUTH, content=b"{}")
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {"code": "invalid_request", "message": "invalid path parameter"}
+    }
+    assert downstream.calls == 0
+
+
+def test_a_bad_path_parameter_elsewhere_keeps_detail():
+    client, _ = _gateway(None)
+    r = client.get("/user/calendars/a%00b/sync", headers=AUTH)
+    assert r.status_code == 400
+    assert r.json() == {"detail": "invalid path parameter"}
+
+
+def test_an_unparseable_hop_url_on_v2_is_400_invalid_request():
+    import httpx
+
+    client, _ = _gateway(None, downstream=RaisingDownstream(httpx.InvalidURL("bad")))
+    r = client.get("/v2/meetings", headers=AUTH)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+
+    r = client.get("/meetings", headers=AUTH)
+    assert r.json() == {"detail": "invalid path parameter"}
+
+
+@pytest.mark.parametrize(
+    "exc,status,message",
+    [
+        ("ReadTimeout", 504, "upstream timeout"),
+        ("ConnectError", 502, "upstream unreachable: ConnectError"),
+    ],
+)
+def test_an_upstream_fault_on_v2_is_unavailable_and_detail_elsewhere(
+    exc, status, message
+):
+    import httpx
+
+    downstream = RaisingDownstream(getattr(httpx, exc)("boom"))
+    client, _ = _gateway(
+        InMemoryIntakeLimiter(limit_per_min=600, clock=Clock()), downstream=downstream
+    )
+
+    for r in (_put(client), client.get("/v2/meetings", headers=AUTH)):
+        assert r.status_code == status
+        assert r.json() == {"error": {"code": "unavailable", "message": message}}
+
+    r = client.get("/meetings", headers=AUTH)
+    assert r.status_code == status
+    assert r.json() == {"detail": message}
+
+
+def test_every_refusal_status_the_gateway_uses_has_a_v2_code():
+    """``_V2_ERROR_CODES`` is a closed mapping: every ``_refusal`` call site in app.py passes a
+    literal status, and each one has a §2.5 code, so no refusal can fail on an unknown status.
+    """
+    import ast
+    import pathlib
+
+    from gateway import app as gateway_app
+
+    tree = ast.parse(pathlib.Path(gateway_app.__file__).read_text())
+    statuses = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_refusal"
+        ):
+            status = node.args[1]
+            assert isinstance(status, ast.Constant) and isinstance(
+                status.value, int
+            ), f"line {node.lineno}: _refusal must be called with a literal status"
+            statuses.append(status.value)
+    assert set(statuses) >= {400, 401, 403, 429, 502, 503, 504}
+    missing = sorted(set(statuses) - set(gateway_app._V2_ERROR_CODES))
+    assert not missing, f"statuses with no §2.5 code: {missing}"
+    assert set(gateway_app._V2_ERROR_CODES.values()) <= {
+        "invalid_request",
+        "unauthorized",
+        "forbidden",
+        "rate_limited",
+        "unavailable",
+    }

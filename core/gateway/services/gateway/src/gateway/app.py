@@ -63,11 +63,20 @@ def _auth_unavailable_response(exc: Exception, *, span: str, path: str) -> Respo
                     headers={"Retry-After": "1"})
 
 
-# §2.5: the edge's OWN refusals (auth, scope, rate, intake storage) on a /v2 path carry the /v2 error
-# body; every other route keeps {"detail": ...}. A downstream answer is never rewritten — this shapes
-# only what the gateway itself refuses.
+# §2.5: every error the edge itself answers on a /v2 path carries the /v2 error body; every other
+# route keeps {"detail": ...}. A downstream answer is never rewritten — this shapes only what the
+# gateway itself refuses. The mapping is CLOSED: every `_refusal` call passes a literal status that is
+# a key here (pinned by test_every_refusal_status_the_gateway_uses_has_a_v2_code).
 _V2_PREFIX = "/v2/"
-_V2_ERROR_CODES = {401: "unauthorized", 403: "forbidden", 429: "rate_limited", 503: "unavailable"}
+_V2_ERROR_CODES = {
+    400: "invalid_request",
+    401: "unauthorized",
+    403: "forbidden",
+    429: "rate_limited",
+    502: "unavailable",
+    503: "unavailable",
+    504: "unavailable",
+}
 
 
 def _refusal(path: str, status: int, message: str, headers: Optional[Dict[str, str]] = None) -> Response:
@@ -200,9 +209,9 @@ _MCP_HEADERS = ("mcp-session-id", "mcp-protocol-version")
 # admin-api's /user. Every param is re-encoded as ONE opaque segment before it is interpolated.
 # Control characters (NUL, CR, LF) are refused here instead: httpx raises ``InvalidURL`` for them,
 # which is NOT a ``RequestError`` and would escape the 502/504 mapping as a gateway 500.
-def _path_segment(value: str) -> Tuple[Optional[str], Optional[Response]]:
+def _path_segment(value: str, path: str) -> Tuple[Optional[str], Optional[Response]]:
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-        return None, _invalid_path_param_response()
+        return None, _invalid_path_param_response(path)
     segment = quote(value, safe="")
     # ``quote`` leaves "." alone (it is unreserved), but httpx RESOLVES a dot-only segment against
     # the base path — "/user/calendars/.." becomes admin-api's "/user". Percent-encode it so the
@@ -212,12 +221,8 @@ def _path_segment(value: str) -> Tuple[Optional[str], Optional[Response]]:
     return segment, None
 
 
-def _invalid_path_param_response() -> Response:
-    return Response(
-        content=json.dumps({"detail": "invalid path parameter"}),
-        status_code=400,
-        media_type="application/json",
-    )
+def _invalid_path_param_response(path: str) -> Response:
+    return _refusal(path, 400, "invalid path parameter")
 
 
 def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
@@ -489,11 +494,7 @@ def create_app(
                 user_id=user_id,
                 fields={"method": method, "path": request.url.path},
             )
-            return None, Response(
-                content=json.dumps({"detail": "GATEWAY_IDENTITY_SECRET is not configured"}),
-                status_code=503,
-                media_type="application/json",
-            )
+            return None, _refusal(request.url.path, 503, "GATEWAY_IDENTITY_SECRET is not configured")
         headers[SIGNATURE_HEADER] = sign_now(secret, headers["x-user-id"], method, url)
         return headers, None
 
@@ -518,13 +519,11 @@ def create_app(
         except httpx.InvalidURL:
             # Not a RequestError: without this arm an unparseable hop URL surfaces as a gateway 500
             # even though the fault is in what the CALLER put in the path.
-            return _invalid_path_param_response()
+            return _invalid_path_param_response(request.url.path)
         except httpx.TimeoutException:
-            return Response(content=json.dumps({"detail": "upstream timeout"}),
-                            status_code=504, media_type="application/json")
+            return _refusal(request.url.path, 504, "upstream timeout")
         except httpx.RequestError as e:
-            return Response(content=json.dumps({"detail": f"upstream unreachable: {type(e).__name__}"}),
-                            status_code=502, media_type="application/json")
+            return _refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
 
         # SYSTEM/debug event: the proxy hop completed.
         log_event(
@@ -699,28 +698,28 @@ def create_app(
 
     @app.get("/v2/meetings/{meeting_id}")
     async def get_v2_meeting(meeting_id: str, request: Request):
-        segment, error = _path_segment(meeting_id)
+        segment, error = _path_segment(meeting_id, request.url.path)
         if error is not None:
             return error
         return await _forward("GET", _meeting(f"/v2/meetings/{segment}"), request)
 
     @app.post("/v2/meetings/{meeting_id}/stop")
     async def stop_v2_meeting(meeting_id: str, request: Request):
-        segment, error = _path_segment(meeting_id)
+        segment, error = _path_segment(meeting_id, request.url.path)
         if error is not None:
             return error
         return await _forward("POST", _meeting(f"/v2/meetings/{segment}/stop"), request)
 
     @app.delete("/v2/meetings/{meeting_id}")
     async def erase_v2_meeting(meeting_id: str, request: Request):
-        segment, error = _path_segment(meeting_id)
+        segment, error = _path_segment(meeting_id, request.url.path)
         if error is not None:
             return error
         return await _forward("DELETE", _meeting(f"/v2/meetings/{segment}"), request)
 
     @app.post("/v2/meetings/{meeting_id}/export")
     async def export_v2_meeting(meeting_id: str, request: Request):
-        segment, error = _path_segment(meeting_id)
+        segment, error = _path_segment(meeting_id, request.url.path)
         if error is not None:
             return error
         return await _forward("POST", _meeting(f"/v2/meetings/{segment}/export"), request)
@@ -859,28 +858,28 @@ def create_app(
 
     @app.patch("/user/calendars/{calendar_id}")
     async def update_user_calendar(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("PATCH", _admin(f"/user/calendars/{segment}"), request)
 
     @app.delete("/user/calendars/{calendar_id}")
     async def delete_user_calendar(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("DELETE", _admin(f"/user/calendars/{segment}"), request)
 
     @app.get("/user/calendars/{calendar_id}/sync")
     async def get_calendar_connection_sync(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("GET", _meeting(f"/user/calendars/{segment}/sync"), request)
 
     @app.post("/user/calendars/{calendar_id}/sync")
     async def run_calendar_connection_sync(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("POST", _meeting(f"/user/calendars/{segment}/sync"), request)
@@ -915,35 +914,35 @@ def create_app(
 
     @app.patch("/v2/webhooks/{subscription_id}")
     async def patch_webhook(subscription_id: str, request: Request):
-        segment, error = _path_segment(subscription_id)
+        segment, error = _path_segment(subscription_id, request.url.path)
         if error is not None:
             return error
         return await _forward("PATCH", _admin(f"/v2/webhooks/{segment}"), request)
 
     @app.delete("/v2/webhooks/{subscription_id}")
     async def delete_webhook(subscription_id: str, request: Request):
-        segment, error = _path_segment(subscription_id)
+        segment, error = _path_segment(subscription_id, request.url.path)
         if error is not None:
             return error
         return await _forward("DELETE", _admin(f"/v2/webhooks/{segment}"), request)
 
     @app.post("/v2/webhooks/{subscription_id}/rotate-secret")
     async def rotate_webhook_secret(subscription_id: str, request: Request):
-        segment, error = _path_segment(subscription_id)
+        segment, error = _path_segment(subscription_id, request.url.path)
         if error is not None:
             return error
         return await _forward("POST", _admin(f"/v2/webhooks/{segment}/rotate-secret"), request)
 
     @app.post("/v2/webhooks/{subscription_id}/test")
     async def test_webhook(subscription_id: str, request: Request):
-        segment, error = _path_segment(subscription_id)
+        segment, error = _path_segment(subscription_id, request.url.path)
         if error is not None:
             return error
         return await _forward("POST", _admin(f"/v2/webhooks/{segment}/test"), request)
 
     @app.get("/v2/webhooks/{subscription_id}/deliveries")
     async def list_webhook_deliveries(subscription_id: str, request: Request):
-        segment, error = _path_segment(subscription_id)
+        segment, error = _path_segment(subscription_id, request.url.path)
         if error is not None:
             return error
         return await _forward("GET", _admin(f"/v2/webhooks/{segment}/deliveries"), request)
@@ -1000,12 +999,10 @@ def create_app(
             )
         except httpx.TimeoutException:
             await stack.aclose()
-            return Response(content=json.dumps({"detail": "upstream timeout"}),
-                            status_code=504, media_type="application/json")
+            return _refusal(request.url.path, 504, "upstream timeout")
         except httpx.RequestError as e:
             await stack.aclose()
-            return Response(content=json.dumps({"detail": f"upstream unreachable: {type(e).__name__}"}),
-                            status_code=502, media_type="application/json")
+            return _refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
 
         log_event(
             "downstream_stream_opened",
