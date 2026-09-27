@@ -227,6 +227,7 @@ def build_production_app(
         health_check_interval=30, retry_on_timeout=True,
     )
 
+    from .intake_limit import from_env as _intake_limiter_from_env
     from .ratelimit import from_env as _rate_limiter_from_env
 
     app = create_app(
@@ -238,6 +239,7 @@ def build_production_app(
         admin_api_url=admin_api_url,  # /user/webhook self-serve proxies to identity (admin-api)
         mcp_url=mcp_url,              # #795: the MCP streamable-HTTP front door under /mcp
         rate_limiter=_rate_limiter_from_env(),  # WS-6: per-user DoS guard (generous defaults; env-tunable)
+        intake_limiter=_intake_limiter_from_env(redis_client),  # §1.13: per-account entry writes, shared count
     )
 
     # --- fastapi-guard: per-IP rate limiting, IP allow/deny + auto-ban (edge_guard.py) ---

@@ -17,6 +17,9 @@ The production edge logic, injectable. Modules:
   carrying `x-user-id` (HMAC-SHA256 with `GATEWAY_IDENTITY_SECRET` over `<t>.<user_id>.<METHOD>.<path>`,
   `path` = the forwarded URL's decoded path, no query). meeting-api and admin-api verify it; the rule
   is pinned by `core/gateway/contracts/gateway-identity/signature.vectors.json`.
+- **`intake_limit.py`** — §1.13: the per-account entry-write budget (`INTAKE_RATE_LIMIT_PER_MIN`
+  per 60 s window, `INCR` + `EXPIRE` in one `MULTI` on the gateway's Redis, shared by every replica).
+  `create_app` applies it to `PUT /v2/entries` and `POST /v2/entries/remove` only.
 - **`obs.py`** — the lane's `logevent.v1` trace emitter: `TraceMiddleware` (mint/read/forward
   `X-Trace-Id`), `log_event` bound to `service="gateway"`, and the `make_*` factories the
   downstream conformance hop reuses for `service="meeting-api"`.

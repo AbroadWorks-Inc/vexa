@@ -73,6 +73,13 @@
    "description": "pub/sub bus backing the /ws fan-in"
   },
   {
+   "key": "INTAKE_RATE_LIMIT_PER_MIN",
+   "class": "defaulted",
+   "default": "600",
+   "description": "§1.13: entry writes (PUT /v2/entries + POST /v2/entries/remove) allowed per account in each 60 s window, counted in Redis (REDIS_URL) and shared by every gateway replica (intake_limit.py). The write past it is 429 rate_limited with Retry-After = the seconds left in the window; with Redis unreachable those writes are 503 unavailable, never let through uncounted.",
+   "targets": []
+  },
+  {
    "key": "LOG_LEVEL",
    "class": "defaulted",
    "default": "info",

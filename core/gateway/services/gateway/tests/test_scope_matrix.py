@@ -196,7 +196,12 @@ def test_scope_matrix(method, url, template, scope):
         assert r.status_code != 403, f"{method} {url} with [{scope}] should pass the scope gate"
     else:
         assert r.status_code == 403, f"{method} {url} with [{scope}] → {r.status_code}, expected 403"
-        assert r.json()["detail"] == "Insufficient scope for this endpoint"
+        if url.startswith("/v2/"):
+            # §2.5: the edge's own refusals on /v2 carry the /v2 error body.
+            assert r.json() == {"error": {"code": "forbidden",
+                                          "message": "Insufficient scope for this endpoint"}}
+        else:
+            assert r.json()["detail"] == "Insufficient scope for this endpoint"
 
 
 def test_browser_only_key_reaches_no_route_at_all():

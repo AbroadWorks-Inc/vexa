@@ -43,6 +43,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 
 from .identity_signature import SIGNATURE_HEADER, identity_secret, sign_now
+from .intake_limit import IntakeLimiter, IntakeUnavailable
 from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event, set_user_id
 from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
 
@@ -50,7 +51,7 @@ from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
 # 401 that blames the caller's (valid) key. Shared by /auth/me and the proxy authorizer. Also
 # emits a TYPED, non-empty auth-infra log line (FM02: the old path swallowed the failure in a
 # silent `except`, erasing the one signal that would have named this incident for what it was).
-def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
+def _auth_unavailable_response(exc: Exception, *, span: str, path: str) -> Response:
     log_event(
         "auth_infra_unavailable",
         audience="system",
@@ -58,12 +59,34 @@ def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
         span=span,
         fields={"reason": type(exc).__name__, "detail": str(exc)},
     )
+    return _refusal(path, 503, "Authentication temporarily unavailable, retry",
+                    headers={"Retry-After": "1"})
+
+
+# §2.5: the edge's OWN refusals (auth, scope, rate, intake storage) on a /v2 path carry the /v2 error
+# body; every other route keeps {"detail": ...}. A downstream answer is never rewritten — this shapes
+# only what the gateway itself refuses.
+_V2_PREFIX = "/v2/"
+_V2_ERROR_CODES = {401: "unauthorized", 403: "forbidden", 429: "rate_limited", 503: "unavailable"}
+
+
+def _refusal(path: str, status: int, message: str, headers: Optional[Dict[str, str]] = None) -> Response:
+    if path.startswith(_V2_PREFIX):
+        body: dict = {"error": {"code": _V2_ERROR_CODES[status], "message": message}}
+    else:
+        body = {"detail": message}
     return Response(
-        content=json.dumps({"detail": "Authentication temporarily unavailable, retry"}),
-        status_code=503,
+        content=json.dumps(body),
+        status_code=status,
         media_type="application/json",
-        headers={"Retry-After": "1"},
+        headers=headers,
     )
+
+
+# §1.13: the entry writes, which share one per-account budget (intake_limit.py).
+_INTAKE_WRITE_ROUTES: FrozenSet[Tuple[str, str]] = frozenset(
+    {("PUT", "/v2/entries"), ("POST", "/v2/entries/remove")}
+)
 
 # --- the scope model -------------------------------------------------------------------------
 # The key scopes, as ``docs/docs/authentication.mdx`` defines them:
@@ -236,12 +259,8 @@ def _is_authority_header(name: str) -> bool:
     return name in _AUTHORITY_HEADER_EXACT or name.startswith(_AUTHORITY_HEADER_PREFIXES)
 
 
-def _insufficient_scope_response() -> Response:
-    return Response(
-        content=json.dumps({"detail": "Insufficient scope for this endpoint"}),
-        status_code=403,
-        media_type="application/json",
-    )
+def _insufficient_scope_response(path: str) -> Response:
+    return _refusal(path, 403, "Insufficient scope for this endpoint")
 
 
 def create_app(
@@ -254,6 +273,7 @@ def create_app(
     admin_api_url: str = _DEFAULT_ADMIN_API_URL,
     mcp_url: str = _DEFAULT_MCP_URL,
     rate_limiter=None,
+    intake_limiter: Optional[IntakeLimiter] = None,
 ) -> FastAPI:
     """Build the gateway FastAPI app over the injected ports.
 
@@ -261,6 +281,7 @@ def create_app(
     ``downstream``  — forwards proxied HTTP requests to meeting-api (the unified control plane:
                       /bots + /transcripts + /meetings + /recordings all live there now, P2).
     ``redis``       — pub/sub bus for the ``/ws`` fan-in.
+    ``intake_limiter`` — the per-account entry-write budget (§1.13); ``None`` counts nothing.
     """
     # ── WHICH DOMAINS THIS DEPLOYMENT FRONTS (PRD decisions 40.6 + 40.7) ─────────────────────
     #
@@ -311,7 +332,7 @@ def create_app(
         try:
             user_data = await authorizer.resolve(api_key)
         except AuthUnavailable as e:
-            return _auth_unavailable_response(e, span="auth")  # #495: infra down → 503, not 401
+            return _auth_unavailable_response(e, span="auth", path=request.url.path)  # #495: infra down → 503, not 401
         if not user_data:
             return Response(content=json.dumps({"detail": "Invalid API key"}),
                             status_code=401, media_type="application/json")
@@ -334,24 +355,16 @@ def create_app(
         client_key = api_key if api_key is not None else request.headers.get("x-api-key")
         # Fail-closed: a client route with no key is rejected before any downstream call.
         if not client_key:
-            return None, Response(
-                content=json.dumps({"detail": "Missing API key"}),
-                status_code=401,
-                media_type="application/json",
-            )
+            return None, _refusal(request.url.path, 401, "Missing API key")
 
         try:
             user_data = await authorizer.resolve(client_key)
         except AuthUnavailable as e:
             # #495: the validation hop is unreachable/faulted — tell the caller the truth (503,
             # retry), never 401. A valid key must not be reported as invalid because we are slow.
-            return None, _auth_unavailable_response(e, span="auth")
+            return None, _auth_unavailable_response(e, span="auth", path=request.url.path)
         if not user_data:
-            return None, Response(
-                content=json.dumps({"detail": "Invalid API key"}),
-                status_code=401,
-                media_type="application/json",
-            )
+            return None, _refusal(request.url.path, 401, "Invalid API key")
 
         # Bind the resolved user to the trace context so every later line carries user_id.
         user_id = user_data["user_id"]
@@ -361,12 +374,7 @@ def create_app(
         # the control plane (the max_concurrent_bots cap bounds active bots, not request rate). 429 when
         # the per-user token bucket is empty; the bucket refills continuously (Retry-After: 1s).
         if rate_limiter is not None and not rate_limiter.allow(str(user_id)):
-            return None, Response(
-                content=json.dumps({"detail": "Rate limit exceeded"}),
-                status_code=429,
-                media_type="application/json",
-                headers={"Retry-After": "1"},
-            )
+            return None, _refusal(request.url.path, 429, "Rate limit exceeded", headers={"Retry-After": "1"})
 
         # Scope enforcement — DENY BY DEFAULT. Every proxied route declares its scopes in
         # ROUTE_SCOPES; an undeclared route is refused here rather than forwarded, so the failure
@@ -387,7 +395,7 @@ def create_app(
                 user_id=user_id,
                 fields={"method": method, "path": request.url.path},
             )
-            return None, _insufficient_scope_response()
+            return None, _insufficient_scope_response(request.url.path)
         user_scopes = set(user_data.get("scopes", []))
         if not user_scopes & required:
             log_event(
@@ -398,7 +406,37 @@ def create_app(
                 user_id=user_id,
                 fields={"method": method, "path": request.url.path, "required": sorted(required)},
             )
-            return None, _insufficient_scope_response()
+            return None, _insufficient_scope_response(request.url.path)
+
+        # §1.13: an entry write spends from its account's per-minute budget, counted only once the
+        # key and scope are good. A store that cannot count refuses the write — never uncounted.
+        route_path = getattr(request.scope.get("route"), "path", None)
+        if intake_limiter is not None and (request.method.upper(), route_path) in _INTAKE_WRITE_ROUTES:
+            try:
+                decision = await intake_limiter.hit(str(user_id))
+            except IntakeUnavailable as e:
+                log_event(
+                    "intake_limit_unavailable",
+                    audience="system",
+                    level="error",
+                    span="auth",
+                    user_id=user_id,
+                    fields={"method": method, "path": request.url.path, "reason": str(e)},
+                )
+                return None, _refusal(request.url.path, 503, "Entry writes are temporarily unavailable, retry")
+            if not decision.allowed:
+                log_event(
+                    "intake_rate_limited",
+                    audience="user",
+                    level="warning",
+                    span="auth",
+                    user_id=user_id,
+                    fields={"method": method, "path": request.url.path, "retry_after": decision.retry_after},
+                )
+                return None, _refusal(
+                    request.url.path, 429, "Entry write rate limit exceeded",
+                    headers={"Retry-After": str(decision.retry_after)},
+                )
 
         # USER-facing event: the request was accepted on behalf of this user.
         log_event(
