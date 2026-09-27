@@ -448,6 +448,11 @@ async def request_bot(
     intake instant join pass it); without it the planned row the R1 ``join_now`` rule picks is
     claimed, else a new row is inserted (``MeetingRepo.create_meeting_guarded``).
     """
+    if claim_meeting_id is not None and continue_meeting:
+        raise ValueError(
+            "claim_meeting_id and continue_meeting are exclusive: a claim spawns on a scheduled "
+            "row, continue_meeting reopens a finished one"
+        )
     authority = authority or AllowAllServiceAuthority()
     # 1. URL.
     constructed_url = meeting_url or construct_meeting_url(

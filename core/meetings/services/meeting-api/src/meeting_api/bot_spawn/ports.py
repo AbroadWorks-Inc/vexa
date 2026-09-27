@@ -429,32 +429,52 @@ class ClaimTargetMoved(Exception):
 class PlannedRow:
     """A planned (``idle``/``scheduled``) row as upstream ``POST /bots`` compares it (§1.5):
     ``start`` is the meeting time (``data.scheduled_at``, else ``start_time``, else
-    ``created_at``), ``end`` its ``meeting_aw_state.scheduled_end_at`` (``None``: open-ended)."""
+    ``created_at``), ``end`` its ``meeting_aw_state.scheduled_end_at`` (``None``: open-ended),
+    ``created`` its ``created_at``, and ``managed`` whether entries manage it (it has at least one
+    ``meeting_entries`` row)."""
 
     id: int
     status: str
     start: Optional[datetime]
     end: Optional[datetime]
+    created: Optional[datetime]
+    managed: bool
 
     @classmethod
     def of(cls, meeting_id: int, status: str, data: Any, start_time: Any, created_at: Any,
-           scheduled_end_at: Any) -> "PlannedRow":
+           scheduled_end_at: Any, managed: bool) -> "PlannedRow":
         from ..intake.rules import as_utc, meeting_start
 
         return cls(meeting_id, status, meeting_start(data, start_time, created_at),
-                   as_utc(scheduled_end_at))
+                   as_utc(scheduled_end_at), as_utc(created_at), bool(managed))
 
 
 def planned_claim(rows: list[PlannedRow], *, now: datetime) -> Optional[int]:
-    """The planned row upstream ``POST /bots`` claims, by the R1 ``join_now`` rule
-    (``intake.rules.join_now_target`` with ``JOIN_NOW_ADOPT_AHEAD_S``): the earliest row with
-    ``end > now`` (or open-ended) and ``start <= now + adopt_ahead``; ``None`` means insert. Both
-    the SQL adapter and the in-memory fake call it, so the two cannot drift."""
+    """The planned row upstream ``POST /bots`` claims (§1.5, Ruling R18); ``None`` means insert.
+
+      1. Among entry-managed rows, the R1 ``join_now`` rule (``intake.rules.join_now_target`` with
+         ``JOIN_NOW_ADOPT_AHEAD_S``): the earliest one not yet ended starting within the window.
+      2. Else among entry-less rows, upstream's own rule: the newest, leaving out any that starts
+         after ``now + JOIN_NOW_ADOPT_AHEAD_S``, so a future occurrence is never claimed.
+
+    Both the SQL adapter and the in-memory fake call it, so the two cannot drift."""
+    from datetime import timedelta
+
     from ..intake.rules import join_now_target
     from ..intake.settings import join_now_adopt_ahead_s
 
-    target = join_now_target(rows, now=now, adopt_ahead_s=join_now_adopt_ahead_s())
-    return None if target is None else target.id
+    ahead = join_now_adopt_ahead_s()
+    target = join_now_target(
+        [r for r in rows if r.managed], now=now, adopt_ahead_s=ahead
+    )
+    if target is not None:
+        return target.id
+    horizon = now + timedelta(seconds=ahead)
+    upstream = [r for r in rows if not r.managed and (r.start is None or r.start <= horizon)]
+    if not upstream:
+        return None
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    return max(upstream, key=lambda r: (r.created or oldest, r.id)).id
 
 
 class DuplicateMeeting(Exception):

@@ -277,6 +277,12 @@ class IntakeTx(Protocol):
         ``last_error_message``) without changing the meeting's status."""
         ...
 
+    async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
+        """Set the outcome on ``meeting_aw_state`` (meeting row lock, then ``meeting_aw_state``)
+        without changing the status: for a meeting another writer already finished (§1.5).
+        """
+        ...
+
     async def move_active_entries(
         self, from_meeting_id: int, to_meeting_id: int
     ) -> None: ...

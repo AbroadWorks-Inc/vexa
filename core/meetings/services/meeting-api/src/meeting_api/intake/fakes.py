@@ -10,7 +10,9 @@
     (``rules.is_rerun``, returned in ``rerun_entry_ids``), and every event is recorded in order in
     ``events`` with the meeting as projected at that moment.
   * ``FakeSpawn`` — ``SpawnPort``: claims a ``scheduled`` row (status ``requested``), answers
-    ``already_live`` for any other row, or returns the failure it was given.
+    ``already_live`` for any other row, or returns the failure it was given: before the claim by
+    default, after it with ``after_claim=True`` (the row then ends ``failed``, outcome
+    ``not_sent``, as the real port leaves it).
   * ``FakeStop`` — ``StopPort``: moves a live meeting to ``stopping`` with the outcome given.
   * ``FakePublisher`` — ``EventPublisher``: records each published batch.
   * ``InMemoryIntakeReads`` — ``IntakeReads`` over an ``InMemoryIntakeStore``: the same visibility,
@@ -401,6 +403,15 @@ class _FakeTx:
             "last_error_message": message,
         }
 
+    async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
+        self._s.aw[meeting_id] = {
+            **self._s.aw[meeting_id],
+            "outcome_kind": outcome.kind,
+            "outcome_detail": outcome.detail,
+            "outcome_message": outcome.message,
+            "outcome_at": self._s._clock().replace(microsecond=0),
+        }
+
     async def move_active_entries(
         self, from_meeting_id: int, to_meeting_id: int
     ) -> None:
@@ -446,22 +457,42 @@ class FakeSpawn:
         *,
         failure: Optional[SpawnOutcome] = None,
         before: Optional[Callable[[int], None]] = None,
+        after_claim: bool = False,
     ) -> None:
         self._store = store
         self.failure = failure
         self.before = before
+        self.after_claim = after_claim
         self.calls: list[tuple[int, int]] = []
 
     async def spawn_exact(self, user_id: int, meeting_id: int) -> SpawnOutcome:
         self.calls.append((user_id, meeting_id))
         if self.before is not None:
             self.before(meeting_id)
+        if self.failure is not None and self.after_claim:
+            return self._fail_after_claim(meeting_id, self.failure)
         if self.failure is not None:
             return self.failure
         if self._store.meetings[meeting_id]["status"] != "scheduled":
             return SpawnOutcome("already_live")
         self._store.write_status(meeting_id, "requested", expected_from={"scheduled"})
         return SpawnOutcome("sent")
+
+    def _fail_after_claim(self, meeting_id: int, failure: SpawnOutcome) -> SpawnOutcome:
+        """The real port's post-claim failure: the row was claimed, then ends ``failed`` with
+        outcome ``not_sent`` (``meeting.not_sent``)."""
+        if self._store.meetings[meeting_id]["status"] != "scheduled":
+            return SpawnOutcome("already_live")
+        self._store.write_status(meeting_id, "requested", expected_from={"scheduled"})
+        self._store.write_status(
+            meeting_id,
+            "failed",
+            expected_from={"requested"},
+            outcome=Outcome("not_sent", failure.code, failure.message),
+            change_reason=failure.code,
+            event_type="meeting.not_sent",
+        )
+        return failure
 
 
 class FakeStop:

@@ -12,12 +12,21 @@ exception:
   * ``already_live`` — a bot already owns the row's link (``DuplicateMeeting``);
   * ``failed`` — anything else, with ``spawn_failure``'s code and message.
 
+A failure after the claim (the token or invocation, the runtime, the post-spawn writes, a stop
+that won the race) would leave a claimed meeting with no bot and no reason, so the port ends it
+``not_sent`` itself (Ruling R17), under the link lock: a row still ``requested`` goes ``failed``
+through the status writer with the outcome (``meeting.not_sent``); a row the spawn flow already
+wrote ``failed`` gets the outcome on ``meeting_aw_state`` and a ``meeting.not_sent`` event. The
+events are handed to ``publisher`` after the commit, when one is given; the outbox holds them
+either way.
+
 A row whose link changed between the read and the claim (``ClaimTargetMoved``) is read again and
 spawned once more. The spawn context (the per-user bot limit and webhook settings) comes from
 ``fetch_bot_context(user_id)``, as for the auto-join sweep; the limit is never guessed, so a
-missing identity edge or an unreachable identity fails the spawn (``internal_error``) rather than
-spawning uncapped. Recording and transcription resolve through ``env_flags.resolve_spawn_flag``,
-the resolver ``POST /bots`` uses.
+missing identity edge, an unreachable identity or a context without ``max_concurrent`` fails the
+spawn (``internal_error``) rather than spawning uncapped. The bot's name is the sweep's: the
+calendar source's name, else the user's default. Recording and transcription resolve through
+``env_flags.resolve_spawn_flag``, the resolver ``POST /bots`` uses.
 
 ``spawn_failure(exc)`` is the §1.5 mapping, used by every caller that spawns (intake, and the
 scheduler): the code, and a message that is the exception's own text wherever it has one.
@@ -26,8 +35,9 @@ scheduler): the code, and a message that is the exception's own text wherever it
 from __future__ import annotations
 
 import traceback
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence, cast
 
+from ..bot_spawn.auto_join import _calendar_bot_name
 from ..bot_spawn.env_flags import resolve_spawn_flag
 from ..bot_spawn.ports import (
     AuthSessionBusy,
@@ -45,7 +55,8 @@ from ..bot_spawn.ports import (
 from ..bot_spawn.service import request_bot
 from ..obs import log_event
 from ..service_authority import ServiceAuthorityDenied, ServiceAuthorityUnavailable
-from .ports import SpawnOutcome
+from .ports import EventPublisher, IntakeStore, Room, SpawnOutcome
+from .status import Outcome
 
 __all__ = ["ExactRowSpawn", "spawn_failure"]
 
@@ -129,6 +140,23 @@ class _Refused(Exception):
     """The spawn context couldn't be read; the message is the outcome's."""
 
 
+class _ClaimWatch:
+    """The repo as ``request_bot`` sees it, noting whether the guarded claim committed: a failure
+    after that point belongs to a claimed row."""
+
+    def __init__(self, repo: MeetingRepo) -> None:
+        self._repo = repo
+        self.claimed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repo, name)
+
+    async def create_meeting_guarded(self, **kwargs: Any) -> dict:
+        row = await self._repo.create_meeting_guarded(**kwargs)
+        self.claimed = True
+        return row
+
+
 class ExactRowSpawn:
     """``SpawnPort`` over ``bot_spawn``'s repo and runtime (§1.5)."""
 
@@ -137,31 +165,39 @@ class ExactRowSpawn:
         repo: MeetingRepo,
         runtime: RuntimeClient,
         *,
+        store: IntakeStore,
         fetch_bot_context: Optional[BotContextFetcher],
+        publisher: Optional[EventPublisher] = None,
         authority: Any = None,
         token_secret: Optional[str] = None,
         redis_url: Optional[str] = None,
     ) -> None:
         self._repo = repo
         self._runtime = runtime
+        self._store = store
+        self._publisher = publisher
         self._fetch_bot_context = fetch_bot_context
         self._authority = authority
         self._token_secret = token_secret
         self._redis_url = redis_url
 
     async def spawn_exact(self, user_id: int, meeting_id: int) -> SpawnOutcome:
+        watch = _ClaimWatch(self._repo)
         try:
-            await self._spawn(user_id, meeting_id)
-        except DuplicateMeeting:
-            return SpawnOutcome("already_live")
+            await self._spawn(watch, user_id, meeting_id)
         except _Refused as exc:
             return self._failed(user_id, meeting_id, "internal_error", str(exc))
+        except DuplicateMeeting:
+            # Raised only by the guarded claim itself, so nothing was claimed.
+            return SpawnOutcome("already_live")
         except Exception as exc:
             code, message = spawn_failure(exc, user_id=user_id, meeting_id=meeting_id)
+            if watch.claimed:
+                await self._end_not_sent(user_id, meeting_id, code, message)
             return self._failed(user_id, meeting_id, code, message)
         return SpawnOutcome("sent")
 
-    async def _spawn(self, user_id: int, meeting_id: int) -> None:
+    async def _spawn(self, watch: _ClaimWatch, user_id: int, meeting_id: int) -> None:
         ctx = await self._context(user_id)
         for attempt in range(2):
             row = await self._repo.get_meeting(meeting_id)
@@ -171,14 +207,14 @@ class ExactRowSpawn:
             data: dict[str, Any] = stored if isinstance(stored, dict) else {}
             try:
                 await request_bot(
-                    self._repo,
+                    cast(MeetingRepo, watch),
                     self._runtime,
                     authority=self._authority,
                     user_id=user_id,
                     platform=row["platform"],
                     native_meeting_id=row["native_meeting_id"],
                     meeting_url=data.get("constructed_meeting_url"),
-                    bot_name=ctx.get("bot_name"),
+                    bot_name=_calendar_bot_name(data) or ctx.get("bot_name"),
                     recording_enabled=resolve_spawn_flag(
                         "RECORDING_ENABLED", default=True
                     ),
@@ -206,7 +242,72 @@ class ExactRowSpawn:
         ctx = await self._fetch_bot_context(user_id)
         if ctx is None:
             raise _Refused("the bot limit could not be read: identity is unavailable")
+        if ctx.get("max_concurrent") is None:
+            raise _Refused(
+                "the bot limit could not be read: identity returned no max_concurrent"
+            )
         return ctx
+
+    async def _end_not_sent(
+        self, user_id: int, meeting_id: int, code: str, message: str
+    ) -> None:
+        """Ruling R17: the claimed row ends ``not_sent`` with the code and message. Best effort:
+        a failure here is logged with its stack, and the spawn's answer stands."""
+        outcome = Outcome("not_sent", code, message)
+        events: list[str] = []
+        try:
+            row = await self._repo.get_meeting(meeting_id)
+            if row is None:
+                raise LookupError(f"meeting {meeting_id} not found")
+            room = Room(row["platform"], row["native_meeting_id"])
+            async with self._store.room_lock(user_id, [room]) as tx:
+                status = (await tx.meeting(meeting_id)).status
+                if status == "requested":
+                    written = await tx.status(
+                        meeting_id,
+                        "failed",
+                        expected_from={"requested"},
+                        outcome=outcome,
+                        change_reason=code,
+                        event_type="meeting.not_sent",
+                    )
+                    events.append(written.event_id)
+                elif status == "failed":
+                    await tx.record_outcome(meeting_id, outcome)
+                    events.append(
+                        (await tx.event(meeting_id, "meeting.not_sent")).event_id
+                    )
+        except Exception as exc:
+            log_event(
+                "spawn_not_sent_record_failed",
+                audience="operator",
+                level="error",
+                span="meetings.spawn",
+                user_id=user_id,
+                meeting_id=str(meeting_id),
+                fields={
+                    "error": type(exc).__name__,
+                    "traceback": "".join(
+                        traceback.format_exception(type(exc), exc, exc.__traceback__)
+                    ),
+                },
+            )
+            return
+        await self._publish(events)
+
+    async def _publish(self, event_ids: Sequence[str]) -> None:
+        if not event_ids or self._publisher is None:
+            return
+        try:
+            await self._publisher.publish(event_ids)
+        except Exception as exc:
+            log_event(
+                "spawn_publish_failed",
+                audience="operator",
+                level="warning",
+                span="meetings.spawn",
+                fields={"events": len(event_ids), "error": type(exc).__name__},
+            )
 
     @staticmethod
     def _failed(user_id: int, meeting_id: int, code: str, message: str) -> SpawnOutcome:

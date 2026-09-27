@@ -32,9 +32,10 @@ the row. Any LIVE row on the link (`auto_join.LIVE_STATUSES`, `needs_help` and `
 is a 409. With `claim_meeting_id` (the scheduler and intake's instant join) exactly that
 `scheduled` row moves to `requested` through `intake.status.write_status` and gets
 `data.auto_join_last_attempt`; any other status is `MeetingStopped`, a row on another link
-`ClaimTargetMoved`. Without it (`POST /bots`) the planned row the R1 `join_now` rule picks is claimed
-(the earliest `idle`/`scheduled` row that hasn't ended and starts within `JOIN_NOW_ADOPT_AHEAD_S`),
-else a new row is inserted: a future occurrence is never claimed.
+`ClaimTargetMoved`. Without it (`POST /bots`): among entry-managed rows, the one the R1 `join_now`
+rule picks (the earliest that hasn't ended and starts within `JOIN_NOW_ADOPT_AHEAD_S`); else among
+entry-less rows, upstream's rule, the newest, leaving out any starting after that window; else a new
+row is inserted. A future occurrence is never claimed.
 
 ### P3c — `continue_meeting` (sequential multi-bot per meeting)
 When the prior meeting for `(platform, native_id)` is TERMINAL (`completed`/`failed`), reuse the

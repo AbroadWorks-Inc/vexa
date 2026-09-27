@@ -69,8 +69,12 @@ It answers `sent`, `already_live` (a bot already owns the link) or `failed` with
 of `spawn_failure(exc)`, the one table from a spawn exception to its §1.13 code (`account_limit`,
 `already_live`, `meeting_stopped`, `spawn_error`, `authority_denied`, `authority_unavailable`,
 `auth_session`, `transcription_config`, else `internal_error`, logged with its stack); it never
-raises. The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
-never guessed: without it the spawn fails `internal_error`.
+raises. A failure after the claim ends the claimed meeting `not_sent` with that code and message,
+under the link lock (Ruling R17): a row still `requested` goes `failed` through `write_status`, a row
+the spawn flow already wrote `failed` gets the outcome on `meeting_aw_state` and a `meeting.not_sent`
+event; the entry service then replies with that meeting (R12 applies only to a failure before the
+claim). The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
+never guessed: without it, or without `max_concurrent` in it, the spawn fails `internal_error`.
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.

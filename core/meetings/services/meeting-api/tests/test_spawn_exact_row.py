@@ -83,6 +83,7 @@ class FakeBackend:
         native: str = NID,
         user_id: int = USER,
         data: Optional[dict] = None,
+        managed: bool = False,
     ) -> int:
         self._next += 1
         mid = self._next
@@ -101,6 +102,7 @@ class FakeBackend:
             "end_time": None,
             "data": payload,
             "scheduled_end_at": end,
+            "has_entries": managed,
             "created_at": "2026-09-01T09:00:00Z",
             "updated_at": "2026-09-01T09:00:00Z",
         }
@@ -134,6 +136,7 @@ class PgBackend:
         native: str = NID,
         user_id: int = USER,
         data: Optional[dict] = None,
+        managed: bool = False,
     ) -> int:
         from sqlalchemy import text
 
@@ -169,6 +172,24 @@ class PgBackend:
                         "VALUES (:m, :e)"
                     ),
                     {"m": mid, "e": end},
+                )
+            if managed:
+                await conn.execute(
+                    text(
+                        "INSERT INTO meeting_entries (user_id, source_user, external_id, "
+                        "meeting_id, meeting_url, platform, native_meeting_id, start_at, "
+                        "content_hash, state) VALUES (:u, 'a@x', :x, :m, :url, :p, :n, "
+                        ":s, 'h', 'active')"
+                    ),
+                    {
+                        "u": user_id,
+                        "x": f"e{mid}",
+                        "m": mid,
+                        "p": PLAT,
+                        "n": native,
+                        "url": f"https://meet.google.com/{native}",
+                        "s": start or _now(),
+                    },
                 )
         return int(mid)
 
@@ -280,7 +301,9 @@ async def test_id_claim_takes_exactly_that_row(backend):
     assert abs((stamp - now).total_seconds()) < 30  # R7: the send time
 
 
-@pytest.mark.parametrize("live", ["needs_help", "stopping", "active"])
+@pytest.mark.parametrize(
+    "live", ["needs_help", "needs_human_help", "stopping", "active"]
+)
 async def test_id_claim_is_blocked_by_any_live_row_on_the_link(backend, live):
     await backend.seed(status=live)
     target = await backend.seed(start=_now())
@@ -332,14 +355,18 @@ async def test_id_claim_at_the_cap_carries_the_numbers(backend):
 # ── upstream POST /bots: the R1 join_now rule, else insert ───────────────────────────────────
 
 
-async def test_post_bots_at_0955_claims_todays_1000_row(backend):
+@pytest.mark.parametrize("managed", [True, False])
+async def test_post_bots_at_0955_claims_todays_1000_row(backend, managed):
     now = _now()  # "09:55"
     today = await backend.seed(
-        start=now + timedelta(minutes=5), end=now + timedelta(minutes=35)
+        start=now + timedelta(minutes=5),
+        end=now + timedelta(minutes=35),
+        managed=managed,
     )
     tomorrow = await backend.seed(
         start=now + timedelta(days=1, minutes=5),
         end=now + timedelta(days=1, minutes=35),
+        managed=managed,
     )
     row = await _guarded(backend)
     assert row["id"] == today and row["status"] == "requested"
@@ -349,11 +376,14 @@ async def test_post_bots_at_0955_claims_todays_1000_row(backend):
 async def test_post_bots_at_1040_inserts_after_todays_row_ended(backend):
     now = _now()  # "10:40"
     ended = await backend.seed(
-        start=now - timedelta(minutes=40), end=now - timedelta(minutes=10)
+        start=now - timedelta(minutes=40),
+        end=now - timedelta(minutes=10),
+        managed=True,
     )
     tomorrow = await backend.seed(
         start=now + timedelta(hours=23, minutes=20),
         end=now + timedelta(hours=23, minutes=50),
+        managed=True,
     )
     before = await backend.ids()
     row = await _guarded(backend)
@@ -362,27 +392,65 @@ async def test_post_bots_at_1040_inserts_after_todays_row_ended(backend):
     assert (await backend.row(tomorrow))["status"] == "scheduled"
 
 
-async def test_post_bots_never_claims_a_future_occurrence(backend):
+@pytest.mark.parametrize("managed", [True, False])
+async def test_post_bots_never_claims_a_future_occurrence(backend, managed):
     now = _now()
     tomorrow = await backend.seed(
-        start=now + timedelta(days=1), end=now + timedelta(days=1, hours=1)
+        start=now + timedelta(days=1),
+        end=now + timedelta(days=1, hours=1),
+        managed=managed,
     )
     row = await _guarded(backend)
     assert row["id"] != tomorrow
     assert (await backend.row(tomorrow))["status"] == "scheduled"
 
 
-async def test_post_bots_claims_the_earliest_adoptable_row(backend):
+async def test_post_bots_claims_the_earliest_adoptable_entry_managed_row(backend):
     now = _now()
     earliest = await backend.seed(
-        start=now - timedelta(minutes=10), end=now + timedelta(minutes=20)
+        start=now - timedelta(minutes=10),
+        end=now + timedelta(minutes=20),
+        managed=True,
     )
     later = await backend.seed(
-        start=now + timedelta(minutes=30), end=now + timedelta(minutes=60)
+        start=now + timedelta(minutes=30),
+        end=now + timedelta(minutes=60),
+        managed=True,
     )
     row = await _guarded(backend)
     assert row["id"] == earliest
     assert (await backend.row(later))["status"] == "scheduled"
+
+
+async def test_post_bots_claims_the_newest_entry_less_plan(backend):
+    """R18: among upstream-planned (entry-less) rows, upstream's own rule: the newest."""
+    now = _now()
+    stale = await backend.seed(start=now - timedelta(days=7))
+    today = await backend.seed(start=now + timedelta(minutes=5))
+    row = await _guarded(backend)
+    assert row["id"] == today
+    assert (await backend.row(stale))["status"] == "scheduled"
+
+
+async def test_post_bots_prefers_the_entry_managed_row_by_r1(backend):
+    now = _now()
+    managed = await backend.seed(
+        start=now + timedelta(minutes=5),
+        end=now + timedelta(minutes=35),
+        managed=True,
+    )
+    entry_less = await backend.seed(start=now)  # newer: upstream's rule would pick it
+    row = await _guarded(backend)
+    assert row["id"] == managed
+    assert (await backend.row(entry_less))["status"] == "scheduled"
+
+
+async def test_post_bots_tolerates_an_unparseable_scheduled_at(backend):
+    """A planned row's ``scheduled_at`` that isn't ISO-8601 falls through to ``start_time`` /
+    ``created_at``, as the auto-join sweep tolerates it; POST /bots still answers."""
+    odd = await backend.seed(data={"scheduled_at": "tomorrow 10am"})
+    row = await _guarded(backend)
+    assert row["id"] == odd and row["status"] == "requested"
 
 
 async def test_post_bots_claims_an_open_ended_planned_row(backend):
@@ -393,7 +461,9 @@ async def test_post_bots_claims_an_open_ended_planned_row(backend):
     assert row["id"] == idle and row["status"] == "requested"
 
 
-@pytest.mark.parametrize("live", ["needs_help", "stopping", "requested"])
+@pytest.mark.parametrize(
+    "live", ["needs_help", "needs_human_help", "stopping", "requested"]
+)
 async def test_post_bots_is_blocked_by_any_live_row_on_the_link(backend, live):
     await backend.seed(status=live)
     with pytest.raises(DuplicateMeeting):
@@ -520,11 +590,19 @@ async def _ctx(_user_id: int) -> dict:
     return {"max_concurrent": 45}
 
 
-def _port(repo, runtime=None, **kw) -> ExactRowSpawn:
+class _NoStore:
+    """The offline tests never reach a post-claim failure, so the store is never opened."""
+
+    def room_lock(self, user_id, rooms):
+        raise AssertionError("no post-claim failure expected")
+
+
+def _port(repo, runtime=None, *, store=None, **kw) -> ExactRowSpawn:
     kw.setdefault("fetch_bot_context", _ctx)
     return ExactRowSpawn(
         repo,
         runtime or FakeRuntimeClient(),
+        store=store or _NoStore(),
         token_secret="s",
         redis_url="redis://r",
         **kw,
@@ -764,26 +842,30 @@ async def test_pg_exact_claim_and_post_bots_race_without_deadlock(pg_engine):
         assert live == 1
 
 
-async def test_pg_instant_join_through_intake_with_the_real_port(pg_engine):
-    from intake_builders import ZOOM, instant_body, make_settings
+class _NoStop:
+    async def stop_live(self, user_id, meeting_id, *, outcome):
+        raise AssertionError("no stop expected")
+
+
+def _pg_intake(pg: PgBackend, runtime=None, **port_kw):
+    """``IntakeService`` over Postgres with the real ``ExactRowSpawn`` over the same database."""
+    from intake_builders import make_settings
     from meeting_api.intake import PostgresIntakeStore
     from meeting_api.intake.fakes import FakePublisher
     from meeting_api.intake.service import IntakeService
 
+    store = PostgresIntakeStore(pg.session_factory)
+    publisher = FakePublisher()
+    port = _port(pg.repo, runtime, store=store, publisher=publisher, **port_kw)
+    service = IntakeService(store, port, _NoStop(), publisher, make_settings())
+    return service, publisher
+
+
+async def test_pg_instant_join_through_intake_with_the_real_port(pg_engine):
+    from intake_builders import ZOOM, instant_body
+
     pg = PgBackend(pg_engine)
-
-    class NoStop:
-        async def stop_live(self, user_id, meeting_id, *, outcome):
-            raise AssertionError("no stop expected")
-
-    port = _port(pg.repo)
-    service = IntakeService(
-        PostgresIntakeStore(pg.session_factory),
-        port,
-        NoStop(),
-        FakePublisher(),
-        make_settings(),
-    )
+    service, _ = _pg_intake(pg)
     sent_at = _now()
     reply = await service.put_entry(USER, instant_body("paste:1", ZOOM))
     assert reply["result"] == "created"
@@ -794,30 +876,390 @@ async def test_pg_instant_join_through_intake_with_the_real_port(pg_engine):
 
 
 async def test_pg_instant_join_at_the_bot_limit_ends_not_sent(pg_engine):
-    from intake_builders import ZOOM, instant_body, make_settings
-    from meeting_api.intake import PostgresIntakeStore
-    from meeting_api.intake.fakes import FakePublisher
-    from meeting_api.intake.service import IntakeService
+    from intake_builders import ZOOM, instant_body
 
     pg = PgBackend(pg_engine)
     for i in range(45):
         await pg.seed(status="active", native=f"n{i:02d}-aaaa-bbb")
-
-    class NoStop:
-        async def stop_live(self, user_id, meeting_id, *, outcome):
-            raise AssertionError("no stop expected")
-
-    service = IntakeService(
-        PostgresIntakeStore(pg.session_factory),
-        _port(pg.repo),
-        NoStop(),
-        FakePublisher(),
-        make_settings(),
-    )
+    service, _ = _pg_intake(pg)
     reply = await service.put_entry(USER, instant_body("paste:2", ZOOM))
     meeting = reply["meeting"]
+    assert reply["result"] == "created"
     assert meeting["status"] == "failed"
     assert meeting["outcome"]["kind"] == "not_sent"
     assert meeting["outcome"]["detail"] == "account_limit"
     assert meeting["outcome"]["message"] == "bot limit reached (45 of 45)"
     assert meeting["bot_joins_at"] is None
+
+
+# ── post-claim failures end not_sent (Ruling R17), driven through the real request_bot ──────
+
+
+async def _outcome_row(pg: PgBackend, mid: int) -> dict:
+    from sqlalchemy import text
+
+    async with pg.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT m.status, a.outcome_kind, a.outcome_detail, a.outcome_message "
+                    "FROM meetings m JOIN meeting_aw_state a ON a.meeting_id = m.id "
+                    "WHERE m.id = :m"
+                ),
+                {"m": mid},
+            )
+        ).one()
+    return dict(row._mapping)
+
+
+async def _events(pg: PgBackend, mid: int) -> list[dict]:
+    from sqlalchemy import text
+
+    async with pg.engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT payload_text FROM webhook_outbox WHERE meeting_id = :m "
+                    "ORDER BY sequence"
+                ),
+                {"m": mid},
+            )
+        ).all()
+    return [json.loads(r[0]) for r in rows]
+
+
+# (runtime, expected code, expected message, the status upstream leaves the claimed row in)
+POST_CLAIM = [
+    pytest.param(
+        {"fail": True},
+        "spawn_error",
+        "kernel could not start the workload",
+        "failed",
+        id="runtime-spawn-failed",
+    ),
+    pytest.param(
+        {"quota_exceeded": True},
+        "account_limit",
+        "bot limit reached (owner quota exceeded)",
+        "requested",
+        id="runtime-quota",
+    ),
+]
+
+
+@pytest.mark.parametrize("runtime_kw,code,message,upstream_status", POST_CLAIM)
+async def test_pg_post_claim_failure_ends_the_row_not_sent(
+    pg_engine, runtime_kw, code, message, upstream_status
+):
+    from meeting_api.intake import PostgresIntakeStore
+
+    pg = PgBackend(pg_engine)
+    target = await pg.seed(start=_now())
+    port = _port(
+        pg.repo,
+        FakeRuntimeClient(**runtime_kw),
+        store=PostgresIntakeStore(pg.session_factory),
+    )
+    outcome = await port.spawn_exact(USER, target)
+    assert outcome == SpawnOutcome("failed", code, message)
+    assert await _outcome_row(pg, target) == {
+        "status": "failed",
+        "outcome_kind": "not_sent",
+        "outcome_detail": code,
+        "outcome_message": message,
+    }
+    events = await _events(pg, target)
+    assert [e["event_type"] for e in events] == [
+        "meeting.status_change",
+        "meeting.not_sent",
+    ]
+    last = events[-1]["data"]
+    assert last["meeting"]["outcome"]["detail"] == code
+    assert last["meeting"]["outcome"]["message"] == message
+    if upstream_status == "requested":
+        # still `requested` after upstream: the port wrote the terminal through the writer
+        assert (
+            last["change"]["from"] == "requested" and last["change"]["to"] == "failed"
+        )
+    else:
+        # upstream wrote `failed` directly: the port recorded the outcome and the event
+        assert "change" not in last
+
+
+async def test_pg_post_claim_token_failure_ends_not_sent(pg_engine, monkeypatch):
+    from meeting_api.intake import PostgresIntakeStore
+
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    pg = PgBackend(pg_engine)
+    target = await pg.seed(start=_now())
+    port = ExactRowSpawn(
+        pg.repo,
+        FakeRuntimeClient(),
+        store=PostgresIntakeStore(pg.session_factory),
+        fetch_bot_context=_ctx,
+        token_secret=None,
+        redis_url="redis://r",
+    )
+    outcome = await port.spawn_exact(USER, target)
+    assert outcome == SpawnOutcome(
+        "failed", "internal_error", "internal error (ValueError)"
+    )
+    assert await _outcome_row(pg, target) == {
+        "status": "failed",
+        "outcome_kind": "not_sent",
+        "outcome_detail": "internal_error",
+        "outcome_message": "internal error (ValueError)",
+    }
+    assert [e["event_type"] for e in await _events(pg, target)] == [
+        "meeting.status_change",
+        "meeting.not_sent",
+    ]
+
+
+async def test_pg_post_claim_failure_of_a_new_instant_join_replies_created(pg_engine):
+    from intake_builders import ZOOM, instant_body
+
+    pg = PgBackend(pg_engine)
+    service, publisher = _pg_intake(pg, FakeRuntimeClient(fail=True))
+    reply = await service.put_entry(USER, instant_body("paste:3", ZOOM))
+    assert reply["result"] == "created"
+    meeting = reply["meeting"]
+    assert meeting["status"] == "failed"
+    assert meeting["outcome"]["kind"] == "not_sent"
+    assert meeting["outcome"]["detail"] == "spawn_error"
+    assert meeting["outcome"]["message"] == "kernel could not start the workload"
+    published = [e for batch in publisher.batches for e in batch]
+    not_sent = await pg.scalar(
+        "SELECT event_id FROM webhook_outbox WHERE event_type = 'meeting.not_sent'"
+    )
+    assert not_sent in published
+
+
+async def test_pg_post_claim_failure_of_an_adopted_meeting_replies_joined_existing(
+    pg_engine,
+):
+    """R12 keeps an adopted meeting scheduled only for a failure BEFORE the claim; after the
+    claim the meeting itself ended not_sent, and the reply names it."""
+    from intake_builders import GMEET, entry_body, instant_body
+
+    pg = PgBackend(pg_engine)
+    service, _ = _pg_intake(pg, FakeRuntimeClient(fail=True))
+    now = _now()
+    planned = await service.put_entry(
+        USER,
+        entry_body(
+            "google:cal-1",
+            meeting_url=GMEET,
+            start=_iso(now + timedelta(minutes=20)),
+            end=_iso(now + timedelta(minutes=50)),
+        ),
+    )
+    reply = await service.put_entry(USER, instant_body("paste:4", GMEET))
+    assert reply["result"] == "joined_existing"
+    meeting = reply["meeting"]
+    assert meeting["id"] == planned["meeting"]["id"]
+    assert meeting["status"] == "failed"
+    assert meeting["outcome"]["detail"] == "spawn_error"
+
+
+async def test_pg_pre_claim_failure_of_an_adopted_meeting_keeps_it_scheduled(pg_engine):
+    from intake_builders import GMEET, entry_body, instant_body
+
+    pg = PgBackend(pg_engine)
+    for i in range(45):
+        await pg.seed(status="active", native=f"n{i:02d}-aaaa-bbb")
+    service, _ = _pg_intake(pg)
+    now = _now()
+    planned = await service.put_entry(
+        USER,
+        entry_body(
+            "google:cal-2",
+            meeting_url=GMEET,
+            start=_iso(now + timedelta(minutes=20)),
+            end=_iso(now + timedelta(minutes=50)),
+        ),
+    )
+    reply = await service.put_entry(USER, instant_body("paste:5", GMEET))
+    meeting = reply["meeting"]
+    assert (reply["result"], meeting["id"], reply["entry"]["state"]) == (
+        "joined_existing",
+        planned["meeting"]["id"],
+        "removed",
+    )
+    assert (meeting["status"], meeting["outcome"]) == ("scheduled", None)
+
+
+# ── spawn context, bot name, exclusivity, the live-index backstop ────────────────────────────
+
+
+async def test_spawn_exact_refuses_a_context_without_a_bot_limit():
+    repo = FakeBackend()
+    target = await repo.seed(start=_now())
+
+    async def no_limit(_user_id: int) -> dict:
+        return {"bot_name": "Scribe"}
+
+    outcome = await _port(repo.repo, fetch_bot_context=no_limit).spawn_exact(
+        USER, target
+    )
+    assert outcome == SpawnOutcome(
+        "failed",
+        "internal_error",
+        "the bot limit could not be read: identity returned no max_concurrent",
+    )
+    assert (await repo.row(target))["status"] == "scheduled"
+
+
+async def test_spawn_exact_names_the_bot_as_the_sweep_does():
+    repo = FakeBackend()
+    target = await repo.seed(
+        start=_now(),
+        data={"calendar_sources": [{"auto_join": True, "bot_name": "Cal Notes"}]},
+    )
+    runtime = FakeRuntimeClient()
+
+    async def ctx(_user_id: int) -> dict:
+        return {"max_concurrent": 45, "bot_name": "Scribe"}
+
+    port = _port(repo.repo, runtime, fetch_bot_context=ctx)
+    assert await port.spawn_exact(USER, target) == SpawnOutcome("sent")
+    assert json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])["botName"] == "Cal Notes"
+
+
+async def test_request_bot_refuses_claim_with_continue_meeting():
+    repo = FakeBackend()
+    target = await repo.seed(start=_now())
+    with pytest.raises(ValueError, match="continue_meeting"):
+        await request_bot(
+            repo.repo,
+            FakeRuntimeClient(),
+            user_id=USER,
+            platform=PLAT,
+            native_meeting_id=NID,
+            token_secret="s",
+            redis_url="redis://r",
+            continue_meeting=True,
+            claim_meeting_id=target,
+        )
+    assert (await repo.row(target))["status"] == "scheduled"
+
+
+async def test_pg_live_index_violation_in_the_exact_claim_is_already_live(pg_engine):
+    """A row made live by a writer outside these locks trips the live-link index at the claim's
+    write: that one IntegrityError is ``DuplicateMeeting``."""
+    from meeting_api.intake.status import lock_meeting
+
+    pg = PgBackend(pg_engine)
+    target = await pg.seed(start=_now())
+    await pg.seed(status="active")  # the row the dedup would have seen
+    async with pg.session_factory() as db:
+        row = await lock_meeting(db, target)
+        with pytest.raises(DuplicateMeeting):
+            await pg.repo._claim_exact(db, row, {})
+    assert (await pg.row(target))["status"] == "scheduled"
+
+
+async def test_pg_any_other_integrity_error_in_the_exact_claim_propagates(pg_engine):
+    from sqlalchemy.exc import IntegrityError
+
+    from meeting_api.intake.status import derive_event_id_v2
+
+    pg = PgBackend(pg_engine)
+    target = await pg.seed(start=_now())
+    uuid = await pg.scalar("SELECT uuid::text FROM meetings WHERE id = :m", m=target)
+    taken = derive_event_id_v2(uuid, "meeting.status_change", 1)
+    async with pg.engine.begin() as conn:
+        from sqlalchemy import text
+
+        await conn.execute(
+            text(
+                "INSERT INTO webhook_outbox (event_id, meeting_id, event_type, sequence, "
+                "payload_text) VALUES (:e, :m, 'meeting.status_change', 1, '{}')"
+            ),
+            {"e": taken, "m": target},
+        )
+    with pytest.raises(IntegrityError):
+        await _guarded(pg, claim=target)
+    assert (await pg.row(target))["status"] == "scheduled"
+
+
+async def test_pg_post_claim_stop_fence_ends_not_sent(pg_engine):
+    """A user's stop landing between the claim and the workload: the spawn fence writes the row
+    ``failed`` directly; the port records not_sent/meeting_stopped with its event."""
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+    from meeting_api.intake import PostgresIntakeStore
+
+    class StopAfterClaim(SqlAlchemyMeetingRepo):
+        async def create_meeting_guarded(self, **kwargs):
+            row = await super().create_meeting_guarded(**kwargs)
+            await self.merge_meeting_data(row["id"], {"stop_requested": True})
+            return row
+
+    pg = PgBackend(pg_engine)
+    target = await pg.seed(start=_now())
+    runtime = FakeRuntimeClient()
+    port = _port(
+        StopAfterClaim(pg.session_factory),
+        runtime,
+        store=PostgresIntakeStore(pg.session_factory),
+    )
+    outcome = await port.spawn_exact(USER, target)
+    assert outcome.result == "failed" and outcome.code == "meeting_stopped"
+    assert runtime.specs == []  # no workload was created
+    assert await _outcome_row(pg, target) == {
+        "status": "failed",
+        "outcome_kind": "not_sent",
+        "outcome_detail": "meeting_stopped",
+        "outcome_message": outcome.message,
+    }
+    assert [e["event_type"] for e in await _events(pg, target)] == [
+        "meeting.status_change",
+        "meeting.not_sent",
+    ]
+
+
+# ── the intake service on a post-claim failure (the fake port's after_claim mode) ────────────
+
+
+async def test_post_claim_failure_of_a_new_instant_join_replies_created():
+    from intake_builders import make_harness
+
+    failure = SpawnOutcome(
+        "failed", "spawn_error", "kernel could not start the workload"
+    )
+    h = make_harness(spawn_failure=failure)
+    h.spawn.after_claim = True
+    reply = await h.instant("manual:1")
+    m = reply["meeting"]
+    assert reply["result"] == "created"
+    assert m["status"] == "failed"
+    assert (m["outcome"]["kind"], m["outcome"]["detail"]) == ("not_sent", "spawn_error")
+    assert [t for _, t in h.events()] == [
+        "meeting.scheduled",
+        "meeting.status_change",
+        "meeting.not_sent",
+    ]
+
+
+async def test_post_claim_failure_of_an_adopted_meeting_replies_joined_existing():
+    from intake_builders import GMEET, make_harness
+
+    failure = SpawnOutcome(
+        "failed", "spawn_error", "kernel could not start the workload"
+    )
+    h = make_harness("2026-09-29T09:00:00Z", spawn_failure=failure)
+    h.spawn.after_claim = True
+    uuid = (await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T10:30:00Z"))[
+        "meeting"
+    ]["id"]
+    h.clock.set("2026-09-29T09:45:00Z")
+    reply = await h.instant("manual:1", GMEET)
+    m = reply["meeting"]
+    assert (reply["result"], m["id"], m["status"]) == (
+        "joined_existing",
+        uuid,
+        "failed",
+    )
+    assert m["outcome"]["detail"] == "spawn_error"
+    # R12 is for failures before the claim: nothing was removed, the meeting itself ended
+    assert h.store.find_entry(1, "a@abroadworks.com", "manual:1").state == "closed"

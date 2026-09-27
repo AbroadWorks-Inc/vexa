@@ -25,9 +25,11 @@ them); stops and spawns run after that, each through its own port.
   6. a ``join_now`` entry whose meeting is still ``scheduled`` after the commit is spawned on
      that exact row: ``sent`` keeps the result, ``already_live`` → ``joined_existing``, a failure
      ends the meeting ``not_sent`` with the typed code and exact message. When other active
-     entries share the meeting (it was adopted), only the pasted entry is removed (reason
-     ``not_sent``), the failure is recorded on the meeting, which stays ``scheduled`` with its
-     time back to the remaining entries (``joined_existing``, Ruling R12).
+     entries share the meeting (it was adopted) and the spawn failed before claiming it, only
+     the pasted entry is removed (reason ``not_sent``), the failure is recorded on the meeting,
+     which stays ``scheduled`` with its time back to the remaining entries (``joined_existing``,
+     Ruling R12). A failure after the claim has already ended the meeting ``not_sent`` (Ruling
+     R17): the reply keeps the result with that meeting.
 Only a write that adds an active entry checks the quota (429 ``quota_exceeded``).
 
 ``remove``: the entry becomes ``removed``. Others remain → the meeting is re-planned
@@ -463,12 +465,18 @@ class IntakeService:
     async def _spawn_failed(
         self, user_id: int, done: _Done, entry: EntryIn, outcome: SpawnOutcome
     ) -> str:
-        """A real spawn failure for a ``join_now`` entry. The meeting ends ``not_sent`` with the
+        """A real spawn failure for a ``join_now`` entry.
+
+        A failure BEFORE the claim leaves the meeting ``scheduled``: it ends ``not_sent`` with the
         typed code and exact message, unless other active entries share it (an adopted meeting,
         Ruling R12): then only the pasted entry goes (``removed``, reason ``not_sent``), the
         failure is recorded on the meeting, its time returns to the remaining entries, and it
-        stays ``scheduled`` for them (``joined_existing``). A meeting that is no longer
-        ``scheduled`` got its bot from the scheduler meanwhile (``joined_existing``)."""
+        stays ``scheduled`` for them (``joined_existing``).
+
+        A failure AFTER the claim finds the meeting finished: the spawn port already ended it
+        ``not_sent`` (Ruling R17), and the reply is ``done.result`` with that meeting (``created``
+        for a new one, ``joined_existing`` for an adopted one). A meeting that is live got its bot
+        from the scheduler meanwhile (``joined_existing``)."""
         meeting = done.meeting
         async with self._store.room_lock(user_id, [meeting.room]) as tx:
             w = _Work(tx)
@@ -479,6 +487,10 @@ class IntakeService:
                 if mine is None or e.id != mine.id
             ]
             current = await tx.meeting(meeting.id)
+            if current.status in FINISHED_STATUSES:
+                # The spawn claimed the row and failed after the claim: the port ended the meeting
+                # not_sent itself. The reply is the meeting as it ended.
+                return done.result
             if current.status != "scheduled":
                 return "joined_existing"
             if others and mine is not None:

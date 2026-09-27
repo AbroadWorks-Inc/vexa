@@ -337,6 +337,17 @@ class PostgresIntakeTx:
         aw.last_error_message = message
         await self._db.flush()
 
+    async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
+        from datetime import datetime, timezone
+
+        await self._locked_meeting(meeting_id)
+        aw = await lock_aw_state(self._db, meeting_id)
+        aw.outcome_kind = outcome.kind
+        aw.outcome_detail = outcome.detail
+        aw.outcome_message = outcome.message
+        aw.outcome_at = datetime.now(timezone.utc).replace(microsecond=0)
+        await self._db.flush()
+
     async def move_active_entries(
         self, from_meeting_id: int, to_meeting_id: int
     ) -> None:

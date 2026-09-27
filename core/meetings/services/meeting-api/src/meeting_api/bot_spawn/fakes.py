@@ -118,8 +118,9 @@ class InMemoryMeetingRepo:
         NO ``await`` between them, so even ``SlowRepo`` (which adds ``await asyncio.sleep(0)`` inside
         the SEPARATE ``count_active_bots`` / ``create_meeting`` methods) cannot interleave concurrent
         spawns here — modelling the real adapter's single-transaction guard (link lock + per-user
-        advisory lock + unique partial index). A row may carry ``scheduled_end_at``: the
-        ``meeting_aw_state`` column the real adapter's claim reads."""
+        advisory lock + unique partial index). A row may carry ``scheduled_end_at`` (the
+        ``meeting_aw_state`` column the real adapter's claim reads) and ``has_entries`` (whether a
+        ``meeting_entries`` row points at it)."""
         from .auto_join import LIVE_STATUSES
 
         # 0. depleted — a cap <= 0 means NO bots allowed (0 is "depleted", never "unlimited");
@@ -182,7 +183,8 @@ class InMemoryMeetingRepo:
         }
         picked = planned_claim(
             [PlannedRow.of(m["id"], m["status"], m["data"], m.get("start_time"),
-                           m.get("created_at"), m.get("scheduled_end_at"))
+                           m.get("created_at"), m.get("scheduled_end_at"),
+                           bool(m.get("has_entries")))
              for m in planned_rows.values()],
             now=datetime.now(timezone.utc),
         )

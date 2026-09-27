@@ -56,6 +56,21 @@ def _iso_utc(dt) -> Optional[str]:
     return aware.isoformat().replace("+00:00", "Z")
 
 
+#: The unique partial index that allows one live meeting per (user, platform, native id).
+LIVE_LINK_INDEX = "uq_meeting_live_user_platform_native"
+
+
+def _violated_constraint(error) -> Optional[str]:
+    """The constraint an ``IntegrityError`` names: asyncpg's error (the DBAPI error's cause)
+    carries ``constraint_name``."""
+    orig = getattr(error, "orig", None)
+    for candidate in (orig, getattr(orig, "__cause__", None)):
+        name = getattr(candidate, "constraint_name", None)
+        if name:
+            return name
+    return None
+
+
 def _row_to_dict(m) -> dict:
     return {
         "id": m.id,
@@ -483,7 +498,7 @@ class SqlAlchemyMeetingRepo:
 
         from ..intake.adapters import take_link_lock
         from ..intake.ports import Room
-        from ..sessions.models import Meeting, MeetingAwState
+        from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
         from .auto_join import LIVE_STATUSES
         from .ports import ClaimTargetMoved, PlannedRow, planned_claim
 
@@ -547,16 +562,18 @@ class SqlAlchemyMeetingRepo:
             if target is not None:
                 return await self._claim_exact(db, target, data)
             # 2b. claim — the PLANNED row (intent status `idle`/`scheduled`, created by POST /meetings,
-            #     calendar sync or intake) the R1 join_now rule picks (`planned_claim`: the earliest
-            #     one not yet ended and starting within JOIN_NOW_ADOPT_AHEAD_S) is UPGRADED in place,
-            #     so the plan, its workspace bind and the transcript live on ONE row. A future
-            #     occurrence is never claimed: the spawn inserts a new row instead. Spawn keys merge
-            #     OVER the planned data; the plan's `title` / `scheduled_at` / `workspace_id` /
-            #     `auto_join` / `calendar_uid` survive.
+            #     calendar sync or intake) `planned_claim` picks is UPGRADED in place, so the plan, its
+            #     workspace bind and the transcript live on ONE row: an entry-managed row by the R1
+            #     join_now rule, else the newest entry-less row (upstream's rule). A future occurrence
+            #     is never claimed: the spawn inserts a new row instead. Spawn keys merge OVER the
+            #     planned data; the plan's `title` / `scheduled_at` / `workspace_id` / `auto_join` /
+            #     `calendar_uid` survive.
+            from sqlalchemy import exists
             from sqlalchemy.orm.attributes import flag_modified
 
+            managed = exists().where(MeetingEntry.meeting_id == Meeting.id)
             planned = (await db.execute(
-                select(Meeting, MeetingAwState.scheduled_end_at)
+                select(Meeting, MeetingAwState.scheduled_end_at, managed.label("managed"))
                 .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
                 .where(
                     Meeting.user_id == user_id,
@@ -566,11 +583,11 @@ class SqlAlchemyMeetingRepo:
                 ).with_for_update(of=Meeting)
             )).all()
             picked = planned_claim(
-                [PlannedRow.of(m.id, m.status, m.data, m.start_time, m.created_at, end)
-                 for m, end in planned],
+                [PlannedRow.of(m.id, m.status, m.data, m.start_time, m.created_at, end, entries)
+                 for m, end, entries in planned],
                 now=datetime.now(timezone.utc),
             )
-            claimable = next((m for m, _ in planned if m.id == picked), None)
+            claimable = next((m for m, _, _ in planned if m.id == picked), None)
             if claimable is not None:
                 planned_data = dict(claimable.data) if isinstance(claimable.data, dict) else {}
                 # A THIS-REQUEST dispatch supersedes an earlier stop ON THE PLAN. Legacy zombie rows
@@ -622,14 +639,16 @@ class SqlAlchemyMeetingRepo:
         try:
             await write_status(db, meeting_id, "requested", expected_from={"scheduled"},
                                data_patch=patch)
+            await db.commit()
         except StatusConflict as e:
             raise MeetingStopped(
                 f"meeting {meeting_id} is {e.actual}; only a scheduled meeting can be sent a bot"
             ) from e
-        try:
-            await db.commit()
         except IntegrityError as e:
-            # The live-row index backstop: a writer outside these locks made another row live.
+            # The live-row index backstop: a writer outside these locks made another row live. Any
+            # other constraint is a fault, not a duplicate, and propagates.
+            if _violated_constraint(e) != LIVE_LINK_INDEX:
+                raise
             await db.rollback()
             raise DuplicateMeeting(f"An active meeting already exists for {room}") from e
         await db.refresh(target)
