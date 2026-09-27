@@ -36,6 +36,7 @@ from ..token_scope import VALID_SCOPES, generate_prefixed_token
 from .db import get_db
 from . import events as events_mod
 from . import person_settings as person_settings_mod
+from .webhook_subscriptions import WebhookDeps, build_webhook_router
 
 ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-API-Key", auto_error=False)
 USER_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -414,7 +415,7 @@ def _resolve_capture_signal(user_data: dict, platform_diagnostics: dict) -> bool
     return True
 
 
-def create_app() -> FastAPI:
+def create_app(*, webhooks: Optional[WebhookDeps] = None) -> FastAPI:
     app = FastAPI(title="Vexa Admin API (v0.12)")
 
     # --- liveness probe (gate:health): process-up, no DB dependency. Readiness (DB reachable)
@@ -1326,6 +1327,11 @@ def create_app() -> FastAPI:
             await _platform_setting("models", db),
             _MODELS_FIELDS,
         )}
+
+    # --- webhook subscriptions (§2.7): /v2/webhooks (scope `webhooks`, through the gateway) and
+    #     meeting-api's internal read of an account's active subscriptions (ciphertext only).
+    app.include_router(build_webhook_router(webhooks or WebhookDeps.from_env(),
+                                            check_internal=_check_internal_no_dev_bypass))
 
     @app.get("/")
     async def root():

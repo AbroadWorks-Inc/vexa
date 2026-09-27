@@ -14,6 +14,9 @@ service stays out of the identity business. Python because it carves the parent 
 | **calls** | terminal / dashboard login | `POST /admin/users` · `POST /admin/users/{id}/tokens` | create user · mint a scoped session token |
 | **consumes** | the gateway | `POST /internal/validate` | a raw token → `{user_id, scopes, max_concurrent, email, webhook_*}` (fail-closed) |
 | **calls** | bot/worker clients | `X-API-Key` on `/user/*` | user-tier self-serve (webhook config in `user.data`) |
+| **calls** | the gateway (scope `webhooks`) | `/v2/webhooks…` + `x-user-id` | webhook subscriptions: add, list, change, delete, rotate the secret, test, delivery log (§2.7) |
+| **consumes** | meeting-api | `GET /internal/users/{id}/webhook-subscriptions` (internal secret) | an account's active subscriptions, secrets as ciphertext + key id only |
+| **outbound** | meeting-api | `POST /internal/webhooks/test` (internal secret, `MEETING_API_URL`) | queue one `webhook.test` send |
 | **produces** | Postgres (backing stack) | SQLAlchemy `users` · `api_tokens` | the identity tables (one `Base`, FK `api_tokens.user_id → users.id`) |
 
 ## Contracts
