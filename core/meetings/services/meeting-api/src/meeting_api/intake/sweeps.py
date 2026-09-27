@@ -7,9 +7,10 @@ under the link lock and answers one of:
   * ``gone`` — the meeting is no longer ``scheduled``, or no longer on ``room``: nothing to decide
     this tick;
   * ``free`` — no other meeting on the link is live: send the bot;
-  * ``merge`` (``live_id``) — the live meeting is open-ended and entries manage it (a ``join_now``
-    meeting): R2's exception, ``IntakeService.merge_into_live``;
-  * ``waiting`` — another bot holds the link. The meeting stays ``scheduled``; the first time,
+  * ``merge`` (``live_id``) — the live meeting is a ``join_now`` meeting whose bot is staying
+    (``service.is_merge_target``): R2's exception, ``IntakeService.merge_into_live``;
+  * ``waiting`` — another bot holds the link, a leaving (``stopping``) one included. The meeting
+    stays ``scheduled``; the first time,
     ``meeting_aw_state.waiting_for_room_sent_at`` is stamped and ``meeting.waiting_for_room`` goes
     out. Nothing else is written (no retry stamp), so the bot goes on the first tick after the link
     is free.
@@ -44,7 +45,7 @@ from typing import Literal, Mapping, Optional, Sequence
 from ..obs import log_event
 from .ports import EventPublisher, IntakeStore, MeetingView, Room
 from .rules import is_live, is_overdue
-from .service import IntakeService
+from .service import IntakeService, is_merge_target
 from .status import Outcome
 
 __all__ = [
@@ -124,7 +125,7 @@ async def check_room(
         ]
         if not live:
             return RoomCheck("free")
-        target = next((m for m in live if m.end is None and m.entries), None)
+        target = next((m for m in live if is_merge_target(m)), None)
         if target is not None:
             return RoomCheck("merge", target.id)
         if not (due.aw or {}).get("waiting_for_room_sent_at"):

@@ -9,6 +9,7 @@ Drives the SHIPPED ``auto_join_tick`` over the in-memory fakes, OFFLINE.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from intake_builders import send_clock, sweep_intake
@@ -375,10 +376,16 @@ async def test_dispatch_records_the_attempt_before_making_it():
     assert repo._meetings[mid]["data"]["auto_join_last_attempt"] == NOW.isoformat()
 
 
-async def test_attempt_stamp_survives_a_failed_spawn_and_holds_the_next_tick():
+async def test_attempt_stamp_survives_a_failed_spawn_and_holds_the_next_tick(capsys):
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient(fail=True)
     mid = _seed(repo)
     assert (await _tick(repo, runtime))["errors"] == 1
+    # §1.5 Ruling R17: the spawn port ends a claimed row not_sent through the intake store; this
+    # rig's store holds no copy of the repo's row, so that best-effort write logs and moves on.
+    logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+              if line.startswith("{")]
+    (failure,) = [e for e in logged if e.get("event") == "spawn_not_sent_record_failed"]
+    assert failure["fields"]["error"] == "LookupError"
     assert repo._meetings[mid]["data"]["auto_join_last_attempt"] == NOW.isoformat()
     assert (await _tick(repo, runtime, now=NOW + timedelta(seconds=1)))["due"] == 0
 

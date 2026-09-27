@@ -80,7 +80,7 @@ from .settings import IntakeSettings
 from .status import Outcome, StatusConflict
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
-__all__ = ["IntakeService"]
+__all__ = ["IntakeService", "is_merge_target"]
 
 #: The sealed ``lifecycle.v1`` reason a removed meeting ends with (R5, R8).
 STOPPED = "stopped"
@@ -96,6 +96,18 @@ _REMOVE_RESULT = {
     "stopping": "bot_stopping",
     "finished": "entry_removed",
 }
+
+
+def is_merge_target(meeting: MeetingView) -> bool:
+    """R2's exception: a live meeting whose bot is staying (not ``stopping``), open-ended, and
+    holding an active ``join_now`` entry. The scheduler's link check and ``merge_into_live``'s
+    re-check under the link lock both decide with this."""
+    return (
+        is_live(meeting.status)
+        and meeting.status != "stopping"
+        and meeting.end is None
+        and any(e.join_now for e in meeting.active_entries())
+    )
 
 
 def _removed_message(reason: Optional[str]) -> str:
@@ -196,7 +208,7 @@ class IntakeService:
         link, which takes the due meeting's title if it has none; the due meeting ends ``failed``
         with outcome ``merged_into_live`` (``meeting.removed``). Returns whether it merged: the
         rows are re-checked under the link lock, and nothing is written unless the due meeting
-        is still ``scheduled`` and the other is live, open-ended and on the same link.
+        is still ``scheduled`` and the other is on the same link and ``is_merge_target``.
         """
         due = await self._read(user_id, due_meeting_id)
         room = due.room
@@ -208,8 +220,7 @@ class IntakeService:
                 due.status != "scheduled"
                 or due.user_id != user_id
                 or due.room != room
-                or not is_live(live.status)
-                or live.end is not None
+                or not is_merge_target(live)
                 or live.room != room
                 or live.user_id != user_id
             ):

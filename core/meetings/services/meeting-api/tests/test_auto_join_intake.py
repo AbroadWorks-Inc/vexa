@@ -233,6 +233,40 @@ async def test_an_entry_less_live_meeting_is_not_a_merge_target():
     assert live != due
 
 
+async def test_a_stopping_join_now_meeting_is_busy_not_a_merge_target():
+    """R2: a bot that is leaving never absorbs the due meeting; the link counts as busy until it
+    finishes, then the due meeting goes."""
+    h = make_harness()
+    live = h.meeting_id((await h.instant("paste:1", GMEET))["meeting"]["id"])
+    due = await _put(h, "e2", "2026-09-26T13:00:00Z", "2026-09-26T13:30:00Z")
+    h.store.write_status(live, "stopping", expected_from={"requested"})
+    assert await check_room(h.store, USER, due, ROOM) == RoomCheck("waiting")
+    assert await h.service.merge_into_live(USER, due, live) is False
+    assert h.store.meetings[due]["status"] == "scheduled"
+    h.store.write_status(live, "completed", expected_from={"stopping"})
+    assert await check_room(h.store, USER, due, ROOM) == RoomCheck("free")
+
+
+async def test_a_live_meeting_whose_join_now_entry_was_removed_is_not_a_merge_target():
+    """R2: the target must still hold an ACTIVE ``join_now`` entry."""
+    h = make_harness("2026-09-29T09:00:00Z")
+    live_uuid = (
+        await h.put(
+            "google:a", start="2026-09-29T10:00:00Z", end="2026-09-29T10:30:00Z"
+        )
+    )["meeting"]["id"]
+    h.clock.set("2026-09-29T09:20:00Z")
+    assert (await h.instant("paste:1", GMEET))["meeting"]["id"] == live_uuid
+    live = h.meeting_id(live_uuid)
+    assert (await h.remove("paste:1"))["result"] == "entry_removed"
+    view = h.store.view(live)
+    assert view.status == "requested" and view.end is None
+    due = await _put(h, "google:b", "2026-09-29T11:00:00Z", "2026-09-29T11:30:00Z")
+    assert await check_room(h.store, USER, due, ROOM) == RoomCheck("waiting")
+    assert await h.service.merge_into_live(USER, due, live) is False
+    assert h.store.meetings[due]["status"] == "scheduled"
+
+
 async def test_a_row_no_longer_scheduled_or_moved_is_gone():
     h = make_harness()
     mid = await _put(h, "e1", "2026-09-29T09:00:00Z", "2026-09-29T09:30:00Z")
@@ -799,6 +833,65 @@ async def test_pg_the_merge_into_an_open_ended_live_join_now_meeting(pg):
         == live
     )
     assert len(pg.runtime.specs) == 1
+
+
+@pg_only
+async def test_pg_a_stopping_join_now_meeting_makes_the_due_meeting_wait(pg):
+    from intake_builders import instant_body
+
+    now = _now()
+    reply = await pg.service.put_entry(USER, instant_body("paste:1", GMEET))
+    live = await pg.id_of(reply["meeting"]["id"])
+    await pg.set_status(live, "stopping")
+    due = await pg.put("cal", now + timedelta(minutes=10), now + timedelta(minutes=40))
+
+    counters = await pg.tick(now + timedelta(minutes=6))
+    assert counters["skipped_live"] == 1 and counters["already"] == 0
+    row = await pg.row(due)
+    assert row["status"] == "scheduled" and row["outcome_kind"] is None
+    assert (await pg.events(due))[-1] == "meeting.waiting_for_room"
+
+    await pg.set_status(live, "completed")
+    counters = await pg.tick(now + timedelta(minutes=6, seconds=30))
+    assert counters["spawned"] == 1
+    assert (await pg.row(due))["status"] == "requested"
+    assert len(pg.runtime.specs) == 2
+
+
+@pytest.mark.parametrize(
+    "context,message",
+    [
+        (None, "the bot limit could not be read: no identity edge is configured"),
+        ("unreachable", "the bot limit could not be read: identity is unavailable"),
+    ],
+)
+@pg_only
+async def test_pg_a_row_skipped_for_its_bot_limit_records_why(pg, context, message):
+    """A meeting skipped because its bot limit can't be read records ``internal_error`` with the
+    refusal's exact text, so it ends ``not_sent`` with that cause, not ``ended_before_sent``.
+    """
+    now = _now()
+    mid = await pg.put("e1", now, now + timedelta(minutes=30))
+
+    async def unreachable(_user_id: int) -> None:
+        return None
+
+    fetch = None if context is None else unreachable
+    counters = await pg.tick(now, fetch_bot_context=fetch)
+    assert counters["spawned"] == 0
+    row = await pg.row(mid)
+    assert row["status"] == "scheduled"
+    assert (row["last_error_code"], row["last_error_message"]) == (
+        "internal_error",
+        message,
+    )
+
+    assert await pg.not_sent(now + timedelta(minutes=30)) == 1
+    row = await pg.row(mid)
+    assert (row["outcome_detail"], row["outcome_message"]) == (
+        "internal_error",
+        message,
+    )
 
 
 @pg_only

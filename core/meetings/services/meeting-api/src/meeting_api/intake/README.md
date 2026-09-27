@@ -79,7 +79,9 @@ never guessed: without it, or without `max_concurrent` in it, the spawn fails `i
 (the one exception is the sweep's `AUTO_JOIN_ALLOW_UNCAPPED` opt-in with no identity edge).
 `sweeps.py` is the scheduler's intake side (§1.5, R2, R6). `check_room` reads a due entry-managed
 meeting and its link again under the link lock: `free`, `gone`, `merge` (the live meeting is an
-open-ended `join_now` meeting: `merge_into_live`), or `waiting` — `meeting.waiting_for_room` goes out
+open-ended meeting with an active `join_now` entry whose bot isn't `stopping`, `is_merge_target`,
+the same predicate `merge_into_live` re-checks: `merge_into_live`), or `waiting` (any other live
+bot, a leaving one included) — `meeting.waiting_for_room` goes out
 once (`meeting_aw_state.waiting_for_room_sent_at`) and no retry pause is stamped, so the bot goes on
 the first tick after the link is free. `not_sent_tick` (every `NOT_SENT_SWEEP_INTERVAL_S`,
 single-flight) ends every `scheduled` entry-managed meeting past its end (`IntakeStore.overdue_meetings`,

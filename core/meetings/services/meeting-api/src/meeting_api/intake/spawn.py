@@ -60,7 +60,18 @@ from ..service_authority import ServiceAuthorityDenied, ServiceAuthorityUnavaila
 from .ports import EventPublisher, IntakeStore, Room, SpawnOutcome
 from .status import Outcome
 
-__all__ = ["ExactRowSpawn", "spawn_failure"]
+__all__ = [
+    "ExactRowSpawn",
+    "IDENTITY_UNAVAILABLE",
+    "NO_BOT_LIMIT",
+    "NO_IDENTITY_EDGE",
+    "spawn_failure",
+]
+
+#: The exact refusals when the per-user bot limit can't be read (code ``internal_error``).
+NO_IDENTITY_EDGE = "the bot limit could not be read: no identity edge is configured"
+IDENTITY_UNAVAILABLE = "the bot limit could not be read: identity is unavailable"
+NO_BOT_LIMIT = "the bot limit could not be read: identity returned no max_concurrent"
 
 BotContextFetcher = Callable[[int], Awaitable[Optional[dict[str, Any]]]]
 
@@ -242,16 +253,12 @@ class ExactRowSpawn:
         if self._fetch_bot_context is None and self._allow_uncapped:
             return {}
         if self._fetch_bot_context is None:
-            raise _Refused(
-                "the bot limit could not be read: no identity edge is configured"
-            )
+            raise _Refused(NO_IDENTITY_EDGE)
         ctx = await self._fetch_bot_context(user_id)
         if ctx is None:
-            raise _Refused("the bot limit could not be read: identity is unavailable")
+            raise _Refused(IDENTITY_UNAVAILABLE)
         if ctx.get("max_concurrent") is None:
-            raise _Refused(
-                "the bot limit could not be read: identity returned no max_concurrent"
-            )
+            raise _Refused(NO_BOT_LIMIT)
         return ctx
 
     async def _end_not_sent(

@@ -12,9 +12,9 @@ under the link lock — so the sweep is idempotent by construction: a claimed ro
 ``already_live`` (someone already joined), counted, never error-stamped.
 
 A meeting entries manage has its link checked again under the link lock first
-(``intake.sweeps.check_room``, R2). A link held by an open-ended ``join_now`` meeting takes the due
-meeting's entries (``IntakeService.merge_into_live``); a link held by any other bot makes the
-meeting wait: ``meeting.waiting_for_room`` goes out once, no retry pause is stamped, and the bot goes
+(``intake.sweeps.check_room``, R2). A link held by an open-ended ``join_now`` meeting whose bot is
+staying takes the due meeting's entries (``IntakeService.merge_into_live``); a link held by any
+other bot, a leaving one included, makes the meeting wait: ``meeting.waiting_for_room`` goes out once, no retry pause is stamped, and the bot goes
 on the first tick after the link is free. A real spawn failure stores its typed code
 (``meeting_aw_state.last_error_code`` / ``last_error_message``) and backs off like any other row;
 the not-sent sweep (``intake.sweeps``) ends the meeting at its end if no bot ever went.
@@ -230,7 +230,8 @@ async def auto_join_tick(
 
     ``fetch_bot_context(user_id)`` supplies the per-user spawn context the gateway would have
     injected as headers (including the Calendar default ``bot_name``), fetched once per user per
-    tick and shared with the spawn.
+    tick and shared with the spawn. An entry-managed row skipped because its bot limit can't be
+    read records ``internal_error`` with the refusal's text, the cause its not-sent outcome carries.
     Three states: the callable is ``None`` (no admin edge configured — the per-user cap is
     UNRESOLVABLE); it returns a dict (use it); it returns ``None`` (identity is configured but
     UNAVAILABLE right now — SKIP the row this tick).
@@ -244,7 +245,12 @@ async def auto_join_tick(
     ``publish_status(user_id=…, meeting_id=…, native_id=…, status=…, when=…)`` optionally fans the
     row's frame to ``u:{user}:meetings`` after an error stamp so the terminal refreshes."""
     from ..intake.ports import Room
-    from ..intake.spawn import ExactRowSpawn, spawn_failure
+    from ..intake.spawn import (
+        IDENTITY_UNAVAILABLE,
+        NO_IDENTITY_EDGE,
+        ExactRowSpawn,
+        spawn_failure,
+    )
     from ..intake.sweeps import check_room
     from .ports import TranscriptionNotConfigured
 
@@ -302,14 +308,20 @@ async def auto_join_tick(
                 when=data.get("scheduled_at"),
             )
 
+    async def _record_cause(row: dict, code: str, message: str) -> None:
+        """Why an entry-managed row got no bot this tick, as its typed code (under the link lock,
+        while it is still scheduled): the cause its not-sent outcome carries if it never gets one."""
+        if not row.get("has_entries"):
+            return
+        room = Room(row["platform"], row["native_meeting_id"])
+        async with store.room_lock(row["user_id"], [room]) as tx:
+            if (await tx.meeting(row["id"])).status == "scheduled":
+                await tx.record_spawn_error(row["id"], code, message)
+
     async def _failed(row: dict, code: str, message: str) -> None:
-        """A spawn that failed before claiming the row: the typed code on an entry-managed row
-        (under the link lock, while it is still scheduled), and the loud stamp + backoff."""
-        if row.get("has_entries"):
-            room = Room(row["platform"], row["native_meeting_id"])
-            async with store.room_lock(row["user_id"], [room]) as tx:
-                if (await tx.meeting(row["id"])).status == "scheduled":
-                    await tx.record_spawn_error(row["id"], code, message)
+        """A spawn that failed before claiming the row: its typed code, and the loud stamp +
+        backoff."""
+        await _record_cause(row, code, message)
         await _stamp_error(row, message)
 
     for row in due:
@@ -351,6 +363,7 @@ async def auto_join_tick(
             # spawn rather than spawn uncapped, unless the operator explicitly opted in.
             if not allow_uncapped:
                 counters["skipped_uncapped"] += 1
+                await _record_cause(row, "internal_error", NO_IDENTITY_EDGE)
                 if not uncapped_warned:
                     uncapped_warned = True
                     log_event(
@@ -362,6 +375,7 @@ async def auto_join_tick(
                 continue
         elif await cached_context(user_id) is None:
             # identity configured but unreachable — skip this tick rather than spawn uncapped
+            await _record_cause(row, "internal_error", IDENTITY_UNAVAILABLE)
             continue
 
         data = row.get("data") if isinstance(row.get("data"), dict) else {}
