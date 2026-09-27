@@ -74,12 +74,13 @@ is refused with `422` — never silently dropped.
 | `tx` | the transcript and meeting-record plane — `/meetings*`, `/transcripts/*`, and the meeting reads `GET /v2/meetings` and `GET /v2/meetings/{id}` |
 | `browser` | browser-tool capabilities. **Reaches no API route today** — a browser-only key can call [`/auth/me`](/api/settings#identity) and nothing else |
 | `erase` | erase a finished meeting's data — `DELETE /v2/meetings/{id}` and nothing else |
-| `webhooks` | manage webhook subscriptions (`/v2/webhooks…`) |
-| `export` | report an export result (`POST /v2/meetings/{id}/export`) |
+| `webhooks` | reserved for managing webhook subscriptions; its routes arrive with later work |
+| `export` | reserved for the exporter reporting its result; its route arrives with later work |
 
 `/recordings*`, `/user/webhook*`, `/user/models`, `/user/transcription`, `/agent/*` and `/mcp` accept
 either `bot` or `tx`. Most keys want both: `{"scopes":["bot","tx"]}`. `erase`, `webhooks` and
-`export` are least-privilege scopes: a `bot`+`tx` key does not reach their routes. The three `/user/*` routes in
+`export` are least-privilege scopes: a `bot`+`tx` key does not reach their routes. A key can hold
+them only once admin-api accepts them when minting. The three `/user/*` routes in
 that list are the [Settings API](/api/settings) — model credentials, transcription backend, and
 webhook delivery, stored per key owner.
 
