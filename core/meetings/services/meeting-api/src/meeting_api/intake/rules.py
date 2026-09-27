@@ -24,6 +24,9 @@ entries of a finished meeting re-run.
   * ``is_future_move`` — R7 after the finish: the same rule with ``now`` as the finish. The
     meeting finished at or before ``now``, so for an entry starting after ``now`` both windows
     give the same answer.
+  * ``is_overdue`` — R6: a meeting still without a bot is past its end: its ``end``, or for an
+    open-ended meeting ``start + open_ended_s`` (the not-sent sweep passes
+    ``JOIN_NOW_ADOPT_AHEAD_S``, the window a pasted link adopts by).
 
 Every tie between candidate meetings goes to the earliest start, then the lowest id.
 """
@@ -41,6 +44,7 @@ __all__ = [
     "finished_window",
     "is_future_move",
     "is_live",
+    "is_overdue",
     "is_rerun",
     "join_now_target",
     "match_entry",
@@ -236,3 +240,17 @@ def is_future_move(entry: Timed, finished: MeetingLike, *, now: datetime) -> boo
     """R7: an update to a finished meeting's entry that points to a new future time."""
     window = finished_window(finished.start, finish=now)
     return is_rerun(entry.start, entry.end, window, finish=now)
+
+
+def is_overdue(
+    start: Optional[datetime],
+    end: Optional[datetime],
+    *,
+    now: datetime,
+    open_ended_s: float,
+) -> bool:
+    """R6: ``now`` is at or past the meeting's end; an open-ended meeting's end is ``start +
+    open_ended_s``. A meeting with neither a start nor an end is never overdue."""
+    if end is not None:
+        return now >= end
+    return start is not None and now >= start + timedelta(seconds=open_ended_s)

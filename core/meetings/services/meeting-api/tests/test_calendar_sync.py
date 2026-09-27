@@ -753,12 +753,15 @@ def _storm_rig():
 
 
 async def _sweep(repo, runtime, at):
+    from intake_builders import send_clock, sweep_intake
     from meeting_api.bot_spawn.auto_join import auto_join_tick
 
-    return await auto_join_tick(
-        repo, runtime, transcribe_gate=lambda: None, now=at,
-        token_secret="s", redis_url="redis://r", allow_uncapped=True,
-    )
+    # §1.5: the exact-row claim stamps the send time with the repo's clock — pinned to the sweep's.
+    with send_clock(at):
+        return await auto_join_tick(
+            repo, runtime, transcribe_gate=lambda: None, now=at,
+            token_secret="s", redis_url="redis://r", allow_uncapped=True, **sweep_intake(),
+        )
 
 
 START = datetime(2026, 7, 8, 15, 0, 0, tzinfo=timezone.utc)   # the event's own start

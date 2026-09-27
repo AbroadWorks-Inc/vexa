@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from intake_builders import sweep_intake
 from meeting_api.bot_spawn.auto_join import auto_join_tick
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.bot_spawn.router import (
@@ -60,7 +61,7 @@ async def _sweep_bot_config(monkeypatch, **env):
     mid = _seed(repo)
     counters = await auto_join_tick(
         repo, runtime, transcribe_gate=_NO_GATE, now=NOW,
-        token_secret="s", redis_url="redis://r", allow_uncapped=True,
+        token_secret="s", redis_url="redis://r", allow_uncapped=True, **sweep_intake(),
     )
     assert counters["spawned"] == 1, counters
     config = json.loads(runtime.specs[0]["env"]["VEXA_BOT_CONFIG"])

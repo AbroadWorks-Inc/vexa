@@ -12,7 +12,8 @@ meeting's entries, outbox and delivery rows. ``reads.py`` holds the Postgres imp
 ``IntakeStore.room_lock(user_id, rooms)`` opens one transaction holding the link lock of every
 room given, taken in the order given (the caller passes them sorted); an empty ``rooms`` is a plain
 transaction with no link lock. The transaction commits when the block exits normally and rolls
-back when it raises.
+back when it raises. ``IntakeStore.overdue_meetings(now, open_ended_s=...)`` is the not-sent
+sweep's read across every account (§1.5).
 
 The views are what the service reads. ``MeetingView`` carries the ``meetings`` row and the
 ``meeting_aw_state`` row as column-name mappings plus the meeting's entries, so the reply is the
@@ -283,6 +284,12 @@ class IntakeTx(Protocol):
         """
         ...
 
+    async def mark_waiting_for_room(self, meeting_id: int) -> None:
+        """Stamp ``meeting_aw_state.waiting_for_room_sent_at`` with the current time (meeting row
+        lock, then ``meeting_aw_state``): the meeting's ``meeting.waiting_for_room`` went out
+        (R2)."""
+        ...
+
     async def move_active_entries(
         self, from_meeting_id: int, to_meeting_id: int
     ) -> None: ...
@@ -316,6 +323,14 @@ class IntakeStore(Protocol):
     def room_lock(
         self, user_id: int, rooms: Sequence[Room]
     ) -> AsyncContextManager[IntakeTx]: ...
+
+    async def overdue_meetings(
+        self, now: datetime, *, open_ended_s: int
+    ) -> list[MeetingView]:
+        """Every account's ``scheduled`` meetings that entries manage and that are past their end
+        at ``now`` (``rules.is_overdue``), by id: the not-sent sweep's candidates (§1.5). Read
+        without a link lock; the sweep reads each one again under its link lock."""
+        ...
 
 
 @dataclass(frozen=True)

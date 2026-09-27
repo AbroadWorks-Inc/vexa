@@ -654,22 +654,45 @@ class SqlAlchemyMeetingRepo:
         await db.refresh(target)
         return _row_to_dict(target)
 
-    async def list_scheduled_meetings(self) -> list[dict]:
-        """Every ``scheduled`` row with a joinable link (the auto-join sweep's candidate set —
-        the time/toggle/backoff filtering is the sweep's pure ``due_rows``)."""
-        from sqlalchemy import select
+    async def list_due_meetings(self, now, lead_s) -> list[dict]:
+        """The ``scheduled`` rows with a joinable link whose meeting time
+        (``meeting_event_time``) is at or before ``now + lead_s`` — the auto-join sweep's
+        candidates (§1.5), read through the partial index ``ix_meeting_scheduled_due``, so a
+        future row is never read. ``status = 'scheduled'`` is a literal: a bound value would let a
+        cached generic plan miss the index's predicate. Each row carries its
+        ``meeting_aw_state.scheduled_end_at`` / ``waiting_for_room_sent_at`` and ``has_entries``
+        (a ``meeting_entries`` row points at it); the toggle/window/backoff filtering is the
+        sweep's pure ``due_rows``."""
+        from datetime import timedelta
 
-        from ..sessions.models import Meeting
+        from sqlalchemy import exists, func, select, text
 
+        from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
+
+        event_time = func.meeting_event_time(Meeting.data, Meeting.start_time, Meeting.created_at)
+        due_by = (now + timedelta(seconds=lead_s)).astimezone(timezone.utc).replace(tzinfo=None)
         async with self._session_factory() as db:
             rows = (await db.execute(
-                select(Meeting).where(
-                    Meeting.status == "scheduled",
+                select(
+                    Meeting,
+                    MeetingAwState.scheduled_end_at,
+                    MeetingAwState.waiting_for_room_sent_at,
+                    exists().where(MeetingEntry.meeting_id == Meeting.id).label("has_entries"),
+                )
+                .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
+                .where(
+                    text("meetings.status = 'scheduled'"),
+                    event_time <= due_by,
                     Meeting.platform_specific_id.isnot(None),
                     Meeting.platform != "unknown",
                 )
-            )).scalars().all()
-            return [_row_to_dict(m) for m in rows]
+                .order_by(event_time, Meeting.id)
+            )).all()
+            return [
+                {**_row_to_dict(m), "scheduled_end_at": _iso_utc(end),
+                 "waiting_for_room_sent_at": _iso_utc(waiting), "has_entries": bool(managed)}
+                for m, end, waiting, managed in rows
+            ]
 
     async def list_live_meetings(self) -> list[dict]:
         """Every row a bot currently OWNS (``auto_join.LIVE_STATUSES``) with a joinable link — the

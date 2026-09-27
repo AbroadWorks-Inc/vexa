@@ -22,7 +22,8 @@ inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelop
 
 `rules.py` holds the R1 matching rules and the meeting windows (§1.1, R7, R10), pure: `overlaps`
 (half-open, a missing end is unbounded), `meeting_start`, `meeting_window`, `match_entry`,
-`join_now_target`, `recompute`, and `finished_window` / `is_rerun` / `is_future_move`. It is the one
+`join_now_target`, `recompute`, `finished_window` / `is_rerun` / `is_future_move`, and `is_overdue`
+(R6, the not-sent sweep's end). It is the one
 definition of these windows; the status writer's re-run rule uses it.
 
 `IntakeService` (`service.py`) is the behaviour of `PUT /v2/entries` and `POST /v2/entries/remove`
@@ -74,7 +75,18 @@ under the link lock (Ruling R17): a row still `requested` goes `failed` through 
 the spawn flow already wrote `failed` gets the outcome on `meeting_aw_state` and a `meeting.not_sent`
 event; the entry service then replies with that meeting (R12 applies only to a failure before the
 claim). The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
-never guessed: without it, or without `max_concurrent` in it, the spawn fails `internal_error`.
+never guessed: without it, or without `max_concurrent` in it, the spawn fails `internal_error`
+(the one exception is the sweep's `AUTO_JOIN_ALLOW_UNCAPPED` opt-in with no identity edge).
+`sweeps.py` is the scheduler's intake side (§1.5, R2, R6). `check_room` reads a due entry-managed
+meeting and its link again under the link lock: `free`, `gone`, `merge` (the live meeting is an
+open-ended `join_now` meeting: `merge_into_live`), or `waiting` — `meeting.waiting_for_room` goes out
+once (`meeting_aw_state.waiting_for_room_sent_at`) and no retry pause is stamped, so the bot goes on
+the first tick after the link is free. `not_sent_tick` (every `NOT_SENT_SWEEP_INTERVAL_S`,
+single-flight) ends every `scheduled` entry-managed meeting past its end (`IntakeStore.overdue_meetings`,
+`rules.is_overdue`; an open-ended one's end is its start plus `JOIN_NOW_ADOPT_AHEAD_S`) `failed`,
+outcome `not_sent`, under its link lock, with detail `last_error_code` (message `last_error_message`),
+else `room_busy` ("another bot was still on this meeting link when the meeting ended"), else
+`ended_before_sent` ("the meeting ended before a bot was sent"), and re-runs the entries it kept (R7).
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.

@@ -8,7 +8,8 @@
     conditional (``StatusConflict``, nothing written), each event adds 1 to the meeting's
     sequence, a finished status closes the active entries except the ones that re-run
     (``rules.is_rerun``, returned in ``rerun_entry_ids``), and every event is recorded in order in
-    ``events`` with the meeting as projected at that moment.
+    ``events`` with the meeting as projected at that moment. ``overdue_meetings`` applies
+    ``rules.is_overdue`` to the ``scheduled`` meetings that have an entry, as the Postgres read does.
   * ``FakeSpawn`` — ``SpawnPort``: claims a ``scheduled`` row (status ``requested``), answers
     ``already_live`` for any other row, or returns the failure it was given: before the claim by
     default, after it with ``after_claim=True`` (the row then ends ``failed``, outcome
@@ -54,6 +55,7 @@ from .rules import (
     Plan,
     finished_window,
     is_live,
+    is_overdue,
     is_rerun,
     meeting_start,
 )
@@ -144,6 +146,21 @@ class InMemoryIntakeStore:
         entry_id = self._entry_keys.get((user_id, source_user, external_id))
         return None if entry_id is None else self.entries[entry_id]
 
+    async def overdue_meetings(
+        self, now: datetime, *, open_ended_s: int
+    ) -> list[MeetingView]:
+        managed = {e.meeting_id for e in self.entries.values()}
+        views = [
+            self.view(mid)
+            for mid, row in sorted(self.meetings.items())
+            if row["status"] == "scheduled" and mid in managed
+        ]
+        return [
+            v
+            for v in views
+            if is_overdue(v.start, v.end, now=now, open_ended_s=open_ended_s)
+        ]
+
     def entries_of(self, meeting_id: int, state: str = "active") -> list[EntryView]:
         return [
             e
@@ -188,6 +205,7 @@ class InMemoryIntakeStore:
             "outcome_at": None,
             "last_error_code": None,
             "last_error_message": None,
+            "waiting_for_room_sent_at": None,
         }
         if plan is not None:
             self.apply_plan(meeting_id, room, plan)
@@ -410,6 +428,12 @@ class _FakeTx:
             "outcome_detail": outcome.detail,
             "outcome_message": outcome.message,
             "outcome_at": self._s._clock().replace(microsecond=0),
+        }
+
+    async def mark_waiting_for_room(self, meeting_id: int) -> None:
+        self._s.aw[meeting_id] = {
+            **self._s.aw[meeting_id],
+            "waiting_for_room_sent_at": self._s._clock().replace(microsecond=0),
         }
 
     async def move_active_entries(

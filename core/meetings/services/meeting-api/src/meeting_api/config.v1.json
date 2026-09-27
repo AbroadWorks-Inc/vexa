@@ -539,7 +539,7 @@
    "key": "AUTO_JOIN_GRACE_S",
    "class": "defaulted",
    "default": "600",
-   "description": "auto-join grace (s) — a scheduled meeting older than this is never auto-joined (no hours-late joins)",
+   "description": "auto-join grace (s) — an entry-less scheduled meeting older than this is never auto-joined (no hours-late joins); a meeting entries manage is due until its end instead (§1.5)",
    "targets": []
   },
   {
@@ -547,6 +547,13 @@
    "class": "defaulted",
    "default": "300",
    "description": "backoff (s) before an auto-join that failed loudly (cap/quota/spawn) is retried",
+   "targets": []
+  },
+  {
+   "key": "NOT_SENT_SWEEP_INTERVAL_S",
+   "class": "defaulted",
+   "default": "30",
+   "description": "not-sent sweep cadence (s, §1.5) — how often scheduled meetings that entries manage are checked for an end passed without a bot (they end failed, outcome not_sent)",
    "targets": []
   },
   {

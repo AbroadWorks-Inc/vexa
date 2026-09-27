@@ -530,13 +530,16 @@ def _attach_background_loops(
             ticks["service-authority"] = _time.monotonic()
             await asyncio.sleep(service_authority_interval)
 
-    # Auto-join: "scheduled" means the bot joins. The sweep spawns a bot for every scheduled row
-    # whose data.scheduled_at arrived (lead window) and whose auto_join toggle is on, through the
-    # SAME request_bot flow POST /bots runs — the claim/upgrade branch makes it idempotent. The
-    # per-user spawn context (max-bots cap + webhook config the gateway would inject as headers)
-    # is fetched from admin-api's internal edge. Fail-closed: unset ADMIN_API_URL/INTERNAL_API_SECRET
-    # makes the cap unresolvable, so the sweep REFUSES to spawn (AUTO_JOIN_ALLOW_UNCAPPED=1 is the
-    # explicit self-host opt-in); an UNREACHABLE identity likewise skips the tick.
+    # Auto-join: "scheduled" means the bot joins. The sweep reads only the scheduled rows that are
+    # due (§1.5) and spawns each on its exact row through the SAME request_bot flow POST /bots runs
+    # (intake.ExactRowSpawn) — the claim makes it idempotent. Meetings entries manage have their
+    # link checked under the link lock first (wait for a busy link, or merge into an open-ended
+    # join_now meeting). The per-user spawn context (max-bots cap + webhook config the gateway
+    # would inject as headers) is fetched from admin-api's internal edge. Fail-closed: unset
+    # ADMIN_API_URL/INTERNAL_API_SECRET makes the cap unresolvable, so the sweep REFUSES to spawn
+    # (AUTO_JOIN_ALLOW_UNCAPPED=1 is the explicit self-host opt-in); an UNREACHABLE identity
+    # likewise skips the tick. Both sweeps need Postgres (the intake store), so neither runs
+    # without a session factory.
     from .bot_spawn.auto_join import DEFAULT_LEAD_S
 
     auto_join_interval = float(os.getenv("AUTO_JOIN_SWEEP_INTERVAL_S", "30"))
@@ -552,15 +555,41 @@ def _attach_background_loops(
     # self-host opt-in that chooses the uncapped mode (never defaulted).
     from .bot_spawn.env_flags import env_flag
     auto_join_allow_uncapped = env_flag("AUTO_JOIN_ALLOW_UNCAPPED", default=False)
+    fetch_bot_context = _bot_context_fetcher(admin_api_url, internal_secret)
+
+    # The scheduler's intake side (§1.5): the store (link locks, the link check, typed failure
+    # codes) and the entry service it merges (R2) and re-runs entries (R7) through. Its events stay
+    # in the outbox for the outbox publisher (§1.8); neither a merge nor a re-run stops a bot.
+    intake_store = intake_service = scheduler_publisher = None
+    if session_factory is not None and meeting_repo is not None and runtime is not None:
+        from .intake import ExactRowSpawn, IntakeService, IntakeSettings, PostgresIntakeStore
+        from .intake.sweeps import NoStop, OutboxOnly
+
+        intake_store = PostgresIntakeStore(session_factory)
+        scheduler_publisher = OutboxOnly()
+        intake_service = IntakeService(
+            intake_store,
+            ExactRowSpawn(
+                meeting_repo, runtime,
+                store=intake_store,
+                fetch_bot_context=fetch_bot_context,
+                publisher=scheduler_publisher,
+                authority=service_authority,
+                token_secret=os.getenv("ADMIN_TOKEN") or None,
+                redis_url=os.getenv("REDIS_URL"),
+                allow_uncapped=auto_join_allow_uncapped,
+            ),
+            NoStop(),
+            scheduler_publisher,
+            IntakeSettings.from_env(),
+        )
 
     async def _auto_join_loop() -> None:
-        if meeting_repo is None or runtime is None or not hasattr(meeting_repo, "list_scheduled_meetings"):
+        if intake_store is None or not hasattr(meeting_repo, "list_due_meetings"):
             return
         import json as _json
 
         from .bot_spawn.auto_join import auto_join_tick
-
-        fetch_bot_context = _bot_context_fetcher(admin_api_url, internal_secret)
 
         async def publish_status(*, user_id, meeting_id, native_id, status, when):
             frame = {"type": "meeting.status", "meeting_id": meeting_id,
@@ -573,6 +602,9 @@ def _attach_background_loops(
         async def _tick():
             await auto_join_tick(
                 meeting_repo, runtime,
+                store=intake_store,
+                intake=intake_service,
+                publisher=scheduler_publisher,
                 authority=service_authority,
                 fetch_bot_context=fetch_bot_context,
                 publish_status=publish_status,
@@ -593,6 +625,36 @@ def _attach_background_loops(
             except Exception:
                 log.exception("auto-join tick failed")
             await asyncio.sleep(auto_join_interval)
+
+    # Not-sent sweep (§1.5, R6): a meeting entries manage that reaches its end without a bot ends
+    # `failed`, outcome `not_sent`, with its cause. An open-ended meeting's end is its start plus
+    # JOIN_NOW_ADOPT_AHEAD_S.
+    not_sent_interval = float(os.getenv("NOT_SENT_SWEEP_INTERVAL_S", "30"))
+
+    async def _not_sent_loop() -> None:
+        if intake_store is None:
+            return
+        from datetime import datetime, timezone
+
+        from .intake import sweeps
+        from .intake.settings import join_now_adopt_ahead_s
+
+        async def _tick():
+            await sweeps.not_sent_tick(
+                intake_store, intake_service,
+                publisher=scheduler_publisher,
+                now=datetime.now(timezone.utc),
+                open_ended_s=join_now_adopt_ahead_s(),
+            )
+
+        while True:
+            try:
+                await _guarded("not-sent", _tick)  # one sweep per interval across replicas
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("not-sent sweep tick failed")
+            await asyncio.sleep(not_sent_interval)
 
     # Calendar sync: each sweep discovers every user with a connected ICS feed (admin-api internal
     # edge), fetches it over the SSRF-pinned transport, and upserts planned meetings (one row per
@@ -741,6 +803,7 @@ def _attach_background_loops(
                 name="service-authority",
             ),
             asyncio.create_task(_auto_join_loop(), name="auto-join"),
+            asyncio.create_task(_not_sent_loop(), name="not-sent"),
             asyncio.create_task(_calendar_sync_loop(), name="calendar-sync"),
             asyncio.create_task(_signal_tape_janitor_loop(), name="signal-tape-janitor"),
             asyncio.create_task(_ensure_fts_index_once(), name="ensure-fts-index"),

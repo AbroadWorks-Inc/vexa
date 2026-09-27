@@ -39,8 +39,27 @@ class _StopLoop(Exception):
 class _FakeMeetingRepo:
     # Only needs to exist + carry the attribute `_auto_join_loop` gates on; auto_join_tick itself
     # is stubbed below, so no real repo behaviour is exercised.
-    def list_scheduled_meetings(self):  # pragma: no cover - never actually called (tick is stubbed)
+    def list_due_meetings(self, now, lead_s):  # pragma: no cover - never called (tick is stubbed)
         return []
+
+
+class _FakeSession:
+    """Just enough of an AsyncSession for the sweeps' advisory lock: every lock is granted."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, *a, **kw):
+        return types.SimpleNamespace(scalar=lambda: True)
+
+
+def _fake_session_factory():
+    # §1.5: the auto-join and not-sent sweeps need Postgres (the intake store) and run only with a
+    # session factory; this one serves the single-flight lock and nothing else.
+    return _FakeSession()
 
 
 class _FakeRuntime:
@@ -104,7 +123,7 @@ async def test_auto_join_tick_publish_status_is_wired_and_publishes(monkeypatch)
         runtime=_FakeRuntime(),
         service_authority=None,
         system_webhook_sink=None,
-        session_factory=None,  # _guarded degrades to run-the-tick unconditionally
+        session_factory=_fake_session_factory,
         storage=None,
     )
 
@@ -145,3 +164,120 @@ async def test_auto_join_tick_publish_status_is_wired_and_publishes(monkeypatch)
         "status": "joining",
         "when": "2026-09-03T08:52:00Z",
     }
+
+
+# ── §1.5: the intake store and entry service reach the tick; the not-sent sweep is wired ────────
+
+
+async def _run_loops(monkeypatch, *, session_factory, env=None):
+    """Start the REAL lifespan once, every loop ending after one tick. Returns the guarded
+    single-flight keys, the sleep delays and the app."""
+    from meeting_api.sweeps import single_flight
+
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    guarded: list[int] = []
+
+    async def _record(lock, key, body):
+        guarded.append(key)
+        await body()
+        return True
+
+    monkeypatch.setattr(single_flight, "run_single_flight", _record)
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _sleep_once_then_stop(delay, *a, **kw):
+        delays.append(delay)
+        raise _StopLoop()
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep_once_then_stop)
+    monkeypatch.setattr(main_mod.log, "exception", lambda *a, **kw: None)
+    app = _fake_app()
+    main_mod._attach_background_loops(
+        app,
+        transcript_store=types.SimpleNamespace(),
+        segment_bus=types.SimpleNamespace(),
+        redis_client=_FakeRedis(),
+        meeting_repo=_FakeMeetingRepo(),
+        runtime=_FakeRuntime(),
+        service_authority=None,
+        system_webhook_sink=None,
+        session_factory=session_factory,
+        storage=None,
+    )
+    async with app.router.lifespan_context(app):
+        await real_sleep(0.05)
+    return guarded, delays
+
+
+async def test_auto_join_tick_gets_the_intake_store_service_and_publisher(monkeypatch):
+    from meeting_api.intake import IntakeService, OutboxOnly, PostgresIntakeStore
+    from meeting_api.sweeps.single_flight import sweep_lock_key
+
+    captured: dict = {}
+
+    async def _stub(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub)
+    guarded, _ = await _run_loops(monkeypatch, session_factory=_fake_session_factory)
+
+    assert isinstance(captured["store"], PostgresIntakeStore)
+    assert isinstance(captured["intake"], IntakeService)
+    assert isinstance(captured["publisher"], OutboxOnly)
+    assert sweep_lock_key("auto-join") in guarded
+
+
+async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from meeting_api.intake import IntakeService, OutboxOnly, PostgresIntakeStore
+    from meeting_api.intake import sweeps as sweeps_mod
+    from meeting_api.sweeps.single_flight import sweep_lock_key
+
+    calls: list[tuple] = []
+
+    async def _stub_auto_join(*args, **kwargs):
+        calls.append(("auto-join", kwargs["store"]))
+
+    async def _stub_not_sent(store, service, **kwargs):
+        calls.append(("not-sent", store, service, kwargs))
+        return 0
+
+    monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub_auto_join)
+    monkeypatch.setattr(sweeps_mod, "not_sent_tick", _stub_not_sent)
+    guarded, delays = await _run_loops(
+        monkeypatch,
+        session_factory=_fake_session_factory,
+        env={"NOT_SENT_SWEEP_INTERVAL_S": "7", "JOIN_NOW_ADOPT_AHEAD_S": "1800"},
+    )
+
+    (not_sent,) = [c for c in calls if c[0] == "not-sent"]
+    (auto_join,) = [c for c in calls if c[0] == "auto-join"]
+    _, store, service, kwargs = not_sent
+    assert isinstance(store, PostgresIntakeStore) and store is auto_join[1]
+    assert isinstance(service, IntakeService)
+    assert isinstance(kwargs["publisher"], OutboxOnly)
+    assert kwargs["open_ended_s"] == 1800
+    assert abs(kwargs["now"] - datetime.now(timezone.utc)) < timedelta(seconds=30)
+    assert sweep_lock_key("not-sent") in guarded
+    assert 7.0 in delays
+
+
+async def test_without_postgres_neither_sweep_runs(monkeypatch):
+    from meeting_api.intake import sweeps as sweeps_mod
+
+    calls: list[str] = []
+
+    async def _stub_auto_join(*args, **kwargs):
+        calls.append("auto-join")
+
+    async def _stub_not_sent(*args, **kwargs):
+        calls.append("not-sent")
+        return 0
+
+    monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub_auto_join)
+    monkeypatch.setattr(sweeps_mod, "not_sent_tick", _stub_not_sent)
+    await _run_loops(monkeypatch, session_factory=None)
+    assert calls == []

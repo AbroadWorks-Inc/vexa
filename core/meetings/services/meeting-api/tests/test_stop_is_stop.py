@@ -29,6 +29,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from intake_builders import sweep_intake
 from meeting_api import create_app
 from meeting_api.bot_spawn.auto_join import auto_join_tick, due_rows
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
@@ -84,7 +85,7 @@ async def _seed_scheduled(repo, *, native=NATIVE, data=None) -> dict:
 async def _sweep(repo, runtime, at):
     return await auto_join_tick(
         repo, runtime, transcribe_gate=lambda: None, now=at,
-        token_secret="s", redis_url="redis://r", allow_uncapped=True,
+        token_secret="s", redis_url="redis://r", allow_uncapped=True, **sweep_intake(),
     )
 
 

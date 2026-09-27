@@ -24,7 +24,9 @@ A row whose link changed between the read and the claim (``ClaimTargetMoved``) i
 spawned once more. The spawn context (the per-user bot limit and webhook settings) comes from
 ``fetch_bot_context(user_id)``, as for the auto-join sweep; the limit is never guessed, so a
 missing identity edge, an unreachable identity or a context without ``max_concurrent`` fails the
-spawn (``internal_error``) rather than spawning uncapped. The bot's name is the sweep's: the
+spawn (``internal_error``) rather than spawning uncapped. The one exception is the sweep's
+``AUTO_JOIN_ALLOW_UNCAPPED`` self-host opt-in: with ``allow_uncapped`` and no identity edge
+configured, the bot is spawned without a limit. The bot's name is the sweep's: the
 calendar source's name, else the user's default. Recording and transcription resolve through
 ``env_flags.resolve_spawn_flag``, the resolver ``POST /bots`` uses.
 
@@ -171,6 +173,7 @@ class ExactRowSpawn:
         authority: Any = None,
         token_secret: Optional[str] = None,
         redis_url: Optional[str] = None,
+        allow_uncapped: bool = False,
     ) -> None:
         self._repo = repo
         self._runtime = runtime
@@ -180,6 +183,7 @@ class ExactRowSpawn:
         self._authority = authority
         self._token_secret = token_secret
         self._redis_url = redis_url
+        self._allow_uncapped = allow_uncapped
 
     async def spawn_exact(self, user_id: int, meeting_id: int) -> SpawnOutcome:
         watch = _ClaimWatch(self._repo)
@@ -235,6 +239,8 @@ class ExactRowSpawn:
                     raise
 
     async def _context(self, user_id: int) -> dict[str, Any]:
+        if self._fetch_bot_context is None and self._allow_uncapped:
+            return {}
         if self._fetch_bot_context is None:
             raise _Refused(
                 "the bot limit could not be read: no identity edge is configured"

@@ -28,6 +28,10 @@ Public surface:
     ``SpawnPort`` (§1.5): ``spawn_exact`` runs ``bot_spawn.request_bot`` claiming exactly the given
     row and answers ``sent`` / ``already_live`` / ``failed`` with a typed code and exact message.
     ``spawn_failure(exc)`` is the one §1.5 table from a spawn exception to ``(code, message)``.
+  * ``check_room`` / ``not_sent_tick`` — ``sweeps.py``. The scheduler's intake side (§1.5): the
+    link check under the link lock before a bot is sent to an entry-managed meeting (wait, or merge
+    into an open-ended live meeting, R2), and the not-sent sweep (R6). ``OutboxOnly`` / ``NoStop``
+    are the scheduler's publisher and stop ports.
   * ``PostgresIntakeStore(session_factory)`` — ``adapters.py``. The ``IntakeStore`` over Postgres:
     one transaction per ``room_lock`` holding the links' advisory locks (§1.4), status changes and
     events through ``write_status`` / ``write_event`` in that transaction.
@@ -70,6 +74,14 @@ from .status import (
     write_event,
     write_status,
 )
+from .sweeps import (
+    NoStop,
+    OutboxOnly,
+    RoomCheck,
+    check_room,
+    not_sent_cause,
+    not_sent_tick,
+)
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
 __all__ = [
@@ -77,6 +89,12 @@ __all__ = [
     "IntakeSettings",
     "ExactRowSpawn",
     "spawn_failure",
+    "check_room",
+    "not_sent_tick",
+    "not_sent_cause",
+    "RoomCheck",
+    "OutboxOnly",
+    "NoStop",
     "IntakeStore",
     "IntakeTx",
     "PostgresIntakeStore",

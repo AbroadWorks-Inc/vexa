@@ -23,6 +23,12 @@ never offered to an entry (Ruling R15). ``count_active_entries`` counts on the p
 ``ix_meeting_entries_active_user``, index-only; the ``state = 'active'`` predicate is a literal so a
 cached generic plan still matches the index.
 
+``overdue_meetings`` is the not-sent sweep's read (§1.5): ``scheduled`` meetings that have an entry
+row and whose ``scheduled_end_at`` has passed (an open-ended one: its start plus ``open_ended_s``).
+A meeting's end is never before its start, so the read also bounds the meeting time by ``now`` and
+walks the partial index ``ix_meeting_scheduled_due`` (``status = 'scheduled'`` is a literal for the
+same generic-plan reason).
+
 SQLAlchemy and the ORM models are imported inside the functions that use them, so the package
 imports without SQLAlchemy installed.
 """
@@ -30,6 +36,7 @@ imports without SQLAlchemy installed.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -97,6 +104,17 @@ class PostgresIntakeStore:
         async with self._session_factory() as db, db.begin():
             for room in ordered:
                 await take_link_lock(db, user_id, room)
+            yield PostgresIntakeTx(db)
+
+    async def overdue_meetings(
+        self, now: datetime, *, open_ended_s: int
+    ) -> list[MeetingView]:
+        async with self._reading() as tx:
+            return await tx._overdue(now, open_ended_s=open_ended_s)
+
+    @asynccontextmanager
+    async def _reading(self) -> AsyncIterator[PostgresIntakeTx]:
+        async with self._session_factory() as db:
             yield PostgresIntakeTx(db)
 
 
@@ -195,6 +213,37 @@ class PostgresIntakeTx:
             .order_by(Meeting.id)
         )
         return await self._views(meetings)
+
+    async def _overdue(self, now: datetime, *, open_ended_s: int) -> list[MeetingView]:
+        """``PostgresIntakeStore.overdue_meetings``'s read."""
+        from sqlalchemy import and_, exists, func, or_, select, text
+
+        from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
+
+        aware = now.astimezone(timezone.utc)
+        naive = aware.replace(tzinfo=None)
+        event_time = func.meeting_event_time(
+            Meeting.data, Meeting.start_time, Meeting.created_at
+        )
+        end = MeetingAwState.scheduled_end_at
+        stmt = (
+            select(Meeting)
+            .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
+            .where(
+                text("meetings.status = 'scheduled'"),
+                event_time <= naive,
+                exists().where(MeetingEntry.meeting_id == Meeting.id),
+                or_(
+                    end <= aware,
+                    and_(
+                        end.is_(None),
+                        event_time <= naive - timedelta(seconds=open_ended_s),
+                    ),
+                ),
+            )
+            .order_by(Meeting.id)
+        )
+        return await self._views(await self._scalars(stmt))
 
     async def meeting(self, meeting_id: int) -> MeetingView:
         from sqlalchemy import select
@@ -338,14 +387,18 @@ class PostgresIntakeTx:
         await self._db.flush()
 
     async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
-        from datetime import datetime, timezone
-
         await self._locked_meeting(meeting_id)
         aw = await lock_aw_state(self._db, meeting_id)
         aw.outcome_kind = outcome.kind
         aw.outcome_detail = outcome.detail
         aw.outcome_message = outcome.message
         aw.outcome_at = datetime.now(timezone.utc).replace(microsecond=0)
+        await self._db.flush()
+
+    async def mark_waiting_for_room(self, meeting_id: int) -> None:
+        await self._locked_meeting(meeting_id)
+        aw = await lock_aw_state(self._db, meeting_id)
+        aw.waiting_for_room_sent_at = datetime.now(timezone.utc).replace(microsecond=0)
         await self._db.flush()
 
     async def move_active_entries(

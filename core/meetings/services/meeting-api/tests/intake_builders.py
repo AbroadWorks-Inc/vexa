@@ -205,6 +205,28 @@ def make_harness(
     return Harness(clock, settings, store, spawn, stop, publisher, service)
 
 
+def sweep_intake(**tick_kw: Any) -> dict[str, Any]:
+    """``auto_join_tick``'s intake arguments over a fresh in-memory harness, for a test that only
+    exercises entry-less rows (the harness never holds them)."""
+    h = make_harness()
+    return {"store": h.store, "intake": h.service, **tick_kw}
+
+
+def send_clock(at: datetime) -> Any:
+    """Pin the in-memory repo's clock, which the exact-row claim stamps as the send time
+    (``data.auto_join_last_attempt``, Ruling R7), to ``at``: the sweep's own clock in a test."""
+    from unittest import mock
+
+    import meeting_api.bot_spawn.fakes as spawn_fakes
+
+    class _At(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return at
+
+    return mock.patch.object(spawn_fakes, "datetime", _At)
+
+
 # ── the /v2 routes ───────────────────────────────────────────────────────────────────────────
 
 
