@@ -61,6 +61,16 @@ in `fakes.py`. `GET /v2/entries` pages by `external_id` (served by
 `uq_meeting_entries_user_source_external`); `GET /v2/meetings` pages by `(meeting_event_time, id)`,
 newest first. meeting-api's production app mounts the router once the real spawn and stop ports
 exist (A12).
+`ExactRowSpawn` (`spawn.py`) is the production `SpawnPort` (§1.5): `spawn_exact(user_id, meeting_id)`
+runs `bot_spawn.request_bot` with `claim_meeting_id`, so the spawn claims exactly that row
+(`scheduled` → `requested` through `write_status`, under the link lock, then the per-user lock, then
+the row) and stamps `data.auto_join_last_attempt` with the send time, which `bot_joins_at` shows.
+It answers `sent`, `already_live` (a bot already owns the link) or `failed` with the code and message
+of `spawn_failure(exc)`, the one table from a spawn exception to its §1.13 code (`account_limit`,
+`already_live`, `meeting_stopped`, `spawn_error`, `authority_denied`, `authority_unavailable`,
+`auth_session`, `transcription_config`, else `internal_error`, logged with its stack); it never
+raises. The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
+never guessed: without it the spawn fails `internal_error`.
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.
@@ -71,6 +81,7 @@ exist (A12).
 - `write_status`, `write_event`, `StatusConflict`, `Outcome`, `WrittenEvent`, `derive_event_id_v2`,
   `row_mapping` — `status.py`.
 - `IntakeService` — `service.py`; `IntakeSettings` — `settings.py`.
+- `ExactRowSpawn`, `spawn_failure` — `spawn.py`.
 - `IntakeStore`, `IntakeTx`, `EntryView`, `MeetingView`, `Room`, `SpawnOutcome`, `SpawnPort`,
   `StopPort`, `EventPublisher` — `ports.py`; the in-memory fakes — `fakes.py`.
 - `PostgresIntakeStore` — `adapters.py`.

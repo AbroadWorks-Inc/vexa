@@ -15,6 +15,7 @@ supplies the production implementations; the module's tests supply in-process fa
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -82,6 +83,7 @@ class MeetingRepo(Protocol):
         data: dict,
         max_concurrent: Optional[int] = None,
         exclude_meeting_id: Optional[int] = None,
+        claim_meeting_id: Optional[int] = None,
     ) -> dict:
         """ATOMIC dedup + cap-check + insert — the TOCTOU-safe spawn primitive (ROB1/ROB2).
 
@@ -90,18 +92,29 @@ class MeetingRepo(Protocol):
         Only ``max_concurrent=None`` (no cap provided) skips the cap gate.
 
         Performs, in a SINGLE transaction with NO yield point between the checks and the insert:
-          1. dedup — if the user already has an ACTIVE row for ``(platform, native_meeting_id)``,
-             raise ``DuplicateMeeting`` (→ HTTP 409);
+          0. with ``claim_meeting_id``: lock that row and re-read it — another user's or a missing
+             row raises ``LookupError``, a row no longer on ``(platform, native_meeting_id)`` raises
+             ``ClaimTargetMoved``;
+          1. dedup — if the user already has a LIVE row (``auto_join.LIVE_STATUSES``) for
+             ``(platform, native_meeting_id)``, raise ``DuplicateMeeting`` (→ HTTP 409);
           2. cap — if ``max_concurrent`` is set and the user already has ``>= max_concurrent`` ACTIVE
              bots (``browser_session`` excluded; ``exclude_meeting_id`` not counted), raise
-             ``MaxBotsExceeded`` (→ HTTP 429);
-          3. insert the ``Meeting`` row (status ``requested``) and return it as a dict.
+             ``MaxBotsExceeded`` (→ HTTP 429) carrying the count and the cap;
+          3. claim or insert (§1.5):
+             * with ``claim_meeting_id``: exactly that row moves ``scheduled`` → ``requested``
+               through the status writer (``intake.status.write_status``), the spawn keys merged
+               over its data and ``data.auto_join_last_attempt`` stamped with the send time; a row
+               in any other status raises ``MeetingStopped``;
+             * without: the planned (``idle``/``scheduled``) row the R1 ``join_now`` rule picks
+               (``planned_claim``) is upgraded to ``requested`` in place, else a new ``Meeting`` row
+               (status ``requested``) is inserted — never a future occurrence;
+             and return the row as a dict.
 
-        The real (SQLAlchemy) adapter serializes concurrent spawns for the SAME user with a per-user
-        ``pg_advisory_xact_lock`` and backstops dedup with a unique partial index on active rows; the
-        in-memory fake performs the check+insert with no ``await`` between them so the race closes
-        offline too. Replaces the old separate ``find_active`` + ``count_active_bots`` +
-        ``create_meeting`` pre-check sequence on the fresh-insert path."""
+        The real (SQLAlchemy) adapter takes the link's advisory lock first (the intake key,
+        ``intake.adapters.take_link_lock``), then the per-user ``pg_advisory_xact_lock``, then the
+        meeting row, and backstops dedup with the unique partial index on live rows; the in-memory
+        fake performs the check+insert with no ``await`` between them so the race closes offline
+        too."""
         ...
 
     async def reopen_meeting(
@@ -286,9 +299,12 @@ class MaxBotsExceeded(Exception):
     (excluding infra ``browser_session``). Distinct from ``QuotaExceeded`` (the kernel's backstop),
     but both map to 429 at the route."""
 
-    def __init__(self, user_id: int, cap: int):
+    def __init__(self, user_id: int, cap: int, active: Optional[int] = None):
         self.user_id = user_id
         self.cap = cap
+        # The user's active-bot count the check saw; ``None`` when the cap was refused unread
+        # (a depleted cap ``<= 0``).
+        self.active = active
         super().__init__(f"User has reached the maximum concurrent bot limit ({cap}).")
 
 
@@ -397,6 +413,48 @@ class MeetingStopped(Exception):
 
     A stopped meeting is not a broken one: a fresh ``POST /bots`` (without ``continue_meeting``)
     starts a new run on a new row, and that is the documented path. The detail string says so."""
+
+
+class ClaimTargetMoved(Exception):
+    """The row named by ``claim_meeting_id`` is no longer on the link the spawn was built for: its
+    link changed between the caller's read and the claim. Nothing was written; the caller re-reads
+    the row and spawns again."""
+
+    def __init__(self, meeting_id: int):
+        self.meeting_id = meeting_id
+        super().__init__(f"meeting {meeting_id} is no longer on the link this spawn was built for")
+
+
+@dataclass(frozen=True)
+class PlannedRow:
+    """A planned (``idle``/``scheduled``) row as upstream ``POST /bots`` compares it (§1.5):
+    ``start`` is the meeting time (``data.scheduled_at``, else ``start_time``, else
+    ``created_at``), ``end`` its ``meeting_aw_state.scheduled_end_at`` (``None``: open-ended)."""
+
+    id: int
+    status: str
+    start: Optional[datetime]
+    end: Optional[datetime]
+
+    @classmethod
+    def of(cls, meeting_id: int, status: str, data: Any, start_time: Any, created_at: Any,
+           scheduled_end_at: Any) -> "PlannedRow":
+        from ..intake.rules import as_utc, meeting_start
+
+        return cls(meeting_id, status, meeting_start(data, start_time, created_at),
+                   as_utc(scheduled_end_at))
+
+
+def planned_claim(rows: list[PlannedRow], *, now: datetime) -> Optional[int]:
+    """The planned row upstream ``POST /bots`` claims, by the R1 ``join_now`` rule
+    (``intake.rules.join_now_target`` with ``JOIN_NOW_ADOPT_AHEAD_S``): the earliest row with
+    ``end > now`` (or open-ended) and ``start <= now + adopt_ahead``; ``None`` means insert. Both
+    the SQL adapter and the in-memory fake call it, so the two cannot drift."""
+    from ..intake.rules import join_now_target
+    from ..intake.settings import join_now_adopt_ahead_s
+
+    target = join_now_target(rows, now=now, adopt_ahead_s=join_now_adopt_ahead_s())
+    return None if target is None else target.id
 
 
 class DuplicateMeeting(Exception):

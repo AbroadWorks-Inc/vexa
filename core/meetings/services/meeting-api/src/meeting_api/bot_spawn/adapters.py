@@ -458,24 +458,34 @@ class SqlAlchemyMeetingRepo:
 
     async def create_meeting_guarded(
         self, *, user_id, platform, native_meeting_id, data, max_concurrent=None,
-        exclude_meeting_id=None,
+        exclude_meeting_id=None, claim_meeting_id=None,
     ) -> dict:
-        """ATOMIC dedup + cap + insert in ONE transaction (ROB1/ROB2).
+        """ATOMIC dedup + cap + claim-or-insert in ONE transaction (ROB1/ROB2, §1.5).
 
-        The TOCTOU-safe spawn primitive. Two layers guard it:
+        The TOCTOU-safe spawn primitive. Its locks, in the one lock order (§1.4):
 
-          * a per-user ``pg_advisory_xact_lock(:user_id)`` taken as the FIRST statement so concurrent
-            spawns for the SAME user SERIALIZE through this txn (the lock auto-releases at commit/
-            rollback). With the lock held, the dedup query + cap COUNT + INSERT see a stable snapshot.
-          * a unique partial index on active rows (``uq_meeting_active_user_platform_native`` — see
-            sessions/models.py) as the DB-level backstop: if a racing transaction (or a different
-            meeting-api process not covered by THIS advisory lock) inserted a duplicate active row, the
-            INSERT's commit raises ``IntegrityError`` → mapped to ``DuplicateMeeting``.
+          * the link's advisory lock (``intake.adapters.take_link_lock`` — the key intake's writes
+            take), so a claim and an intake write on the same link queue instead of interleaving;
+          * the per-user ``pg_advisory_xact_lock(:user_id)``, so concurrent spawns for the SAME user
+            SERIALIZE through this txn and the dedup query + cap COUNT + write see a stable
+            snapshot (both locks auto-release at commit/rollback);
+          * the claimed meeting row (``FOR UPDATE``), then its ``meeting_aw_state`` row inside the
+            status writer.
+
+        Nothing takes the user lock and then a link lock, and intake takes every link lock before
+        any row, so the order cannot cycle. The unique partial index on live rows
+        (``uq_meeting_live_user_platform_native`` — see sessions/models.py) is the DB-level
+        backstop: a duplicate live row that slipped past the advisory locks (e.g. a different
+        meeting-api process) raises ``IntegrityError`` at commit → mapped to ``DuplicateMeeting``.
         """
         from sqlalchemy import bindparam, func, select, text
         from sqlalchemy.exc import IntegrityError
 
-        from ..sessions.models import Meeting
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..sessions.models import Meeting, MeetingAwState
+        from .auto_join import LIVE_STATUSES
+        from .ports import ClaimTargetMoved, PlannedRow, planned_claim
 
         # 0. depleted — a cap <= 0 means NO bots allowed (0 is "depleted", never "unlimited");
         #    reject before touching the DB. Only ``None`` (no cap provided) skips the gate.
@@ -484,19 +494,32 @@ class SqlAlchemyMeetingRepo:
 
         active = ["requested", "joining", "awaiting_admission", "active"]
         async with self._session_factory() as db:
+            await take_link_lock(db, user_id, Room(platform, native_meeting_id))
             # Per-user serialization: hold the advisory lock for the whole transaction. asyncpg needs a
             # bound int param (not a literal-format string), so bind it explicitly.
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(:uid)").bindparams(bindparam("uid", user_id))
             )
-            # 1. dedup — under the lock, an active row for (user, platform, native) blocks the spawn.
+            # 0b. the exact row — locked and re-read under the link lock, so the link it is on now
+            #     is the link this spawn was built for and locked.
+            target = None
+            if claim_meeting_id is not None:
+                from ..intake.status import lock_meeting
+
+                target = await lock_meeting(db, claim_meeting_id)
+                if target is None or target.user_id != user_id:
+                    raise LookupError(f"meeting {claim_meeting_id} not found for user {user_id}")
+                if (target.platform, target.platform_specific_id) != (platform, native_meeting_id):
+                    raise ClaimTargetMoved(claim_meeting_id)
+            # 1. dedup — under the locks, a LIVE row for (user, platform, native) blocks the spawn:
+            #    whatever its status, a bot already owns the room.
             dup = (
                 await db.execute(
                     select(Meeting.id).where(
                         Meeting.user_id == user_id,
                         Meeting.platform == platform,
                         Meeting.platform_specific_id == native_meeting_id,
-                        Meeting.status.in_(active),
+                        Meeting.status.in_(LIVE_STATUSES),
                     )
                 )
             ).scalars().first()
@@ -520,36 +543,46 @@ class SqlAlchemyMeetingRepo:
                     count_stmt = count_stmt.where(Meeting.id != exclude_meeting_id)
                 n_active = int((await db.execute(count_stmt)).scalar() or 0)
                 if n_active >= max_concurrent:
-                    raise MaxBotsExceeded(user_id, max_concurrent)
-            # 2b. claim — a PLANNED row (intent status `idle`/`scheduled`, created by POST /meetings
-            #     or calendar sync) for the SAME (user, platform, native) is UPGRADED in place instead
-            #     of inserting a second row: without this, the unique partial index (which covers
-            #     intent statuses too) would 409 the spawn. The planned analog of ``reopen_meeting``,
-            #     atomic under the same advisory lock. Spawn keys merge OVER the planned data; the
-            #     plan's `title` / `scheduled_at` / `workspace_id` / `auto_join` / `calendar_uid`
-            #     survive — the plan, its workspace bind, and the transcript live on ONE row.
+                    raise MaxBotsExceeded(user_id, max_concurrent, active=n_active)
+            if target is not None:
+                return await self._claim_exact(db, target, data)
+            # 2b. claim — the PLANNED row (intent status `idle`/`scheduled`, created by POST /meetings,
+            #     calendar sync or intake) the R1 join_now rule picks (`planned_claim`: the earliest
+            #     one not yet ended and starting within JOIN_NOW_ADOPT_AHEAD_S) is UPGRADED in place,
+            #     so the plan, its workspace bind and the transcript live on ONE row. A future
+            #     occurrence is never claimed: the spawn inserts a new row instead. Spawn keys merge
+            #     OVER the planned data; the plan's `title` / `scheduled_at` / `workspace_id` /
+            #     `auto_join` / `calendar_uid` survive.
             from sqlalchemy.orm.attributes import flag_modified
 
-            claimable = (await db.execute(
-                select(Meeting).where(
+            planned = (await db.execute(
+                select(Meeting, MeetingAwState.scheduled_end_at)
+                .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
+                .where(
                     Meeting.user_id == user_id,
                     Meeting.platform == platform,
                     Meeting.platform_specific_id == native_meeting_id,
                     Meeting.status.in_(("idle", "scheduled")),
-                ).order_by(Meeting.created_at.desc()).limit(1).with_for_update()
-            )).scalars().first()
+                ).with_for_update(of=Meeting)
+            )).all()
+            picked = planned_claim(
+                [PlannedRow.of(m.id, m.status, m.data, m.start_time, m.created_at, end)
+                 for m, end in planned],
+                now=datetime.now(timezone.utc),
+            )
+            claimable = next((m for m, _ in planned if m.id == picked), None)
             if claimable is not None:
-                planned = dict(claimable.data) if isinstance(claimable.data, dict) else {}
+                planned_data = dict(claimable.data) if isinstance(claimable.data, dict) else {}
                 # A THIS-REQUEST dispatch supersedes an earlier stop ON THE PLAN. Legacy zombie rows
                 # exist (a scheduled row a rev-193 DELETE flagged but never terminalized), and
                 # claiming one with the flag still on it would make the spawn fence abort the very
                 # bot the user just asked for. Post-fix a stop terminalizes the planned row, so it is
                 # no longer claimable at all — this only ever meets rows an older build wrote.
-                planned.pop("stop_requested", None)
+                planned_data.pop("stop_requested", None)
                 claimable.status = "requested"
                 claimable.end_time = None
                 claimable.bot_container_id = None
-                claimable.data = {**planned, **dict(data or {})}
+                claimable.data = {**planned_data, **dict(data or {})}
                 flag_modified(claimable, "data")
                 await db.commit()
                 await db.refresh(claimable)
@@ -571,6 +604,36 @@ class SqlAlchemyMeetingRepo:
                 ) from e
             await db.refresh(m)
             return _row_to_dict(m)
+
+    async def _claim_exact(self, db, target, data) -> dict:
+        """§1.5: the exact row ``scheduled`` → ``requested`` through the one status writer
+        (conditional, so a row that is no longer scheduled is never claimed), the spawn keys merged
+        over its data and the send time stamped as ``data.auto_join_last_attempt`` (Ruling R7:
+        ``bot_joins_at`` reads it). Commits the caller's transaction."""
+        from sqlalchemy.exc import IntegrityError
+
+        from ..intake.status import StatusConflict, write_status
+
+        # The row is locked and the live-row dedup has passed, so a status other than `scheduled`
+        # here is a finished or intent-only row, never a live one.
+        meeting_id, room = target.id, f"{target.platform}/{target.platform_specific_id}"
+        patch = {**dict(data or {}),
+                 "auto_join_last_attempt": datetime.now(timezone.utc).isoformat()}
+        try:
+            await write_status(db, meeting_id, "requested", expected_from={"scheduled"},
+                               data_patch=patch)
+        except StatusConflict as e:
+            raise MeetingStopped(
+                f"meeting {meeting_id} is {e.actual}; only a scheduled meeting can be sent a bot"
+            ) from e
+        try:
+            await db.commit()
+        except IntegrityError as e:
+            # The live-row index backstop: a writer outside these locks made another row live.
+            await db.rollback()
+            raise DuplicateMeeting(f"An active meeting already exists for {room}") from e
+        await db.refresh(target)
+        return _row_to_dict(target)
 
     async def list_scheduled_meetings(self) -> list[dict]:
         """Every ``scheduled`` row with a joinable link (the auto-join sweep's candidate set —

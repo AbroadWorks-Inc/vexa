@@ -567,7 +567,7 @@
    "key": "JOIN_NOW_ADOPT_AHEAD_S",
    "class": "defaulted",
    "default": "3600",
-   "description": "intake (§1.1 R1): a join_now entry adopts the earliest non-finished meeting on its link that hasn't ended and starts within this many seconds",
+   "description": "intake (§1.1 R1) and POST /bots (§1.5): a join_now entry, or a POST /bots without a row id, adopts the earliest non-finished meeting on its link that hasn't ended and starts within this many seconds",
    "targets": []
   },
   {

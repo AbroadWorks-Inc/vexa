@@ -26,6 +26,16 @@ effect (403 deny, 503 unavailable)**
 eager-create the `MeetingSession` (`session_uid` == `connectionId`) → write the kernel workload id
 back as `bot_container_id` → return the `api.v1` `MeetingResponse` (now listing its `sessions`).
 
+### Which row a spawn claims (§1.5)
+`create_meeting_guarded` takes the link's advisory lock (intake's key), then the per-user lock, then
+the row. Any LIVE row on the link (`auto_join.LIVE_STATUSES`, `needs_help` and `stopping` included)
+is a 409. With `claim_meeting_id` (the scheduler and intake's instant join) exactly that
+`scheduled` row moves to `requested` through `intake.status.write_status` and gets
+`data.auto_join_last_attempt`; any other status is `MeetingStopped`, a row on another link
+`ClaimTargetMoved`. Without it (`POST /bots`) the planned row the R1 `join_now` rule picks is claimed
+(the earliest `idle`/`scheduled` row that hasn't ended and starts within `JOIN_NOW_ADOPT_AHEAD_S`),
+else a new row is inserted: a future occurrence is never claimed.
+
 ### P3c — `continue_meeting` (sequential multi-bot per meeting)
 When the prior meeting for `(platform, native_id)` is TERMINAL (`completed`/`failed`), reuse the
 SAME meeting row + add a NEW `MeetingSession` instead of the 409. Transcripts + recordings stay keyed

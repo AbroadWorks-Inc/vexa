@@ -1,0 +1,222 @@
+"""The production ``SpawnPort`` (§1.5): send the bot to exactly one meeting row, and the one table
+that turns every spawn failure into its typed code and exact message.
+
+``ExactRowSpawn.spawn_exact(user_id, meeting_id)`` reads the row, then runs the same
+``bot_spawn.request_bot`` flow ``POST /bots`` and the auto-join sweep run, with
+``claim_meeting_id``: the spawn claims exactly that row (``scheduled`` → ``requested`` through the
+status writer, under the link lock) and stamps ``data.auto_join_last_attempt`` with the send time
+(Ruling R7), so ``bot_joins_at`` shows it. The answer is always a ``SpawnOutcome``, never an
+exception:
+
+  * ``sent`` — the bot was spawned on the row;
+  * ``already_live`` — a bot already owns the row's link (``DuplicateMeeting``);
+  * ``failed`` — anything else, with ``spawn_failure``'s code and message.
+
+A row whose link changed between the read and the claim (``ClaimTargetMoved``) is read again and
+spawned once more. The spawn context (the per-user bot limit and webhook settings) comes from
+``fetch_bot_context(user_id)``, as for the auto-join sweep; the limit is never guessed, so a
+missing identity edge or an unreachable identity fails the spawn (``internal_error``) rather than
+spawning uncapped. Recording and transcription resolve through ``env_flags.resolve_spawn_flag``,
+the resolver ``POST /bots`` uses.
+
+``spawn_failure(exc)`` is the §1.5 mapping, used by every caller that spawns (intake, and the
+scheduler): the code, and a message that is the exception's own text wherever it has one.
+"""
+
+from __future__ import annotations
+
+import traceback
+from typing import Any, Awaitable, Callable, Optional
+
+from ..bot_spawn.env_flags import resolve_spawn_flag
+from ..bot_spawn.ports import (
+    AuthSessionBusy,
+    AuthSessionNotConfigured,
+    ClaimTargetMoved,
+    DuplicateMeeting,
+    MaxBotsExceeded,
+    MeetingRepo,
+    MeetingStopped,
+    QuotaExceeded,
+    RuntimeClient,
+    SpawnFailed,
+    TranscriptionNotConfigured,
+)
+from ..bot_spawn.service import request_bot
+from ..obs import log_event
+from ..service_authority import ServiceAuthorityDenied, ServiceAuthorityUnavailable
+from .ports import SpawnOutcome
+
+__all__ = ["ExactRowSpawn", "spawn_failure"]
+
+BotContextFetcher = Callable[[int], Awaitable[Optional[dict[str, Any]]]]
+
+
+def _bot_limit(exc: MaxBotsExceeded) -> str:
+    if exc.active is None:
+        return f"bot limit reached (limit {exc.cap})"
+    return f"bot limit reached ({exc.active} of {exc.cap})"
+
+
+def _quota(exc: QuotaExceeded) -> str:
+    return f"bot limit reached ({exc})" if str(exc) else "bot limit reached"
+
+
+def _authority_denied(exc: ServiceAuthorityDenied) -> str:
+    return f"service not allowed ({exc.reason}; decision {exc.decision_id})"
+
+
+def _own_text(default: str) -> Callable[[BaseException], str]:
+    return lambda exc: str(exc) or default
+
+
+#: §1.5: each spawn exception, its typed code (§1.13) and its exact message.
+_FAILURES: tuple[tuple[type[BaseException], str, Callable[[Any], str]], ...] = (
+    (MaxBotsExceeded, "account_limit", _bot_limit),
+    (QuotaExceeded, "account_limit", _quota),
+    (DuplicateMeeting, "already_live", _own_text("a bot is already in this meeting")),
+    (MeetingStopped, "meeting_stopped", _own_text("the meeting was stopped")),
+    (SpawnFailed, "spawn_error", _own_text("bot workload failed to start")),
+    (ServiceAuthorityDenied, "authority_denied", _authority_denied),
+    (
+        ServiceAuthorityUnavailable,
+        "authority_unavailable",
+        _own_text("service authority unavailable"),
+    ),
+    (
+        AuthSessionNotConfigured,
+        "auth_session",
+        _own_text("bot sign-in is not configured"),
+    ),
+    (AuthSessionBusy, "auth_session", _own_text("the bot's signed-in session is busy")),
+    (
+        TranscriptionNotConfigured,
+        "transcription_config",
+        _own_text("transcription is not configured"),
+    ),
+)
+
+
+def spawn_failure(
+    exc: BaseException,
+    *,
+    user_id: Optional[int] = None,
+    meeting_id: Optional[int] = None,
+) -> tuple[str, str]:
+    """``(code, message)`` for a spawn exception (§1.5). Anything not in the table is
+    ``internal_error``, logged here with its stack."""
+    for kind, code, message in _FAILURES:
+        if isinstance(exc, kind):
+            return code, message(exc)
+    log_event(
+        "spawn_internal_error",
+        audience="operator",
+        level="error",
+        span="meetings.spawn",
+        user_id=user_id,
+        meeting_id=None if meeting_id is None else str(meeting_id),
+        fields={
+            "error": type(exc).__name__,
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ),
+        },
+    )
+    return "internal_error", f"internal error ({type(exc).__name__})"
+
+
+class _Refused(Exception):
+    """The spawn context couldn't be read; the message is the outcome's."""
+
+
+class ExactRowSpawn:
+    """``SpawnPort`` over ``bot_spawn``'s repo and runtime (§1.5)."""
+
+    def __init__(
+        self,
+        repo: MeetingRepo,
+        runtime: RuntimeClient,
+        *,
+        fetch_bot_context: Optional[BotContextFetcher],
+        authority: Any = None,
+        token_secret: Optional[str] = None,
+        redis_url: Optional[str] = None,
+    ) -> None:
+        self._repo = repo
+        self._runtime = runtime
+        self._fetch_bot_context = fetch_bot_context
+        self._authority = authority
+        self._token_secret = token_secret
+        self._redis_url = redis_url
+
+    async def spawn_exact(self, user_id: int, meeting_id: int) -> SpawnOutcome:
+        try:
+            await self._spawn(user_id, meeting_id)
+        except DuplicateMeeting:
+            return SpawnOutcome("already_live")
+        except _Refused as exc:
+            return self._failed(user_id, meeting_id, "internal_error", str(exc))
+        except Exception as exc:
+            code, message = spawn_failure(exc, user_id=user_id, meeting_id=meeting_id)
+            return self._failed(user_id, meeting_id, code, message)
+        return SpawnOutcome("sent")
+
+    async def _spawn(self, user_id: int, meeting_id: int) -> None:
+        ctx = await self._context(user_id)
+        for attempt in range(2):
+            row = await self._repo.get_meeting(meeting_id)
+            if row is None or row.get("user_id") != user_id:
+                raise LookupError(f"meeting {meeting_id} not found for user {user_id}")
+            stored = row.get("data")
+            data: dict[str, Any] = stored if isinstance(stored, dict) else {}
+            try:
+                await request_bot(
+                    self._repo,
+                    self._runtime,
+                    authority=self._authority,
+                    user_id=user_id,
+                    platform=row["platform"],
+                    native_meeting_id=row["native_meeting_id"],
+                    meeting_url=data.get("constructed_meeting_url"),
+                    bot_name=ctx.get("bot_name"),
+                    recording_enabled=resolve_spawn_flag(
+                        "RECORDING_ENABLED", default=True
+                    ),
+                    transcribe_enabled=resolve_spawn_flag(
+                        "TRANSCRIBE_ENABLED", default=True
+                    ),
+                    max_concurrent=ctx.get("max_concurrent"),
+                    webhook_url=ctx.get("webhook_url"),
+                    webhook_secret=ctx.get("webhook_secret"),
+                    webhook_events=ctx.get("webhook_events"),
+                    token_secret=self._token_secret,
+                    redis_url=self._redis_url,
+                    claim_meeting_id=meeting_id,
+                )
+                return
+            except ClaimTargetMoved:
+                if attempt:
+                    raise
+
+    async def _context(self, user_id: int) -> dict[str, Any]:
+        if self._fetch_bot_context is None:
+            raise _Refused(
+                "the bot limit could not be read: no identity edge is configured"
+            )
+        ctx = await self._fetch_bot_context(user_id)
+        if ctx is None:
+            raise _Refused("the bot limit could not be read: identity is unavailable")
+        return ctx
+
+    @staticmethod
+    def _failed(user_id: int, meeting_id: int, code: str, message: str) -> SpawnOutcome:
+        log_event(
+            "spawn_exact_failed",
+            audience="user",
+            level="warning",
+            span="meetings.spawn",
+            user_id=user_id,
+            meeting_id=str(meeting_id),
+            fields={"code": code, "message": message},
+        )
+        return SpawnOutcome("failed", code, message)

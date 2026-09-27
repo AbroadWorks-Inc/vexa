@@ -431,6 +431,7 @@ async def request_bot(
     webhook_url: Optional[str] = None,
     webhook_secret: Optional[str] = None,
     webhook_events: Optional[dict] = None,
+    claim_meeting_id: Optional[int] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -442,6 +443,10 @@ async def request_bot(
     per-user cap — the spawn is rejected if the user already has that many ACTIVE bots. A cap
     ``<= 0`` means the quota is DEPLETED (every spawn rejected) — 0 is never "unlimited"; ``None``
     means no cap was provided, so no pre-check.
+
+    ``claim_meeting_id`` (§1.5): spawn on exactly that ``scheduled`` row (the scheduler and the
+    intake instant join pass it); without it the planned row the R1 ``join_now`` rule picks is
+    claimed, else a new row is inserted (``MeetingRepo.create_meeting_guarded``).
     """
     authority = authority or AllowAllServiceAuthority()
     # 1. URL.
@@ -675,7 +680,9 @@ async def request_bot(
                     span="bots.create", user_id=user_id,
                     fields={"active": active, "cap": max_concurrent},
                 )
-                raise MaxBotsExceeded(user_id, max_concurrent)
+                raise MaxBotsExceeded(
+                    user_id, max_concurrent, active=active if max_concurrent > 0 else None,
+                )
         row = await repo.reopen_meeting(
             meeting_id=reused_row["id"],
             data_patch={
@@ -716,6 +723,7 @@ async def request_bot(
                 native_meeting_id=native_meeting_id,
                 data=meeting_data,
                 max_concurrent=max_concurrent,
+                claim_meeting_id=claim_meeting_id,
             )
         except MaxBotsExceeded:
             log_event(

@@ -16,18 +16,22 @@ fully in-process.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..lifecycle.machine import dominant_completion_reason
 from .ports import (
+    ClaimTargetMoved,
     DuplicateMeeting,
     MaxBotsExceeded,
     MeetingStopped,
+    PlannedRow,
     QuotaExceeded,
     SpawnFailed,
     WorkloadUnknown,
     _archive_completion,
     _stopped_reopen_detail,
+    planned_claim,
     reconcile_grace_for_status,
 )
 
@@ -108,23 +112,35 @@ class InMemoryMeetingRepo:
 
     async def create_meeting_guarded(
         self, *, user_id, platform, native_meeting_id, data, max_concurrent=None,
-        exclude_meeting_id=None,
+        exclude_meeting_id=None, claim_meeting_id=None,
     ) -> dict:
-        """ATOMIC dedup + cap + insert (ROB1/ROB2). The check and the insert run with NO ``await``
-        between them, so even ``SlowRepo`` (which adds ``await asyncio.sleep(0)`` inside the SEPARATE
-        ``count_active_bots`` / ``create_meeting`` methods) cannot interleave concurrent spawns here —
-        modelling the real adapter's single-transaction guard (advisory lock + unique partial index)."""
+        """ATOMIC dedup + cap + claim-or-insert (ROB1/ROB2, §1.5). The check and the write run with
+        NO ``await`` between them, so even ``SlowRepo`` (which adds ``await asyncio.sleep(0)`` inside
+        the SEPARATE ``count_active_bots`` / ``create_meeting`` methods) cannot interleave concurrent
+        spawns here — modelling the real adapter's single-transaction guard (link lock + per-user
+        advisory lock + unique partial index). A row may carry ``scheduled_end_at``: the
+        ``meeting_aw_state`` column the real adapter's claim reads."""
+        from .auto_join import LIVE_STATUSES
+
         # 0. depleted — a cap <= 0 means NO bots allowed (0 is "depleted", never "unlimited");
         #    only ``None`` (no cap provided) skips the gate. Mirrors the real adapter.
         if max_concurrent is not None and max_concurrent <= 0:
             raise MaxBotsExceeded(user_id, max_concurrent)
-        # 1. dedup — an ACTIVE row for (user, platform, native) blocks the spawn (409).
+        # 0b. the exact row — another user's or a missing row, or one on another link, is refused.
+        target = None
+        if claim_meeting_id is not None:
+            target = self._meetings.get(claim_meeting_id)
+            if target is None or target["user_id"] != user_id:
+                raise LookupError(f"meeting {claim_meeting_id} not found for user {user_id}")
+            if (target["platform"], target["native_meeting_id"]) != (platform, native_meeting_id):
+                raise ClaimTargetMoved(claim_meeting_id)
+        # 1. dedup — a LIVE row for (user, platform, native) blocks the spawn (409).
         for m in self._meetings.values():
             if (
                 m["user_id"] == user_id
                 and m["platform"] == platform
                 and m["native_meeting_id"] == native_meeting_id
-                and m["status"] in _ACTIVE_STATUSES
+                and m["status"] in LIVE_STATUSES
             ):
                 raise DuplicateMeeting(
                     f"An active meeting already exists for {platform}/{native_meeting_id}"
@@ -139,19 +155,39 @@ class InMemoryMeetingRepo:
                 and m["id"] != exclude_meeting_id
             )
             if active >= max_concurrent:
-                raise MaxBotsExceeded(user_id, max_concurrent)
-        # 2b. claim — a PLANNED row (intent status) for the same (user, platform, native) is
-        #     UPGRADED in place, mirroring the real adapter: spawn keys merge OVER the planned
-        #     data (title / scheduled_at / workspace_id / auto_join / calendar_uid survive).
-        planned_rows = [
-            m for m in self._meetings.values()
+                raise MaxBotsExceeded(user_id, max_concurrent, active=active)
+        # 2a. the exact row moves `scheduled` → `requested` (any other status → MeetingStopped),
+        #     the spawn keys merged over its data and the send time stamped (Ruling R7).
+        if target is not None:
+            if target["status"] != "scheduled":
+                raise MeetingStopped(
+                    f"meeting {claim_meeting_id} is {target['status']}; only a scheduled meeting "
+                    f"can be sent a bot"
+                )
+            target["status"] = "requested"
+            target["data"] = {
+                **dict(target["data"]), **dict(data or {}),
+                "auto_join_last_attempt": datetime.now(timezone.utc).isoformat(),
+            }
+            return dict(target)
+        # 2b. claim — the PLANNED row (intent status) the R1 join_now rule picks is UPGRADED in
+        #     place, mirroring the real adapter: spawn keys merge OVER the planned data (title /
+        #     scheduled_at / workspace_id / auto_join / calendar_uid survive).
+        planned_rows = {
+            m["id"]: m for m in self._meetings.values()
             if m["user_id"] == user_id
             and m["platform"] == platform
             and m["native_meeting_id"] == native_meeting_id
             and m["status"] in ("idle", "scheduled")
-        ]
-        if planned_rows:
-            row = max(planned_rows, key=lambda m: m["id"])  # newest, like the real adapter
+        }
+        picked = planned_claim(
+            [PlannedRow.of(m["id"], m["status"], m["data"], m.get("start_time"),
+                           m.get("created_at"), m.get("scheduled_end_at"))
+             for m in planned_rows.values()],
+            now=datetime.now(timezone.utc),
+        )
+        if picked is not None:
+            row = planned_rows[picked]
             row["status"] = "requested"
             row["end_time"] = None
             row["bot_container_id"] = None

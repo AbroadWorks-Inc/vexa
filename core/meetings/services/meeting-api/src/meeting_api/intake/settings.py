@@ -2,6 +2,8 @@
 
 ``AUTO_JOIN_LEAD_S`` is the auto-join sweep's own setting: ``auto_join_lead_s`` reads it exactly as
 the sweep's entrypoint does, with the sweep's default, and is the one reader intake uses.
+``join_now_adopt_ahead_s`` is the one reader of ``JOIN_NOW_ADOPT_AHEAD_S``, which a ``join_now``
+entry and upstream ``POST /bots`` both adopt by (§1.1 R1, §1.5).
 """
 
 from __future__ import annotations
@@ -9,7 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-__all__ = ["IntakeSettings", "auto_join_lead_s"]
+__all__ = ["IntakeSettings", "auto_join_lead_s", "join_now_adopt_ahead_s"]
 
 
 def auto_join_lead_s() -> int:
@@ -18,6 +20,12 @@ def auto_join_lead_s() -> int:
     from ..bot_spawn.auto_join import DEFAULT_LEAD_S
 
     return int(float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))))
+
+
+def join_now_adopt_ahead_s() -> int:
+    """``JOIN_NOW_ADOPT_AHEAD_S``: a pasted link adopts a meeting starting within this many
+    seconds."""
+    return int(os.getenv("JOIN_NOW_ADOPT_AHEAD_S", "3600"))
 
 
 @dataclass(frozen=True)
@@ -33,7 +41,7 @@ class IntakeSettings:
         blocked = os.getenv("ENTRY_BLOCKED_HOSTS", "meet.abroadworks.com")
         return cls(
             max_days_ahead=int(os.getenv("ENTRY_MAX_DAYS_AHEAD", "30")),
-            join_now_adopt_ahead_s=int(os.getenv("JOIN_NOW_ADOPT_AHEAD_S", "3600")),
+            join_now_adopt_ahead_s=join_now_adopt_ahead_s(),
             lead_s=auto_join_lead_s(),
             blocked_hosts=frozenset(
                 h.strip().lower() for h in blocked.split(",") if h.strip()

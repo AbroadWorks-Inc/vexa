@@ -13,11 +13,11 @@ Field-source decisions (grounded in the existing code, not invented):
   * ``title`` / ``meeting_url`` — ``data.title`` / ``data.constructed_meeting_url``, the keys
     ``collector/adapters.py`` and ``bot_spawn/service.py`` already write; there is no plain
     ``data.meeting_url``.
-  * ``bot_joins_at`` once sent — ``data.auto_join_last_attempt``
-    (``bot_spawn/auto_join.py``'s own "stamped BEFORE every dispatch attempt" marker), the only
-    recorded "the bot was sent at this instant" fact in the codebase today. A meeting sent through
-    a path that never stamps it (a direct spawn that skipped the auto-join sweep) renders ``None``
-    here rather than an invented value.
+  * ``bot_joins_at`` once sent — ``data.auto_join_last_attempt``, the "the bot was sent at this
+    instant" stamp: ``bot_spawn/auto_join.py`` writes it before every dispatch attempt and the
+    exact-row claim (``intake/spawn.py``) writes it when it claims the row. A meeting sent through
+    a path that never stamps it (upstream ``POST /bots``) renders ``None`` here rather than an
+    invented value.
 """
 
 from __future__ import annotations
