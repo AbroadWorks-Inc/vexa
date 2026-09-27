@@ -61,9 +61,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
-            # Signs x-user-id for meeting-api and admin-api. From the Secret secrets.existingSecretName
-            # names (the chart-managed Secret never carries it), and not optional: the gateway refuses
-            # to start without it.
+            # Signs x-user-id for meeting-api and admin-api. Not optional: the gateway refuses to start
+            # without it.
             - name: GATEWAY_IDENTITY_SECRET
               valueFrom:
                 secretKeyRef:

@@ -123,7 +123,7 @@
     "secret",
     "<REPLACE_ME>"
    ],
-   "targets": ["helm"]
+   "targets": ["compose", "helm", "lite"]
   },
   {
    "key": "DEFAULT_BOT_NAME",

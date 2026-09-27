@@ -580,8 +580,8 @@ env_is "$RENDER_INTAKE" meeting-api VEXA_JITSI_HOSTS 'value: "meet.example.org"'
 env_is "$RENDER_INTAKE" admin-api WEBHOOK_PRIVATE_HOST_ALLOWLIST 'value: "portal.example.svc.cluster.local"'
 env_is "$RENDER_INTAKE" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "900"'
 
-# §1.10/§1.11 secrets come from secrets.existingSecretName by secretKeyRef, never from a chart
-# value: GATEWAY_IDENTITY_SECRET on all three services, the webhook key ring on meeting-api and
+# §1.10/§1.11 secrets reach the services by secretKeyRef to the shared Secret (existingSecretName
+# when set): GATEWAY_IDENTITY_SECRET on all three services, the webhook key ring on meeting-api and
 # admin-api. The gateway cannot run without the identity secret, so its reference is NOT optional
 # (a missing key stops the pod at creation); the other two degrade without it, so theirs are.
 RENDER_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
@@ -606,27 +606,49 @@ for comp in meeting-api admin-api; do
     secret_ref "$comp" "$key" yes
   done
 done
-# With both Secrets pre-created (the aw-bots shape) the chart renders no Secret at all, and in the
-# chart-managed shape its Secret never carries these keys.
+# With both Secrets pre-created (the aw-bots shape) the chart renders no Secret at all.
 if grep -qE '^kind: Secret' <<< "$RENDER_EXISTING"; then
   echo "  FAIL: a Secret rendered with existingSecretName + existingCredentialsSecret set"; fail=1
 else
   echo "  OK: no Secret rendered with existingSecretName + existingCredentialsSecret set"
 fi
-if grep -qE '^  (GATEWAY_IDENTITY_SECRET|WEBHOOK_SECRET_ENC_KEYS|WEBHOOK_SECRET_ENC_ACTIVE_KEY):' <<< "$RENDER"; then
-  echo "  FAIL: the chart-managed Secret carries an identity or webhook key"; fail=1
+# Without existingSecretName the chart-managed Secret supplies GATEWAY_IDENTITY_SECRET from
+# secrets.gatewayIdentitySecret (required, like internalApiSecret) and the gateway reads it from
+# there; the webhook key ring is never in it (the services switch webhooks off without it).
+if grep -qxF '  GATEWAY_IDENTITY_SECRET: "helm-render-test-identity-only"' <<< "$RENDER"; then
+  echo "  OK: the chart-managed Secret carries GATEWAY_IDENTITY_SECRET from secrets.gatewayIdentitySecret"
 else
-  echo "  OK: the chart-managed Secret carries no identity or webhook key"
+  echo "  FAIL: the chart-managed Secret does not carry GATEWAY_IDENTITY_SECRET"; fail=1
+fi
+if grep -A5 'name: GATEWAY_IDENTITY_SECRET$' <<< "$(component_deploy "$RENDER" gateway)" | grep -q 'name: vexa-vexa-secrets'; then
+  echo "  OK: gateway reads GATEWAY_IDENTITY_SECRET from the chart-managed Secret"
+else
+  echo "  FAIL: gateway does not read GATEWAY_IDENTITY_SECRET from the chart-managed Secret"; fail=1
+fi
+if grep -qE '^  (WEBHOOK_SECRET_ENC_KEYS|WEBHOOK_SECRET_ENC_ACTIVE_KEY):' <<< "$RENDER"; then
+  echo "  FAIL: the chart-managed Secret carries a webhook key-ring key"; fail=1
+else
+  echo "  OK: the chart-managed Secret carries no webhook key-ring key"
+fi
+if NO_IDENTITY="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+    --set secrets.gatewayIdentitySecret= 2>&1)"; then
+  echo "  FAIL: the chart-managed Secret rendered without secrets.gatewayIdentitySecret"; fail=1
+elif grep -q 'secrets.gatewayIdentitySecret is required' <<< "$NO_IDENTITY"; then
+  echo "  OK: the chart-managed Secret refuses to render without secrets.gatewayIdentitySecret"
+else
+  echo "  FAIL: render without secrets.gatewayIdentitySecret failed for another reason"; fail=1
 fi
 
 # Per-service pod annotations (meetingApi/adminApi.podAnnotations) merge over
 # global.podAnnotations; the per-service key wins, the global-only key stays, other services keep
 # the global map alone. Empty by default.
-if grep -A1 '^      annotations:' <<< "$(component_deploy "$RENDER" meeting-api)" | grep -qx '        {}'; then
-  echo "  OK: meeting-api pod annotations empty by default"
-else
-  echo "  FAIL: meeting-api pod annotations not empty by default"; fail=1
-fi
+for comp in meeting-api admin-api; do
+  if grep -A1 '^      annotations:' <<< "$(component_deploy "$RENDER" "$comp")" | grep -qx '        {}'; then
+    echo "  OK: $comp pod annotations empty by default"
+  else
+    echo "  FAIL: $comp pod annotations not empty by default"; fail=1
+  fi
+done
 RENDER_ANN="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
   --set-string 'global.podAnnotations.prometheus\.io/scrape=false' \
   --set-string 'global.podAnnotations.team=platform' \

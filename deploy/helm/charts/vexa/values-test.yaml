@@ -16,6 +16,8 @@ secrets:
   # `vexa-internal-secret` is on every service's forbidden-values list now (F95) and a boot
   # holding it refuses to start.
   internalApiSecret: "helm-render-test-only"
+  # Same terms: a render fixture, never a running value.
+  gatewayIdentitySecret: "helm-render-test-identity-only"
   transcriptionServiceToken: ""
   dispatchSigningKey: "dev-dispatch-signing-key"
 

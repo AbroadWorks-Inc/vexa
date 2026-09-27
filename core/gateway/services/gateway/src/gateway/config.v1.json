@@ -38,7 +38,7 @@
     "secret",
     "<REPLACE_ME>"
    ],
-   "targets": ["helm"]
+   "targets": ["compose", "helm", "lite"]
   },
   {
    "key": "ADMIN_API_URL",

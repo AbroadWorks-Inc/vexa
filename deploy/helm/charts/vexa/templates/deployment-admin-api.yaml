@@ -65,7 +65,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
-            # From the Secret secrets.existingSecretName names; the chart-managed Secret never carries it.
+            # The identity secret is in either Secret; the webhook key ring only in an existing one.
             - name: GATEWAY_IDENTITY_SECRET
               valueFrom:
                 secretKeyRef:

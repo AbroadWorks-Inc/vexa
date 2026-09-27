@@ -9,7 +9,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 env_file="${1:-$here/.env}"
 [ -f "$env_file" ] || cp "$here/.env.example" "$env_file"
 mint() { openssl rand -hex 32; }
-for key in INTERNAL_API_SECRET VEXA_FLOWS_API_KEY VEXA_FLOWS_TIMELINE_KEY; do
+for key in INTERNAL_API_SECRET GATEWAY_IDENTITY_SECRET VEXA_FLOWS_API_KEY VEXA_FLOWS_TIMELINE_KEY; do
   if grep -qE "^${key}=\s*$" "$env_file"; then
     v="$(mint)"
     # portable in-place edit (GNU and BSD sed)
