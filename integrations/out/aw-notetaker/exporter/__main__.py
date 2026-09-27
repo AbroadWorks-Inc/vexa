@@ -14,6 +14,7 @@ import uvicorn
 from exporter.app import create_app
 from exporter.audio import webm_to_wav
 from exporter.config import Settings
+from exporter.export_result import ExportReporter
 from exporter.job import Deps
 from exporter.notetaker import Notetaker
 from exporter.queue import PendingQueue
@@ -30,8 +31,13 @@ def main() -> None:
     deps = Deps(
         settings=settings,
         storage=storage,
-        meeting_api=MeetingApi(settings.meeting_api_url, http_client),
+        meeting_api=MeetingApi(
+            settings.gateway_url, settings.exporter_api_key, http_client
+        ),
         notetaker=Notetaker(settings.notetaker_url, http_client),
+        export_result=ExportReporter(
+            settings.gateway_url, settings.exporter_api_key, http_client
+        ),
         transcode=webm_to_wav,
         now=lambda: datetime.now(timezone.utc),
     )

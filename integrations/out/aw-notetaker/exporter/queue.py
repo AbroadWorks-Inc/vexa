@@ -7,6 +7,17 @@ float, "last_error": str | None}`; a restart re-lists that prefix, so an
 in-flight job always resumes. Failed ones (>= max_attempts) move to
 `aw-exporter/failed/<id>.json`.
 
+Retries: a job that raises is recorded as a failure and becomes visible to
+the sweep again only after its backoff (`next_attempt_at`), up to
+`EXPORT_MAX_ATTEMPTS`. The export result report (`export_result.py`) is a
+step of the job, so an unaccepted report is retried the same way: the re-run
+finds the folder's `_export.json` already `handed_off` and only reports
+again. When the attempts run out, the item is quarantined: an unaccepted
+report leaves the recorded outcome as it is; any other failure writes the
+`failed` marker and reports `failed` once. A webhook without a meeting uuid
+(`MissingMeetingUuid`) is quarantined on its first attempt and writes nothing
+to the export bucket.
+
 The worker must never die: a bad envelope, a broken S3 call for one id, or
 an unexpected exception anywhere in a single sweep is logged and contained
 to that id/sweep so every other pending meeting keeps draining.
@@ -20,7 +31,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from exporter.job import Deps, ExportResult, export_meeting
+from exporter.export_result import ExportReportError
+from exporter.job import Deps, ExportResult, MissingMeetingUuid, export_meeting
 from exporter.naming import folder_name
 from exporter.retention import METADATA
 from exporter.storage import Storage
@@ -130,6 +142,7 @@ def _quarantine_marker(
         "state": "failed",
         "error": error,
         "attempts": attempts,
+        "meeting_id": m.get("uuid"),
         "vexa_meeting_id": vexa_meeting_id,
     }
 
@@ -154,6 +167,15 @@ async def sweep_once(
             try:
                 async with semaphore:
                     await asyncio.to_thread(job, envelope, deps)
+            except MissingMeetingUuid as exc:
+                attempts = queue.record_failure(meeting_id, str(exc), now=now)
+                logger.error(
+                    "export job failed: webhook has no meeting uuid meeting_id=%s "
+                    "attempts=%s; moved to failed/, nothing exported",
+                    meeting_id,
+                    attempts,
+                )
+                queue.fail(meeting_id)
             except Exception as exc:  # noqa: BLE001 - contained per id, logged
                 attempts = queue.record_failure(meeting_id, str(exc), now=now)
                 logger.warning(
@@ -163,26 +185,17 @@ async def sweep_once(
                     type(exc).__name__,
                 )
                 if attempts >= settings.max_attempts:
-                    marker = _quarantine_marker(envelope, attempts, str(exc))
-                    if marker is None:
+                    if isinstance(exc, ExportReportError):
                         logger.error(
-                            "quarantine: meeting_id=%s attempts=%s - envelope too "
-                            "malformed to derive an export folder, skipping marker",
+                            "quarantine: meeting_id=%s attempts=%s export result not "
+                            "accepted; the outcome in _export.json stands, moved to "
+                            "failed/",
                             meeting_id,
                             attempts,
                         )
                     else:
-                        folder, body = marker
-                        deps.storage.put_json(
-                            settings.export_bucket,
-                            settings.export_prefix + folder + "/_export.json",
-                            body,
-                            retention=METADATA,
-                        )
-                        logger.error(
-                            "quarantine: meeting_id=%s attempts=%s moved to failed/",
-                            meeting_id,
-                            attempts,
+                        await _quarantine(
+                            envelope, attempts, str(exc), meeting_id, deps
                         )
                     queue.fail(meeting_id)
             else:
@@ -196,6 +209,51 @@ async def sweep_once(
         *(process_one(meeting_id) for meeting_id in queue.pending_ids()),
         return_exceptions=True,
     )
+
+
+async def _quarantine(
+    envelope: dict[str, Any], attempts: int, error: str, meeting_id: str, deps: Deps
+) -> None:
+    """Write the `failed` marker and report `failed` once: the queue's retry
+    budget for this meeting is spent, so an unaccepted report is logged and
+    left for an operator's re-enqueue, which runs the whole job again."""
+    settings = deps.settings
+    marker = _quarantine_marker(envelope, attempts, error)
+    if marker is None:
+        logger.error(
+            "quarantine: meeting_id=%s attempts=%s - envelope too "
+            "malformed to derive an export folder, skipping marker",
+            meeting_id,
+            attempts,
+        )
+        return
+    folder, body = marker
+    base = settings.export_prefix + folder + "/"
+    deps.storage.put_json(
+        settings.export_bucket, base + "_export.json", body, retention=METADATA
+    )
+    logger.error(
+        "quarantine: meeting_id=%s attempts=%s moved to failed/",
+        meeting_id,
+        attempts,
+    )
+    meeting_uuid = body["meeting_id"]
+    if not meeting_uuid:
+        return
+    try:
+        await asyncio.to_thread(
+            deps.export_result.report,
+            str(meeting_uuid),
+            "failed",
+            f"s3://{settings.export_bucket}/{base}",
+            error,
+        )
+    except ExportReportError as exc:
+        logger.error(
+            "quarantine: meeting_id=%s export result not accepted (%s)",
+            meeting_id,
+            exc,
+        )
 
 
 async def run_worker(queue: PendingQueue, deps: Deps, stop: asyncio.Event) -> None:

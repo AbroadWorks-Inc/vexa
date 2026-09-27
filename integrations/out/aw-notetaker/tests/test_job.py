@@ -21,9 +21,11 @@ from exporter.job import (
     ActivityNotReady,
     Deps,
     ExportResult,
+    MissingMeetingUuid,
     export_meeting,
     recording_origin_ms,
 )
+from exporter.export_result import ExportReportError
 from exporter.queue import PendingQueue, sweep_once
 from exporter.storage import Storage
 from tests.builders import (
@@ -39,6 +41,9 @@ EXPORT_BUCKET = "aw-chatworks-transcribe"
 FOLDER = "google_meet_abc-defg-hij_20260618T100000000Z"
 BASE = f"recordings/{FOLDER}/"
 
+S3_PATH = f"s3://{EXPORT_BUCKET}/{BASE}"
+MEETING_UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
+
 RECORDING_CREATED_AT = "2026-06-18T10:00:15.000Z"
 TIMESLICE_MS = 15000
 
@@ -50,6 +55,7 @@ def _origin_ms() -> int:
 def _envelope(**meeting_overrides: Any) -> dict[str, Any]:
     meeting: dict[str, Any] = {
         "id": 11367,
+        "uuid": MEETING_UUID,
         "user_id": 7,
         "platform": "google_meet",
         "native_meeting_id": "abc-defg-hij",
@@ -79,22 +85,36 @@ class FakeMeetingApi:
         self.recordings = recordings if recordings is not None else []
         self._master = master
         self._transcript = transcript
-        self.list_recordings_calls: list[tuple[int, int]] = []
-        self.master_calls: list[tuple[int, int]] = []
-        self.transcript_calls: list[tuple[int, int]] = []
+        self.list_recordings_calls: list[int] = []
+        self.master_calls: list[int] = []
+        self.transcript_calls: list[int] = []
 
-    def list_recordings(self, user_id: int, meeting_id: int) -> list[dict[str, Any]]:
-        self.list_recordings_calls.append((user_id, meeting_id))
+    def list_recordings(self, meeting_id: int) -> list[dict[str, Any]]:
+        self.list_recordings_calls.append(meeting_id)
         return self.recordings
 
-    def master(self, user_id: int, recording_id: int) -> dict[str, Any]:
-        self.master_calls.append((user_id, recording_id))
+    def master(self, recording_id: int) -> dict[str, Any]:
+        self.master_calls.append(recording_id)
         assert self._master is not None
         return self._master
 
-    def transcript(self, user_id: int, meeting_id: int) -> dict[str, Any] | None:
-        self.transcript_calls.append((user_id, meeting_id))
+    def transcript(self, meeting_id: int) -> dict[str, Any] | None:
+        self.transcript_calls.append(meeting_id)
         return self._transcript
+
+
+class FakeExportResult:
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.calls: list[tuple[str, str, str, str | None]] = []
+
+    def report(
+        self, meeting_uuid: str, state: str, s3_path: str, error: str | None = None
+    ) -> None:
+        self.calls.append((meeting_uuid, state, s3_path, error))
+        if self.failures > 0:
+            self.failures -= 1
+            raise ExportReportError("gateway 503 /v2/meetings/x/export")
 
 
 class FakeNotetaker:
@@ -141,7 +161,8 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[Storage]:
 
 def _settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
-        "meeting_api_url": "http://meeting-api",
+        "gateway_url": "http://gateway",
+        "exporter_api_key": "test-exporter-key",
         "webhook_secret": "s",
         "vexa_bucket": VEXA_BUCKET,
         "export_bucket": EXPORT_BUCKET,
@@ -160,12 +181,14 @@ def _deps(
     settings: Settings | None = None,
     now: Callable[[], datetime] | None = None,
     transcode: Callable[[Path, Path], None] = _fake_transcode,
+    export_result: Any = None,
 ) -> Deps:
     return Deps(
         settings=settings or _settings(),
         storage=storage,
         meeting_api=meeting_api,
         notetaker=notetaker,
+        export_result=export_result or FakeExportResult(),
         transcode=transcode,
         now=now or (lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc)),
     )
@@ -228,7 +251,7 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
         BASE + "recordings.json",
         BASE + "_export.json",
     }
-    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"webm-bytes"
     wav_bytes = storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav")
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
@@ -246,6 +269,124 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
     assert meeting_json["id"] == 11367
     recordings_json = storage.get_json(EXPORT_BUCKET, BASE + "recordings.json")
     assert recordings_json == {"recordings": [_audio_recording(855958819514)]}
+
+
+def test_the_meeting_uuid_is_the_id_in_every_exported_file_and_the_hand_off(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 50, "uid-50")
+    _put_activity(storage, "uid-50", two_speaker_gmeet_lines(_origin_ms()))
+    notetaker = FakeNotetaker()
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage, _api_for(50, storage_path), notetaker, export_result=export_result
+    )
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    for name in ("speaker_timeline.json", "participants.json", "_export.json"):
+        written_file = storage.get_json(EXPORT_BUCKET, BASE + name)
+        assert isinstance(written_file, dict)
+        assert written_file["meeting_id"] == MEETING_UUID, name
+        if name == "_export.json":
+            assert written_file["vexa_meeting_id"] == 11367
+    assert export_result.calls == [(MEETING_UUID, "handed_off", S3_PATH, None)]
+    written = b"".join(
+        storage.get_bytes(EXPORT_BUCKET, key)
+        for key in storage.list_keys(EXPORT_BUCKET, BASE)
+        if key.endswith(".json")
+    )
+    assert b"vexa-" not in written
+
+
+def test_a_webhook_without_uuid_fails_loudly_and_writes_nothing(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 51, "uid-51")
+    notetaker = FakeNotetaker()
+    meeting_api = _api_for(51, storage_path)
+    export_result = FakeExportResult()
+    deps = _deps(storage, meeting_api, notetaker, export_result=export_result)
+    envelope = _envelope()
+    del envelope["data"]["meeting"]["uuid"]
+
+    with pytest.raises(MissingMeetingUuid, match="11367"):
+        export_meeting(envelope, deps)
+
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
+    assert meeting_api.list_recordings_calls == []
+    assert notetaker.calls == []
+    assert export_result.calls == []
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_a_blank_uuid_is_a_missing_uuid(storage: Storage, blank: Any) -> None:
+    deps = _deps(storage, FakeMeetingApi(), FakeNotetaker())
+
+    with pytest.raises(MissingMeetingUuid):
+        export_meeting(_envelope(uuid=blank), deps)
+
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
+
+
+def test_an_unaccepted_report_fails_the_job_after_the_hand_off_is_recorded(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 52, "uid-52")
+    notetaker = FakeNotetaker()
+    deps = _deps(
+        storage,
+        _api_for(52, storage_path),
+        notetaker,
+        export_result=FakeExportResult(failures=1),
+    )
+
+    with pytest.raises(ExportReportError):
+        export_meeting(_envelope(), deps)
+
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert isinstance(marker, dict) and marker["state"] == "handed_off"
+
+
+def test_a_rerun_after_the_hand_off_reports_again_without_re_exporting(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 53, "uid-53")
+    deps = _deps(storage, _api_for(53, storage_path), FakeNotetaker())
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    meeting_api = FakeMeetingApi()
+    notetaker = FakeNotetaker()
+    export_result = FakeExportResult()
+    rerun = _deps(storage, meeting_api, notetaker, export_result=export_result)
+
+    assert export_meeting(_envelope(), rerun).state == "already_done"
+    assert export_result.calls == [(MEETING_UUID, "handed_off", S3_PATH, None)]
+    assert meeting_api.list_recordings_calls == []
+    assert notetaker.calls == []
+
+
+def test_no_audio_is_reported_as_a_failed_export(storage: Storage) -> None:
+    video_only = {
+        "id": 1,
+        "created_at": RECORDING_CREATED_AT,
+        "media_files": [{"type": "video", "format": "mp4"}],
+    }
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage,
+        FakeMeetingApi(recordings=[video_only]),
+        FakeNotetaker(),
+        export_result=export_result,
+    )
+
+    assert export_meeting(_envelope(), deps).state == "no_audio"
+
+    assert export_result.calls == [
+        (MEETING_UUID, "failed", S3_PATH, "no audio recording")
+    ]
 
 
 def test_rerun_after_success_is_already_done_and_does_not_reprocess(
@@ -337,7 +478,7 @@ def test_transcribe_enabled_writes_live_transcript(storage: Storage) -> None:
     )
 
     assert result.state == "handed_off"
-    assert meeting_api.transcript_calls == [(7, 11367)]
+    assert meeting_api.transcript_calls == [11367]
     assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") == {
         "segments": ["hi"]
     }
@@ -373,7 +514,7 @@ def test_missing_speaker_activity_still_hands_off_with_missing_marker(
     result = export_meeting(_envelope(), deps)
 
     assert result.state == "handed_off"
-    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "missing"
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
@@ -596,7 +737,7 @@ def test_absent_activity_after_deadline_hands_off_with_missing_marker(
         result = export_meeting(_envelope(), deps)
 
     assert result.state == "handed_off"
-    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "missing"
     assert any(
@@ -682,7 +823,7 @@ def test_activity_not_ready_then_retry_with_activity_present_hands_off_once(
     asyncio.run(sweep_once(queue, deps, now=lambda: 5000.0))
 
     assert queue.pending_ids() == []
-    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["state"] == "handed_off" and marker["speaker_activity"] == "ok"
 
@@ -696,7 +837,7 @@ def test_header_less_activity_hands_off_with_invalid_marker(storage: Storage) ->
     result = export_meeting(_envelope(), deps)
 
     assert result.state == "handed_off"
-    assert notetaker.calls == [("vexa-11367", BASE, "google_meet")]
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "invalid"
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
@@ -814,7 +955,7 @@ def test_multiple_audio_recordings_are_counted_and_warned(
     with caplog.at_level(logging.WARNING, logger="exporter"):
         export_meeting(_envelope(), deps)
 
-    assert meeting_api.master_calls == [(7, 31)]
+    assert meeting_api.master_calls == [31]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["audio_recordings"] == 2
     assert any("audio_recordings=2" in r.getMessage() for r in caplog.records)

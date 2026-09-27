@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import exporter.queue as queue_module  # noqa: E402
 from exporter.app import create_app  # noqa: E402
 from exporter.config import Settings  # noqa: E402
+from exporter.export_result import ExportReporter  # noqa: E402
 from exporter.job import Deps, ExportResult  # noqa: E402
 from exporter.naming import folder_name  # noqa: E402
 from exporter.notetaker import Notetaker  # noqa: E402
@@ -44,6 +45,7 @@ VEXA_BUCKET = "aw-bots"
 EXPORT_BUCKET = "aw-chatworks-transcribe"
 MEETING = {
     "id": 11367,
+    "uuid": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
     "user_id": 7,
     "platform": "google_meet",
     "native_meeting_id": "abc-defg-hij",
@@ -111,7 +113,8 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[Storage]:
 
 def _settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = dict(
-        meeting_api_url="http://meeting-api",
+        gateway_url="http://gateway",
+        exporter_api_key="test-exporter-key",
         webhook_secret=WEBHOOK_SECRET,
         vexa_bucket=VEXA_BUCKET,
         export_bucket=EXPORT_BUCKET,
@@ -134,8 +137,11 @@ def _deps(storage: Storage, settings: Settings) -> Deps:
     return Deps(
         settings=settings,
         storage=storage,
-        meeting_api=MeetingApi(settings.meeting_api_url, http),
+        meeting_api=MeetingApi(settings.gateway_url, settings.exporter_api_key, http),
         notetaker=Notetaker(settings.notetaker_url, http),
+        export_result=ExportReporter(
+            settings.gateway_url, settings.exporter_api_key, http
+        ),
         transcode=_fake_transcode,
         now=lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc),
     )
@@ -466,6 +472,7 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
     assert marker["state"] == "failed"
     assert marker["error"] == "boom"
     assert marker["attempts"] == 2
+    assert marker["meeting_id"] == MEETING["uuid"]
     assert marker["vexa_meeting_id"] == 11367
 
     # retention-class tagging (spec §3/§7): the quarantine marker is exporter-bucket
@@ -478,6 +485,32 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
         Bucket=VEXA_BUCKET, Key="aw-exporter/failed/11367.json"
     )["TagSet"]
     assert failed_tags == []
+
+
+def test_a_webhook_without_uuid_goes_straight_to_failed_and_writes_no_export(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Design §1.9: a webhook without `uuid` fails the job loudly. Retrying
+    can't give it one, so it is quarantined on its first attempt, and nothing
+    is written to the export bucket (no `_export.json`, no report)."""
+    settings = _settings(max_attempts=5)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope_missing("uuid"))
+    deps = _deps(storage, settings)
+
+    with caplog.at_level(logging.ERROR, logger="exporter"):
+        asyncio.run(sweep_once(queue, deps))  # default job=export_meeting
+
+    assert queue.pending_ids() == []
+    failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
+    assert failed is not None
+    assert failed["attempts"] == 1
+    assert "uuid" in failed["last_error"]
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
+    assert any(
+        "no meeting uuid" in r.getMessage() and "meeting_id=11367" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_run_worker_exits_when_stop_is_set(storage: Storage) -> None:

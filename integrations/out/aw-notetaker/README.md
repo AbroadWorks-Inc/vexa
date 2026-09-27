@@ -2,18 +2,22 @@
 
 On Vexa's `meeting.completed` webhook, builds the per-meeting AbroadWorks notetaker folder in
 `aw-chatworks-transcribe` (audio, speaker-activity-derived speaker attribution, meeting metadata)
-and hands it off to `notetaker-worker` via `POST /process`.
+and hands it off to `notetaker-worker` via `POST /process`. The meeting's UUID is its id in every
+file and in the hand-off. It reads meeting-api and reports the export result
+(`POST /v2/meetings/{uuid}/export`) through the gateway with its own key (scopes `tx` + `export`),
+never with `X-User-Id` or the internal secret (design
+[`docs/2026-09-25-meeting-intake-and-webhooks-design.md`](docs/2026-09-25-meeting-intake-and-webhooks-design.md) §1.9).
 
 Spec: [`docs/2026-09-23-aw-rearchitecture-design.md`](docs/2026-09-23-aw-rearchitecture-design.md)
 (§4), [`docs/2026-09-23-speaker-activity-design.md`](docs/2026-09-23-speaker-activity-design.md).
 Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.md).
 
 ## Config (names only — see spec §4.4)
-`MEETING_API_URL`, `VEXA_WEBHOOK_SECRET`, `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`,
-`NOTETAKER_URL`, `EXPORT_DEBUG`, `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`,
-`EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`, `SPEECH_HANGOVER_MS`,
-`MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`, `ACTIVITY_WAIT_SECONDS`,
-`AWS_REGION`. S3 access is via IRSA (no static keys).
+`GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `VEXA_WEBHOOK_SECRET`,
+`VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
+`EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
+`SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`,
+`ACTIVITY_WAIT_SECONDS`, `AWS_REGION`. S3 access is via IRSA (no static keys).
 
 ## Retention tagging (see spec §3/§7)
 `EXPORT_BUCKET` expires objects by the `retention-class` S3 object tag

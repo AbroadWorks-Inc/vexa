@@ -10,6 +10,7 @@ One module per job; the flow is `app` → `queue` → `job`.
 | `activity.py` | Reads the bot's `speaker-activity.jsonl` (who-spoke-when, no audio) into speaker start/end events — no fallback to the debug capture tape |
 | `attribution.py` | Turns those events into `speaker_timeline.json` / `participants.json` (rules ported from the old cloud bot) |
 | `schemas.py` | The JSON shapes `notetaker-worker` reads |
-| `storage.py`, `vexa_client.py`, `notetaker.py`, `audio.py` | S3, meeting-api, notetaker-worker and ffmpeg adapters |
+| `export_result.py` | Reports the export result through the gateway (`POST /v2/meetings/{uuid}/export`); the queue retries it |
+| `storage.py`, `vexa_client.py`, `notetaker.py`, `audio.py` | S3, meeting-api (through the gateway), notetaker-worker and ffmpeg adapters |
 | `config.py`, `naming.py`, `signature.py` | Env settings, export folder name, webhook signature check |
 | `__main__.py` | Entry point: `python -m exporter` |

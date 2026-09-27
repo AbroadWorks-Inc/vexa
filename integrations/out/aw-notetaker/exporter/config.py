@@ -12,7 +12,8 @@ def _bool(raw: str | None) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    meeting_api_url: str
+    gateway_url: str
+    exporter_api_key: str
     webhook_secret: str
     vexa_bucket: str
     export_bucket: str
@@ -43,7 +44,8 @@ class Settings:
 
         prefix = env.get("EXPORT_PREFIX", "recordings/").strip() or "recordings/"
         return cls(
-            meeting_api_url=req("MEETING_API_URL").rstrip("/"),
+            gateway_url=req("GATEWAY_URL").rstrip("/"),
+            exporter_api_key=req("EXPORTER_API_KEY"),
             webhook_secret=req("VEXA_WEBHOOK_SECRET"),
             vexa_bucket=req("VEXA_BUCKET"),
             export_bucket=req("EXPORT_BUCKET"),

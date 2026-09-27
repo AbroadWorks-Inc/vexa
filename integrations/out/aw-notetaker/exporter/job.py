@@ -1,5 +1,14 @@
-"""Per-meeting export job (spec §4.2-4.3); idempotent, keyed on the Vexa
-meeting id.
+"""Per-meeting export job (spec §4.2-4.3, design §1.9); idempotent, keyed on
+the export folder.
+
+The meeting's UUID (`data.meeting.uuid`) is its id in every file written and
+in the `/process` hand-off; the integer Vexa id is kept in `_export.json` and
+used only to read the meeting's recordings and transcript. A webhook without
+a UUID raises `MissingMeetingUuid` before anything is read or written.
+
+The outcome is reported through the gateway (`export_result.py`) after it is
+recorded in `_export.json`: `handed_off` after `/process`, `failed` when the
+meeting has no audio. A re-run of a handed-off folder only reports again.
 
 `export_meeting` raises on retryable failure — the caller (the durable
 queue) counts attempts and re-runs; `aw-bots` is never modified, so a re-run
@@ -22,6 +31,7 @@ from exporter.activity import ActivityEvent, parse_activity, speech_events
 from exporter.activity import names as activity_names
 from exporter.attribution import build_participants, build_speaker_timeline
 from exporter.config import Settings
+from exporter.export_result import ExportResultPort
 from exporter.naming import folder_name, parse_utc
 from exporter.notetaker import Notetaker
 from exporter.retention import AUDIO, METADATA, RECORDING_MP4
@@ -38,6 +48,10 @@ State = Literal["handed_off", "no_audio", "already_done"]
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 
 
+class MissingMeetingUuid(Exception):
+    """The webhook's meeting has no `uuid`; retrying can't give it one."""
+
+
 class ActivityNotReady(Exception):
     """`speaker-activity.jsonl` is absent but the bot may still be uploading
     it (it does so in teardown, after `meeting.completed`, before the debug
@@ -50,6 +64,7 @@ class Deps:
     storage: Storage
     meeting_api: MeetingApi
     notetaker: Notetaker
+    export_result: ExportResultPort
     transcode: Callable[[Path, Path], None]
     now: Callable[[], datetime]
 
@@ -88,27 +103,39 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     storage = deps.storage
     started = deps.now()
     m = envelope["data"]["meeting"]
+    vexa_meeting_id = m["id"]
+    meeting_uuid = str(m.get("uuid") or "").strip()
+    if not meeting_uuid:
+        raise MissingMeetingUuid(
+            f"webhook for vexa_meeting_id={vexa_meeting_id} has no meeting uuid"
+        )
     folder = folder_name(m["platform"], m["native_meeting_id"], m["start_time"])
     base = settings.export_prefix + folder + "/"
+    s3_path = f"s3://{settings.export_bucket}/{base}"
 
     existing = storage.get_json(settings.export_bucket, base + "_export.json")
     if existing and existing.get("state") == "handed_off":
+        deps.export_result.report(meeting_uuid, "handed_off", s3_path)
         return ExportResult("already_done", folder)
 
     user_id = m["user_id"]
-    vexa_meeting_id = m["id"]
-    meeting_id = f"vexa-{vexa_meeting_id}"
     platform = m["platform"]
 
-    recs = deps.meeting_api.list_recordings(user_id, vexa_meeting_id)
+    recs = deps.meeting_api.list_recordings(vexa_meeting_id)
     audio_recs = _audio_recordings(recs)
     if not audio_recs:
         storage.put_json(
             settings.export_bucket,
             base + "_export.json",
-            {"state": "no_audio", "audio_recordings": 0},
+            {
+                "state": "no_audio",
+                "meeting_id": meeting_uuid,
+                "vexa_meeting_id": vexa_meeting_id,
+                "audio_recordings": 0,
+            },
             retention=METADATA,
         )
+        deps.export_result.report(meeting_uuid, "failed", s3_path, "no audio recording")
         return ExportResult("no_audio", folder)
     if len(audio_recs) > 1:
         logger.warning(
@@ -119,7 +146,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         )
     rec = audio_recs[0]
 
-    master = deps.meeting_api.master(user_id, rec["id"])
+    master = deps.meeting_api.master(rec["id"])
     storage_path = str(master["storage_path"])
     session_uid = storage_path.split("/")[3]
     signal_prefix = f"signal/{user_id}/{vexa_meeting_id}/{session_uid}/"
@@ -215,7 +242,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     timeline = build_speaker_timeline(
         events,
         platform=platform,
-        meeting_id=meeting_id,
+        meeting_id=meeting_uuid,
         room_name=room_name,
         recording_started_at=recording_started_at,
         recording_ended_at=recording_ended_at,
@@ -224,7 +251,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     participants = build_participants(
         speaker_names,
         platform=platform,
-        meeting_id=meeting_id,
+        meeting_id=meeting_uuid,
         joined_at=recording_started_at,
         host_email=host_email,
     )
@@ -252,7 +279,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     )
 
     if (m.get("data") or {}).get("transcribe_enabled"):
-        transcript = deps.meeting_api.transcript(user_id, vexa_meeting_id)
+        transcript = deps.meeting_api.transcript(vexa_meeting_id)
         if transcript is not None:
             storage.put_json(
                 settings.export_bucket,
@@ -272,7 +299,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
                 retention=AUDIO,
             )
 
-    deps.notetaker.process(meeting_id, base, platform)
+    deps.notetaker.process(meeting_uuid, base, platform)
 
     finished = deps.now()
     storage.put_json(
@@ -280,6 +307,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         base + "_export.json",
         {
             "state": "handed_off",
+            "meeting_id": meeting_uuid,
             "vexa_meeting_id": vexa_meeting_id,
             "exported_at": finished.isoformat(),
             "elapsed_s": (finished - started).total_seconds(),
@@ -290,4 +318,5 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         },
         retention=METADATA,
     )
+    deps.export_result.report(meeting_uuid, "handed_off", s3_path)
     return ExportResult("handed_off", folder)

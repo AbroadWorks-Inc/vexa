@@ -59,6 +59,8 @@ MINIO_SECRET_KEY = "minio-it-secret"  # test-only literal
 
 USER_ID = 1
 VEXA_MEETING_ID = 99
+MEETING_UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
+EXPORTER_API_KEY = "it-exporter-key"  # test-only literal, not a real credential
 RECORDING_ID = 2
 SESSION_UID = "sess-1"
 NATIVE_MEETING_ID = "it-synthetic-meet-abcd"
@@ -172,6 +174,7 @@ def _envelope() -> dict[str, Any]:
         "data": {
             "meeting": {
                 "id": VEXA_MEETING_ID,
+                "uuid": MEETING_UUID,
                 "user_id": USER_ID,
                 "platform": "google_meet",
                 "native_meeting_id": NATIVE_MEETING_ID,
@@ -309,11 +312,11 @@ def meeting_api_server() -> Iterator[dict[str, Any]]:
         "created_at": RECORDING_CREATED_AT,
         "media_files": [{"type": "audio", "format": "webm"}],
     }
-    app = create_meeting_api_app(recording, STORAGE_PATH)
+    app = create_meeting_api_app(recording, STORAGE_PATH, EXPORTER_API_KEY)
     server = _UvicornThread(app, port)
     server.start()
     try:
-        yield {"port": port}
+        yield {"port": port, "reports": app.state.reports}
     finally:
         server.stop()
 
@@ -341,7 +344,8 @@ def exporter(
     name = f"aw-exporter-it-exporter-{suffix}"
     port = _free_port()
     env = {
-        "MEETING_API_URL": f"http://host.docker.internal:{meeting_api_server['port']}",
+        "GATEWAY_URL": f"http://host.docker.internal:{meeting_api_server['port']}",
+        "EXPORTER_API_KEY": EXPORTER_API_KEY,
         "VEXA_WEBHOOK_SECRET": WEBHOOK_SECRET,
         "VEXA_BUCKET": VEXA_BUCKET,
         "EXPORT_BUCKET": EXPORT_BUCKET,
@@ -384,6 +388,7 @@ def test_compose_flow_hands_off_meeting(
     exporter: dict[str, Any],
     seeded_s3: S3Client,
     notetaker_server: dict[str, Any],
+    meeting_api_server: dict[str, Any],
 ) -> None:
     body = json.dumps(_envelope()).encode()
     headers = {**_sign(body, WEBHOOK_SECRET), "Content-Type": "application/json"}
@@ -416,10 +421,10 @@ def test_compose_flow_hands_off_meeting(
 
     assert notetaker_server["calls"] == [
         {
-            "meeting_id": f"vexa-{VEXA_MEETING_ID}",
+            "meeting_id": MEETING_UUID,
             "s3_path": BASE,
             "platform": "google_meet",
-            "idempotency_key": f"vexa-{VEXA_MEETING_ID}",
+            "idempotency_key": MEETING_UUID,
         }
     ]
 
@@ -446,6 +451,14 @@ def test_compose_flow_hands_off_meeting(
     ]
 
     _wait_for_pending_deleted(seeded_s3, timeout=10)
+    # The job step ends with the export result; the pending item goes once it is accepted.
+    assert meeting_api_server["reports"] == [
+        {
+            "meeting_id": MEETING_UUID,
+            "state": "handed_off",
+            "s3_path": f"s3://{EXPORT_BUCKET}/{BASE}",
+        }
+    ]
     vexa_keys = _list_keys(seeded_s3, VEXA_BUCKET, "")
     assert {k for k in vexa_keys if not k.startswith("aw-exporter/")} == (
         SEEDED_VEXA_KEYS

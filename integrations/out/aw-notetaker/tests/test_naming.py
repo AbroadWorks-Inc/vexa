@@ -35,7 +35,8 @@ def test_missing_start_time_raises() -> None:
 
 
 BASE = {
-    "MEETING_API_URL": "http://meeting-api:8080/",
+    "GATEWAY_URL": "http://gateway:8000/",
+    "EXPORTER_API_KEY": "test-exporter-key",
     "VEXA_WEBHOOK_SECRET": "test-secret",
     "VEXA_BUCKET": "aw-bots",
     "EXPORT_BUCKET": "aw-chatworks-transcribe",
@@ -45,7 +46,8 @@ BASE = {
 
 def test_settings_defaults() -> None:
     s = Settings.from_env(BASE)
-    assert s.meeting_api_url == "http://meeting-api:8080"
+    assert s.gateway_url == "http://gateway:8000"
+    assert s.exporter_api_key == "test-exporter-key"
     assert s.export_prefix == "recordings/"
     assert s.debug is False and s.concurrency == 4
     assert s.rms_speech_threshold == 0.026
@@ -56,6 +58,17 @@ def test_settings_defaults() -> None:
 def test_settings_activity_env_overrides() -> None:
     s = Settings.from_env({**BASE, "ACTIVITY_WAIT_SECONDS": "30"})
     assert s.activity_wait_seconds == 30.0
+
+
+@pytest.mark.parametrize("name", ["GATEWAY_URL", "EXPORTER_API_KEY"])
+def test_settings_gateway_and_key_are_required(name: str) -> None:
+    with pytest.raises(RuntimeError, match=name):
+        Settings.from_env({k: v for k, v in BASE.items() if k != name})
+
+
+def test_settings_no_longer_read_meeting_api_url() -> None:
+    s = Settings.from_env({**BASE, "MEETING_API_URL": "http://meeting-api:8080"})
+    assert not hasattr(s, "meeting_api_url")
 
 
 def test_settings_missing_required() -> None:

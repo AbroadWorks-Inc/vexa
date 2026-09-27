@@ -1,4 +1,5 @@
-"""meeting-api client, notetaker client, and ffmpeg transcode (spec §4.2)."""
+"""meeting-api client (through the gateway), notetaker client, and ffmpeg
+transcode (spec §4.2, design §1.9)."""
 
 from __future__ import annotations
 
@@ -17,26 +18,54 @@ from exporter.notetaker import Notetaker, NotetakerError
 from exporter.vexa_client import MeetingApi, MeetingApiError
 
 
-def test_meeting_api_sends_user_header_and_parses() -> None:
+KEY = "test-exporter-key"
+
+
+def _api(handler: Any) -> MeetingApi:
+    return MeetingApi(
+        "http://gateway/", KEY, httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+
+def test_meeting_api_reads_through_the_gateway_with_the_exporter_key() -> None:
     seen: list[httpx.Request] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(req)
         return httpx.Response(200, json={"recordings": [{"id": 7}]})
 
-    api = MeetingApi("http://m", httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.list_recordings(user_id=3, meeting_id=9) == [{"id": 7}]
-    assert seen[0].headers["X-User-Id"] == "3"
+    assert _api(handler).list_recordings(meeting_id=9) == [{"id": 7}]
+    assert str(seen[0].url) == "http://gateway/recordings?meeting_id=9"
+    assert seen[0].headers["X-API-Key"] == KEY
     assert seen[0].url.params["meeting_id"] == "9"
 
 
+def test_meeting_api_never_sends_a_user_id_or_the_internal_secret() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        if req.url.path == "/recordings":
+            return httpx.Response(200, json={"recordings": []})
+        return httpx.Response(200, json={"storage_path": "x"})
+
+    api = _api(handler)
+    api.list_recordings(meeting_id=1)
+    api.master(recording_id=2)
+    api.transcript(meeting_id=3)
+    assert len(seen) == 3
+    for req in seen:
+        names = {name.lower() for name in req.headers}
+        assert "x-user-id" not in names
+        assert "x-internal-secret" not in names
+        assert "authorization" not in names
+
+
 def test_meeting_api_error() -> None:
-    api = MeetingApi(
-        "http://m",
-        httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
-    )
-    with pytest.raises(MeetingApiError):
-        api.master(user_id=1, recording_id=2)
+    api = _api(lambda r: httpx.Response(404))
+    with pytest.raises(MeetingApiError) as exc_info:
+        api.master(recording_id=2)
+    assert KEY not in str(exc_info.value)
 
 
 def test_meeting_api_master_parses_storage_path() -> None:
@@ -46,13 +75,12 @@ def test_meeting_api_master_parses_storage_path() -> None:
         seen.append(req)
         return httpx.Response(200, json={"storage_path": "aw-bots/x/master.webm"})
 
-    api = MeetingApi("http://m", httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.master(user_id=4, recording_id=11) == {
+    assert _api(handler).master(recording_id=11) == {
         "storage_path": "aw-bots/x/master.webm"
     }
     assert seen[0].url.path == "/recordings/11/master"
     assert seen[0].url.params["type"] == "audio"
-    assert seen[0].headers["X-User-Id"] == "4"
+    assert seen[0].headers["X-API-Key"] == KEY
 
 
 def test_meeting_api_transcript_parses_on_200() -> None:
@@ -62,18 +90,18 @@ def test_meeting_api_transcript_parses_on_200() -> None:
         seen.append(req)
         return httpx.Response(200, json={"segments": []})
 
-    api = MeetingApi("http://m", httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.transcript(user_id=5, meeting_id=42) == {"segments": []}
+    assert _api(handler).transcript(meeting_id=42) == {"segments": []}
     assert seen[0].url.path == "/transcripts/by-id/42"
-    assert seen[0].headers["X-User-Id"] == "5"
+    assert seen[0].headers["X-API-Key"] == KEY
 
 
 def test_meeting_api_transcript_404_returns_none() -> None:
-    api = MeetingApi(
-        "http://m",
-        httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
-    )
-    assert api.transcript(user_id=1, meeting_id=2) is None
+    assert _api(lambda r: httpx.Response(404)).transcript(meeting_id=2) is None
+
+
+def test_meeting_api_transcript_error_raises() -> None:
+    with pytest.raises(MeetingApiError):
+        _api(lambda r: httpx.Response(403)).transcript(meeting_id=2)
 
 
 def test_notetaker_body_and_retry_on_5xx() -> None:
