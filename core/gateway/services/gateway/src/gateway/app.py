@@ -65,10 +65,13 @@ def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
     )
 
 # --- the scope model -------------------------------------------------------------------------
-# The three key scopes, as ``docs/docs/authentication.mdx`` defines them:
-#   bot     — "send and manage meeting bots, read transcripts"
-#   tx      — "transcription / transcript access"
-#   browser — "browser-tool capabilities"
+# The key scopes, as ``docs/docs/authentication.mdx`` defines them:
+#   bot      — "send and manage meeting bots, read transcripts"
+#   tx       — "transcription / transcript access"
+#   browser  — "browser-tool capabilities"
+#   erase    — "erase a finished meeting's data"
+#   webhooks — "manage webhook subscriptions"
+#   export   — "report an export result"
 #
 # Read as capabilities, that gives one rule per domain:
 #   BOT       anything that can make a bot EXIST, stop existing, or change how it behaves — the
@@ -81,6 +84,9 @@ def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
 #             NEITHER — a browser-only key — is refused.
 #   browser   grants NO gateway route. v0.12 serves no browser-tool surface at this edge, so a
 #             browser-only key can authenticate (GET /auth/me) and do nothing else.
+#   erase     least privilege for one act: DELETE /v2/meetings/{id} (erase a finished meeting's
+#             aw-bots data, §1.13). `webhooks` and `export` are in the vocabulary for the webhook
+#             subscription routes and the exporter's result route; their domains declare them.
 # ── THE TABLE IS ASSEMBLED, NOT WRITTEN HERE (PRD decisions 40.5 + 40.7) ─────────────────────
 #
 # This used to be a 92-line literal holding all 69 rows, seven of them the agent domain's. That
@@ -614,6 +620,45 @@ def create_app(
     @app.delete("/meetings/{meeting_id}", status_code=204)
     async def delete_planned_meeting(meeting_id: int, request: Request):
         return await _forward("DELETE", _meeting(f"/meetings/{meeting_id}"), request)
+
+    # ---- meeting intake (§2.1): entries in, aw-bots meetings out, keyed by the meeting UUID. Each
+    # forwards verbatim to the same meeting-api path; the UUID is re-encoded as one opaque segment.
+    @app.put("/v2/entries")
+    async def put_entry(request: Request):
+        return await _forward("PUT", _meeting("/v2/entries"), request)
+
+    @app.post("/v2/entries/remove")
+    async def remove_entry(request: Request):
+        return await _forward("POST", _meeting("/v2/entries/remove"), request)
+
+    @app.get("/v2/entries")
+    async def list_entries(request: Request):
+        return await _forward("GET", _meeting("/v2/entries"), request)
+
+    @app.get("/v2/meetings")
+    async def list_v2_meetings(request: Request):
+        return await _forward("GET", _meeting("/v2/meetings"), request)
+
+    @app.get("/v2/meetings/{meeting_id}")
+    async def get_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id)
+        if error is not None:
+            return error
+        return await _forward("GET", _meeting(f"/v2/meetings/{segment}"), request)
+
+    @app.post("/v2/meetings/{meeting_id}/stop")
+    async def stop_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id)
+        if error is not None:
+            return error
+        return await _forward("POST", _meeting(f"/v2/meetings/{segment}/stop"), request)
+
+    @app.delete("/v2/meetings/{meeting_id}")
+    async def erase_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id)
+        if error is not None:
+            return error
+        return await _forward("DELETE", _meeting(f"/v2/meetings/{segment}"), request)
 
     # User-owned scheduling intent (schedule/cancel) — the Meetings surface's Schedule/Cancel action
     # PUTs here; forwards to meeting-api's PUT /meetings/{platform}/{native}/intent (owner-scoped).

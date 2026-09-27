@@ -270,6 +270,55 @@
         "bot",
         "tx"
       ]
+    },
+    {
+      "method": "PUT",
+      "path": "/v2/entries",
+      "scopes": [
+        "bot"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v2/entries/remove",
+      "scopes": [
+        "bot"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v2/entries",
+      "scopes": [
+        "bot"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v2/meetings",
+      "scopes": [
+        "tx"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v2/meetings/{meeting_id}",
+      "scopes": [
+        "tx"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v2/meetings/{meeting_id}/stop",
+      "scopes": [
+        "bot"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/v2/meetings/{meeting_id}",
+      "scopes": [
+        "erase"
+      ]
     }
   ]
 }

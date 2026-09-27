@@ -64,6 +64,15 @@ CASES = [
     ("GET", "/meetings/google_meet/abc-defg-hij/participants",
      "/meetings/{platform}/{native_meeting_id}/participants"),
 
+    ("PUT", "/v2/entries", "/v2/entries"),
+    ("POST", "/v2/entries/remove", "/v2/entries/remove"),
+    ("GET", "/v2/entries", "/v2/entries"),
+    ("GET", "/v2/meetings", "/v2/meetings"),
+    ("GET", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/stop",
+     "/v2/meetings/{meeting_id}/stop"),
+    ("DELETE", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", "/v2/meetings/{meeting_id}"),
+
     ("GET", "/transcripts/by-id/42", "/transcripts/by-id/{meeting_id}"),
     ("GET", "/transcripts/google_meet/abc-defg-hij", "/transcripts/{platform}/{native_meeting_id}"),
     ("POST", "/transcripts/google_meet/abc-defg-hij/share",
@@ -119,7 +128,7 @@ CASES = [
     ("OPTIONS", "/mcp/session", "/mcp/{path:path}"),
 ]
 
-SCOPES = ["bot", "tx", "browser"]
+SCOPES = ["bot", "tx", "browser", "erase", "webhooks", "export"]
 
 # CASES IS THE FULL PRODUCT'S DECLARATION LIST AND STAYS WHOLE — it is reviewed once, above, and a
 # list that shrinks with the tree is a list that cannot catch a row going missing. What varies is
@@ -223,10 +232,26 @@ def test_bot_scope_still_runs_the_bot_lifecycle():
 
 def test_a_bot_and_tx_key_reaches_every_route():
     """The shape every real key has (the terminal mints bot+tx+browser; the docs' own mint example
-    is bot+tx) is unaffected end to end — no route in the matrix regresses to 403."""
+    is bot+tx) is unaffected end to end — no route in the matrix regresses to 403. The routes that
+    need a least-privilege scope of their own (``erase``) are the exception, and are refused."""
     client = _client(["bot", "tx"])
-    for method, url, _template in CARRIED_CASES:
-        assert _request(client, method, url).status_code != 403, f"{method} {url} regressed"
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if ROUTE_SCOPES[(method, template)] & {"bot", "tx"}:
+            assert status != 403, f"{method} {url} regressed"
+        else:
+            assert status == 403, f"{method} {url} let a bot+tx key past its own scope"
+
+
+def test_an_erase_key_reaches_only_the_erase_route():
+    """``erase`` (§1.10) is least privilege: it opens DELETE /v2/meetings/{id} and nothing else."""
+    client = _client(["erase"])
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) == ("DELETE", "/v2/meetings/{meeting_id}"):
+            assert status != 403, f"{method} {url} refused an erase key"
+        else:
+            assert status == 403, f"{method} {url} let an erase key in"
 
 
 # --- deny by default -----------------------------------------------------------------------------
@@ -332,7 +357,7 @@ def test_scope_lookup_denies_when_the_matched_route_is_unknowable():
 def test_route_scope_declarations_only_use_real_scopes():
     """A typo'd scope name ('bots', 'transcript') would be unsatisfiable and lock a route out
     silently; the vocabulary is the one admin-api mints against."""
-    vocabulary = {"bot", "tx", "browser"}
+    vocabulary = {"bot", "tx", "browser", "erase", "webhooks", "export"}
     for key, scopes in ROUTE_SCOPES.items():
         assert scopes, f"{key} declares an EMPTY scope set — that denies every key"
         assert set(scopes) <= vocabulary, f"{key} declares unknown scope(s) {set(scopes) - vocabulary}"
