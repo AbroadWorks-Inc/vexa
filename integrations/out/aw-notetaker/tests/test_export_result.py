@@ -355,3 +355,87 @@ def test_a_failed_report_that_is_not_accepted_still_quarantines(
         "export result not accepted" in r.getMessage() and r.levelno == logging.ERROR
         for r in caplog.records
     )
+
+
+class _FlakyMarkerRead:
+    """`Storage` whose reads of `_export.json` fail while `failing` is set: a
+    transient S3 error on the folder's marker."""
+
+    def __init__(self, storage: Storage) -> None:
+        self._storage = storage
+        self.failing = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._storage, name)
+
+    def get_json(self, bucket: str, key: str) -> Any:
+        if self.failing and key.endswith("_export.json"):
+            raise OSError("transient S3 error")
+        return self._storage.get_json(bucket, key)
+
+
+def _handed_off_then_marker_read_fails(
+    storage: Storage, gateway: _Gateway, *, quarantine_read_fails: bool
+) -> tuple[PendingQueue, Deps]:
+    """Attempts 1-4 hand off the folder but the report isn't accepted;
+    attempt 5 fails reading `_export.json`, which sends the item to
+    quarantine."""
+    flaky = _FlakyMarkerRead(storage)
+    deps = _deps(storage, gateway, _Notetaker())
+    deps.storage = flaky  # type: ignore[assignment]
+    queue = PendingQueue(storage, VEXA_BUCKET)
+    queue.enqueue(_envelope())
+    for now in (1000.0, 1e5, 1e6, 1e7):
+        asyncio.run(sweep_once(queue, deps, now=_at(now)))
+    assert _marker(storage)["state"] == "handed_off"
+    assert len(gateway.bodies) == 4
+
+    real_get_json = flaky.get_json
+    reads = {"n": 0}
+
+    def get_json(bucket: str, key: str) -> Any:
+        if key.endswith("_export.json"):
+            reads["n"] += 1
+            if reads["n"] == 1 or quarantine_read_fails:
+                raise OSError("transient S3 error")
+        return real_get_json(bucket, key)
+
+    flaky.get_json = get_json  # type: ignore[method-assign]
+    asyncio.run(sweep_once(queue, deps, now=_at(1e8)))
+    return queue, deps
+
+
+def test_a_handed_off_folder_is_never_quarantined_as_failed(
+    storage: Storage,
+) -> None:
+    gateway = _Gateway(failures=4)
+
+    queue, _ = _handed_off_then_marker_read_fails(
+        storage, gateway, quarantine_read_fails=False
+    )
+
+    assert queue.pending_ids() == []
+    marker = _marker(storage)
+    assert marker["state"] == "handed_off"
+    assert gateway.bodies[-1] == {"state": "handed_off", "s3_path": S3_PATH}
+    assert all(body["state"] == "handed_off" for body in gateway.bodies)
+
+
+def test_an_unreadable_marker_at_quarantine_is_left_alone(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    gateway = _Gateway(failures=4)
+
+    caplog.set_level(logging.INFO, logger="exporter")
+    queue, _ = _handed_off_then_marker_read_fails(
+        storage, gateway, quarantine_read_fails=True
+    )
+
+    assert queue.pending_ids() == []
+    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is not None
+    assert _marker(storage)["state"] == "handed_off"
+    assert len(gateway.bodies) == 4
+    assert any(
+        "could not read _export.json" in r.getMessage() and r.levelno == logging.ERROR
+        for r in caplog.records
+    )

@@ -186,7 +186,6 @@ def test_copy_without_retention_is_untagged(storage: Storage) -> None:
 # ---------------------------------------------------------------------------
 
 _EXPORTER_DIR = Path(__file__).resolve().parent.parent / "exporter"
-_DELETE_CALLS = {"delete", "delete_object", "delete_objects"}
 #: Every delete call the exporter may make, by (module, enclosing function):
 #: the pending-queue marker's removal on success (``done``) and on quarantine
 #: (``fail``), and ``Storage.delete`` itself, the one S3 delete they go through.
@@ -197,54 +196,105 @@ _ALLOWED = {
 }
 
 
-def _delete_calls(path: Path) -> list[tuple[str, str, str]]:
+def _is_delete(name: str) -> bool:
+    return name.startswith("delete")
+
+
+def _delete_calls(path: Path, root: Path | None = None) -> list[tuple[str, str, str]]:
+    """Every use of a `delete…` function in `path`: a call through an
+    attribute (`s.delete(...)`) or a bare name (`delete_object(...)`), a
+    `getattr(obj, "delete…")`, and an attribute taken without calling it
+    (`remove = s.delete`), each by (module, enclosing function, name)."""
+    module = path.relative_to(root).as_posix() if root else path.name
     tree = ast.parse(path.read_text(), filename=str(path))
     found: list[tuple[str, str, str]] = []
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
     def visit(node: ast.AST, scope: list[str]) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 visit(child, [*scope, child.name])
                 continue
-            if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr in _DELETE_CALLS
-            ):
-                found.append((path.name, ".".join(scope), child.func.attr))
-            if (
+            where = (module, ".".join(scope))
+            if isinstance(child, ast.Call):
+                func = child.func
+                if isinstance(func, ast.Attribute) and _is_delete(func.attr):
+                    found.append((*where, func.attr))
+                elif isinstance(func, ast.Name) and _is_delete(func.id):
+                    found.append((*where, func.id))
+                elif (
+                    isinstance(func, ast.Name)
+                    and func.id == "getattr"
+                    and len(child.args) >= 2
+                    and isinstance(child.args[1], ast.Constant)
+                    and isinstance(child.args[1].value, str)
+                    and _is_delete(child.args[1].value)
+                ):
+                    found.append((*where, f"getattr {child.args[1].value}"))
+            elif (
                 isinstance(child, ast.Attribute)
-                and child.attr in _DELETE_CALLS
-                and not any(
-                    isinstance(parent, ast.Call) and parent.func is child
-                    for parent in ast.walk(node)
-                )
+                and _is_delete(child.attr)
+                and id(child) not in called
             ):
-                found.append((path.name, ".".join(scope), child.attr + " (ref)"))
+                found.append((*where, child.attr + " (ref)"))
             visit(child, scope)
 
     visit(tree, [])
     return found
 
 
-def test_the_only_deletes_are_the_two_queue_marker_sites() -> None:
-    calls = [
+def _scan(root: Path) -> list[tuple[str, str, str]]:
+    return [
         call
-        for path in sorted(_EXPORTER_DIR.glob("*.py"))
-        for call in _delete_calls(path)
+        for path in sorted(root.rglob("*.py"))
+        for call in _delete_calls(path, root)
     ]
-    assert sorted(calls) == sorted(_ALLOWED)
 
 
-def test_the_delete_guard_sees_a_new_delete_call(tmp_path: Path) -> None:
+def test_the_only_deletes_are_the_two_queue_marker_sites() -> None:
+    assert sorted(_scan(_EXPORTER_DIR)) == sorted(_ALLOWED)
+
+
+def _stray(tmp_path: Path, source: str) -> list[tuple[str, str, str]]:
+    (tmp_path / "job.py").write_text(source)
+    return _scan(tmp_path)
+
+
+def test_the_delete_guard_sees_an_attribute_call(tmp_path: Path) -> None:
     """Negative control: a delete added anywhere else is named by the guard."""
-    stray = tmp_path / "job.py"
-    stray.write_text(
+    assert _stray(
+        tmp_path,
         "def export_meeting(storage):\n"
-        "    storage.delete('aw-chatworks-transcribe', 'recordings/x/audio.wav')\n"
-        "    remove = storage.delete\n"
-    )
-    assert _delete_calls(stray) == [
-        ("job.py", "export_meeting", "delete"),
-        ("job.py", "export_meeting", "delete (ref)"),
-    ]
+        "    storage.delete('aw-chatworks-transcribe', 'recordings/x/audio.wav')\n",
+    ) == [("job.py", "export_meeting", "delete")]
+
+
+def test_the_delete_guard_sees_an_attribute_reference(tmp_path: Path) -> None:
+    assert _stray(
+        tmp_path, "def export_meeting(storage):\n    remove = storage.delete\n"
+    ) == [("job.py", "export_meeting", "delete (ref)")]
+
+
+def test_the_delete_guard_sees_a_bare_name_call(tmp_path: Path) -> None:
+    assert _stray(
+        tmp_path,
+        "from somewhere import delete_object\n"
+        "def export_meeting():\n"
+        "    delete_object(Bucket='aw-chatworks-transcribe', Key='k')\n",
+    ) == [("job.py", "export_meeting", "delete_object")]
+
+
+def test_the_delete_guard_sees_getattr(tmp_path: Path) -> None:
+    assert _stray(
+        tmp_path,
+        "def export_meeting(client):\n"
+        "    getattr(client, 'delete_objects')(Bucket='b', Delete={})\n",
+    ) == [("job.py", "export_meeting", "getattr delete_objects")]
+
+
+def test_the_delete_guard_scans_subpackages(tmp_path: Path) -> None:
+    sub = tmp_path / "adapters"
+    sub.mkdir()
+    (sub / "__init__.py").write_text("")
+    (sub / "s3.py").write_text("def purge(s):\n    s.delete_object(Bucket='b')\n")
+    assert _scan(tmp_path) == [("adapters/s3.py", "purge", "delete_object")]

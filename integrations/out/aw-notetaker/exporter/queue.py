@@ -13,8 +13,10 @@ the sweep again only after its backoff (`next_attempt_at`), up to
 step of the job, so an unaccepted report is retried the same way: the re-run
 finds the folder's `_export.json` already `handed_off` and only reports
 again. When the attempts run out, the item is quarantined: an unaccepted
-report leaves the recorded outcome as it is; any other failure writes the
-`failed` marker and reports `failed` once. A webhook without a meeting uuid
+report leaves the recorded outcome as it is; any other failure reads the
+folder's `_export.json` first. A folder already `handed_off` keeps its marker
+and reports `handed_off` once; otherwise the `failed` marker is written and
+`failed` reported once. A marker that can't be read is left as it is. A webhook without a meeting uuid
 (`MissingMeetingUuid`) is quarantined on its first attempt and writes nothing
 to the export bucket.
 
@@ -31,7 +33,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from exporter.export_result import ExportReportError
+from exporter.export_result import ExportReportError, ReportState
 from exporter.job import Deps, ExportResult, MissingMeetingUuid, export_meeting
 from exporter.naming import folder_name
 from exporter.retention import METADATA
@@ -214,9 +216,13 @@ async def sweep_once(
 async def _quarantine(
     envelope: dict[str, Any], attempts: int, error: str, meeting_id: str, deps: Deps
 ) -> None:
-    """Write the `failed` marker and report `failed` once: the queue's retry
-    budget for this meeting is spent, so an unaccepted report is logged and
-    left for an operator's re-enqueue, which runs the whole job again."""
+    """Record the quarantined outcome and report it once. A folder whose
+    `_export.json` is already `handed_off` (notetaker-worker has it) keeps
+    that marker and reports `handed_off`; any other gets the `failed` marker
+    and reports `failed`. If the marker can't be read, nothing is written or
+    reported. The queue's retry budget for this meeting is spent, so any of
+    these left undone is logged for an operator's re-enqueue, which runs the
+    whole job again."""
     settings = deps.settings
     marker = _quarantine_marker(envelope, attempts, error)
     if marker is None:
@@ -229,14 +235,39 @@ async def _quarantine(
         return
     folder, body = marker
     base = settings.export_prefix + folder + "/"
-    deps.storage.put_json(
-        settings.export_bucket, base + "_export.json", body, retention=METADATA
-    )
-    logger.error(
-        "quarantine: meeting_id=%s attempts=%s moved to failed/",
-        meeting_id,
-        attempts,
-    )
+    marker_key = base + "_export.json"
+    try:
+        existing = deps.storage.get_json(settings.export_bucket, marker_key)
+    except Exception as exc:  # noqa: BLE001 - logged; the marker is left alone
+        logger.error(
+            "quarantine: meeting_id=%s attempts=%s could not read _export.json "
+            "(error_class=%s); marker left as it is, moved to failed/ for an "
+            "operator re-enqueue",
+            meeting_id,
+            attempts,
+            type(exc).__name__,
+        )
+        return
+    state: ReportState
+    report_error: str | None
+    if isinstance(existing, dict) and existing.get("state") == "handed_off":
+        state, report_error = "handed_off", None
+        logger.error(
+            "quarantine: meeting_id=%s attempts=%s folder already handed off; "
+            "marker kept, moved to failed/",
+            meeting_id,
+            attempts,
+        )
+    else:
+        state, report_error = "failed", error
+        deps.storage.put_json(
+            settings.export_bucket, marker_key, body, retention=METADATA
+        )
+        logger.error(
+            "quarantine: meeting_id=%s attempts=%s moved to failed/",
+            meeting_id,
+            attempts,
+        )
     meeting_uuid = body["meeting_id"]
     if not meeting_uuid:
         return
@@ -244,9 +275,9 @@ async def _quarantine(
         await asyncio.to_thread(
             deps.export_result.report,
             str(meeting_uuid),
-            "failed",
+            state,
             f"s3://{settings.export_bucket}/{base}",
-            error,
+            report_error,
         )
     except ExportReportError as exc:
         logger.error(
