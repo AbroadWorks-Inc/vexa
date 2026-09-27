@@ -1141,9 +1141,13 @@ class SqlAlchemyTranscriptStore:
         ``meeting.data['scheduled_at']``. NEVER touches the bot FSM."""
         from sqlalchemy.orm.attributes import flag_modified
 
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
         from ..intake.resolver import LinkKind, ManagedByEntries
+        from ..intake.status import write_status
 
         async with self._session_factory() as db:
+            await take_link_lock(db, user_id, Room(platform, native_meeting_id))
             meeting = await self._room_meeting(
                 db, user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT, for_update=True
             )
@@ -1155,13 +1159,15 @@ class SqlAlchemyTranscriptStore:
             prev_status = meeting.status
             prev_at = data.get("scheduled_at")
             new_at = scheduled_at if status == "scheduled" else None
-            meeting.status = status
             if status == "scheduled":
                 data["scheduled_at"] = new_at
             else:
                 data.pop("scheduled_at", None)
             meeting.data = data
             flag_modified(meeting, "data")
+            if prev_status != status:
+                await db.flush()
+                await write_status(db, meeting.id, status, expected_from={prev_status})
             await db.commit()
             changed = (prev_status != status) or (prev_at != new_at)
             return {
@@ -1208,10 +1214,15 @@ class SqlAlchemyTranscriptStore:
         ``auto_join_last_attempt``/``auto_join_error`` seed the row with a backoff already earned
         elsewhere — calendar sync passes them when this row replaces a terminal one the auto-join
         sweep already dispatched for, so the replacement is not due the instant it exists. Written
-        in the INSERT, not patched after, so no sweep tick can see the row without them."""
+        in the INSERT, not patched after, so no sweep tick can see the row without them. The row
+        and its first event go through the status writer, under the link's lock (taken before the
+        per-user lock, the §1.4 order ``create_meeting_guarded`` keeps too)."""
         from sqlalchemy import bindparam, select, text
         from sqlalchemy.exc import IntegrityError
 
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting
         from .models import Meeting
 
         data: dict = {"auto_join": bool(auto_join)}
@@ -1241,6 +1252,8 @@ class SqlAlchemyTranscriptStore:
         status = "scheduled" if scheduled_at else "idle"
 
         async with self._session_factory() as db:
+            if native_meeting_id is not None:
+                await take_link_lock(db, user_id, Room(platform, native_meeting_id))
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(:uid)").bindparams(bindparam("uid", user_id))
             )
@@ -1255,12 +1268,12 @@ class SqlAlchemyTranscriptStore:
                 )).scalars().first()
                 if dup is not None:
                     return {"error": "duplicate"}
-            m = Meeting(
-                user_id=user_id, platform=platform, platform_specific_id=native_meeting_id,
-                status=status, data=data,
-            )
-            db.add(m)
             try:
+                m = await insert_meeting(
+                    db, user_id=user_id, platform=platform,
+                    native_meeting_id=native_meeting_id, status=status, data=data,
+                    first_event=STATUS_CHANGE_EVENT,
+                )
                 await db.commit()
             except IntegrityError:
                 await db.rollback()
@@ -1481,14 +1494,35 @@ class SqlAlchemyTranscriptStore:
 
     async def update_planned_meeting(self, user_id, meeting_id, updates) -> "Optional[dict]":
         """ROW-id-addressed PATCH of a planned row (intent status only). ``updates`` carries only
-        the keys the caller sent — presence means apply (None clears where documented)."""
+        the keys the caller sent — presence means apply (None clears where documented).
+
+        Locks in the §1.4 order: the row's link, and the new link when the edit moves it (sorted),
+        then the per-user lock, then the row. A row whose link changed before the row lock answers
+        ``conflict``. A status change (``scheduled_at`` set or cleared) goes through the status
+        writer."""
         from sqlalchemy import bindparam, select, text
         from sqlalchemy.exc import IntegrityError
         from sqlalchemy.orm.attributes import flag_modified
 
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..intake.status import write_status
         from .models import Meeting
 
         async with self._session_factory() as db:
+            link = (await db.execute(
+                select(Meeting.platform, Meeting.platform_specific_id)
+                .where(Meeting.id == meeting_id, Meeting.user_id == user_id)
+            )).first()
+            if link is None:
+                return None
+            rooms = set()
+            if link[1] is not None:
+                rooms.add(Room(link[0], link[1]))
+            if updates.get("native_meeting_id") is not None:
+                rooms.add(Room(updates.get("platform") or link[0], updates["native_meeting_id"]))
+            for room in sorted(rooms):
+                await take_link_lock(db, user_id, room)
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(:uid)").bindparams(bindparam("uid", user_id))
             )
@@ -1498,6 +1532,8 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
+            if (meeting.platform, meeting.platform_specific_id) != tuple(link):
+                return {"error": "conflict"}
             # Entries manage it: edited only through /v2/entries (§1.6, Ruling R21).
             if await self._has_entries(db, meeting.id):
                 return {"error": "managed_by_entries"}
@@ -1532,13 +1568,14 @@ class SqlAlchemyTranscriptStore:
                     data["title"] = updates["title"]
                 else:
                     data.pop("title", None)
+            new_status = meeting.status
             if "scheduled_at" in updates:
                 if updates["scheduled_at"]:
                     data["scheduled_at"] = updates["scheduled_at"]
-                    meeting.status = "scheduled"
+                    new_status = "scheduled"
                 else:
                     data.pop("scheduled_at", None)
-                    meeting.status = "idle"
+                    new_status = "idle"
             if "workspace_id" in updates:
                 if updates["workspace_id"]:
                     # an explicit bind is the USER's choice — it also lifts any series tombstone
@@ -1587,6 +1624,9 @@ class SqlAlchemyTranscriptStore:
             meeting.data = data
             flag_modified(meeting, "data")
             try:
+                if new_status != meeting.status:
+                    await db.flush()
+                    await write_status(db, meeting.id, new_status, expected_from={meeting.status})
                 await db.commit()
             except IntegrityError:
                 await db.rollback()

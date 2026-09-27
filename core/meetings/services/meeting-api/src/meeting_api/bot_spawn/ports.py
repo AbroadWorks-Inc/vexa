@@ -149,6 +149,7 @@ class MeetingRepo(Protocol):
         failure_stage: Optional[str] = "requested",
         completion_reason: str = "start_failed",
         data: Optional[dict] = None,
+        outcome: Any = None,
     ) -> Optional[dict]:
         """Mark a meeting ``failed`` BY ID (no session_uid), stamping ``reason``/``failure_stage`` into
         ``meeting.data`` — the spawn-time failure path (#718). A workload dead on arrival is refused
@@ -163,7 +164,11 @@ class MeetingRepo(Protocol):
 
         ``failure_stage=None`` writes NO stage: a PLANNED row that is cancelled before any bot
         existed has no stage to attribute, and inventing one ("requested") would claim a spawn that
-        never happened. ``data`` merges extra keys (the stop path's ``stop_requested``)."""
+        never happened. ``data`` merges extra keys (the stop path's ``stop_requested``).
+
+        ``outcome`` (an ``intake.status.Outcome``) is the ``not_sent`` outcome the spawn failure
+        ends the meeting with; a meeting that already has an outcome keeps it. A row that already
+        finished is left as it is: its terminal is written once."""
         ...
 
     async def get_meeting(self, meeting_id: int) -> Optional[dict]:
@@ -246,6 +251,7 @@ class MeetingRepo(Protocol):
         completion_reason: Optional[str] = None,
         failure_stage: Optional[str] = None,
         data: Optional[dict] = None,
+        change_reason: Optional[str] = None,
     ) -> Optional[dict]:
         """Persist a bot ``lifecycle.v1`` advance to the DB meeting row + RETURN the updated row dict
         (incl. ``data`` — so the lifecycle callback can deliver the per-user webhook from
@@ -254,7 +260,8 @@ class MeetingRepo(Protocol):
         ``meeting.data`` JSONB. Maps ``session_uid`` (== the bot's ``connectionId``) → meeting via
         ``meeting_sessions``; a no-op for an unknown session (e.g. a self-host bot). So the live FSM is
         DURABLE + QUERYABLE (``GET /meetings`` reflects it, survives a restart) — not only the
-        in-process ``MeetingStore``."""
+        in-process ``MeetingStore``. A status change is recorded through the status writer (§1.4),
+        its event's ``change.reason`` being ``change_reason``."""
         ...
 
 

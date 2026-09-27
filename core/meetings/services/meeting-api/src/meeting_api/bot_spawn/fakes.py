@@ -314,11 +314,13 @@ class InMemoryMeetingRepo:
 
     async def fail_meeting(
         self, *, meeting_id, reason, failure_stage="requested",
-        completion_reason="start_failed", data=None,
+        completion_reason="start_failed", data=None, outcome=None,
     ) -> Optional[dict]:
         row = self._meetings.get(meeting_id)
         if row is None:
             return None
+        if row["status"] in ("completed", "failed"):
+            return dict(row)
         row["status"] = "failed"
         row["data"].update(dict(data or {}))
         if failure_stage is not None:
@@ -365,7 +367,8 @@ class InMemoryMeetingRepo:
         }
 
     async def update_meeting_status(
-        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
+        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
+        change_reason=None,
     ) -> None:
         sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
         if sess is None:

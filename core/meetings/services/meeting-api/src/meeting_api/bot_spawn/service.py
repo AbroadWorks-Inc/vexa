@@ -373,9 +373,19 @@ async def _stop_requested_on(repo: MeetingRepo, meeting_id: Any) -> bool:
     return bool(((row or {}).get("data") or {}).get("stop_requested"))
 
 
+def _not_sent(exc: BaseException) -> Any:
+    """The ``not_sent`` outcome a spawn failure ends its meeting with: the §1.5 typed code and exact
+    message (``intake.spawn.spawn_failure``), the same the caller reports."""
+    from ..intake.spawn import spawn_failure
+    from ..intake.status import Outcome
+
+    code, message = spawn_failure(exc)
+    return Outcome("not_sent", code, message)
+
+
 async def _terminalize_as_stopped(
     repo: MeetingRepo, meeting_id: Any, status: Optional[str], *,
-    fenced_before_spawn: bool = False,
+    fenced_before_spawn: bool = False, outcome: Any = None,
 ) -> None:
     """Land a stop-fenced row on its truthful terminal: ``failed`` / ``stopped``.
 
@@ -396,6 +406,7 @@ async def _terminalize_as_stopped(
             failure_stage=status if status in ("requested", "joining", "awaiting_admission") else "requested",
             completion_reason="stopped",
             data={"stop_requested": True},
+            outcome=outcome,
         )
     except Exception as e:  # noqa: BLE001 — reconcile backstops; never mask the stop verdict
         log_event("bot_spawn_stop_terminalize_failed", audience="system", level="error",
@@ -799,11 +810,13 @@ async def request_bot(
     #     said no to, and the stop's own direct teardown cannot reach a workload that does not exist
     #     yet. Refusing HERE means the common case creates no pod at all.
     if await _stop_requested_on(repo, meeting_id):
-        await _terminalize_as_stopped(repo, meeting_id, row.get("status"), fenced_before_spawn=True)
+        stopped = MeetingStopped(_stopped_spawn_detail(meeting_id))
+        await _terminalize_as_stopped(repo, meeting_id, row.get("status"), fenced_before_spawn=True,
+                                      outcome=_not_sent(stopped))
         log_event("bot_spawn_fenced_by_stop", audience="user", level="warning",
                   span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
                   fields={"phase": "before_workload_create"})
-        raise MeetingStopped(_stopped_spawn_detail(meeting_id))
+        raise stopped
 
     # 5. Spawn over runtime.v1.
     spec = build_workload_spec(
@@ -834,7 +847,8 @@ async def request_bot(
         # session-keyed update_meeting_status cannot reach it yet.
         reason = str(e) or "bot workload failed to start"
         try:
-            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested")
+            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
+                                    outcome=_not_sent(e))
         except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
             log_event(
                 "bot_spawn_fail_row_error", audience="system", level="error",
@@ -911,8 +925,9 @@ async def request_bot(
             # The run is over before it began, and the row must SAY SO now rather than sit
             # non-terminal until a reaper guesses. Truthfully: `failed` (the FSM's only legal
             # pre-active terminal) with the user's own reason.
-            await _terminalize_as_stopped(repo, meeting_id, raced_status)
-            raise MeetingStopped(_stopped_spawn_detail(meeting_id))
+            stopped = MeetingStopped(_stopped_spawn_detail(meeting_id))
+            await _terminalize_as_stopped(repo, meeting_id, raced_status, outcome=_not_sent(stopped))
+            raise stopped
 
     # The response lists the meeting's sessions (P3c) — all session_uids that ran against this row.
     sessions = await repo.list_sessions(meeting_id=meeting_id)

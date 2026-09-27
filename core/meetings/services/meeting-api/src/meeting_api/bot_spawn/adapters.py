@@ -88,6 +88,21 @@ def _row_to_dict(m) -> dict:
     }
 
 
+def _with_projection(row: dict, projected: Optional[dict]) -> dict:
+    """The row dict plus the meeting's ``uuid``, ``entries``, ``outcome`` and event ``sequence``
+    from the one meeting projection (``intake.status.project_stored``): what the legacy system and
+    per-user webhooks add to their meeting block (§1.8)."""
+    if projected is None:
+        return row
+    return {
+        **row,
+        "uuid": projected["id"],
+        "entries": projected["entries"],
+        "outcome": projected["outcome"],
+        "sequence": projected["sequence"],
+    }
+
+
 class SqlAlchemyMeetingRepo:
     """``MeetingRepo`` over a SQLAlchemy-async ``session_factory`` (``meetings`` /
     ``meeting_sessions`` tables). Carve of the parent ``meetings.request_bot`` DB ops."""
@@ -182,17 +197,13 @@ class SqlAlchemyMeetingRepo:
             return _row_to_dict(m) if m else None
 
     async def reopen_meeting(self, *, meeting_id, data_patch=None) -> dict:
-        from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
-        from ..sessions.models import Meeting
+        from ..intake.adapters import lock_meeting_on_its_link
+        from ..intake.status import write_status
 
         async with self._session_factory() as db:
-            m = (
-                await db.execute(
-                    select(Meeting).where(Meeting.id == meeting_id).with_for_update()
-                )
-            ).scalars().first()
+            m = await lock_meeting_on_its_link(db, meeting_id)
             data = dict(m.data) if isinstance(m.data, dict) else {}
             # Last line of defense behind the service-level 409: a row the USER stopped is never
             # reopened in place, by any caller. Under the row lock, so a stop committing concurrently
@@ -208,7 +219,6 @@ class SqlAlchemyMeetingRepo:
             )
             if m.status not in ("completed", "failed") or deletion_pending:
                 raise DuplicateMeeting("Terminal meeting is no longer reusable")
-            m.status = "requested"
             m.end_time = None
             m.bot_container_id = None
             _archive_completion(data)
@@ -219,6 +229,8 @@ class SqlAlchemyMeetingRepo:
                     data[key] = value
             m.data = data
             flag_modified(m, "data")
+            await db.flush()
+            await write_status(db, m.id, "requested", expected_from={m.status})
             # updated_at is set server-side by the column's onupdate=func.now() (main's pattern);
             # never write a tz-aware Python datetime into the naive column (asyncpg DataError).
             await db.commit()
@@ -299,12 +311,15 @@ class SqlAlchemyMeetingRepo:
             }
 
     async def update_meeting_status(
-        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
+        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
+        change_reason=None,
     ) -> None:
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
-        from ..sessions.models import Meeting, MeetingSession
+        from ..intake.adapters import lock_meeting_on_its_link
+        from ..intake.status import project_stored, write_status
+        from ..sessions.models import MeetingSession
 
         async with self._session_factory() as db:
             sess = (
@@ -312,15 +327,13 @@ class SqlAlchemyMeetingRepo:
             ).scalars().first()
             if sess is None:
                 return  # unknown session (e.g. a self-host bot) — nothing to persist
-            m = (
-                await db.execute(select(Meeting).where(Meeting.id == sess.meeting_id).with_for_update())
-                # FOR UPDATE: db-writer/recordings/docs all lock before read-modify-write of data
-                # JSONB; without it a concurrent db-writer merge commit is clobbered (#53 review).
-            ).scalars().first()
+            # The link lock, then FOR UPDATE: db-writer/recordings/docs all lock before
+            # read-modify-write of data JSONB; without it a concurrent db-writer merge commit is
+            # clobbered (#53 review).
+            m = await lock_meeting_on_its_link(db, sess.meeting_id)
             if m is None:
                 return
-            m.status = status
-            merged = dict(m.data) if isinstance(m.data, dict) else {}
+            merged = {}
             if completion_reason is not None:
                 merged["completion_reason"] = completion_reason
             if failure_stage is not None:
@@ -341,22 +354,33 @@ class SqlAlchemyMeetingRepo:
                         select(_func.count()).select_from(Transcription).where(Transcription.meeting_id == m.id)
                     )
                 ).scalar() or 0
-            m.data = merged
-            flag_modified(m, "data")
             # Naive UTC into the naive time columns (tz-aware → asyncpg DataError, per set_bot_container).
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if status == "active" and m.start_time is None:
                 m.start_time = now
             if status in ("completed", "failed") and m.end_time is None:
                 m.end_time = now
+            if m.status != status:
+                # A status change: through the status writer, which re-reads the row (the times are
+                # flushed first so its event shows them).
+                await db.flush()
+                await write_status(
+                    db, m.id, status, expected_from={m.status}, data_patch=merged,
+                    change_reason=change_reason,
+                )
+            else:
+                m.data = {**(m.data if isinstance(m.data, dict) else {}), **merged}
+                flag_modified(m, "data")
+            projected = await project_stored(db, m.id)
             await db.commit()
             # Refresh BEFORE _row_to_dict: `updated_at` has a server-side onupdate, so it is expired
             # post-commit; reading it in _row_to_dict would trigger implicit async IO (MissingGreenlet).
             # The other write adapters (create_meeting/set_bot_container/reopen) follow the same pattern.
             await db.refresh(m)
             # Return the updated row so the lifecycle callback can deliver the per-user webhook from
-            # meeting.data (and the stop route gets a clean dict) without a second query.
-            return _row_to_dict(m)
+            # meeting.data (and the stop route gets a clean dict) without a second query; it carries
+            # the meeting's uuid, entries, outcome and event sequence for the legacy webhooks (§1.8).
+            return _with_projection(_row_to_dict(m), projected)
 
     async def count_active_bots(self, *, user_id, exclude_meeting_id=None) -> int:
         from sqlalchemy import func, select
@@ -459,14 +483,16 @@ class SqlAlchemyMeetingRepo:
         return [(mid, st, sid, bcid, sr) for mid, (st, sid, bcid, sr) in out.items()]
 
     async def create_meeting(self, *, user_id, platform, native_meeting_id, data) -> dict:
-        from ..sessions.models import Meeting
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting
 
         async with self._session_factory() as db:
-            m = Meeting(
-                user_id=user_id, platform=platform, platform_specific_id=native_meeting_id,
-                status="requested", data=dict(data or {}),
+            await take_link_lock(db, user_id, Room(platform, native_meeting_id))
+            m = await insert_meeting(
+                db, user_id=user_id, platform=platform, native_meeting_id=native_meeting_id,
+                status="requested", data=dict(data or {}), first_event=STATUS_CHANGE_EVENT,
             )
-            db.add(m)
             await db.commit()
             await db.refresh(m)
             return _row_to_dict(m)
@@ -498,6 +524,7 @@ class SqlAlchemyMeetingRepo:
 
         from ..intake.adapters import take_link_lock
         from ..intake.ports import Room
+        from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting, write_status
         from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
         from .auto_join import LIVE_STATUSES
         from .ports import ClaimTargetMoved, PlannedRow, planned_claim
@@ -596,21 +623,24 @@ class SqlAlchemyMeetingRepo:
                 # bot the user just asked for. A stop never touches a planned row (§1.6: it stops the
                 # live meeting only), so the flag on a plan only ever comes from an older build.
                 planned_data.pop("stop_requested", None)
-                claimable.status = "requested"
                 claimable.end_time = None
                 claimable.bot_container_id = None
                 claimable.data = {**planned_data, **dict(data or {})}
                 flag_modified(claimable, "data")
+                await db.flush()
+                await write_status(
+                    db, claimable.id, "requested", expected_from={claimable.status}
+                )
                 await db.commit()
                 await db.refresh(claimable)
                 return _row_to_dict(claimable)
             # 3. insert — still inside the same txn/lock, so check+insert is atomic.
-            m = Meeting(
-                user_id=user_id, platform=platform, platform_specific_id=native_meeting_id,
-                status="requested", data=dict(data or {}),
-            )
-            db.add(m)
             try:
+                m = await insert_meeting(
+                    db, user_id=user_id, platform=platform,
+                    native_meeting_id=native_meeting_id, status="requested",
+                    data=dict(data or {}), first_event=STATUS_CHANGE_EVENT,
+                )
                 await db.commit()
             except IntegrityError as e:
                 # The unique partial index backstop fired — a concurrent duplicate active row won the
@@ -767,20 +797,14 @@ class SqlAlchemyMeetingRepo:
         request,
         decision,
     ) -> bool:
-        """Persist one request-bound boundary decision under a row lock."""
-        from sqlalchemy import select
+        """Persist one request-bound boundary decision under the link and row locks."""
         from sqlalchemy.orm.attributes import flag_modified
 
-        from ..sessions.models import Meeting
+        from ..intake.adapters import lock_meeting_on_its_link
+        from ..intake.status import write_status
 
         async with self._session_factory() as db:
-            row = (
-                await db.execute(
-                    select(Meeting)
-                    .where(Meeting.id == meeting_id)
-                    .with_for_update()
-                )
-            ).scalars().first()
+            row = await lock_meeting_on_its_link(db, meeting_id)
             if row is None:
                 return False
             data = dict(row.data) if isinstance(row.data, dict) else {}
@@ -809,17 +833,20 @@ class SqlAlchemyMeetingRepo:
             metadata.update(decision.to_record())
             metadata["last_boundary_at"] = boundary
             metadata["last_decision_id"] = decision.decision_id
-            if (
+            stop = (
                 decision.enforced
                 and not decision.allow
                 and decision.stop_scope == "billable_service"
-            ):
+            )
+            if stop:
                 metadata["teardown_confirmed"] = False
                 data["stop_requested"] = True
-                row.status = "stopping"
             data["service_authority"] = metadata
             row.data = data
             flag_modified(row, "data")
+            if stop and row.status != "stopping":
+                await db.flush()
+                await write_status(db, row.id, "stopping", expected_from={row.status})
             await db.commit()
             return True
 
@@ -1000,42 +1027,52 @@ class SqlAlchemyMeetingRepo:
 
     async def fail_meeting(
         self, *, meeting_id, reason, failure_stage="requested",
-        completion_reason="start_failed", data=None,
+        completion_reason="start_failed", data=None, outcome=None,
     ) -> Optional[dict]:
         """Mark a meeting ``failed`` BY ID (no session needed) — the spawn-time failure path (#718).
 
         A workload dead on arrival (kernel ``start_failed``) is refused BEFORE the ``MeetingSession``
         exists, so the session-keyed ``update_meeting_status`` cannot reach the row; this fails it
         directly, stamping the reason into ``data`` so ``GET /meetings`` and the terminal show WHY
-        instead of leaving a ``requested`` row for the 5-minute reaper to flip reason-less. Row-locked;
-        a missing row is a no-op."""
-        from sqlalchemy import select
-        from sqlalchemy.orm.attributes import flag_modified
-
-        from ..sessions.models import Meeting
+        instead of leaving a ``requested`` row for the 5-minute reaper to flip reason-less. Link- and
+        row-locked; a missing row is a no-op, and so is a row that already finished (its terminal is
+        written once). Through the status writer: the ``failed`` event is ``meeting.not_sent``
+        carrying ``outcome`` when one is given and the meeting has none yet (an outcome recorded
+        before, such as R5's ``cancelled_by_calendar``, stands), else ``meeting.status_change``."""
+        from ..intake.adapters import lock_meeting_on_its_link
+        from ..intake.status import FINISHED_STATUSES, write_status
+        from ..sessions.models import MeetingAwState
 
         async with self._session_factory() as db:
-            m = (
-                await db.execute(select(Meeting).where(Meeting.id == meeting_id).with_for_update())
-            ).scalars().first()
+            m = await lock_meeting_on_its_link(db, meeting_id)
             if m is None:
                 return None
-            m.status = "failed"
-            merged = dict(m.data) if isinstance(m.data, dict) else {}
-            merged.update(dict(data or {}))
+            if m.status in FINISHED_STATUSES:
+                return _row_to_dict(m)
+            merged = {**dict(data or {})}
             # A PLANNED row cancelled before any bot existed has NO stage — inventing one would
             # claim a spawn that never happened.
             if failure_stage is not None:
                 merged["failure_stage"] = failure_stage
             merged["failure_reason"] = reason
+            current = m.data if isinstance(m.data, dict) else {}
             merged["completion_reason"] = dominant_completion_reason(
-                completion_reason, stop_requested=bool(merged.get("stop_requested"))
+                completion_reason,
+                stop_requested=bool({**current, **merged}.get("stop_requested")),
             )
-            m.data = merged
-            flag_modified(m, "data")
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if m.end_time is None:
                 m.end_time = now
+                await db.flush()
+            aw = await db.get(MeetingAwState, m.id, populate_existing=True)
+            if aw is not None and aw.outcome_kind is not None:
+                outcome = None
+            await write_status(
+                db, m.id, "failed", expected_from={m.status}, data_patch=merged,
+                outcome=outcome,
+                change_reason=None if outcome is None else outcome.detail,
+                event_type=None if outcome is None else "meeting.not_sent",
+            )
             await db.commit()
             await db.refresh(m)
             return _row_to_dict(m)

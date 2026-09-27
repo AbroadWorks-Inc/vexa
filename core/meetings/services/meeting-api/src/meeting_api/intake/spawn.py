@@ -15,10 +15,12 @@ exception:
 A failure after the claim (the token or invocation, the runtime, the post-spawn writes, a stop
 that won the race) would leave a claimed meeting with no bot and no reason, so the port ends it
 ``not_sent`` itself (Ruling R17), under the link lock: a row still ``requested`` goes ``failed``
-through the status writer with the outcome (``meeting.not_sent``); a row the spawn flow already
-wrote ``failed`` gets the outcome on ``meeting_aw_state`` and a ``meeting.not_sent`` event. The
-events are handed to ``publisher`` after the commit, when one is given; the outbox holds them
-either way.
+through the status writer with the outcome (``meeting.not_sent``). A row the spawn flow already
+ended (a runtime spawn failure, the stop fence) is left alone: the flow wrote its ``failed``
+through the status writer with that same outcome, in one ``meeting.not_sent`` event. A row still
+``requested`` whose workload exists (``bot_container_id`` set: the failure came after the workload
+was recorded) is left alone too, and logged: its bot is live and the lifecycle ends it. The events
+are handed to ``publisher`` after the commit, when one is given; the outbox holds them either way.
 
 A row whose link changed between the read and the claim (``ClaimTargetMoved``) is read again and
 spawned once more. The spawn context (the per-user bot limit and webhook settings) comes from
@@ -274,8 +276,20 @@ class ExactRowSpawn:
                 raise LookupError(f"meeting {meeting_id} not found")
             room = Room(row["platform"], row["native_meeting_id"])
             async with self._store.room_lock(user_id, [room]) as tx:
-                status = (await tx.meeting(meeting_id)).status
-                if status == "requested":
+                current = await tx.meeting(meeting_id)
+                if current.status == "requested" and current.row.get(
+                    "bot_container_id"
+                ):
+                    log_event(
+                        "spawn_not_sent_skipped_live_workload",
+                        audience="operator",
+                        level="warning",
+                        span="meetings.spawn",
+                        user_id=user_id,
+                        meeting_id=str(meeting_id),
+                        fields={"code": code},
+                    )
+                elif current.status == "requested":
                     written = await tx.status(
                         meeting_id,
                         "failed",
@@ -285,11 +299,6 @@ class ExactRowSpawn:
                         event_type="meeting.not_sent",
                     )
                     events.append(written.event_id)
-                elif status == "failed":
-                    await tx.record_outcome(meeting_id, outcome)
-                    events.append(
-                        (await tx.event(meeting_id, "meeting.not_sent")).event_id
-                    )
         except Exception as exc:
             log_event(
                 "spawn_not_sent_record_failed",

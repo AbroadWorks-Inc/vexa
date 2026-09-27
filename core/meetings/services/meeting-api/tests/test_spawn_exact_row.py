@@ -976,14 +976,10 @@ async def test_pg_post_claim_failure_ends_the_row_not_sent(
     last = events[-1]["data"]
     assert last["meeting"]["outcome"]["detail"] == code
     assert last["meeting"]["outcome"]["message"] == message
-    if upstream_status == "requested":
-        # still `requested` after upstream: the port wrote the terminal through the writer
-        assert (
-            last["change"]["from"] == "requested" and last["change"]["to"] == "failed"
-        )
-    else:
-        # upstream wrote `failed` directly: the port recorded the outcome and the event
-        assert "change" not in last
+    # One terminal event either way: the port wrote it for a row still `requested`, the spawn flow
+    # wrote it (through the writer, with the same outcome) for the row it failed itself.
+    assert last["change"]["from"] == "requested" and last["change"]["to"] == "failed"
+    assert last["change"]["reason"] == code
 
 
 async def test_pg_post_claim_token_failure_ends_not_sent(pg_engine, monkeypatch):
@@ -1028,11 +1024,14 @@ async def test_pg_post_claim_failure_of_a_new_instant_join_replies_created(pg_en
     assert meeting["outcome"]["kind"] == "not_sent"
     assert meeting["outcome"]["detail"] == "spawn_error"
     assert meeting["outcome"]["message"] == "kernel could not start the workload"
-    published = [e for batch in publisher.batches for e in batch]
-    not_sent = await pg.scalar(
-        "SELECT event_id FROM webhook_outbox WHERE event_type = 'meeting.not_sent'"
+    # The spawn flow wrote the one terminal event (in the outbox, where the outbox publisher picks
+    # it up); the port found the meeting ended and wrote no second one.
+    assert (
+        await pg.scalar(
+            "SELECT count(*) FROM webhook_outbox WHERE event_type = 'meeting.not_sent'"
+        )
+        == 1
     )
-    assert not_sent in published
 
 
 async def test_pg_post_claim_failure_of_an_adopted_meeting_replies_joined_existing(
@@ -1184,8 +1183,9 @@ async def test_pg_any_other_integrity_error_in_the_exact_claim_propagates(pg_eng
 
 
 async def test_pg_post_claim_stop_fence_ends_not_sent(pg_engine):
-    """A user's stop landing between the claim and the workload: the spawn fence writes the row
-    ``failed`` directly; the port records not_sent/meeting_stopped with its event."""
+    """A user's stop landing between the claim and the workload: the spawn fence ends the row
+    ``failed`` through the status writer with not_sent/meeting_stopped, in one ``meeting.not_sent``
+    event; the port adds nothing."""
     from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
     from meeting_api.intake import PostgresIntakeStore
 

@@ -373,6 +373,40 @@ def _webhook_target_host(url: str) -> str:
         return "?"
 
 
+def legacy_meeting_projection(row: dict) -> dict:
+    """The parent's `_build_meeting_event_data` shape (webhooks.py) from a meeting row dict —
+    the meeting block the typed webhooks the legacy system and per-user URLs receive carry (golden
+    Envelope.meeting-completed.json). completion_reason/failure_stage are hoisted to top level;
+    internal data keys stripped. `uuid`, `entries`, `outcome` and `sequence` are the meeting's
+    from the one meeting projection (§1.8), which the repo's status write returns with the row."""
+    from .webhooks import clean_meeting_data
+
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    return {
+        "id": row.get("id"),
+        "uuid": row.get("uuid"),
+        "user_id": row.get("user_id"),
+        "platform": row.get("platform"),
+        "native_meeting_id": row.get("native_meeting_id"),
+        "constructed_meeting_url": row.get("constructed_meeting_url"),
+        "status": row.get("status"),
+        "completion_reason": data.get("completion_reason"),
+        "failure_stage": data.get("failure_stage"),
+        "outcome": row.get("outcome"),
+        "entries": row.get("entries"),
+        "sequence": row.get("sequence"),
+        "service_provenance": data.get("service_provenance"),
+        "start_time": _iso(row.get("start_time")),
+        "end_time": _iso(row.get("end_time")),
+        "data": clean_meeting_data(data),
+        "created_at": _iso(row.get("created_at")),
+        "updated_at": _iso(row.get("updated_at")),
+    }
+
+
 def _mount_lifecycle(
     app: FastAPI,
     sink: LifecycleSink,
@@ -405,32 +439,6 @@ def _mount_lifecycle(
     from .lifecycle.receiver import conforms
     from .lifecycle.webhook import build_status_change_envelope, build_typed_envelope
     from .obs import log_event
-    from .webhooks import clean_meeting_data
-
-    def _iso(v):
-        return v.isoformat() if hasattr(v, "isoformat") else v
-
-    def _meeting_projection_from_row(row: dict) -> dict:
-        """The parent's `_build_meeting_event_data` shape (webhooks.py) from a meeting row dict —
-        the meeting block the typed webhooks carry (golden Envelope.meeting-completed.json).
-        completion_reason/failure_stage are hoisted to top level; internal data keys stripped."""
-        data = row.get("data") if isinstance(row.get("data"), dict) else {}
-        return {
-            "id": row.get("id"),
-            "user_id": row.get("user_id"),
-            "platform": row.get("platform"),
-            "native_meeting_id": row.get("native_meeting_id"),
-            "constructed_meeting_url": row.get("constructed_meeting_url"),
-            "status": row.get("status"),
-            "completion_reason": data.get("completion_reason"),
-            "failure_stage": data.get("failure_stage"),
-            "service_provenance": data.get("service_provenance"),
-            "start_time": _iso(row.get("start_time")),
-            "end_time": _iso(row.get("end_time")),
-            "data": clean_meeting_data(data),
-            "created_at": _iso(row.get("created_at")),
-            "updated_at": _iso(row.get("updated_at")),
-        }
 
     app.state.status_change_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
     app.state.typed_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
@@ -573,6 +581,7 @@ def _mount_lifecycle(
                     completion_reason=rec.completion_reason.value if rec.completion_reason else None,
                     failure_stage=rec.failure_stage.value if rec.failure_stage else None,
                     data=rec.data if isinstance(rec.data, dict) else None,
+                    change_reason=change.reason,
                 )
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
@@ -672,7 +681,7 @@ def _mount_lifecycle(
         if not change.no_op:
             typed_envelope = build_typed_envelope(
                 change,
-                meeting=_meeting_projection_from_row(meeting_row)
+                meeting=legacy_meeting_projection(meeting_row)
                 if isinstance(meeting_row, dict) else None,
             )
             if typed_envelope is not None:

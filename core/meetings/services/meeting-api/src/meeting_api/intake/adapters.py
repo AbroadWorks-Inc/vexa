@@ -33,6 +33,9 @@ same generic-plan reason).
 in the caller's session, narrow (no ``data`` beyond ``scheduled_at``), for ``resolver.resolve``.
 The collector store and the bot-spawn repo both resolve links through it.
 
+``lock_meeting_on_its_link(db, meeting_id)`` is the §1.4 lock order for a writer that knows a
+meeting by id (the bot-spawn repo's status writes): the row's link lock, then the row.
+
 SQLAlchemy and the ORM models are imported inside the functions that use them, so the package
 imports without SQLAlchemy installed.
 """
@@ -58,6 +61,7 @@ from .rules import FINISHED_STATUSES, Plan
 from .status import (
     Outcome,
     WrittenEvent,
+    insert_meeting,
     lock_aw_state,
     lock_meeting,
     row_mapping,
@@ -69,7 +73,14 @@ from .validation import EntryIn
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-__all__ = ["PostgresIntakeStore", "PostgresIntakeTx", "link_rows", "take_link_lock"]
+__all__ = [
+    "LinkMoved",
+    "PostgresIntakeStore",
+    "PostgresIntakeTx",
+    "link_rows",
+    "lock_meeting_on_its_link",
+    "take_link_lock",
+]
 
 
 async def take_link_lock(db: AsyncSession, user_id: int, room: Room) -> None:
@@ -80,6 +91,51 @@ async def take_link_lock(db: AsyncSession, user_id: int, room: Room) -> None:
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
         {"key": f"aw-intake:{user_id}:{room.platform}:{room.native_meeting_id}"},
     )
+
+
+class LinkMoved(Exception):
+    """The meeting's link changed between reading it and locking the row."""
+
+    def __init__(self, meeting_id: int) -> None:
+        super().__init__(
+            f"meeting {meeting_id} moved to another link while it was being locked"
+        )
+        self.meeting_id = meeting_id
+
+
+async def lock_meeting_on_its_link(db: AsyncSession, meeting_id: int) -> Any:
+    """Meeting ``meeting_id`` locked in the §1.4 order for the rest of ``db``'s transaction: its
+    link's advisory lock, then the row (``FOR UPDATE``, freshly read). ``None`` when the row doesn't
+    exist. A row without a link (no native id) is locked directly: no entry can be on it. Raises
+    ``LinkMoved`` when the row's link changed between the read and the row lock."""
+    from sqlalchemy import select
+
+    from ..sessions.models import Meeting
+
+    found = (
+        await db.execute(
+            select(
+                Meeting.user_id, Meeting.platform, Meeting.platform_specific_id
+            ).where(Meeting.id == meeting_id)
+        )
+    ).first()
+    if found is None:
+        return None
+    link = tuple(found)
+    if link[2] is not None:
+        await take_link_lock(db, link[0], Room(link[1], link[2]))
+    meeting = await lock_meeting(db, meeting_id)
+    if (
+        meeting is not None
+        and (
+            meeting.user_id,
+            meeting.platform,
+            meeting.platform_specific_id,
+        )
+        != link
+    ):
+        raise LinkMoved(meeting_id)
+    return meeting
 
 
 async def link_rows(db: AsyncSession, user_id: int, room: Room) -> list[LinkRow]:
@@ -330,26 +386,19 @@ class PostgresIntakeTx:
     async def create_meeting(
         self, user_id: int, room: Room, plan: Plan, *, join_now: bool
     ) -> MeetingView:
-        from ..sessions.models import Meeting, MeetingAwState
-
-        meeting = Meeting(
+        # The service records the meeting's first event (``meeting.scheduled``) once its entry is
+        # attached, in this transaction.
+        meeting = await insert_meeting(
+            self._db,
             user_id=user_id,
             platform=room.platform,
-            platform_specific_id=room.native_meeting_id,
+            native_meeting_id=room.native_meeting_id,
             status="scheduled",
             data={**_plan_data(plan), "auto_join": True},
+            first_event=None,
+            scheduled_end_at=plan.end,
+            time_zone=plan.time_zone,
         )
-        self._db.add(meeting)
-        await self._db.flush()
-        self._db.add(
-            MeetingAwState(
-                meeting_id=meeting.id,
-                event_seq=0,
-                scheduled_end_at=plan.end,
-                time_zone=plan.time_zone,
-            )
-        )
-        await self._db.flush()
         return await self.meeting(meeting.id)
 
     async def save_entry(

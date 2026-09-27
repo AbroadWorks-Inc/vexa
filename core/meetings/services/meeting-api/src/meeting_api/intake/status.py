@@ -1,7 +1,14 @@
 """``write_status`` / ``write_event`` — the one status writer and the outbox (§1.4).
 
-Every change to ``meetings.status`` goes through ``write_status``; every other meeting event goes
-through ``write_event``. Both run inside the CALLER's transaction and never commit.
+Every change to ``meetings.status`` goes through ``write_status``, and every new ``meetings`` row
+through ``insert_meeting`` (a new row's status is its first status change); every other meeting
+event goes through ``write_event``. All three run inside the CALLER's transaction and never commit.
+Nothing else in meeting-api writes ``meetings.status`` (``tests/test_status_writers_all.py``).
+
+``completion_reason`` stays in the sealed ``lifecycle.v1`` set (§1.1): a ``data`` patch naming any
+other value is refused before anything is written. The one exception is upstream's ``start_failed``
+on a ``failed`` row (``lifecycle.occurrence.START_FAILED``), the reason ``fail_meeting`` gives a
+workload that never started and the auto-join retry rule reads.
 
 ``write_status`` does five things, in this order:
   1. lock the ``meetings`` row (``FOR UPDATE``); if its status isn't in ``expected_from`` raise
@@ -57,13 +64,17 @@ if TYPE_CHECKING:
 __all__ = [
     "API_VERSION",
     "FINISHED_STATUSES",
+    "STATUS_CHANGE_EVENT",
     "Outcome",
     "StatusConflict",
     "WrittenEvent",
+    "check_completion_reason",
     "check_event_data",
     "derive_event_id_v2",
+    "insert_meeting",
     "lock_aw_state",
     "lock_meeting",
+    "project_stored",
     "row_mapping",
     "write_event",
     "write_status",
@@ -114,6 +125,27 @@ def check_event_data(event_data: Optional[Mapping[str, Any]]) -> None:
     reserved = set(event_data or ()) & {"meeting", "change"}
     if reserved:
         raise ValueError(f"event_data may not set {sorted(reserved)}")
+
+
+def check_completion_reason(
+    to_status: str, data_patch: Optional[Mapping[str, Any]]
+) -> None:
+    """A ``data.completion_reason`` the patch sets is in the sealed ``lifecycle.v1`` set (read from
+    the schema the lifecycle receiver validates against), or upstream's ``start_failed`` on a
+    ``failed`` row. Raises ``ValueError`` otherwise."""
+    reason = (data_patch or {}).get("completion_reason")
+    if reason is None:
+        return
+    from ..lifecycle.occurrence import START_FAILED
+    from ..lifecycle.receiver import SEALED_COMPLETION_REASONS
+
+    if reason in SEALED_COMPLETION_REASONS:
+        return
+    if reason == START_FAILED and to_status == "failed":
+        return
+    raise ValueError(
+        f"completion_reason {reason!r} is not in the sealed lifecycle.v1 set"
+    )
 
 
 def row_mapping(row: Any) -> dict[str, Any]:
@@ -244,9 +276,16 @@ async def write_status(
     record the event (§1.4 steps 1–5). Raises ``StatusConflict`` otherwise, having written
     nothing. The event type is ``event_type`` or ``meeting.status_change``; its ``change`` is
     ``{from, to, reason, at}``. ``event_data`` adds keys to the envelope's ``data`` next to
-    ``meeting`` and ``change`` (``merged_into``, §2.7); it may not name either of those.
+    ``meeting`` and ``change`` (``merged_into``, §2.7); it may not name either of those. A
+    ``data_patch`` whose ``completion_reason`` is outside the sealed set raises ``ValueError``
+    before anything is written (``check_completion_reason``).
+
+    The caller holds the meeting's link lock (§1.4 lock order). Changes the caller made to the row
+    itself (columns, or ``data`` keys a merge can't remove) are flushed before the call: the row is
+    re-read here.
     """
     check_event_data(event_data)
+    check_completion_reason(to_status, data_patch)
     now = _now()
     meeting = await lock_meeting(db, meeting_id)
     if meeting is None or meeting.status not in expected_from:
@@ -301,6 +340,79 @@ async def write_status(
         event_data=event_data,
     )
     return WrittenEvent(event_id, int(aw.event_seq), tuple(rerun))
+
+
+async def insert_meeting(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    platform: str,
+    native_meeting_id: Optional[str],
+    status: str,
+    data: Mapping[str, Any],
+    first_event: Optional[str],
+    scheduled_end_at: Optional[datetime] = None,
+    time_zone: Optional[str] = None,
+) -> Any:
+    """Create a ``meetings`` row in ``status``, with its ``meeting_aw_state`` row, and return it
+    (loaded). A new row's status is its first status change (§1.4), so ``first_event`` names the
+    event recorded with it: sequence 1, ``change`` ``{from: null, to: status}``. ``None`` only when
+    the caller records the meeting's first event itself in this transaction, once the row carries
+    what that event must show (intake: the entry it was created for, then ``meeting.scheduled``).
+
+    The caller holds the link's lock when the row has a link. A unique-index violation raises
+    ``IntegrityError`` at the flush here."""
+    from ..sessions.models import Meeting, MeetingAwState
+
+    check_completion_reason(status, data)
+    now = _now()
+    meeting = Meeting(
+        user_id=user_id,
+        platform=platform,
+        platform_specific_id=native_meeting_id,
+        status=status,
+        data=dict(data),
+    )
+    db.add(meeting)
+    await db.flush()
+    await db.refresh(meeting)
+    aw = MeetingAwState(
+        meeting_id=meeting.id,
+        event_seq=0,
+        scheduled_end_at=scheduled_end_at,
+        time_zone=time_zone,
+    )
+    db.add(aw)
+    await db.flush()
+    if first_event is not None:
+        aw.event_seq = 1
+        change = {
+            "from": None,
+            "to": status,
+            "reason": None,
+            "at": iso_utc(_stamp(now)),
+        }
+        await _insert_outbox(db, meeting, aw, [], first_event, change, now=now)
+    return meeting
+
+
+async def project_stored(db: AsyncSession, meeting_id: int) -> Optional[dict[str, Any]]:
+    """The one meeting projection (``project_meeting``) of meeting ``meeting_id`` as ``db``'s
+    transaction sees it now, or ``None`` when it doesn't exist. Reads only; takes no lock.
+    """
+    from ..sessions.models import Meeting, MeetingAwState
+
+    meeting = await db.get(Meeting, meeting_id, populate_existing=True)
+    if meeting is None:
+        return None
+    aw = await db.get(MeetingAwState, meeting_id, populate_existing=True)
+    entries = await _entries(db, meeting_id)
+    return project_meeting(
+        row_mapping(meeting),
+        None if aw is None else row_mapping(aw),
+        [row_mapping(e) for e in entries],
+        lead_s=auto_join_lead_s(),
+    )
 
 
 async def write_event(

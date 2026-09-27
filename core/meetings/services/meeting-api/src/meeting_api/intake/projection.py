@@ -25,6 +25,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Sequence
 
+from .rules import scheduled_time
+
 __all__ = ["iso_utc", "project_meeting"]
 
 _FINISHED_STATUSES = frozenset({"completed", "failed"})
@@ -57,13 +59,12 @@ def _bot_joins_at(
       the bot hasn't been sent, this is the forward projection.
     * Sent (any other status): the auto-join sweep's own dispatch stamp
       (``data.auto_join_last_attempt``) if one was recorded, else ``None``.
-    * Neither (an unsent instant join with no schedule): ``None``.
+    * Neither (an unsent instant join with no schedule, or a ``scheduled_at`` that isn't a time):
+      ``None``.
     """
-    scheduled_at = data.get("scheduled_at")
-    if meeting.get("status") == "scheduled" and scheduled_at:
-        dt = datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
-        dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        return iso_utc(dt - timedelta(seconds=lead_s))
+    scheduled_at = scheduled_time(data)
+    if meeting.get("status") == "scheduled" and scheduled_at is not None:
+        return iso_utc(scheduled_at - timedelta(seconds=lead_s))
     return iso_utc(data.get("auto_join_last_attempt"))
 
 
@@ -132,8 +133,7 @@ def project_meeting(
         "room": meeting.get("platform_specific_id"),
         "meeting_url": data.get("constructed_meeting_url"),
         "title": data.get("title"),
-        "start": iso_utc(data.get("scheduled_at"))
-        or iso_utc(meeting.get("start_time")),
+        "start": iso_utc(scheduled_time(data)) or iso_utc(meeting.get("start_time")),
         "end": iso_utc(aw.get("scheduled_end_at")) if aw is not None else None,
         "time_zone": aw.get("time_zone") if aw is not None else None,
         "bot_joins_at": _bot_joins_at(meeting, data, lead_s=lead_s),

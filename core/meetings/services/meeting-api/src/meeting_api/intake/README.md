@@ -19,6 +19,17 @@ inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelop
 `write_event(db, meeting_id, event_type, change)` records a non-status event the same way.
 `write_status(..., event_data=...)` adds keys to the envelope's `data` next to `meeting` and
 `change` (`merged_into` on a merge's `meeting.removed`, §2.7), never replacing those two.
+`insert_meeting(db, ...)` creates a `meetings` row with its `meeting_aw_state` row and its first
+event (a new row's status is its first change). Every writer of `meetings.status` in meeting-api
+goes through these two (intake, the bot-spawn repo's claim, reopen, `fail_meeting`, lifecycle and
+service-authority writes, the collector's planned create, `set_intent` and planned edit), holding
+the meeting's link lock first (`adapters.take_link_lock`, or `lock_meeting_on_its_link` for a
+writer that knows the meeting by id); `tests/test_status_writers_all.py` fails on any other write.
+A `data` patch whose `completion_reason` is outside the sealed `lifecycle.v1` set is refused before
+anything is written (`check_completion_reason`; upstream's `start_failed` on a `failed` row is the
+one exception). `project_stored(db, meeting_id)` is the one projection of a stored meeting, which
+the legacy system and per-user webhooks' meeting block takes `uuid`, `entries`, `outcome` and
+`sequence` from (§1.8).
 
 `rules.py` holds the R1 matching rules and the meeting windows (§1.1, R7, R10), pure: `overlaps`
 (half-open, a missing end is unbounded), `meeting_start`, `meeting_window`, `match_entry`,
@@ -91,10 +102,11 @@ of `spawn_failure(exc)`, the one table from a spawn exception to its §1.13 code
 `already_live`, `meeting_stopped`, `spawn_error`, `authority_denied`, `authority_unavailable`,
 `auth_session`, `transcription_config`, else `internal_error`, logged with its stack); it never
 raises. A failure after the claim ends the claimed meeting `not_sent` with that code and message,
-under the link lock (Ruling R17): a row still `requested` goes `failed` through `write_status`, a row
-the spawn flow already wrote `failed` gets the outcome on `meeting_aw_state` and a `meeting.not_sent`
-event; the entry service then replies with that meeting (R12 applies only to a failure before the
-claim). The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
+under the link lock (Ruling R17): a row still `requested` goes `failed` through `write_status`; a row
+the spawn flow already ended (a runtime spawn failure, the stop fence) carries that outcome in the
+flow's own `meeting.not_sent` event, so nothing more is written; a row still `requested` whose
+workload exists (`bot_container_id` set) is left to its bot and logged. The entry service then
+replies with that meeting (R12 applies only to a failure before the claim). The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
 never guessed: without it, or without `max_concurrent` in it, the spawn fails `internal_error`
 (the one exception is the sweep's `AUTO_JOIN_ALLOW_UNCAPPED` opt-in with no identity edge).
 `IntakeStop` (`stop.py`) is the production `StopPort` (§1.7), behind `POST /v2/meetings/{id}/stop`
@@ -130,7 +142,7 @@ else `room_busy` ("another bot was still on this meeting link when the meeting e
 - `project_meeting` — `projection.py`.
 - `parse_entry`, `parse_remove`, `EntryIn`, `RemoveIn`, `IntakeError` — `validation.py`.
 - `write_status`, `write_event`, `StatusConflict`, `Outcome`, `WrittenEvent`, `derive_event_id_v2`,
-  `row_mapping` — `status.py`.
+  `row_mapping` — `status.py` (with `insert_meeting`, `project_stored`, `check_completion_reason`).
 - `IntakeService` — `service.py`; `IntakeSettings` — `settings.py`.
 - `ExactRowSpawn`, `spawn_failure` — `spawn.py`.
 - `IntakeStop`, `record_stop` — `stop.py`.
