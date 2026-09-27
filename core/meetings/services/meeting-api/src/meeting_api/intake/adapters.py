@@ -431,6 +431,16 @@ class PostgresIntakeTx:
         aw.outcome_at = datetime.now(timezone.utc).replace(microsecond=0)
         await self._db.flush()
 
+    async def mark_stop_requested(
+        self, meeting_id: int, outcome: Optional[Outcome]
+    ) -> None:
+        meeting = await self._locked_meeting(meeting_id)
+        data = meeting.data if isinstance(meeting.data, dict) else {}
+        meeting.data = {**data, "stop_requested": True}
+        await self._db.flush()
+        if outcome is not None:
+            await self.record_outcome(meeting_id, outcome)
+
     async def mark_waiting_for_room(self, meeting_id: int) -> None:
         await self._locked_meeting(meeting_id)
         aw = await lock_aw_state(self._db, meeting_id)

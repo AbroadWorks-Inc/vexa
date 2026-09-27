@@ -28,6 +28,11 @@ Public surface:
     ``SpawnPort`` (§1.5): ``spawn_exact`` runs ``bot_spawn.request_bot`` claiming exactly the given
     row and answers ``sent`` / ``already_live`` / ``failed`` with a typed code and exact message.
     ``spawn_failure(exc)`` is the one §1.5 table from a spawn exception to ``(code, message)``.
+  * ``IntakeStop(store, commands, runtime, *, publisher)`` — ``stop.py``. The production
+    ``StopPort`` (§1.7): under the link lock, a bot that reached the meeting goes ``stopping``
+    through ``write_status`` with ``data.stop_requested`` and the outcome given; a bot still
+    booting keeps its stage and gets the flag and the outcome; then ``stop_meeting_row`` sends the
+    leave command and deletes a booting bot's workload.
   * ``check_room`` / ``not_sent_tick`` — ``sweeps.py``. The scheduler's intake side (§1.5): the
     link check under the link lock before a bot is sent to an entry-managed meeting (wait, or merge
     into an open-ended live meeting, R2), and the not-sent sweep (R6). ``OutboxOnly`` / ``NoStop``
@@ -65,6 +70,7 @@ from .router import build_intake_router
 from .service import IntakeService
 from .settings import IntakeSettings
 from .spawn import ExactRowSpawn, spawn_failure
+from .stop import IntakeStop
 from .status import (
     Outcome,
     StatusConflict,
@@ -89,6 +95,7 @@ __all__ = [
     "IntakeSettings",
     "ExactRowSpawn",
     "spawn_failure",
+    "IntakeStop",
     "check_room",
     "not_sent_tick",
     "not_sent_cause",

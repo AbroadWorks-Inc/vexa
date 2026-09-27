@@ -284,6 +284,14 @@ class IntakeTx(Protocol):
         """
         ...
 
+    async def mark_stop_requested(
+        self, meeting_id: int, outcome: Optional[Outcome]
+    ) -> None:
+        """Set ``data.stop_requested`` and, when given, the outcome (meeting row lock, then
+        ``meeting_aw_state``) without changing the status: the stop of a bot still booting, which
+        keeps the stage it reached (§1.7)."""
+        ...
+
     async def mark_waiting_for_room(self, meeting_id: int) -> None:
         """Stamp ``meeting_aw_state.waiting_for_room_sent_at`` with the current time (meeting row
         lock, then ``meeting_aw_state``): the meeting's ``meeting.waiting_for_room`` went out

@@ -15,7 +15,9 @@ composition, P2), behaviour-matched to the parent ``meetings.stop_bot``:
      later attributed to a user stop, never a silent failure — and so ``lifecycle.occurrence`` never
      lets the calendar re-dispatch the occurrence), then ``stop_meeting_row`` per row: PUBLISH
      ``bot_commands:meeting:{id}`` ``{"action":"leave"}``, and tear down a still-booting bot's
-     workload. ``stop_meeting_row`` is the one stop of a row whose stop is recorded.
+     workload. ``stop_meeting_row`` is the one stop of a row whose stop is recorded;
+     ``intake.IntakeStop`` (the ``/v2`` stop and R5, §1.7) records the stop through the status
+     writer and calls it too.
   4. The bot honours the command, leaves, and emits its terminal ``lifecycle.v1`` event — which the
      existing ``/bots/internal/callback/lifecycle`` handler classifies (→ ``completed``/``failed``,
      ``meeting.status_change`` webhook fires). This route TRIGGERS the stop; it never jumps the FSM itself.

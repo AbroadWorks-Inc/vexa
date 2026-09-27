@@ -457,6 +457,17 @@ class _FakeTx:
             "outcome_at": self._s._clock().replace(microsecond=0),
         }
 
+    async def mark_stop_requested(
+        self, meeting_id: int, outcome: Optional[Outcome]
+    ) -> None:
+        row = self._s.meetings[meeting_id]
+        self._s.meetings[meeting_id] = {
+            **row,
+            "data": {**row["data"], "stop_requested": True},
+        }
+        if outcome is not None:
+            await self.record_outcome(meeting_id, outcome)
+
     async def mark_waiting_for_room(self, meeting_id: int) -> None:
         self._s.aw[meeting_id] = {
             **self._s.aw[meeting_id],
