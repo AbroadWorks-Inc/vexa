@@ -230,17 +230,23 @@ def test_bot_scope_still_runs_the_bot_lifecycle():
     assert client.get("/bots/status", headers=AUTH).status_code == 200
 
 
+#: The routes a bot+tx key must NOT reach: each needs a least-privilege scope of its own (§1.10).
+#: Written down here, not read from ROUTE_SCOPES, so a manifest edit that moves any other route out
+#: of bot/tx turns the test below red instead of redefining what it expects.
+LEAST_PRIVILEGE = frozenset({("DELETE", "/v2/meetings/{meeting_id}")})
+
+
 def test_a_bot_and_tx_key_reaches_every_route():
     """The shape every real key has (the terminal mints bot+tx+browser; the docs' own mint example
-    is bot+tx) is unaffected end to end — no route in the matrix regresses to 403. The routes that
-    need a least-privilege scope of their own (``erase``) are the exception, and are refused."""
+    is bot+tx) is unaffected end to end — no route in the matrix regresses to 403, except the
+    least-privilege routes listed above, which it must not reach."""
     client = _client(["bot", "tx"])
     for method, url, template in CARRIED_CASES:
         status = _request(client, method, url).status_code
-        if ROUTE_SCOPES[(method, template)] & {"bot", "tx"}:
-            assert status != 403, f"{method} {url} regressed"
-        else:
+        if (method, template) in LEAST_PRIVILEGE:
             assert status == 403, f"{method} {url} let a bot+tx key past its own scope"
+        else:
+            assert status != 403, f"{method} {url} regressed"
 
 
 def test_an_erase_key_reaches_only_the_erase_route():
