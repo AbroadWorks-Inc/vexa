@@ -127,9 +127,10 @@ def test_every_reply_golden_meeting_is_the_full_projection_shape():
         assert set(data["meeting"].keys()) == expected_keys, path.name
 
 
-def test_intake_contract_is_not_sealed_yet():
-    """Ruling R1: intake.v1 is a DRAFT — sealed later in task A8."""
+def test_intake_contract_is_sealed():
+    """§1.12: intake.v1 is sealed once the /v2 routes are built against it; gate:contract-version
+    checks the hash."""
     seal = json.loads(
         (_CONTRACTS.parent.parent.parent / "contracts.seal.json").read_text()
     )
-    assert "core/meetings/contracts/intake.v1" not in seal
+    assert "core/meetings/contracts/intake.v1" in seal
