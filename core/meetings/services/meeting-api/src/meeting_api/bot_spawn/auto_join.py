@@ -47,6 +47,9 @@ calendar bot records like a manual one (#1216). Passing nothing meant inheriting
 ``recording_enabled=False`` default, and every calendar-joined meeting on stage rev 194 came back
 unrecorded while manual ones recorded — a split default nobody chose.
 
+Each bot sent moves ``aw_autojoin_lag_seconds`` (§1.13) by the tick's time minus
+(``scheduled_at`` − lead): how long after the bot became due it went.
+
 The tick is a pure-ish function over injected ports (repo, runtime, context fetcher, clock) — the
 entrypoint (``__main__``) wraps it in the standard poll loop; tests drive single ticks offline.
 """
@@ -56,6 +59,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+from ..metrics import autojoin_lag
 from ..obs import log_event
 
 # Sweep cadence/window env vocabulary (config.v1: all optional, sane defaults).
@@ -411,6 +415,9 @@ async def auto_join_tick(
                           outcome.message or "bot workload failed to start")
             continue
         counters["spawned"] += 1
+        scheduled_at = _parse_iso(data.get("scheduled_at")) if isinstance(data, dict) else None
+        if scheduled_at is not None:
+            autojoin_lag((now - (scheduled_at - timedelta(seconds=lead_s))).total_seconds())
         if data.get("auto_join_error"):
             # a prior failure resolved — clear the stamp so the row reads clean
             await repo.merge_meeting_data(row["id"], {

@@ -27,6 +27,7 @@ and stays in their ecosystem (FastAPI + redis + DB).
 | publishes | api-gateway `/ws` | redis channel `tc:meeting:{id}:mutable` | the live mutable transcript bundle |
 | publishes | api-gateway `/ws` | redis channel `bm:meeting:{id}:status` | ws.v1 `meeting.status` (BotStatus) on each FSM advance |
 | produces | user webhook endpoint | `webhook.v1` envelope | `meeting.status_change` (signed, best-effort delivery) |
+| scraped-by | the cluster's Prometheus | `GET /metrics` on the pod (in no gateway route table) | the §1.13 metrics (`src/meeting_api/metrics.py`) |
 
 ## Contracts
 

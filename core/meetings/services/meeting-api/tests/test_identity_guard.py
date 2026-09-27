@@ -39,6 +39,7 @@ EXEMPT = {
     "/runtime/callback",
     "/internal/recordings/upload",
     "/internal/webhooks/test",
+    "/metrics",
 }
 
 

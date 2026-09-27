@@ -38,6 +38,11 @@ nothing. The attempt row is written either way, since the send happened.
 Errors stored and logged name a type or a cause, never a URL, a host, a secret or a key. Redis is
 not used anywhere here.
 
+Metrics (§1.13): each claim moves ``aw_webhook_deliveries_total{event_type,outcome,user_id}`` once,
+with the attempt's ``outcome`` (``delivered``, ``retry``, ``failed``, ``dead``) or what happened
+instead (``cancelled``, ``superseded``, ``lease_short``, ``crashed``); each post made moves
+``aw_webhook_delivery_seconds``.
+
 ``DeliveryStore`` is the storage port (``PostgresDeliveryStore`` in production) and ``Poster`` the
 transport port (``HttpxPoster``: httpx over ``ssrf.build_pinned_transport``, dialling the address
 the guard validated with the Host header and TLS SNI of the real host).
@@ -51,6 +56,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Collection, List, Mapping, Optional, Protocol
 
+from ..metrics import webhook_delivery
 from ..obs import log_event
 from .secret_box import SecretBox, SecretBoxError
 from .signing import signed_headers
@@ -225,6 +231,7 @@ class WebhookSender:
             raise
         # the lease expires and the row is claimed again
         except Exception as exc:  # noqa: BLE001
+            webhook_delivery(claim.event_type, "crashed", claim.user_id, None)
             log_event(
                 "webhook_delivery_crashed",
                 audience="operator",
@@ -354,6 +361,16 @@ class WebhookSender:
         }
 
     def _log(self, claim: Claim, state: str, result: Optional[DeliveryResult]) -> None:
+        webhook_delivery(
+            claim.event_type,
+            state if result is None or state == "superseded" else result.outcome,
+            claim.user_id,
+            (
+                None
+                if result is None or result.duration_ms is None
+                else result.duration_ms / 1000
+            ),
+        )
         fields = {**self._ids(claim), "state": state}
         if result is not None:
             fields.update(

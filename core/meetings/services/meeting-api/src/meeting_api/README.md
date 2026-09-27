@@ -10,6 +10,7 @@ an isolated brick behind a port-seam.
 |---|---|---|
 | `app.py` | `create_app(...)` — composes the modules onto ONE app; the shared `/health`. | `GET /health` |
 | `identity_guard.py` | §1.10 — a client route believes `x-user-id` only with the gateway's fresh `x-gateway-signature` (`GATEWAY_IDENTITY_SECRET`), else 401; `/internal/*`, the bot and runtime callbacks, `/health*` and `/metrics` are exempt. Vectors: `core/gateway/contracts/gateway-identity/`. | — |
+| `metrics.py` | §1.13 — the Prometheus metrics (own registry): intake requests and latency, meetings by status, `not_sent` by reason, auto-join lag, webhook deliveries, latency, due and unpublished, exports, sweep stamps. Labelled by `user_id` where per request, meeting or account. The three database gauges are read at scrape time (`PostgresMetricsSource`, 2 s). Exempt from the identity guard; in no gateway route table. | `GET /metrics` |
 | `lifecycle/` | **O-MTG-1** — the lifecycle.v1 receiver + meeting-state FSM. | `POST /bots/internal/callback/lifecycle` |
 | `callback_auth.py` | §1.10 — who may call the callbacks: the bot's lifecycle callback needs `x-internal-secret`; the runtime posts to a `callbackUrl` carrying a per-bot token (HMAC of `aw-runtime-callback.<workloadId>` under `INTERNAL_API_SECRET`), never logged. Vectors: `core/meetings/contracts/runtime-callback/`. | — |
 | `bot_spawn/` | `POST /bots` — build the invocation.v1 invocation + mint the MeetingToken + spawn the meeting-bot over runtime.v1, eager-creating the MeetingSession. | `POST /bots` |

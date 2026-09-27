@@ -20,6 +20,9 @@ workload that never started and the auto-join retry rule reads.
   5. insert the event into ``webhook_outbox``: the §2.7 envelope around the one meeting projection
      (``project_meeting``), serialised once; the stored ``payload_text`` is the exact body sent.
 
+A ``not_sent`` outcome also moves ``aw_meetings_not_sent_total{detail,user_id}`` (§1.13) once the
+five steps are written; the count is taken inside the caller's transaction, before its commit.
+
 Lock order (§1.4): the caller takes the link's advisory lock first, then ``write_status`` locks the
 meeting row, then ``meeting_aw_state``. ``meeting_aw_state`` is always reached through its meeting
 row's lock, which is why creating a missing row here cannot race another writer.
@@ -48,6 +51,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
 
+from ..metrics import meeting_not_sent
 from .projection import iso_utc, project_meeting
 from .rules import (
     FINISHED_STATUSES,
@@ -359,6 +363,8 @@ async def write_status(
         now=now,
         event_data=event_data,
     )
+    if outcome is not None and outcome.kind == "not_sent":
+        meeting_not_sent(meeting.user_id, outcome.detail)
     return WrittenEvent(event_id, int(aw.event_seq), tuple(rerun))
 
 

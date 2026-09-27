@@ -237,6 +237,7 @@ def build_production_app():
     # The entry service (§1.3) over Postgres, ONE instance behind the /v2 routes and the scheduler.
     from .intake import PostgresIntakeReads
     from .intake.outbox import PostgresWebhookTests
+    from .metrics import PostgresMetricsSource
 
     intake = _build_intake(
         session_factory, meeting_repo, runtime_client,
@@ -265,6 +266,7 @@ def build_production_app():
         intake_reads=PostgresIntakeReads(session_factory),
         intake_stop=intake.stop,
         webhook_tests=PostgresWebhookTests(session_factory),
+        metrics_source=PostgresMetricsSource(session_factory),
     )
 
     _attach_background_loops(
@@ -307,6 +309,7 @@ def _attach_background_loops(
     single-delivery is already exact, and guarding it would needlessly serialize the replicas' reads.
     """
     from .collector.ingest import RECLAIM_MIN_IDLE_MS, consume_segments, reclaim_segments
+    from .metrics import sweep_ran
     from .sweeps.single_flight import PgAdvisoryLock, run_single_flight, sweep_lock_key
 
     # One shared advisory-lock backend across the guarded loops (each keyed by its own loop name).
@@ -314,8 +317,12 @@ def _attach_background_loops(
     sweep_lock = PgAdvisoryLock(session_factory) if session_factory is not None else None
 
     async def _guarded(loop_name: str, body):
-        """Run ``body`` (a zero-arg coroutine fn) at most once per interval across replicas."""
-        return await run_single_flight(sweep_lock, sweep_lock_key(loop_name), body)
+        """Run ``body`` (a zero-arg coroutine fn) at most once per interval across replicas. A tick
+        that ran to its end on this replica stamps ``aw_sweep_last_run_timestamp_seconds``."""
+        ran = await run_single_flight(sweep_lock, sweep_lock_key(loop_name), body)
+        if ran:
+            sweep_ran(loop_name)
+        return ran
 
     seg_interval = float(os.getenv("SEGMENT_CONSUMER_INTERVAL", "0.5"))
     # #636: orphan-reclaim cadence — fold a bounded XAUTOCLAIM into the consumer loop every N ticks
@@ -733,6 +740,7 @@ def _attach_background_loops(
         while True:
             try:
                 await sender.run_once()
+                sweep_ran("webhook-sender")
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -14,6 +14,7 @@ sub-package of ``meeting_api`` mounted here (the v0.12 analog of the parent ``ma
   * **recordings** — POST ``/internal/recordings/upload``, GET ``/recordings``,
     GET ``/recordings/{id}/master`` (chunks + master → ``meeting.data`` JSONB).
   * **obs** — ``TraceMiddleware`` (logevent.v1 trace_id threading) + the shared ``GET /health``.
+  * **metrics** — ``GET /metrics``: the §1.13 Prometheus metrics (``metrics.py``).
 
 webhooks + scheduling are library bricks (no HTTP surface of their own in the core path — they are
 driven by the lifecycle/bot_spawn flows); they are re-exported from the package front door and wired
@@ -32,7 +33,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import bot_spawn as _bot_spawn
 from . import events as _flows_events
@@ -54,6 +55,7 @@ from .obs import TraceMiddleware
 if TYPE_CHECKING:
     from .intake import IntakeReads, IntakeService, StopPort
     from .intake.outbox import WebhookTests
+    from .metrics import MetricsSource
 
 #: In-process capture of the last N emitted webhook envelopes — an eval/introspection seam, never a
 #: durable store (the DB meeting row is the durable record; the WebhookSink is the delivery path).
@@ -204,6 +206,8 @@ def create_app(
     # admin-api's webhook.test hand-off (§2.7): writes the test event and its one delivery. None →
     # POST /internal/webhooks/test answers 503 (the app factory / tests have no Postgres).
     webhook_tests: Optional["WebhookTests"] = None,
+    # the database gauges GET /metrics reads at scrape time (§1.13). None → served without samples.
+    metrics_source: Optional["MetricsSource"] = None,
 ) -> FastAPI:
     """Build the unified meeting-api app from the injected ports.
 
@@ -240,6 +244,14 @@ def create_app(
                 body["status"] = "degraded"
                 return JSONResponse(body, status_code=503)
         return body
+
+    # --- metrics (§1.13): exempt from the identity guard and in no gateway route table. ---
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics() -> Response:
+        from .metrics import render
+
+        body, content_type = await render(metrics_source)
+        return Response(body, media_type=content_type)
 
     # --- bot_spawn ports (resolved FIRST: the meeting_repo is also the lifecycle-persistence target) ---
     if meeting_repo is None:

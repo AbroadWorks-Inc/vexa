@@ -33,11 +33,17 @@ The export result (§1.9) has its body and write in ``export.py`` (``parse_expor
 (``meeting_not_found`` otherwise, ``meeting_not_finished`` for a scheduled or live one), stored on
 ``meeting_aw_state`` and emitted as ``export.handed_off`` / ``export.failed``; the same result again
 changes nothing. The reply is the meeting (``intake.v1`` ``Meeting``), whose ``export`` shows it.
+
+Metrics (§1.13): every request moves ``aw_intake_requests_total{route,result,user_id}`` and
+``aw_intake_request_seconds``. ``route`` is the method and the path template; ``result`` is an entry
+write's ``result``, a failure's §2.5 code (``internal_error`` for an unexpected exception), else
+``ok``. Each new export result moves ``aw_export_total{state,user_id}``.
 """
 
 from __future__ import annotations
 
 import re
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -50,6 +56,7 @@ from fastapi.routing import APIRoute
 from ..bot_spawn.auto_join import LIVE_STATUSES
 from ..collector.app import delete_completed_artifacts
 from ..collector.ports import TranscriptStore
+from ..metrics import export_recorded, intake_request
 from ..obs import log_event
 from .export import EXPORT_NOT_FINISHED, parse_export
 from .ports import IntakeReads, MeetingQuery, MeetingView, StopPort
@@ -134,13 +141,21 @@ class _IntakeRoute(APIRoute):
 
     def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
         handler = super().get_route_handler()
+        label = f"{','.join(sorted(self.methods))} {self.path}"
 
         async def route(request: Request) -> Response:
+            started = time.monotonic()
+            result = "internal_error"
             try:
-                return await handler(request)
+                response = await handler(request)
+                # an entry write leaves its reply's result on request.state
+                result = getattr(request.state, "intake_result", "ok")
+                return response
             except RequestValidationError as exc:
-                return _error(IntakeError("invalid_request", _validation_message(exc)))
+                result = "invalid_request"
+                return _error(IntakeError(result, _validation_message(exc)))
             except IntakeError as exc:
+                result = exc.code
                 return _error(exc)
             except Exception as exc:
                 if not _retryable(exc):
@@ -152,8 +167,16 @@ class _IntakeRoute(APIRoute):
                     span="meetings.intake",
                     fields={"path": request.url.path, "error": type(exc).__name__},
                 )
+                result = "unavailable"
                 return _error(
-                    IntakeError("unavailable", "storage is unavailable; retry")
+                    IntakeError(result, "storage is unavailable; retry")
+                )
+            finally:
+                intake_request(
+                    label,
+                    result,
+                    request.headers.get("x-user-id"),
+                    time.monotonic() - started,
                 )
 
         return route
@@ -253,14 +276,18 @@ def build_intake_router(
         request: Request, x_user_id: Optional[str] = Header(default=None)
     ) -> JSONResponse:
         user_id = _account(x_user_id)
-        return JSONResponse(await service.put_entry(user_id, await _body(request)))
+        reply = await service.put_entry(user_id, await _body(request))
+        request.state.intake_result = reply["result"]
+        return JSONResponse(reply)
 
     @router.post("/v2/entries/remove")
     async def remove_entry(
         request: Request, x_user_id: Optional[str] = Header(default=None)
     ) -> JSONResponse:
         user_id = _account(x_user_id)
-        return JSONResponse(await service.remove_entry(user_id, await _body(request)))
+        reply = await service.remove_entry(user_id, await _body(request))
+        request.state.intake_result = reply["result"]
+        return JSONResponse(reply)
 
     @router.get("/v2/entries")
     async def list_entries(
@@ -421,6 +448,8 @@ def build_intake_router(
         if meeting.status not in FINISHED_STATUSES:
             raise IntakeError("meeting_not_finished", EXPORT_NOT_FINISHED)
         event_id = await reads.record_export(user_id, meeting.id, report)
+        if event_id:
+            export_recorded(report.state, user_id)
         log_event(
             "intake_export_recorded" if event_id else "intake_export_unchanged",
             audience="user",
