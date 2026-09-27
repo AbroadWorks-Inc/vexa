@@ -385,6 +385,13 @@
    "targets": []
   },
   {
+   "key": "WEBHOOK_SEND_INTERVAL_S",
+   "class": "defaulted",
+   "default": "1",
+   "description": "webhooks (§1.8): cadence (s) of the subscription sender, one loop per replica (not single-flight: due webhook_deliveries rows are claimed FOR UPDATE SKIP LOCKED with a 60 s lease, so replicas share them). It runs only with Postgres, ADMIN_API_URL + INTERNAL_API_SECRET (the subscription read) and the WEBHOOK_SECRET_ENC_* key ring.",
+   "targets": []
+  },
+  {
    "key": "SCHEDULER_TICK_INTERVAL",
    "class": "defaulted",
    "default": "1",

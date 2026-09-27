@@ -23,6 +23,14 @@ webhooks.py}`, reimplemented clean. The wire shape is sealed in `meetings/contra
   `WEBHOOK_PRIVATE_HOST_ALLOWLIST`; a host in it passes unresolved, at validate and at connect time.
   An IPv4-mapped IPv6 address is judged as the IPv4 address it maps. The secret box and URL rules are
   pinned by the shared vectors in `core/identity/contracts/webhook-subscriptions/`.
+- **Subscription sender** (`sender.py`, `subscriptions.py`, §1.8) — one loop per replica claims due
+  `webhook_deliveries` rows (`FOR UPDATE SKIP LOCKED`, `sending` with a 60 s lease), re-checks the
+  subscription is active in `webhook_subscriptions` (else `cancelled`) and its URL passes the guard,
+  signs the stored `payload_text` and posts it (10 s). One attempt row per attempt; 2xx `delivered`,
+  5xx/429/timeout/connection error retried at +60 s, +300 s, +1800 s, +7200 s then `dead`, any other
+  answer `failed`. Every move out of `sending` is guarded by the claim's lease, so a pause or delete
+  mid-flight stays `cancelled`. Subscriptions come from admin-api's internal read, cached 30 s.
+  Redis is not used.
 - **Event filter** (`delivery.py`) — `is_event_enabled`: per-client subscribers only receive the
   events in their `webhook_events` map (default: `meeting.completed`). Suppressed before any HTTP.
 - **Scopes** — `WebhookSink.deliver(..., scope=)`: `per-client` applies the filter; `system`
@@ -48,6 +56,7 @@ fake in-memory receiver — no httpx, no network, no live receiver.
 ## Evals
 `tests/test_webhook_signing.py` · `test_webhook_delivery.py` · `test_webhook_ssrf.py` ·
 `test_webhook_subscription_signing.py` (the §2.7 signing, secret box and shared vectors) ·
+`test_webhook_sender.py` (the §1.8 sender, offline and on a real Postgres) ·
 `test_webhook_ledger.py` (the #841 delivery-history path — a real delivery lands in
 `GET /webhooks/deliveries`, host-only rows). Ride `gate:python`. `webhook.v1` goldens conform via
 `gate:schema` (the contract is UNSEALED — sealing is the human `lane:contract` step).

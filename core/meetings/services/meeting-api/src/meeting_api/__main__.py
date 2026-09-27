@@ -12,6 +12,8 @@ control-plane background loops alongside the HTTP app via the FastAPI lifespan:
     write) and drains the copilot's ``proc:meeting:{id}`` notes into ``meeting.data`` JSONB.
   * **webhook retry-drain** — one ``drain_retry_queue`` sweep per interval over the redis retry
     queue (failed ``meeting.status_change`` deliveries are retried with backoff).
+  * **webhook sender** (§1.8) — one per replica: claims due ``webhook_deliveries`` rows with a lease
+    and posts each signed subscription delivery (``webhooks.sender``). No Redis.
 
 Each loop is a single-tick function the eval drives explicitly; here the entrypoint wraps it in the
 ``while True: tick; sleep`` poll the deployment uses. uvicorn-target: ``uvicorn meeting_api.__main__:app``.
@@ -115,6 +117,11 @@ def build_production_app():
     # ADMIN_TOKEN, exactly like main. (INTERNAL_API_SECRET is for the gateway↔admin-api internal
     # validation only — a different concern.) None → the recordings verifier falls back to ADMIN_TOKEN.
     token_secret = os.getenv("ADMIN_TOKEN") or None
+    # §2.7: the webhook-secret key ring the sender opens subscription secrets with. Set but wrong
+    # → KeyRingError: refuse to boot. Unset → no box, and the sender stays off.
+    from .webhooks.secret_box import secret_box_from_env
+
+    webhook_secret_box = secret_box_from_env()
 
     engine = build_engine(database_url)  # #635: env-steered pool (pool_pre_ping preserved in the helper)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -263,6 +270,7 @@ def build_production_app():
         session_factory=session_factory,
         storage=storage,
         intake=intake,
+        webhook_secret_box=webhook_secret_box,
     )
     return app
 
@@ -279,7 +287,7 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
-    *, intake,
+    *, intake, webhook_secret_box=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
 
@@ -655,6 +663,47 @@ def _attach_background_loops(
                 log.exception("not-sent sweep tick failed")
             await asyncio.sleep(not_sent_interval)
 
+    # Subscription webhooks (§1.8). The sender runs on EVERY replica, unguarded: rows are claimed
+    # with FOR UPDATE SKIP LOCKED and a 60 s lease, so the replicas share the work instead of
+    # taking turns. It needs Postgres, the admin edge (the subscription read, cached 30 s) and the
+    # secret key ring; without them deliveries wait in webhook_deliveries (no Redis anywhere here).
+    from .webhooks.ssrf import DEFAULT_PRIVATE_HOST_ALLOWLIST, parse_allowlist
+    from .webhooks.subscriptions import AdminSubscriptions
+
+    webhook_send_interval = float(os.getenv("WEBHOOK_SEND_INTERVAL_S", "1"))
+    webhook_allowlist = parse_allowlist(
+        os.getenv("WEBHOOK_PRIVATE_HOST_ALLOWLIST", DEFAULT_PRIVATE_HOST_ALLOWLIST)
+    )
+    webhook_subscriptions = AdminSubscriptions(admin_api_url, internal_secret)
+
+    async def _webhook_send_loop() -> None:
+        if session_factory is None:
+            return
+        if webhook_secret_box is None or not webhook_subscriptions.configured:
+            log.warning(
+                "webhook sender off: it needs WEBHOOK_SECRET_ENC_KEYS + "
+                "WEBHOOK_SECRET_ENC_ACTIVE_KEY and ADMIN_API_URL + INTERNAL_API_SECRET; "
+                "subscription deliveries wait in webhook_deliveries"
+            )
+            return
+        from .webhooks.sender import HttpxPoster, PostgresDeliveryStore, WebhookSender
+
+        sender = WebhookSender(
+            PostgresDeliveryStore(session_factory),
+            webhook_subscriptions,
+            webhook_secret_box,
+            HttpxPoster(allowlist=webhook_allowlist),
+            allowlist=webhook_allowlist,
+        )
+        while True:
+            try:
+                await sender.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("webhook sender tick failed")
+            await asyncio.sleep(webhook_send_interval)
+
     # Calendar sync: each sweep discovers every user with a connected ICS feed (admin-api internal
     # edge), fetches it over the SSRF-pinned transport, and upserts planned meetings (one row per
     # calendar UID — next occurrence only). Per-user try/except: one bad feed never stalls the
@@ -803,6 +852,7 @@ def _attach_background_loops(
             ),
             asyncio.create_task(_auto_join_loop(), name="auto-join"),
             asyncio.create_task(_not_sent_loop(), name="not-sent"),
+            asyncio.create_task(_webhook_send_loop(), name="webhook-sender"),
             asyncio.create_task(_calendar_sync_loop(), name="calendar-sync"),
             asyncio.create_task(_signal_tape_janitor_loop(), name="signal-tape-janitor"),
             asyncio.create_task(_ensure_fts_index_once(), name="ensure-fts-index"),
