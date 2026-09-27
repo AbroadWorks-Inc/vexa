@@ -29,6 +29,10 @@ A meeting's end is never before its start, so the read also bounds the meeting t
 walks the partial index ``ix_meeting_scheduled_due`` (``status = 'scheduled'`` is a literal for the
 same generic-plan reason).
 
+``link_rows(db, user_id, room)`` is the link resolver's read (§1.6): the account's rows on one link
+in the caller's session, narrow (no ``data`` beyond ``scheduled_at``), for ``resolver.resolve``.
+The collector store and the bot-spawn repo both resolve links through it.
+
 SQLAlchemy and the ORM models are imported inside the functions that use them, so the package
 imports without SQLAlchemy installed.
 """
@@ -49,6 +53,7 @@ from typing import (
 
 from .ports import EntryView, MeetingView, Room
 from .projection import iso_utc
+from .resolver import LinkRow
 from .rules import FINISHED_STATUSES, Plan
 from .status import (
     Outcome,
@@ -64,7 +69,7 @@ from .validation import EntryIn
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-__all__ = ["PostgresIntakeStore", "PostgresIntakeTx", "take_link_lock"]
+__all__ = ["PostgresIntakeStore", "PostgresIntakeTx", "link_rows", "take_link_lock"]
 
 
 async def take_link_lock(db: AsyncSession, user_id: int, room: Room) -> None:
@@ -75,6 +80,37 @@ async def take_link_lock(db: AsyncSession, user_id: int, room: Room) -> None:
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
         {"key": f"aw-intake:{user_id}:{room.platform}:{room.native_meeting_id}"},
     )
+
+
+async def link_rows(db: AsyncSession, user_id: int, room: Room) -> list[LinkRow]:
+    """Every row of the account on the link, as the link resolver reads it (§1.6,
+    ``resolver.resolve``): id, status, ``data.scheduled_at``, ``start_time``, ``created_at`` and
+    whether a ``meeting_entries`` row points at it. Only those columns are read, never ``data``
+    whole."""
+    from sqlalchemy import exists, select
+
+    from ..sessions.models import Meeting, MeetingEntry
+
+    rows = (
+        await db.execute(
+            select(
+                Meeting.id,
+                Meeting.status,
+                Meeting.data["scheduled_at"].astext,
+                Meeting.start_time,
+                Meeting.created_at,
+                exists().where(MeetingEntry.meeting_id == Meeting.id),
+            ).where(
+                Meeting.user_id == user_id,
+                Meeting.platform == room.platform,
+                Meeting.platform_specific_id == room.native_meeting_id,
+            )
+        )
+    ).all()
+    return [
+        LinkRow.of(mid, status, {"scheduled_at": at}, start_time, created_at, managed)
+        for mid, status, at, start_time, created_at, managed in rows
+    ]
 
 
 def _plan_data(plan: Plan) -> dict[str, Any]:

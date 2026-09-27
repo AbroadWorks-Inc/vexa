@@ -80,15 +80,13 @@ class InMemoryMeetingRepo:
         return None
 
     async def find_latest(self, user_id, platform, native_meeting_id) -> Optional[dict]:
-        rows = [
-            m for m in self._meetings.values()
-            if m["user_id"] == user_id
-            and m["platform"] == platform
-            and m["native_meeting_id"] == native_meeting_id
-        ]
-        if not rows:
-            return None
-        return dict(max(rows, key=lambda m: m["id"]))  # id is monotonic → most recent
+        from ..intake.fakes import link_rows_in
+        from ..intake.ports import Room
+        from ..intake.resolver import LinkKind, resolve
+
+        rows = link_rows_in(self._meetings.values(), user_id, Room(platform, native_meeting_id))
+        picked = resolve(rows, LinkKind.READ, now=datetime.now(timezone.utc))
+        return dict(self._meetings[picked.id]) if picked is not None else None
 
     async def create_meeting(self, *, user_id, platform, native_meeting_id, data) -> dict:
         mid = self._next_id

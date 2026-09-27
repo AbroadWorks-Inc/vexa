@@ -192,7 +192,7 @@ def build_router(
     # --- GET /transcripts/by-id/{meeting_id} → api.v1 TranscriptionResponse for an EXACT row (P0).
     # Registered BEFORE /transcripts/{platform}/{native_meeting_id} so `by-id` is not swallowed as a
     # platform. Owner-scoped: the row must belong to the caller (X-User-Id) or 404 — so it can neither
-    # leak another tenant's transcript NOR (unlike the native path, which resolves to the NEWEST row)
+    # leak another tenant's transcript NOR (unlike the native path, which resolves to ONE row, §1.6)
     # hydrate the wrong one of a user's several rows on the same meeting link. The terminal fetches the
     # EXACT row it is displaying by its id. ---
     @router.get("/transcripts/by-id/{meeting_id}")
@@ -547,18 +547,37 @@ def build_router(
     # workspace / auto_join). Owner-scoped; refused (409) once the row advanced into the bot FSM —
     # the FSM is never fought. `scheduled_at: null` clears the time (status flips to `idle`);
     # `meeting_url: null` detaches the link (row becomes link-less). ---
-    # --- native-id → owned ROW resolver (#579 C1). Resolve (platform, native) to the caller's
-    # NEWEST OWNED row, exactly the rule the native transcript/authorize paths use (list_meetings is
-    # created_at-desc). OWNER-scoped: `shared` rows (a workspace/transcript-share grant) are excluded
-    # so a viewer can never mutate/delete someone else's meeting via the native path. None → 404. ---
-    async def _resolve_owned_native(user_id: int, platform: str, native_meeting_id: str):
-        meetings = await store.list_meetings(user_id, platform=platform)
-        for m in meetings:  # newest-first
-            if (not m.get("shared")
-                    and m.get("platform") == platform
-                    and m.get("native_meeting_id") == native_meeting_id):
-                return m.get("id")
-        return None
+    # --- §1.6 link conflicts, in upstream's error shape: 409 with the code as the `detail` value
+    # (`ambiguous_room` — a planned edit on a link holding several planned meetings;
+    # `managed_by_entries` — an upstream edit of a meeting entries manage). ---
+    async def _on_link(call):
+        from ..intake.resolver import AmbiguousRoom, ManagedByEntries
+
+        try:
+            return await call
+        except (AmbiguousRoom, ManagedByEntries) as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
+
+    # --- native-id → owned ROW resolver (#579 C1): the one link resolver (§1.6) over the caller's
+    # OWN rows on (platform, native) — READ for annotate and chat, PLANNED_EDIT for PATCH/DELETE.
+    # OWNER-scoped: a workspace/transcript-share grant never makes a row a candidate, so a viewer can
+    # never mutate/delete someone else's meeting via the native path. None → 404. ---
+    async def _resolve_owned_native(user_id: int, platform: str, native_meeting_id: str, kind: str):
+        from ..intake.resolver import LinkKind
+
+        row = await _on_link(
+            store.resolve_room(user_id, platform, native_meeting_id, LinkKind(kind))
+        )
+        return row.id if row is not None else None
+
+    # --- an entry-managed meeting is edited only through /v2/entries (§1.6): the upstream PATCH and
+    # DELETE, by row id or native pair, answer 409 `managed_by_entries`. An unknown or unowned id is
+    # not managed here, so it still reaches the store's 404. ---
+    async def _refuse_managed(user_id: int, meeting_id: int) -> None:
+        from ..intake.resolver import ManagedByEntries
+
+        if await store.entry_managed(user_id, meeting_id):
+            raise HTTPException(status_code=409, detail=ManagedByEntries.code)
 
     # --- the ROW-id PATCH/DELETE bodies, factored out so the native-keyed aliases (#579 C1) forward
     # to the SAME owner-scoped, FSM-refusing logic once they have resolved (platform, native) → row. ---
@@ -567,6 +586,7 @@ def build_router(
 
         if not isinstance(payload, dict):
             raise HTTPException(status_code=422, detail="body must be an object")
+        await _refuse_managed(user_id, meeting_id)
 
         updates: dict = {}
         if "title" in payload:
@@ -641,6 +661,7 @@ def build_router(
         return {**row, "data": project_response_data(row.get("data"), viewer_is_owner=True)}
 
     async def _apply_meeting_delete(user_id: int, meeting_id: int) -> dict:
+        await _refuse_managed(user_id, meeting_id)
         result = await store.delete_planned_meeting(user_id, meeting_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Meeting not found")
@@ -685,8 +706,8 @@ def build_router(
 
     # --- native-keyed PATCH/DELETE /meetings/{platform}/{native_meeting_id} (#579 C1) — the sealed
     # api.v1 mutate routes a 0.10 client (incl. the shipped dashboard) calls. Resolve (platform,
-    # native) → the caller's newest OWNED row, then forward to the SAME row-id logic above (which
-    # refuses an FSM-owned row with 409). Unknown/unowned native → 404. Additive: the int routes are
+    # native) → the caller's OWNED row the link resolver picks for a planned edit (§1.6), then
+    # forward to the SAME row-id logic above (which refuses an FSM-owned row with 409). Unknown/unowned native → 404. Additive: the int routes are
     # unchanged. DELETE returns 200 + a small body (the sealed native-delete response), NOT the 204
     # the row-id route returns. ---
     # --- POST /meetings/{platform}/{native_meeting_id}/annotate → the caller's OWN description of
@@ -725,9 +746,9 @@ def build_router(
 
     # --- POST /meetings/{meeting_id}/annotate → the SAME write, addressed by the identity a
     # meeting always has. The (platform, native) pair is not one: a Google Meet room code is
-    # reused across sessions, and `_resolve_owned_native` resolves it to the caller's NEWEST row,
-    # so an older meeting on a recurring link could be read but never annotated — an agent that
-    # pulled a transcript had nowhere to write what it learned back (fr_b6340167da32b8b6).
+    # reused across sessions, and `_resolve_owned_native` resolves it to ONE row (the live meeting,
+    # else the most recent started, §1.6), so an older meeting on a recurring link is annotated by
+    # its id — an agent that pulled a transcript writes what it learned back (fr_b6340167da32b8b6).
     #
     # Three segments against the pair route's four, so on segment count alone neither shadows the
     # other — the same property `POST /meetings/{meeting_id}/share` already relies on. Owner-scoped
@@ -780,7 +801,7 @@ def build_router(
             raise HTTPException(status_code=422, detail="invalid JSON body")
         title, metadata = _annotation_from(payload)
 
-        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
+        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id, "read")
         if meeting_id is None:
             raise HTTPException(
                 status_code=404,
@@ -801,7 +822,7 @@ def build_router(
             payload = await request.json()
         except Exception:
             raise HTTPException(status_code=422, detail="invalid JSON body")
-        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
+        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id, "planned_edit")
         if meeting_id is None:
             raise HTTPException(
                 status_code=404,
@@ -817,7 +838,7 @@ def build_router(
         x_user_id: Optional[str] = Header(default=None),
     ):
         user_id = _resolve_user_id(x_user_id)
-        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
+        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id, "planned_edit")
         if meeting_id is None:
             raise HTTPException(
                 status_code=404,
@@ -850,7 +871,7 @@ def build_router(
         x_user_id: Optional[str] = Header(default=None),
     ):
         user_id = _resolve_user_id(x_user_id)
-        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id)
+        meeting_id = await _resolve_owned_native(user_id, platform, native_meeting_id, "read")
         if meeting_id is None:
             raise HTTPException(
                 status_code=404,
@@ -954,7 +975,7 @@ def build_router(
         workspace_id = str(payload.get("workspace_id", "")).strip() if isinstance(payload, dict) else ""
         if not workspace_id:
             raise HTTPException(status_code=422, detail="'workspace_id' is required")
-        bound = await store.bind_workspace(user_id, platform, native_meeting_id, workspace_id)
+        bound = await _on_link(store.bind_workspace(user_id, platform, native_meeting_id, workspace_id))
         if bound is None:
             raise HTTPException(
                 status_code=404,
@@ -1083,9 +1104,9 @@ def build_router(
         except Exception:
             payload = {}
         mode, emails, ttl = _share_payload(payload)
-        minted = await store.mint_transcript_share(
+        minted = await _on_link(store.mint_transcript_share(
             user_id, platform, native_meeting_id, mode=mode, allowed_emails=emails, expires_in_sec=ttl,
-        )
+        ))
         if minted is None:
             log_event(
                 "transcript_share_mint_failed", audience="system", level="warning",
@@ -1239,9 +1260,9 @@ def build_router(
         if intent == "scheduled" and not scheduled_at:
             raise HTTPException(status_code=422, detail="'at' is required when intent is 'scheduled'")
 
-        result = await store.set_intent(
+        result = await _on_link(store.set_intent(
             user_id, platform, native_meeting_id, intent, scheduled_at=scheduled_at
-        )
+        ))
         if result is None:
             raise HTTPException(
                 status_code=404,

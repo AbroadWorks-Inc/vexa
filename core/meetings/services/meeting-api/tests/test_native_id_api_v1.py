@@ -5,7 +5,8 @@ A 0.10 api.v1 client (incl. the shipped 0.10 dashboard) addresses meetings by
 native paths 404'd. These tests drive the SHIPPED collector handlers (offline, in-memory fake)
 proving the restored native-keyed surface:
 
-  * PATCH /meetings/{platform}/{native} — resolves native → newest OWNED row → 200 (rename);
+  * PATCH /meetings/{platform}/{native} — resolves native → the OWNED row the link resolver picks
+    for a planned edit (§1.6) → 200 (rename); several plans → 409 ambiguous_room;
     unknown native → 404; FSM-owned row → 409; a shared (non-owned) row → 404 (never mutable).
   * DELETE /meetings/{platform}/{native} — 200 + row gone; unknown → 404.
   * GET /bots/status — carries BOTH `running` and `running_bots` (sealed golden field), same list.
@@ -51,16 +52,24 @@ def test_native_patch_renames_owned_meeting_200():
     assert r.json()["data"]["title"] == "new"
 
 
-def test_native_patch_resolves_to_newest_row():
-    """Several rows on the SAME native link → the native path addresses the NEWEST (spawn-dedup rule)."""
+def test_native_patch_resolves_by_the_link_resolver():
+    """Several rows on the SAME native link → the planned edit addresses the single plan (§1.6); two
+    plans name no single meeting → 409 ``ambiguous_room``, nothing written."""
     client, store = _client()
-    store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="idle",
-                       created_at="2026-01-01T00:00:00Z")
-    newest = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="idle",
-                                created_at="2026-06-01T00:00:00Z")
-    r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "hit-newest"}, headers=H)
+    store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="completed",
+                       created_at="2026-06-01T00:00:00Z")
+    plan = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="idle",
+                              created_at="2026-01-01T00:00:00Z")
+    r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "hit-plan"}, headers=H)
     assert r.status_code == 200, r.text
-    assert r.json()["id"] == newest
+    assert r.json()["id"] == plan
+
+    second = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="idle",
+                                created_at="2026-06-02T00:00:00Z")
+    r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "which?"}, headers=H)
+    assert r.status_code == 409, r.text
+    assert r.json() == {"detail": "ambiguous_room"}
+    assert store._meetings[second]["data"].get("title") is None
 
 
 def test_native_patch_unknown_native_404():

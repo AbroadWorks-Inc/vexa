@@ -63,8 +63,9 @@ class MeetingRepo(Protocol):
         ...
 
     async def find_latest(self, user_id: int, platform: str, native_meeting_id: str) -> Optional[dict]:
-        """The user's MOST-RECENT meeting for ``(platform, native_id)`` regardless of status, or
-        ``None``. ``continue_meeting`` reuses this row when it is TERMINAL (completed/failed)."""
+        """The user's meeting the link resolver READS for ``(platform, native_id)`` (§1.6): the live
+        one, else the most recent that has started — never a future occurrence — or ``None``.
+        ``continue_meeting`` reuses this row when it is TERMINAL (completed/failed)."""
         ...
 
     async def create_meeting(

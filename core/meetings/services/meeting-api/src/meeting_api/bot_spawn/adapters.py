@@ -155,19 +155,19 @@ class SqlAlchemyMeetingRepo:
     async def find_latest(self, user_id, platform, native_meeting_id) -> Optional[dict]:
         from sqlalchemy import select
 
+        from ..intake.adapters import link_rows
+        from ..intake.ports import Room
+        from ..intake.resolver import LinkKind, resolve
         from ..sessions.models import Meeting
 
         async with self._session_factory() as db:
-            stmt = (
-                select(Meeting)
-                .where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                )
-                .order_by(Meeting.created_at.desc(), Meeting.id.desc())
-            )
-            m = (await db.execute(stmt)).scalars().first()
+            rows = await link_rows(db, user_id, Room(platform, native_meeting_id))
+            picked = resolve(rows, LinkKind.READ, now=datetime.now(timezone.utc))
+            if picked is None:
+                return None
+            m = (
+                await db.execute(select(Meeting).where(Meeting.id == picked.id))
+            ).scalars().first()
             return _row_to_dict(m) if m else None
 
     async def get_meeting(self, meeting_id) -> Optional[dict]:

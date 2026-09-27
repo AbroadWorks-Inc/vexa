@@ -20,6 +20,10 @@
     order and cursors as ``reads.PostgresIntakeReads``. The store has no delivery rows, so
     ``deliveries`` maps an event id to the number of delivery rows a test says it has; ``erase``
     removes those with the meeting's events.
+  * ``link_rows_in(rows, user_id, room)`` — the twin of ``adapters.link_rows`` (§1.6): the link
+    resolver's rows out of plain meeting dicts (``id``, ``user_id``, ``platform``,
+    ``native_meeting_id``, ``status``, ``data``, ``start_time``, ``created_at`` and
+    ``has_entries``), the shape the collector and bot-spawn fakes hold.
 
 Rows are replaced, never mutated, so a transaction's rollback restores a shallow copy.
 """
@@ -36,6 +40,7 @@ from typing import (
     AsyncIterator,
     Callable,
     Collection,
+    Iterable,
     Mapping,
     Optional,
     Sequence,
@@ -50,6 +55,7 @@ from .ports import (
     SpawnOutcome,
 )
 from .projection import iso_utc
+from .resolver import LinkRow
 from .rules import (
     FINISHED_STATUSES,
     Plan,
@@ -76,7 +82,28 @@ __all__ = [
     "InMemoryIntakeReads",
     "InMemoryIntakeStore",
     "RecordedEvent",
+    "link_rows_in",
 ]
+
+
+def link_rows_in(
+    rows: Iterable[Mapping[str, Any]], user_id: int, room: Room
+) -> list[LinkRow]:
+    """The account's rows on the link as ``LinkRow`` (``adapters.link_rows``'s twin)."""
+    return [
+        LinkRow.of(
+            row["id"],
+            row["status"],
+            row.get("data"),
+            row.get("start_time"),
+            row.get("created_at"),
+            bool(row.get("has_entries")),
+        )
+        for row in rows
+        if row.get("user_id") == user_id
+        and row.get("platform") == room.platform
+        and row.get("native_meeting_id") == room.native_meeting_id
+    ]
 
 
 @dataclass(frozen=True)

@@ -90,44 +90,26 @@ async def _sweep(repo, runtime, at):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-# F1 — a stop on a SCHEDULED occurrence: never dispatched, and terminal immediately
+# F1 — a stop on a SCHEDULED occurrence. §1.6: the stop means the live meeting only and never
+# cancels a plan; a plan is called off by removing its entry (or DELETE /meetings/… upstream).
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-async def test_f1_stopping_a_scheduled_occurrence_terminalizes_it_and_no_bot_is_dispatched():
-    """Row 26306, exactly: stop a scheduled occurrence, then run the sweep in its own due window.
-
-    Two assertions, and the second is the one rev 193 failed: the row must be TERMINAL (a flagged
-    ``scheduled`` row is a zombie no rule owns), and the sweep must send nothing."""
+async def test_f1_a_stop_never_cancels_a_scheduled_occurrence():
+    """§1.6: ``DELETE /bots/{p}/{n}`` on a link whose only meeting is a scheduled occurrence finds
+    no live meeting → 404, and the plan is left exactly as it was: still ``scheduled``, no
+    ``stop_requested`` flag (the zombie shape F1 was), still due in its window."""
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     planned = await _seed_scheduled(repo)
 
     async with _client(_app(repo, runtime)) as client:
         r = await client.delete(f"/bots/{PLATFORM}/{NATIVE}", headers={"x-user-id": str(USER)})
 
-    assert r.status_code == 200, r.text
-    assert r.json()["cancelled"] == [planned["id"]], (
-        "the response must name the plan it CANCELLED — a caller cannot tell 'asked a bot to leave' "
-        "from 'called off a meeting that had none' otherwise"
-    )
-
+    assert r.status_code == 404, r.text
     row = await repo.get_meeting(planned["id"])
-    assert row["status"] == "failed", (
-        "a stopped plan must be TERMINAL. Left `scheduled`, it falls between the sweep's rate rule "
-        "and occurrence.py's eligibility rule — which is how 26306 was dispatched at 02:52:16"
-    )
-    assert row["data"]["completion_reason"] == "stopped"
-    assert row["data"]["stop_requested"] is True
-    assert "failure_stage" not in row["data"], (
-        "no bot ever ran, so there is no stage to attribute; stamping one would claim a spawn that "
-        "never happened"
-    )
-    assert disposition(row) is Disposition.USER_STOPPED
-    assert not may_dispatch_again(row)
-
-    # The sweep, in the exact window the storm fired in.
-    counters = await _sweep(repo, runtime, _at(0))
-    assert counters["due"] == 0 and counters["spawned"] == 0
-    assert runtime.specs == [], "a bot went into a meeting the user had already called off"
+    assert row["status"] == "scheduled"
+    assert "stop_requested" not in row["data"]
+    assert runtime.specs == [] and runtime.deleted == []
+    assert due_rows([row], now=_at(0)) == [row]
 
 
 async def test_f1_a_flagged_scheduled_row_is_never_due():
@@ -149,8 +131,8 @@ async def test_f1_a_flagged_scheduled_row_is_never_due():
 
 
 async def test_f1_an_explicit_new_post_still_works_on_a_stopped_room():
-    """The stop ends THAT occurrence, never the room. A user who stops a scheduled meeting and then
-    asks for a bot must get one — otherwise the fix trades a false positive for a dead product."""
+    """A stop never closes the room. A user who stops on a link holding a scheduled meeting and
+    then asks for a bot must get one (the stop found no live meeting, §1.6)."""
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     await _seed_scheduled(repo)
     async with _client(_app(repo, runtime)) as client:

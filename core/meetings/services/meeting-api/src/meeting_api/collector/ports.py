@@ -27,7 +27,13 @@ class TranscriptStore(Protocol):
     """Read a meeting's transcript; list a user's meetings; append a segment; authorize a
     subscribe. Mirrors the SQL the deployed ``collector/endpoints.py`` runs against the
     ``meetings`` / ``transcriptions`` tables (``meeting.data`` JSONB is the recordings/notes
-    home — there is NO separate recordings table)."""
+    home — there is NO separate recordings table).
+
+    Every method that takes ``(platform, native_meeting_id)`` addresses the meeting the one link
+    resolver picks (§1.6, ``intake.resolver``): reads, docs and chat by ``READ``, workspace, share
+    and intent by ``PLANNED_EDIT``. A ``PLANNED_EDIT`` raises ``AmbiguousRoom`` when the link holds
+    several planned meetings, and ``set_intent`` raises ``ManagedByEntries`` for a meeting entries
+    manage; the routes answer both with 409."""
 
     async def get_transcript(
         self, user_id: int, platform: str, native_meeting_id: str
@@ -45,8 +51,8 @@ class TranscriptStore(Protocol):
         ``TranscriptionResponse`` shape ``get_transcript`` returns, or ``None`` when unauthorized.
 
         P0 (wrong-row hydration fix): ``get_transcript`` resolves ``(user, platform, native_id)`` to
-        the NEWEST matching row, so a user with several rows on the same native link always reads the
-        latest — the terminal can't address an OLDER row's notes. This by-ROW-id path lets the
+        ONE row (the live meeting, else the most recent started, §1.6), so the terminal can't
+        address an OLDER row's notes through it. This by-ROW-id path lets the
         terminal fetch EXACTLY the row it is displaying (each row is a distinct meeting run). Still
         owner-scoped: a row owned by another user returns ``None`` (404), never another tenant's data."""
         ...
@@ -146,6 +152,19 @@ class TranscriptStore(Protocol):
         """Withdraw retracted drafts by ``segment_id``: drop them from the live segments hash (before an
         un-flushed draft reaches Postgres) AND delete any already-flushed rows. Idempotent — a missing id
         is a no-op. The mixed lane's full-replace pending tail leaves stale drafts otherwise."""
+        ...
+
+    async def resolve_room(
+        self, user_id: int, platform: str, native_meeting_id: str, kind: Any
+    ) -> Optional[Any]:
+        """The ``intake.resolver.LinkRow`` the ``kind`` (``LinkKind``) resolves the caller's link to
+        (§1.6), or ``None``. Raises ``AmbiguousRoom`` for a ``PLANNED_EDIT`` on several planned
+        meetings. OWNER-scoped: only the caller's own rows are candidates."""
+        ...
+
+    async def entry_managed(self, user_id: int, meeting_id: int) -> bool:
+        """Whether the caller's meeting ``meeting_id`` has at least one ``meeting_entries`` row;
+        ``False`` for an unknown meeting or another user's (§1.6)."""
         ...
 
     async def connect_doc(

@@ -26,6 +26,19 @@ inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelop
 (R6, the not-sent sweep's end). It is the one
 definition of these windows; the status writer's re-run rule uses it.
 
+`resolver.py` is the one link resolver (§1.6): which meeting an upstream route that takes a link
+(platform + room code) means. `resolve(rows, kind, *, now)` over the link's rows as `LinkRow`
+(status, `meeting_start`, `created_at`, whether entries manage it): `READ` (transcript,
+participants, `/ws/authorize-subscribe`, chat, annotate, docs, `continue_meeting`) is the live
+meeting, else the most recent that has started, never a future one; `PLANNED_EDIT` (`PATCH`/`DELETE
+/meetings/{p}/{n}`, intent, workspace, share) is the live meeting, else the single planned
+(`scheduled`/`idle`) one, several raising `AmbiguousRoom`, and with neither the `READ` answer; `STOP`
+(`DELETE /bots/{p}/{n}`) is the live meeting only and never a plan. `adapters.link_rows(db, user_id,
+room)` reads the rows from Postgres and `fakes.link_rows_in` is its twin; the collector store, the
+bot-spawn repo and the stop route all resolve through them. `ManagedByEntries` is the refusal of an
+upstream edit (`PATCH`/`DELETE /meetings/…`, `PUT …/intent`) to a meeting with a `meeting_entries`
+row; the upstream routes answer both with 409 and the code as `detail`.
+
 `IntakeService` (`service.py`) is the behaviour of `PUT /v2/entries` and `POST /v2/entries/remove`
 (§1.3, every §2.6 case): under the entry's link lock (both links, sorted, when the link changes;
 restarted once when the entry's link changed before the read), it answers `unchanged`, attaches

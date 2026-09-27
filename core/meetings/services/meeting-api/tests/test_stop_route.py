@@ -4,6 +4,9 @@ Drives the SAME shipped ``create_app`` mount with the in-memory fakes: a seeded 
 stopped → the route marks it ``stopping`` + ``stop_requested`` and publishes the bot's ``leave``
 command on ``bot_commands:meeting:{id}``. (The bot's terminal lifecycle event — classified by the
 existing callback — is exercised by the lifecycle tests; here we assert the trigger.)
+
+§1.6: the stop resolves the link to the LIVE meeting only and never cancels a scheduled occurrence
+on it — the last two tests, over 1 live + 2 future rows and 0 live + 1 past + 2 future rows.
 """
 from __future__ import annotations
 
@@ -279,3 +282,56 @@ def test_stop_marks_a_row_that_has_no_session_yet():
     assert r.status_code == 200, r.text
     rows = {row["id"]: row for row in asyncio.run(repo.find_active_rows(7, "google_meet", "nosess"))}
     assert (rows[sessionless["id"]]["data"] or {}).get("stop_requested") is True
+
+
+# ── §1.6: the stop means the live meeting only; it never cancels future plans ────────────────────
+
+
+def _seed_plan(repo, *, native, days):
+    """A scheduled occurrence on the link: a row with a future time and no bot."""
+    from datetime import datetime, timedelta, timezone
+
+    when = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    m = asyncio.run(repo.create_meeting(
+        user_id=7, platform="google_meet", native_meeting_id=native, data={"scheduled_at": when}
+    ))
+    repo.set_status(m["id"], "scheduled")
+    return m
+
+
+def test_stop_takes_the_live_meeting_and_leaves_the_plans_on_the_link():
+    """§1.6, 1 live + 2 future rows (the plans are the NEWEST rows): the stop takes the live
+    meeting — flag, leave command — and both scheduled occurrences stay exactly as they were."""
+    repo, pub = InMemoryMeetingRepo(), InMemoryCommandPublisher()
+    app = create_app(meeting_repo=repo, command_publisher=pub)
+    live = _seed_active(repo, user_id=7, platform="google_meet", native="plans")
+    plans = [_seed_plan(repo, native="plans", days=d) for d in (1, 8)]
+
+    r = TestClient(app).delete("/bots/google_meet/plans", headers={"x-user-id": "7"})
+    assert r.status_code == 200, r.text
+    assert r.json()["meeting_id"] == live["id"]
+    assert r.json()["also_stopped"] == [] and r.json()["cancelled"] == []
+    assert [chan for chan, _ in pub.published] == [f"bot_commands:meeting:{live['id']}"]
+    for plan in plans:
+        row = asyncio.run(repo.get_meeting(plan["id"]))
+        assert row["status"] == "scheduled"
+        assert "stop_requested" not in row["data"]
+
+
+def test_stop_without_a_live_meeting_404s_and_never_cancels_a_plan():
+    """§1.6, 0 live + 1 past + 2 future rows: no live meeting → 404, nothing published, and the
+    plans are not cancelled (a plan is called off by removing its entry)."""
+    repo, pub = InMemoryMeetingRepo(), InMemoryCommandPublisher()
+    app = create_app(meeting_repo=repo, command_publisher=pub)
+    past = _seed(repo, user_id=7, platform="google_meet", native="history", status="active")
+    repo.set_status(past["id"], "completed")
+    plans = [_seed_plan(repo, native="history", days=d) for d in (1, 8)]
+
+    r = TestClient(app).delete("/bots/google_meet/history", headers={"x-user-id": "7"})
+    assert r.status_code == 404, r.text
+    assert r.json() == {"detail": "No active meeting for this bot"}
+    assert pub.published == []
+    for plan in plans:
+        row = asyncio.run(repo.get_meeting(plan["id"]))
+        assert row["status"] == "scheduled"
+        assert "stop_requested" not in row["data"]
