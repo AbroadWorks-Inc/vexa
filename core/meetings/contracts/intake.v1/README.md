@@ -31,7 +31,8 @@ responses against the same shapes.
   `completion_reason` / `failure_stage` / `outcome.kind` / `export.state` are left as open strings
   here (not enumerated): `status` mirrors the sealed `lifecycle.v1` FSM plus intake's own
   pre-lifecycle `scheduled`, which this draft does not own or duplicate.
-- **`MeetingEntryRef`** — one item of `Meeting.entries` (active entries only).
+- **`MeetingEntryRef`** — one item of `Meeting.entries`: a finished meeting lists its closed
+  entries, any other meeting its active entries; removed entries are never listed.
 - **`Outcome`** / **`Export`** — `Meeting.outcome` / `Meeting.export`, each `null` until set.
 - **`EntryState`** — `GET /v2/entries` row (§2.1): the entry's own §2.2 fields, plus
   `content_hash` and `state`, so a sender can diff its view against aw-bots'.
