@@ -30,7 +30,9 @@ webhooks.py}`, reimplemented clean. The wire shape is sealed in `meetings/contra
   5xx/429/timeout/connection error retried at +60 s, +300 s, +1800 s, +7200 s then `dead`, any other
   answer `failed`. Every move out of `sending` is guarded by the claim's lease, so a pause or delete
   mid-flight stays `cancelled`. Subscriptions come from admin-api's internal read, cached 30 s.
-  Redis is not used.
+  Redis is not used. `fakes.py` holds `InMemoryDeliveryStore`, the offline `DeliveryStore`.
+- **`POST /internal/webhooks/test`** (`internal_router.py`) — admin-api's `webhook.test` hand-off
+  (internal secret); the write itself is `intake/outbox.py`'s `PostgresWebhookTests`.
 - **Event filter** (`delivery.py`) — `is_event_enabled`: per-client subscribers only receive the
   events in their `webhook_events` map (default: `meeting.completed`). Suppressed before any HTTP.
 - **Scopes** — `WebhookSink.deliver(..., scope=)`: `per-client` applies the filter; `system`

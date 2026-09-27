@@ -152,8 +152,8 @@ whose read fails waits for the next tick). In one transaction per batch it re-re
 subscriber (`ON CONFLICT (event_id, subscription_id) DO NOTHING`) and sets `published_at`, so a
 crash before the commit is redone without duplicates and a concurrent pause in admin-api is either
 seen or cancels what was inserted. `webhook.test` rows are never fanned out.
-`PostgresWebhookTests` backs `POST /internal/webhooks/test` (`build_webhook_test_router`, internal
-secret): one `webhook.test` outbox row (sequence 0, `evt_test_<uuid4 hex>`, already published) and
+`PostgresWebhookTests` backs `POST /internal/webhooks/test` (the route is
+`webhooks/internal_router.py`, internal secret): one `webhook.test` outbox row (sequence 0, `evt_test_<uuid4 hex>`, already published) and
 one delivery for that subscription, in one transaction; the reply is `{event_id}`.
 
 ## Front door
@@ -169,5 +169,6 @@ one delivery for that subscription, in one transaction; the reply is `{event_id}
 - `PostgresIntakeStore` — `adapters.py`.
 - `build_intake_router` — `router.py`; `IntakeReads`, `MeetingQuery`, `ErasedRows` — `ports.py`;
   `PostgresIntakeReads` — `reads.py`.
-- `OutboxPublisher`, `fan_out`, `PostgresWebhookTests`, `build_webhook_test_router` — `outbox.py`.
+- `OutboxPublisher`, `fan_out`, `PostgresWebhookTests`, `SubscriptionNotFound`, `WebhookTests` —
+  `outbox.py`.
 - The matching rules — `rules.py` (used inside the package).

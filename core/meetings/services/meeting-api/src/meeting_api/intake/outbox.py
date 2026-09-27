@@ -27,8 +27,9 @@ commits first is seen, and a pause that comes second waits for this commit and t
 inserted. A crash before the commit publishes nothing, and the next tick redoes the batch; the
 conflict clause means a redo never duplicates a delivery.
 
-``PostgresWebhookTests.queue_test`` — behind ``POST /internal/webhooks/test`` (admin-api's hand-off
-of ``POST /v2/webhooks/{id}/test``): in one transaction, an outbox row (``sequence`` 0, id
+``PostgresWebhookTests.queue_test`` — behind ``POST /internal/webhooks/test``
+(``webhooks/internal_router.py``, admin-api's hand-off of ``POST /v2/webhooks/{id}/test``): in one
+transaction, an outbox row (``sequence`` 0, id
 ``evt_test_<uuid4 hex>``, ``meeting_id`` NULL, ``published_at`` now, so the publisher never takes
 it and it never counts as unpublished) and exactly one delivery for that subscription. The route
 answers ``{"event_id"}``.
@@ -38,16 +39,11 @@ Redis is not used anywhere here.
 
 from __future__ import annotations
 
-import hmac
 import json
-import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
-
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 
 from ..obs import log_event
 from ..webhooks.subscriptions import (
@@ -68,7 +64,6 @@ __all__ = [
     "PublishResult",
     "SubscriptionNotFound",
     "WebhookTests",
-    "build_webhook_test_router",
     "fan_out",
 ]
 
@@ -345,57 +340,3 @@ class PostgresWebhookTests:
             fields={"event_id": event_id, "subscription_id": str(sid)},
         )
         return event_id
-
-
-def _error(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(
-        {"error": {"code": code, "message": message}}, status_code=status
-    )
-
-
-def build_webhook_test_router(tests: Optional[WebhookTests]) -> APIRouter:
-    """``POST /internal/webhooks/test`` ``{user_id, subscription_id}`` → 202 ``{event_id}``.
-
-    ``X-Internal-Secret`` must equal ``INTERNAL_API_SECRET`` (unset → 503, wrong → 403). No
-    ``tests`` port (no Postgres) → 503. A body that isn't ``{user_id: int, subscription_id: str}``
-    → 400; a subscription that isn't the account's → 404."""
-    router = APIRouter()
-
-    @router.post("/internal/webhooks/test", include_in_schema=False)
-    async def queue_webhook_test(request: Request) -> JSONResponse:
-        secret = os.getenv("INTERNAL_API_SECRET") or ""
-        if not secret:
-            return _error(503, "unavailable", "INTERNAL_API_SECRET is not configured")
-        given = request.headers.get("X-Internal-Secret", "")
-        if not hmac.compare_digest(given.encode(), secret.encode()):
-            return _error(403, "forbidden", "invalid internal secret")
-        if tests is None:
-            return _error(503, "unavailable", "webhook tests need Postgres")
-        try:
-            body = await request.json()
-        except ValueError:
-            body = None
-        user_id = body.get("user_id") if isinstance(body, dict) else None
-        subscription_id = (
-            body.get("subscription_id") if isinstance(body, dict) else None
-        )
-        if (
-            not isinstance(user_id, int)
-            or isinstance(user_id, bool)
-            or not isinstance(subscription_id, str)
-            or not subscription_id
-        ):
-            return _error(
-                400,
-                "invalid_request",
-                "the body must be {user_id: integer, subscription_id: string}",
-            )
-        try:
-            event_id = await tests.queue_test(user_id, subscription_id)
-        except SubscriptionNotFound:
-            return _error(
-                404, "webhook_not_found", "no such subscription for this account"
-            )
-        return JSONResponse({"event_id": event_id}, status_code=202)
-
-    return router

@@ -334,7 +334,7 @@ def create_app(
 
     # --- webhooks: POST /internal/webhooks/test — admin-api's webhook.test hand-off (§1.8, §2.7).
     # Internal secret only; the gateway routes nothing here. ---
-    from .intake.outbox import build_webhook_test_router
+    from .webhooks.internal_router import build_webhook_test_router
 
     app.state.webhook_tests = webhook_tests
     app.include_router(build_webhook_test_router(webhook_tests))

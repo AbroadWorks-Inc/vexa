@@ -677,6 +677,14 @@ async def test_the_test_route_checks_the_secret_and_the_body(
         assert "error" in r.json()
 
 
+def test_the_route_lives_beside_the_app_not_in_the_outbox_writer():
+    import meeting_api.intake.outbox as outbox
+    from meeting_api.webhooks.internal_router import build_webhook_test_router
+
+    assert callable(build_webhook_test_router)
+    assert not hasattr(outbox, "build_webhook_test_router")
+
+
 async def test_without_a_database_the_test_route_is_unavailable(monkeypatch):
     monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
     async with http(create_app()) as client:
