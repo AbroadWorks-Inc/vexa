@@ -439,3 +439,35 @@ def test_an_unreadable_marker_at_quarantine_is_left_alone(
         "could not read _export.json" in r.getMessage() and r.levelno == logging.ERROR
         for r in caplog.records
     )
+
+
+def test_an_accepted_hand_off_at_quarantine_completes_the_item(
+    storage: Storage,
+) -> None:
+    """The folder is handed off and meeting-api accepted the report: the item
+    is finished, so it leaves the queue without landing in failed/."""
+    gateway = _Gateway(failures=4)
+
+    queue, _ = _handed_off_then_marker_read_fails(
+        storage, gateway, quarantine_read_fails=False
+    )
+
+    assert queue.pending_ids() == []
+    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is None
+    assert gateway.bodies[-1] == {"state": "handed_off", "s3_path": S3_PATH}
+
+
+def test_an_unaccepted_hand_off_at_quarantine_goes_to_failed(
+    storage: Storage,
+) -> None:
+    gateway = _Gateway(failures=5)
+
+    queue, _ = _handed_off_then_marker_read_fails(
+        storage, gateway, quarantine_read_fails=False
+    )
+
+    assert queue.pending_ids() == []
+    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is not None
+    assert _marker(storage)["state"] == "handed_off"
+    assert len(gateway.bodies) == 5
+    assert gateway.bodies[-1] == {"state": "handed_off", "s3_path": S3_PATH}

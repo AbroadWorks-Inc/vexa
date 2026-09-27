@@ -15,8 +15,10 @@ finds the folder's `_export.json` already `handed_off` and only reports
 again. When the attempts run out, the item is quarantined: an unaccepted
 report leaves the recorded outcome as it is; any other failure reads the
 folder's `_export.json` first. A folder already `handed_off` keeps its marker
-and reports `handed_off` once; otherwise the `failed` marker is written and
-`failed` reported once. A marker that can't be read is left as it is. A webhook without a meeting uuid
+and reports `handed_off` once; once that report is accepted the item is
+finished and leaves the queue (`done`), not `failed/`. Otherwise the `failed`
+marker is written and `failed` reported once. A marker that can't be read is
+left as it is. A webhook without a meeting uuid
 (`MissingMeetingUuid`) is quarantined on its first attempt and writes nothing
 to the export bucket.
 
@@ -187,6 +189,7 @@ async def sweep_once(
                     type(exc).__name__,
                 )
                 if attempts >= settings.max_attempts:
+                    finished = False
                     if isinstance(exc, ExportReportError):
                         logger.error(
                             "quarantine: meeting_id=%s attempts=%s export result not "
@@ -196,10 +199,13 @@ async def sweep_once(
                             attempts,
                         )
                     else:
-                        await _quarantine(
+                        finished = await _quarantine(
                             envelope, attempts, str(exc), meeting_id, deps
                         )
-                    queue.fail(meeting_id)
+                    if finished:
+                        queue.done(meeting_id)
+                    else:
+                        queue.fail(meeting_id)
             else:
                 queue.done(meeting_id)
         except Exception:  # noqa: BLE001 - one id's bug must not sink the sweep
@@ -215,14 +221,16 @@ async def sweep_once(
 
 async def _quarantine(
     envelope: dict[str, Any], attempts: int, error: str, meeting_id: str, deps: Deps
-) -> None:
+) -> bool:
     """Record the quarantined outcome and report it once. A folder whose
     `_export.json` is already `handed_off` (notetaker-worker has it) keeps
     that marker and reports `handed_off`; any other gets the `failed` marker
     and reports `failed`. If the marker can't be read, nothing is written or
     reported. The queue's retry budget for this meeting is spent, so any of
     these left undone is logged for an operator's re-enqueue, which runs the
-    whole job again."""
+    whole job again. True when the item is finished: the folder was handed
+    off and that report was accepted; the caller then completes the item
+    instead of moving it to failed/."""
     settings = deps.settings
     marker = _quarantine_marker(envelope, attempts, error)
     if marker is None:
@@ -232,7 +240,7 @@ async def _quarantine(
             meeting_id,
             attempts,
         )
-        return
+        return False
     folder, body = marker
     base = settings.export_prefix + folder + "/"
     marker_key = base + "_export.json"
@@ -247,14 +255,14 @@ async def _quarantine(
             attempts,
             type(exc).__name__,
         )
-        return
+        return False
     state: ReportState
     report_error: str | None
     if isinstance(existing, dict) and existing.get("state") == "handed_off":
         state, report_error = "handed_off", None
-        logger.error(
+        logger.warning(
             "quarantine: meeting_id=%s attempts=%s folder already handed off; "
-            "marker kept, moved to failed/",
+            "marker kept, reporting handed_off",
             meeting_id,
             attempts,
         )
@@ -270,7 +278,7 @@ async def _quarantine(
         )
     meeting_uuid = body["meeting_id"]
     if not meeting_uuid:
-        return
+        return False
     try:
         await asyncio.to_thread(
             deps.export_result.report,
@@ -281,10 +289,13 @@ async def _quarantine(
         )
     except ExportReportError as exc:
         logger.error(
-            "quarantine: meeting_id=%s export result not accepted (%s)",
+            "quarantine: meeting_id=%s export result not accepted (%s); "
+            "moved to failed/",
             meeting_id,
             exc,
         )
+        return False
+    return state == "handed_off"
 
 
 async def run_worker(queue: PendingQueue, deps: Deps, stop: asyncio.Event) -> None:
