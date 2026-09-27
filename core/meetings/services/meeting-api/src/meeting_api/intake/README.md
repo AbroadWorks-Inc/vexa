@@ -32,8 +32,9 @@ definition of these windows; the status writer's re-run rule uses it.
 participants, `/ws/authorize-subscribe`, chat, annotate, docs, `continue_meeting`) is the live
 meeting, else the most recent that has started (left planning, or its start is past), never a
 future one; `PLANNED_EDIT` (`PATCH`/`DELETE /meetings/{p}/{n}`, intent, workspace, share) is the
-live meeting, else the single planned (`scheduled`/`idle`) one that can still be sent (an
-entry-less plan past its start plus `AUTO_JOIN_GRACE_S` is ignored, Ruling R22), several raising
+live meeting, else the single planned (`scheduled`/`idle`) one that isn't stale (a timed,
+entry-less `scheduled` plan past its `data.scheduled_at` plus `AUTO_JOIN_GRACE_S` is ignored; idle
+and untimed plans never go stale, Ruling R22), several raising
 `AmbiguousRoom`, and with neither the `READ` answer; `STOP`
 (`DELETE /bots/{p}/{n}`) is the live meeting only and never a plan. `adapters.link_rows(db, user_id,
 room)` reads the rows from Postgres and `fakes.link_rows_in` is its twin; the collector store, the

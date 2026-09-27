@@ -12,10 +12,12 @@ Postgres and ``fakes.link_rows_in`` is its in-memory twin, so both stores choose
     slot) or when its start is at or before ``now``.
   * ``PLANNED_EDIT`` (``PATCH``/``DELETE /meetings/{p}/{n}``, ``PUT …/intent``, ``POST
     …/workspace``, ``POST …/share``): the live meeting, else the single planned one (``scheduled``
-    or ``idle``) that can still be sent; two or more raise ``AmbiguousRoom``. An entry-less plan
-    past its start plus ``AUTO_JOIN_GRACE_S`` is a leftover the sweep never sends, so it doesn't
-    count (Ruling R22); an entry-managed plan never goes stale (the not-sent sweep ends it). A link
-    with neither resolves as ``READ`` does, so a finished meeting stays addressable.
+    or ``idle``) that is not stale; two or more raise ``AmbiguousRoom``. A plan is stale only when
+    it is entry-less, ``scheduled`` and timed (a parseable ``data.scheduled_at``, ``planned_at``)
+    and that time plus ``AUTO_JOIN_GRACE_S`` has passed: the sweep will never send it (Ruling R22).
+    An ``idle`` row or any untimed plan never goes stale and stays editable by link; an
+    entry-managed plan never does either (the not-sent sweep ends it). A link with neither resolves
+    as ``READ`` does, so a finished meeting stays addressable.
   * ``STOP`` (``DELETE /bots/{p}/{n}``): the live meeting only; a stop never cancels a plan.
 
 "Live" is ``rules.is_live`` (``LIVE_STATUSES``) and a meeting's start is ``rules.meeting_start``.
@@ -34,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional, Sequence
 
-from .rules import as_utc, is_live, meeting_start
+from .rules import as_utc, is_live, meeting_start, scheduled_time
 
 __all__ = [
     "PLANNED_STATUSES",
@@ -60,13 +62,16 @@ class LinkKind(str, Enum):
 @dataclass(frozen=True)
 class LinkRow:
     """One ``meetings`` row on a link: its status, its start (``rules.meeting_start``), its
-    ``created_at`` and whether entries manage it (it has a ``meeting_entries`` row)."""
+    ``created_at``, whether entries manage it (it has a ``meeting_entries`` row) and
+    ``planned_at``, its ``data.scheduled_at`` alone (``rules.scheduled_time``; ``None`` for an
+    untimed row)."""
 
     id: int
     status: str
     start: Optional[datetime]
     created: Optional[datetime]
     managed: bool = False
+    planned_at: Optional[datetime] = None
 
     @classmethod
     def of(
@@ -84,6 +89,7 @@ class LinkRow:
             meeting_start(data, start_time, created_at),
             as_utc(created_at),
             bool(managed),
+            scheduled_time(data),
         )
 
 
@@ -130,12 +136,13 @@ def _most_recent_started(rows: Sequence[LinkRow], now: datetime) -> list[LinkRow
     return [max(started, key=lambda r: (r.start or _OLDEST, r.id))]
 
 
-def _sendable(row: LinkRow, now: datetime, grace_s: float) -> bool:
-    """A plan that can still be sent: entry-managed, or not yet past its start plus the grace."""
+def _stale(row: LinkRow, now: datetime, grace_s: float) -> bool:
+    """A timed, entry-less ``scheduled`` plan past its ``scheduled_at`` plus the grace."""
     return (
-        row.managed
-        or row.start is None
-        or now <= row.start + timedelta(seconds=grace_s)
+        row.status == "scheduled"
+        and not row.managed
+        and row.planned_at is not None
+        and row.planned_at + timedelta(seconds=grace_s) < now
     )
 
 
@@ -163,7 +170,7 @@ def resolve_all(
         planned = [
             r
             for r in rows
-            if r.status in PLANNED_STATUSES and _sendable(r, now, grace_s)
+            if r.status in PLANNED_STATUSES and not _stale(r, now, grace_s)
         ]
         if len(planned) > 1:
             raise AmbiguousRoom([r.id for r in planned])

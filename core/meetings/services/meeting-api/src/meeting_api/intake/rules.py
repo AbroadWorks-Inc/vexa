@@ -8,7 +8,8 @@ entries of a finished meeting re-run.
     unbounded. Back-to-back times (15:00 end, 15:00 start) don't overlap.
   * ``meeting_start`` — ``data.scheduled_at``, else ``start_time``, else ``created_at`` (the
     ``meeting_event_time()`` order). A ``scheduled_at`` that isn't an ISO-8601 time (upstream rows
-    carry whatever their writer stored) counts as absent, as the auto-join sweep reads it.
+    carry whatever their writer stored) counts as absent, as the auto-join sweep reads it;
+    ``scheduled_time`` is that ``scheduled_at`` alone.
   * ``meeting_window`` — a meeting's stored time; an open-ended live meeting's window is
     ``[start, now]``, and an open-ended meeting that isn't live yet is unbounded.
   * ``match_entry`` — R1: the non-finished meeting whose window overlaps the entry. An open-ended
@@ -52,6 +53,7 @@ __all__ = [
     "meeting_window",
     "overlaps",
     "recompute",
+    "scheduled_time",
 ]
 
 FINISHED_STATUSES = frozenset({"completed", "failed"})
@@ -141,8 +143,12 @@ def meeting_start(
 ) -> Optional[datetime]:
     """``data.scheduled_at``, else ``start_time``, else ``created_at``, as aware UTC. An
     unparseable ``scheduled_at`` falls through to the next."""
-    scheduled_at = data.get("scheduled_at") if isinstance(data, Mapping) else None
-    return _parsed(scheduled_at) or as_utc(start_time) or as_utc(created_at)
+    return scheduled_time(data) or as_utc(start_time) or as_utc(created_at)
+
+
+def scheduled_time(data: Optional[Mapping[str, Any]]) -> Optional[datetime]:
+    """``data.scheduled_at`` as aware UTC, or ``None`` when it is absent or not a time."""
+    return _parsed(data.get("scheduled_at") if isinstance(data, Mapping) else None)
 
 
 def _parsed(value: Any) -> Optional[datetime]:

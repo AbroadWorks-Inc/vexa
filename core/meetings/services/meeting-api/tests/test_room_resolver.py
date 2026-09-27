@@ -57,11 +57,13 @@ def _iso(dt: datetime) -> str:
 def _row(
     mid: int, status: str, start: datetime, created: Optional[datetime] = None
 ) -> LinkRow:
+    """A row whose start is its ``data.scheduled_at`` when it is ``scheduled`` (a timed plan)."""
     return LinkRow(
         id=mid,
         status=status,
         start=start,
         created=created or start - timedelta(days=30),
+        planned_at=start if status == "scheduled" else None,
     )
 
 
@@ -128,11 +130,29 @@ def test_planned_edit_takes_the_single_planned_meeting_even_in_the_future():
 
 def test_planned_edit_counts_an_idle_plan_as_planned():
     rows = [
-        _row(2, "idle", NOW - timedelta(minutes=5)),
+        _row(2, "idle", NOW - timedelta(days=40)),
         _row(3, "scheduled", NOW + timedelta(days=1)),
     ]
     with pytest.raises(AmbiguousRoom):
         resolve(rows, LinkKind.PLANNED_EDIT, now=NOW)
+
+
+def test_an_untimed_plan_never_goes_stale():
+    """Ruling R22 (refined): only a timed plan (``scheduled`` with a parseable
+    ``data.scheduled_at``) goes stale. An idle row, or a scheduled one whose ``scheduled_at`` is
+    absent or not a time, is an untimed plan and stays editable by link however old it is.
+    """
+    long_ago = NOW - timedelta(days=40)
+    untimed = [
+        LinkRow.of(1, "idle", {}, None, long_ago),
+        LinkRow.of(2, "scheduled", {"scheduled_at": "whenever"}, None, long_ago),
+        LinkRow.of(3, "scheduled", {}, _iso(long_ago), long_ago),
+    ]
+    for row in untimed:
+        assert row.planned_at is None
+        assert resolve([row], LinkKind.PLANNED_EDIT, now=NOW).id == row.id
+    timed = LinkRow.of(4, "scheduled", {"scheduled_at": _iso(long_ago)}, None, long_ago)
+    assert timed.planned_at == long_ago
 
 
 def test_planned_edit_of_a_link_holding_only_history_is_its_most_recent_started_meeting():
@@ -159,8 +179,9 @@ def test_read_counts_a_meeting_that_left_planning_as_started_whatever_its_schedu
 
 
 def test_planned_edit_ignores_a_stale_entry_less_plan():
-    """Ruling R22: an entry-less plan past its start + ``AUTO_JOIN_GRACE_S`` can never be sent; it
-    is a leftover, so it neither counts as the plan nor makes the link ambiguous."""
+    """Ruling R22: an entry-less ``scheduled`` plan past its ``scheduled_at`` +
+    ``AUTO_JOIN_GRACE_S`` can never be sent; it is a leftover, so it neither counts as the plan nor
+    makes the link ambiguous."""
     rows = [
         _row(1, "scheduled", NOW - timedelta(hours=2)),
         _row(2, "scheduled", NOW + timedelta(days=1)),
@@ -185,6 +206,7 @@ def test_an_entry_managed_plan_never_goes_stale():
         start=NOW - timedelta(hours=2),
         created=NOW - timedelta(days=3),
         managed=True,
+        planned_at=NOW - timedelta(hours=2),
     )
     with pytest.raises(AmbiguousRoom):
         resolve(
@@ -495,6 +517,34 @@ def test_planned_edit_skips_a_stale_entry_less_plan():
     assert r.status_code == 200, r.text
     assert r.json()["id"] == plan
     assert store._meetings[stale]["data"].get("title") is None
+
+
+def test_planned_edit_reaches_a_long_past_idle_plan_next_to_a_newer_finished_meeting():
+    """An untimed idle plan created long ago is still the link's plan: a native PATCH edits it,
+    not the finished meeting held on the same link since (Ruling R22, refined)."""
+    now = _real_now()
+    store = InMemoryTranscriptStore()
+    idle = store.seed_meeting(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        status="idle",
+        start_time=None,
+        created_at=_iso(now - timedelta(days=40)),
+    )
+    store.seed_meeting(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        status="completed",
+        start_time=_iso(now - timedelta(days=2)),
+        created_at=_iso(now - timedelta(days=2)),
+    )
+    redis: Any = _CaptureRedis()
+    client = TestClient(create_collector_app(store, redis=redis))
+    r = client.patch(f"/meetings/{PLAT}/{NID}", headers=H, json={"title": "Planning"})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == idle
 
 
 def test_reads_of_a_link_holding_only_future_meetings_404():

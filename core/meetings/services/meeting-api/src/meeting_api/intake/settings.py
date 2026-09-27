@@ -4,8 +4,9 @@
 the sweep's entrypoint does, with the sweep's default, and is the one reader intake uses.
 ``join_now_adopt_ahead_s`` is the one reader of ``JOIN_NOW_ADOPT_AHEAD_S``, which a ``join_now``
 entry and upstream ``POST /bots`` both adopt by (§1.1 R1, §1.5). ``auto_join_grace_s`` reads the
-sweep's ``AUTO_JOIN_GRACE_S`` with the sweep's default: the link resolver ignores an entry-less
-plan past its start plus this grace, which the sweep will never send (§1.6, Ruling R22).
+sweep's ``AUTO_JOIN_GRACE_S`` with the sweep's default: the link resolver ignores a timed,
+entry-less ``scheduled`` plan past its ``scheduled_at`` plus this grace, which the sweep will never
+send (§1.6, Ruling R22).
 """
 
 from __future__ import annotations

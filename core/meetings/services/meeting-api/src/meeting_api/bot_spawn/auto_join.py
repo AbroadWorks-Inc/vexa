@@ -111,9 +111,9 @@ def due_rows(rows: list[dict], *, now: datetime,
         # because a scheduled row is not terminal. Founder ruling 2026-08-17: "explicit stop must be
         # stop, evict."
         #
-        # The stop path now terminalizes a planned row outright (``stop_router``), so a flagged
-        # `scheduled` row should no longer exist at all. This stays as the standing guarantee: no
-        # row carrying the user's stop is EVER due, whichever writer left it in this state.
+        # The stop route never touches a planned row (§1.6: it stops the live meeting only), so no
+        # current writer flags a `scheduled` row. This stays as the standing guarantee: no row
+        # carrying the user's stop is EVER due, whichever writer left it in this state.
         if data.get("stop_requested"):
             continue
         if data.get("auto_join") is False:

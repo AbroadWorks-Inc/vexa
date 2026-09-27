@@ -539,7 +539,7 @@
    "key": "AUTO_JOIN_GRACE_S",
    "class": "defaulted",
    "default": "600",
-   "description": "auto-join grace (s) — an entry-less scheduled meeting older than this is never auto-joined (no hours-late joins); a meeting entries manage is due until its end instead (§1.5)",
+   "description": "auto-join grace (s) — an entry-less scheduled meeting older than this is never auto-joined (no hours-late joins); a meeting entries manage is due until its end instead (§1.5). The link resolver also uses it to ignore stale timed plans (an entry-less scheduled row past data.scheduled_at + this grace) on upstream planned edits (§1.6)",
    "targets": []
   },
   {
