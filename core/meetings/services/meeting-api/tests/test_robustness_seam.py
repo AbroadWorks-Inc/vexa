@@ -309,8 +309,9 @@ def test_real_loop_factory_survives_throwing_consume(monkeypatch):
 
         app = FastAPI()
         # Attach only the loops; the consumer loop is what we exercise. Signature is positional:
-        # _attach_background_loops(app, transcript_store, segment_bus, redis_client, meeting_repo=None).
-        entry._attach_background_loops(app, object(), object(), object(), None)
+        # _attach_background_loops(app, transcript_store, segment_bus, redis_client, meeting_repo=None),
+        # plus the entry service (none: no Postgres).
+        entry._attach_background_loops(app, object(), object(), object(), None, intake=None)
         # The lifespan starts the four loop tasks.
         async with app.router.lifespan_context(app):
             # Let the consumer tick: fail once, then keep ticking.

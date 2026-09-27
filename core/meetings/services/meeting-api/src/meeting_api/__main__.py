@@ -279,12 +279,13 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
-    intake=None,
+    *, intake,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
 
     ``intake`` is the entry service ``build_production_app`` also mounts behind the ``/v2`` routes
-    (``_build_intake``); without it one is built here over ``session_factory``.
+    (``_build_intake``), or ``None`` without Postgres; the auto-join and not-sent sweeps run only
+    with it. It is never built here, so no spawn port exists without its service authority.
 
     #637 — single-flight sweeps: at ``replicaCount>1`` every replica runs these same loops, so each
     live tick body is wrapped in a per-loop Postgres advisory lock (``_guarded``) — the real work runs
@@ -578,12 +579,6 @@ def _attach_background_loops(
     # codes) and the entry service it merges (R2) and re-runs entries (R7) through. Its events stay
     # in the outbox for the outbox publisher (§1.8).
     intake_store = intake_service = scheduler_publisher = None
-    if intake is None and session_factory is not None and meeting_repo is not None \
-            and runtime is not None:
-        intake = _build_intake(
-            session_factory, meeting_repo, runtime,
-            service_authority=service_authority, commands=redis_client,
-        )
     if intake is not None:
         intake_store, intake_service = intake.store, intake.service
         scheduler_publisher = intake.publisher
@@ -847,7 +842,11 @@ def _build_intake(session_factory, meeting_repo, runtime, *, service_authority, 
     (§1.5) under the same service authority ``POST /bots`` uses and the auto-join sweep's spawn
     context (``_bot_context_fetcher``, its ``AUTO_JOIN_ALLOW_UNCAPPED`` opt-in), the stop of the
     bot in the call (§1.7) over the bot command bus and the runtime, and ``OutboxOnly``: every
-    event is already in ``webhook_outbox``, where the outbox publisher picks it up."""
+    event is already in ``webhook_outbox``, where the outbox publisher picks it up.
+
+    ``service_authority`` is required: the spawn would read ``None`` as allow-all."""
+    if service_authority is None:
+        raise ValueError("the entry service needs the service authority POST /bots uses")
     from .bot_spawn.env_flags import env_flag
     from .intake import (
         ExactRowSpawn,

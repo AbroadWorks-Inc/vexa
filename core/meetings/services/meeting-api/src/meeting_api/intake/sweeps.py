@@ -43,7 +43,7 @@ from datetime import datetime
 from typing import Literal, Mapping, Optional, Sequence
 
 from ..obs import log_event
-from .ports import EventPublisher, IntakeStore, MeetingView, Room
+from .ports import EventPublisher, IntakeStore, MeetingView, RecordedStop, Room
 from .rules import is_live, is_overdue
 from .service import IntakeService, is_merge_target
 from .status import Outcome
@@ -87,6 +87,11 @@ class NoStop:
         self, user_id: int, meeting_id: int, *, outcome: Optional[Outcome]
     ) -> None:
         raise RuntimeError(f"the scheduler never stops a bot (meeting {meeting_id})")
+
+    async def leave(self, user_id: int, stop: RecordedStop) -> None:
+        raise RuntimeError(
+            f"the scheduler never stops a bot (meeting {stop.meeting_id})"
+        )
 
 
 async def _publish(publisher: Optional[EventPublisher], event_ids: list[str]) -> None:

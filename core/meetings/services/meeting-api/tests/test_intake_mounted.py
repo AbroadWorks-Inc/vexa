@@ -112,3 +112,23 @@ def test_the_routes_run_on_the_production_ports(production):
     # One entry service: the scheduler merges and re-runs through the one the routes use.
     assert attached["intake"].service is service
     assert attached["intake"].stop is stop
+
+
+def test_a_half_wired_mount_is_refused():
+    with pytest.raises(ValueError, match="intake"):
+        create_app(intake_service=object())  # type: ignore[arg-type]
+
+
+def test_the_loops_take_the_entry_service_from_the_caller():
+    import inspect
+
+    param = inspect.signature(main_mod._attach_background_loops).parameters["intake"]
+    assert param.default is inspect.Parameter.empty
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_no_entry_service_is_built_without_a_service_authority():
+    with pytest.raises(ValueError, match="service authority"):
+        main_mod._build_intake(
+            object(), object(), object(), service_authority=None, commands=object()
+        )

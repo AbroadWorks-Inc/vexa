@@ -103,9 +103,12 @@ with the remove reason). Under the meeting's link lock it locks the meeting row,
 `meeting_aw_state`: a bot that reached the meeting goes `stopping` through `write_status` with
 `data.stop_requested` and the outcome, so every later event carries it; a bot still booting
 (`requested`, `joining`, `awaiting_admission`) keeps the stage it reached and gets only the flag and
-the outcome (`IntakeTx.mark_stop_requested`). After the commit, `lifecycle.stop_router.stop_meeting_row`
-publishes the leave command on `bot_commands:meeting:{id}` and deletes the workload of a bot still
-booting. A meeting with no live bot, or already stop-requested, is left as it is; a command bus
+the outcome (`IntakeTx.mark_stop_requested`). Those steps are `record_stop(tx, meeting_id, outcome)`,
+the one implementation: R5 calls it inside the removal's own transaction, so the removed last entry
+and its stop commit together, and the `/v2` stop opens a transaction for it. After the commit,
+`IntakeStop.leave` (`lifecycle.stop_router.stop_meeting_row`) publishes the leave command on
+`bot_commands:meeting:{id}` and deletes the workload of a bot still booting; when R5's leave fails,
+the removal still answers `bot_stopping` and the stale-stopping reconcile sweep ends the bot. A meeting with no live bot, or already stop-requested, is left as it is; a command bus
 that can't be reached is 503 `unavailable`, with the stop already recorded.
 `sweeps.py` is the scheduler's intake side (§1.5, R2, R6). `check_room` reads a due entry-managed
 meeting and its link again under the link lock: `free`, `gone`, `merge` (the live meeting is an
@@ -130,7 +133,7 @@ else `room_busy` ("another bot was still on this meeting link when the meeting e
   `row_mapping` — `status.py`.
 - `IntakeService` — `service.py`; `IntakeSettings` — `settings.py`.
 - `ExactRowSpawn`, `spawn_failure` — `spawn.py`.
-- `IntakeStop` — `stop.py`.
+- `IntakeStop`, `record_stop` — `stop.py`.
 - `IntakeStore`, `IntakeTx`, `EntryView`, `MeetingView`, `Room`, `SpawnOutcome`, `SpawnPort`,
   `StopPort`, `EventPublisher` — `ports.py`; the in-memory fakes — `fakes.py`.
 - `PostgresIntakeStore` — `adapters.py`.

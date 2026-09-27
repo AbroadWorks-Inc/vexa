@@ -101,7 +101,7 @@ async def test_boot_loop_set_excludes_dead_scheduler_tick(caplog):
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     bus = RedisStreamBus(redis)
     # meeting_repo/runtime/session_factory left None → guarded loops degrade cleanly (Lite shape).
-    _attach_background_loops(app, store, bus, redis, meeting_repo=None, runtime=None)
+    _attach_background_loops(app, store, bus, redis, meeting_repo=None, runtime=None, intake=None)
 
     with caplog.at_level(logging.INFO, logger="meeting_api.entrypoint"):
         async with app.router.lifespan_context(app):

@@ -61,6 +61,16 @@ class _DownBus:
         raise ConnectionError("redis unreachable")
 
 
+class _CrashingBus:
+    """The process dies between the removal's commit and the leave command."""
+
+    async def publish(self, channel: str, message: str) -> Any:
+        raise RuntimeError("the process died before the leave command")
+
+
+REMOVE = {"external_id": "google:3n5kq8example", "user": A, "reason": "deleted"}
+
+
 class _Stack:
     """The in-memory harness with the real ``IntakeStop`` in place of ``FakeStop``."""
 
@@ -312,6 +322,59 @@ async def test_the_stop_takes_the_meetings_link_lock():
     assert s.h.store.lock_log[locks:] == [(1, ()), (1, (room,)), (1, ())]
 
 
+# ── R5: the stop is recorded in the removal's transaction ───────────────────────────────────
+
+
+async def test_r5_records_the_stop_in_the_removals_one_locked_transaction():
+    s = _stack()
+    await s.live("active")
+    locks = len(s.h.store.lock_log)
+    await s.service.remove_entry(1, REMOVE)
+    room = Room("google_meet", "kxo-misr-avz")
+    # One transaction under the link lock holds both the removal and the stop (§1.7 steps 1–4).
+    assert [rooms for _, rooms in s.h.store.lock_log[locks:] if rooms] == [(room,)]
+
+
+@pytest.mark.parametrize("bus", [_DownBus, _CrashingBus])
+async def test_r5_a_failed_leave_never_loses_the_stop(bus):
+    """The leave command fails after the removal committed: the stop is already recorded with the
+    removal, so the reply stands and the stale-stopping reconcile sweep ends the bot."""
+    s = _stack(commands=bus())
+    mid = await s.live("active")
+    reply = await s.service.remove_entry(1, REMOVE)
+    assert reply["result"] == "bot_stopping"
+    assert reply["meeting"]["status"] == "stopping"
+    row = s.h.store.meetings[mid]
+    assert row["status"] == "stopping"
+    assert row["data"]["stop_requested"] is True
+    assert s.h.store.aw[mid]["outcome_kind"] == "cancelled_by_calendar"
+    assert [e.state for e in s.h.store.entries.values()] == ["removed"]
+
+
+async def test_r5_a_stop_that_fails_to_record_keeps_the_entry():
+    """Recording the stop fails inside the removal's transaction: the removal rolls back with it,
+    so the entry is still there and a retry removes it and stops the bot."""
+    s = _stack()
+    mid = await s.live("active")
+    real = s.h.store.write_status
+
+    def failing(meeting_id: int, to_status: str, **kw: Any) -> Any:
+        if to_status == "stopping":
+            raise RuntimeError("storage failed mid-transaction")
+        return real(meeting_id, to_status, **kw)
+
+    s.h.store.write_status = failing  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        await s.service.remove_entry(1, REMOVE)
+    assert [e.state for e in s.h.store.entries.values()] == ["active"]
+    assert s.h.store.meetings[mid]["status"] == "active"
+
+    s.h.store.write_status = real  # type: ignore[method-assign]
+    reply = await s.service.remove_entry(1, REMOVE)
+    assert reply["result"] == "bot_stopping"
+    assert [ch for ch, _ in s.leaves()] == [f"bot_commands:meeting:{mid}"]
+
+
 # ── Postgres ────────────────────────────────────────────────────────────────────────────────
 
 
@@ -346,7 +409,7 @@ async def pg_engine():
 
 
 class _PgStack:
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, commands: Any = None) -> None:
         from sqlalchemy.ext.asyncio import async_sessionmaker
 
         from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
@@ -357,7 +420,7 @@ class _PgStack:
         self.repo = SqlAlchemyMeetingRepo(self.session_factory)
         self.store = PostgresIntakeStore(self.session_factory)
         self.reads = PostgresIntakeReads(self.session_factory)
-        self.commands = InMemoryCommandPublisher()
+        self.commands = commands if commands is not None else InMemoryCommandPublisher()
         self.runtime = FakeRuntimeClient()
         self.publisher = FakePublisher()
         self.stop = IntakeStop(
@@ -405,15 +468,17 @@ class _PgStack:
         return mid
 
 
-async def _waiting_on(stack: _PgStack, wait_event_type: str, wait_event: str) -> None:
+async def _waiting_on(
+    stack: _PgStack, wait_event_type: str, wait_event: str, n: int = 1
+) -> None:
     for _ in range(300):
-        n = await stack.scalar(
+        waiting = await stack.scalar(
             "SELECT count(*) FROM pg_stat_activity "
             "WHERE wait_event_type = :t AND wait_event = :e",
             t=wait_event_type,
             e=wait_event,
         )
-        if int(n) >= 1:
+        if int(waiting) >= n:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"the stop never queued on {wait_event_type}/{wait_event}")
@@ -597,3 +662,63 @@ async def test_pg_r5_outcome_survives_the_bots_completion(pg_engine):
     assert projected["status"] == "completed"
     assert projected["outcome"]["kind"] == "cancelled_by_calendar"
     assert projected["outcome"]["detail"] == "deleted"
+
+
+async def test_pg_r5_a_failed_leave_leaves_the_stop_to_the_reconcile_sweep(pg_engine):
+    """The leave command can't be sent after the removal committed. The stop committed with the
+    removal, so the meeting is ``stopping`` with its outcome and the stale-stopping reconcile sweep
+    (``list_stale_stopping`` → complete + workload delete) ends the bot; a retried remove answers
+    ``already_removed`` and sends nothing."""
+    s = _PgStack(pg_engine, commands=_DownBus())
+    mid = await s.live("active")
+    await s.exec("UPDATE meetings SET bot_container_id = 'wl-r5' WHERE id = :m", m=mid)
+    reply = await s.service.remove_entry(7, REMOVE)
+    assert reply["result"] == "bot_stopping"
+    row = await s.repo.get_meeting(mid)
+    assert row is not None
+    assert row["status"] == "stopping"
+    assert row["data"]["stop_requested"] is True
+    assert (
+        await s.scalar(
+            "SELECT outcome_kind FROM meeting_aw_state WHERE meeting_id = :m", m=mid
+        )
+        == "cancelled_by_calendar"
+    )
+    stale = await s.repo.list_stale_stopping(older_than_seconds=0)
+    assert (mid, "sess-r5", "wl-r5") in stale
+    again = await s.service.remove_entry(7, REMOVE)
+    assert again["result"] == "already_removed"
+
+
+async def test_pg_a_put_after_the_removal_already_sees_the_stop(pg_engine):
+    """A PUT on the link queued right behind the removal runs after it, and finds the meeting
+    ``stopping``: no transaction can land between the removal and its stop."""
+    from sqlalchemy import text
+
+    s = _PgStack(pg_engine)
+    mid = await s.live("active")
+    async with pg_engine.connect() as holder:
+        tx = await holder.begin()
+        await holder.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+            {"k": "aw-intake:7:google_meet:kxo-misr-avz"},
+        )
+        remove = asyncio.create_task(s.service.remove_entry(7, REMOVE))
+        await _waiting_on(s, "Lock", "advisory", n=1)
+        put = asyncio.create_task(
+            s.service.put_entry(
+                7,
+                entry_body(
+                    "google:late-invite",
+                    start="2026-10-20T09:00:00Z",
+                    end="2026-10-20T09:30:00Z",
+                ),
+            )
+        )
+        await _waiting_on(s, "Lock", "advisory", n=2)
+        await tx.rollback()
+    removed, put_reply = await asyncio.gather(remove, put)
+    assert removed["result"] == "bot_stopping"
+    assert put_reply["meeting"]["status"] == "stopping"
+    row = await s.repo.get_meeting(mid)
+    assert row is not None and row["status"] == "stopping"

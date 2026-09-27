@@ -49,6 +49,7 @@ __all__ = [
     "IntakeTx",
     "MeetingQuery",
     "MeetingView",
+    "RecordedStop",
     "Room",
     "SpawnOutcome",
     "SpawnPort",
@@ -355,11 +356,28 @@ class SpawnPort(Protocol):
     async def spawn_exact(self, user_id: int, meeting_id: int) -> SpawnOutcome: ...
 
 
+@dataclass(frozen=True)
+class RecordedStop:
+    """A stop recorded under the meeting's link lock (§1.7 steps 1–4, ``stop.record_stop``): the
+    meeting row as read before the write, the outcome recorded, and the events written.
+    """
+
+    meeting_id: int
+    row: Mapping[str, Any]
+    outcome: Optional[Outcome]
+    events: tuple[str, ...]
+
+
 class StopPort(Protocol):
     async def stop_live(
         self, user_id: int, meeting_id: int, *, outcome: Optional[Outcome]
     ) -> None:
         """Stop the bot in the call (§1.7), recording ``outcome`` on the meeting."""
+        ...
+
+    async def leave(self, user_id: int, stop: RecordedStop) -> None:
+        """§1.7 steps 5–6 for a stop already recorded and committed: the leave command, and the
+        workload delete while the bot is still booting."""
         ...
 
 

@@ -1,11 +1,8 @@
-"""The production ``StopPort`` (§1.7): stop the bot that is in the call.
+"""The stop of the bot in the call (§1.7): ``record_stop`` and the production ``StopPort``.
 
-``IntakeStop.stop_live(user_id, meeting_id, *, outcome)`` serves ``POST /v2/meetings/{id}/stop``
-(no outcome: the meeting ends with upstream's ``stopped``) and R5 (outcome
-``cancelled_by_calendar`` with the remove reason, so the final webhook carries it). In §1.7's
-order:
+§1.7's order:
 
-  1. the link lock (``IntakeStore.room_lock`` on the meeting's link, learnt by a read first);
+  1. the link lock;
   2. the meeting row, locked by the status writer;
   3. the outcome on ``meeting_aw_state``, when given;
   4. the status: a bot that reached the meeting (``active``, ``needs_help``, …) goes ``stopping``
@@ -16,14 +13,20 @@ order:
   5. after the commit, the leave command on ``bot_commands:meeting:{id}``;
   6. and, while the bot is still booting, a workload delete.
 
-Steps 5 and 6 are ``lifecycle.stop_router.stop_meeting_row``, the one stop of a recorded row that
-upstream ``DELETE /bots`` uses too. The bot then leaves and its lifecycle callback ends the meeting
+``record_stop(tx, meeting_id, outcome)`` is steps 2–4 inside a transaction that already holds the
+meeting's link lock, the one implementation of them. R5 calls it in the removal's own
+transaction (``IntakeService``), so a removed last entry and its stop commit together or not at
+all. ``IntakeStop.stop_live`` (``POST /v2/meetings/{id}/stop``, no outcome: the meeting ends with
+upstream's ``stopped``) opens that transaction itself: it reads the meeting's link, takes the link
+lock and calls ``record_stop``. ``IntakeStop.leave`` is steps 5–6 after the commit:
+``lifecycle.stop_router.stop_meeting_row``, the one stop of a recorded row that upstream
+``DELETE /bots`` uses too. The bot then leaves and its lifecycle callback ends the meeting
 ``completed``/``failed`` with upstream's ``stopped`` reason.
 
 A meeting with no live bot, or one already stop-requested, is left as it is: nothing is written
 and nothing is sent (the route answers ``no_live_bot`` for the first before it gets here). A
 command bus that can't be reached is ``unavailable`` (503); the stop is already recorded, and the
-stale-stopping sweep converges the meeting. Events are handed to ``publisher`` after the commit,
+stale-stopping reconcile sweep ends the bot. Events are handed to ``publisher`` after the commit,
 when one is given; the outbox holds them either way.
 """
 
@@ -32,17 +35,24 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 from ..lifecycle.stop_router import (
-    _BOOTING_STATUSES,
+    BOOTING_STATUSES,
     CommandPublisher,
     stop_meeting_row,
 )
 from ..obs import log_event
-from .ports import EventPublisher, IntakeStore, MeetingView, Room
+from .ports import (
+    EventPublisher,
+    IntakeStore,
+    IntakeTx,
+    MeetingView,
+    RecordedStop,
+    Room,
+)
 from .rules import is_live
 from .status import Outcome
 from .validation import IntakeError
 
-__all__ = ["IntakeStop"]
+__all__ = ["IntakeStop", "record_stop"]
 
 #: The sealed ``lifecycle.v1`` reason a stop ends with, carried as the ``stopping`` change reason.
 STOPPED = "stopped"
@@ -50,6 +60,28 @@ STOPPED = "stopped"
 
 def _stop_requested(meeting: MeetingView) -> bool:
     return meeting.status == "stopping" or bool(meeting.data.get("stop_requested"))
+
+
+async def record_stop(
+    tx: IntakeTx, meeting_id: int, outcome: Optional[Outcome]
+) -> Optional[RecordedStop]:
+    """§1.7 steps 2–4 in ``tx``, which holds the meeting's link lock. ``None`` when there is no
+    live bot to stop, or its stop is already recorded."""
+    meeting = await tx.meeting(meeting_id)
+    if not is_live(meeting.status) or _stop_requested(meeting):
+        return None
+    if meeting.status in BOOTING_STATUSES:
+        await tx.mark_stop_requested(meeting_id, outcome)
+        return RecordedStop(meeting_id, dict(meeting.row), outcome, ())
+    written = await tx.status(
+        meeting_id,
+        "stopping",
+        expected_from={meeting.status},
+        data_patch={"stop_requested": True},
+        outcome=outcome,
+        change_reason=STOPPED,
+    )
+    return RecordedStop(meeting_id, dict(meeting.row), outcome, (written.event_id,))
 
 
 class _StoreRows:
@@ -87,11 +119,16 @@ class IntakeStop:
         recorded = await self._record(user_id, meeting_id, outcome)
         if recorded is None:
             return
-        row, events = recorded
-        await self._publish(events)
+        await self._publish(recorded.events)
+        await self.leave(user_id, recorded)
+
+    async def leave(self, user_id: int, stop: RecordedStop) -> None:
         try:
             await stop_meeting_row(
-                _StoreRows(self._store, user_id), self._commands, self._runtime, row
+                _StoreRows(self._store, user_id),
+                self._commands,
+                self._runtime,
+                dict(stop.row),
             )
         except Exception as exc:
             log_event(
@@ -100,7 +137,7 @@ class IntakeStop:
                 level="warning",
                 span="meetings.intake.stop",
                 user_id=user_id,
-                meeting_id=str(meeting_id),
+                meeting_id=str(stop.meeting_id),
                 fields={"error": type(exc).__name__},
             )
             raise IntakeError(
@@ -111,31 +148,17 @@ class IntakeStop:
 
     async def _record(
         self, user_id: int, meeting_id: int, outcome: Optional[Outcome]
-    ) -> Optional[tuple[dict[str, Any], list[str]]]:
-        """Steps 1–4 in one transaction. ``None`` when there is no live bot to stop, or its stop
-        is already recorded; else the row as read before the write, and the events written.
-        """
+    ) -> Optional[RecordedStop]:
+        """Steps 1–4 in one transaction under the meeting's link lock (restarted once when the
+        link changed between the read and the lock)."""
         room = await self._room(user_id, meeting_id)
         for _ in range(2):
             async with self._store.room_lock(user_id, [room]) as tx:
-                meeting = await tx.meeting(meeting_id)
-                if meeting.room != room:
-                    room = meeting.room
+                current = (await tx.meeting(meeting_id)).room
+                if current != room:
+                    room = current
                     continue
-                if not is_live(meeting.status) or _stop_requested(meeting):
-                    return None
-                if meeting.status in _BOOTING_STATUSES:
-                    await tx.mark_stop_requested(meeting_id, outcome)
-                    return dict(meeting.row), []
-                written = await tx.status(
-                    meeting_id,
-                    "stopping",
-                    expected_from={meeting.status},
-                    data_patch={"stop_requested": True},
-                    outcome=outcome,
-                    change_reason=STOPPED,
-                )
-                return dict(meeting.row), [written.event_id]
+                return await record_stop(tx, meeting_id, outcome)
         raise IntakeError(
             "unavailable", "the meeting's link changed during the stop; retry"
         )

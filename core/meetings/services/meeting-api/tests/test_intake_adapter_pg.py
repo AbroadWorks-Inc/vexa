@@ -105,8 +105,8 @@ class PgSpawn:
 
 
 class PgStop:
-    """``StopPort`` over Postgres, the ``FakeStop`` behaviour: a live meeting goes ``stopping``
-    with the outcome given."""
+    """``StopPort`` over Postgres, the ``FakeStop`` behaviour: ``stop_live`` moves a live meeting
+    to ``stopping`` with the outcome given; ``leave`` records the stop it is handed."""
 
     def __init__(self, store: PostgresIntakeStore) -> None:
         self._store = store
@@ -123,6 +123,9 @@ class PgStop:
                 await tx.status(
                     meeting_id, "stopping", expected_from={status}, outcome=outcome
                 )
+
+    async def leave(self, user_id: int, stop: Any) -> None:
+        self.calls.append((user_id, stop.meeting_id, stop.outcome))
 
 
 async def read_meeting(store: PostgresIntakeStore, user_id: int, meeting_id: int):

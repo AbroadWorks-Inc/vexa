@@ -74,6 +74,16 @@ class _FakeRedis:
         self.published.append((channel, message))
 
 
+def _intake(session_factory, repo, runtime, redis_client):
+    """The entry service as ``build_production_app`` builds it (``_build_intake``), over the fakes."""
+    from meeting_api.service_authority import AllowAllServiceAuthority
+
+    return main_mod._build_intake(
+        session_factory, repo, runtime,
+        service_authority=AllowAllServiceAuthority(), commands=redis_client,
+    )
+
+
 def _fake_app():
     app = types.SimpleNamespace()
     app.state = types.SimpleNamespace()
@@ -113,18 +123,20 @@ async def test_auto_join_tick_publish_status_is_wired_and_publishes(monkeypatch)
 
     app = _fake_app()
     redis_client = _FakeRedis()
+    repo, runtime = _FakeMeetingRepo(), _FakeRuntime()
 
     main_mod._attach_background_loops(
         app,
         transcript_store=types.SimpleNamespace(),
         segment_bus=types.SimpleNamespace(),
         redis_client=redis_client,
-        meeting_repo=_FakeMeetingRepo(),
-        runtime=_FakeRuntime(),
+        meeting_repo=repo,
+        runtime=runtime,
         service_authority=None,
         system_webhook_sink=None,
         session_factory=_fake_session_factory,
         storage=None,
+        intake=_intake(_fake_session_factory, repo, runtime, redis_client),
     )
 
     async with app.router.lifespan_context(app):
@@ -194,17 +206,23 @@ async def _run_loops(monkeypatch, *, session_factory, env=None):
     monkeypatch.setattr(asyncio, "sleep", _sleep_once_then_stop)
     monkeypatch.setattr(main_mod.log, "exception", lambda *a, **kw: None)
     app = _fake_app()
+    redis_client, repo, runtime = _FakeRedis(), _FakeMeetingRepo(), _FakeRuntime()
     main_mod._attach_background_loops(
         app,
         transcript_store=types.SimpleNamespace(),
         segment_bus=types.SimpleNamespace(),
-        redis_client=_FakeRedis(),
-        meeting_repo=_FakeMeetingRepo(),
-        runtime=_FakeRuntime(),
+        redis_client=redis_client,
+        meeting_repo=repo,
+        runtime=runtime,
         service_authority=None,
         system_webhook_sink=None,
         session_factory=session_factory,
         storage=None,
+        intake=(
+            _intake(session_factory, repo, runtime, redis_client)
+            if session_factory is not None
+            else None
+        ),
     )
     async with app.router.lifespan_context(app):
         await real_sleep(0.05)

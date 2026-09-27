@@ -70,7 +70,7 @@ def _resolve_user_id(x_user_id: Optional[str]) -> int:
 # fire-and-forget leave below can be LOST (the POST→immediate-DELETE orphan). For these we ALSO tear the
 # workload down directly. An `active`/`needs_help` bot IS listening → trust the graceful leave (so it
 # finalizes its recording cleanly); the reconcile loop is the backstop if it never completes.
-_BOOTING_STATUSES = {"requested", "joining", "awaiting_admission"}
+BOOTING_STATUSES = frozenset({"requested", "joining", "awaiting_admission"})
 
 # The sealed api.v1 `Platform` enum — the DELETE path param is typed as this enum in the contract, so an
 # unsupported platform is a VALIDATION error (422), not a missing-resource (404). Mirrors the POST /bots
@@ -184,7 +184,7 @@ async def stop_meeting_row(repo, publisher: CommandPublisher, runtime, row: dict
        honours it, leaves, and emits its terminal ``lifecycle.v1`` event. A publish failure
        propagates to the caller, and nothing is torn down.
     2. GUARANTEE no orphan: a stop must not rely solely on a fire-and-forget command the bot may
-       never receive. A BOOTING bot (status in ``_BOOTING_STATUSES``) has likely not subscribed yet
+       never receive. A BOOTING bot (status in ``BOOTING_STATUSES``) has likely not subscribed yet
        → directly tear its workload down (it has nothing to finalize), when a ``runtime`` is given.
        Best-effort: logged, never fails the stop. A sibling waiting in the lobby is almost always
        in exactly that state.
@@ -207,7 +207,7 @@ async def stop_meeting_row(repo, publisher: CommandPublisher, runtime, row: dict
         return
     fresh = await _reread(repo, row)
     container = fresh.get("bot_container_id")
-    if container and fresh.get("status") in _BOOTING_STATUSES:
+    if container and fresh.get("status") in BOOTING_STATUSES:
         try:
             await runtime.delete_workload(container)
         except Exception as e:  # noqa: BLE001 — best-effort; reconcile backstops
@@ -280,7 +280,7 @@ async def _mark_stop_requested(repo, row: dict) -> None:
     if sessions:
         await repo.update_meeting_status(
             session_uid=sessions[-1],
-            status=status if status in _BOOTING_STATUSES else "stopping",
+            status=status if status in BOOTING_STATUSES else "stopping",
             data={"stop_requested": True},
         )
         return

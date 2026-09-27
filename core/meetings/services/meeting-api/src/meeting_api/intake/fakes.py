@@ -14,7 +14,9 @@
     ``already_live`` for any other row, or returns the failure it was given: before the claim by
     default, after it with ``after_claim=True`` (the row then ends ``failed``, outcome
     ``not_sent``, as the real port leaves it).
-  * ``FakeStop`` — ``StopPort``: moves a live meeting to ``stopping`` with the outcome given.
+  * ``FakeStop`` — ``StopPort``: ``stop_live`` moves a live meeting to ``stopping`` with the
+    outcome given; ``leave`` records the stop it is handed (the entry service records R5's stop
+    itself, in the removal's transaction).
   * ``FakePublisher`` — ``EventPublisher``: records each published batch.
   * ``InMemoryIntakeReads`` — ``IntakeReads`` over an ``InMemoryIntakeStore``: the same visibility,
     order and cursors as ``reads.PostgresIntakeReads``. The store has no delivery rows, so
@@ -51,6 +53,7 @@ from .ports import (
     ErasedRows,
     MeetingQuery,
     MeetingView,
+    RecordedStop,
     Room,
     SpawnOutcome,
 )
@@ -571,6 +574,9 @@ class FakeStop:
             self._store.write_status(
                 meeting_id, "stopping", expected_from={status}, outcome=outcome
             )
+
+    async def leave(self, user_id: int, stop: RecordedStop) -> None:
+        self.calls.append((user_id, stop.meeting_id, stop.outcome))
 
 
 class FakePublisher:

@@ -6,7 +6,8 @@ after a link change while live), plus the new link on an update, all sorted, thr
 transaction ends without writing and the service starts again once with those links added. A
 remove or a re-run doesn't know the links before reading, so it first reads without a link lock.
 Events are published after the transaction commits (a failed publish is logged: the outbox holds
-them); stops and spawns run after that, each through its own port.
+them). A stop (R5) is recorded inside the transaction (``stop.record_stop``); the leave command
+and spawns run after the commit, each through its own port.
 
 ``PUT`` (§1.3 steps 1–9):
   1. validate (``parse_entry``) and parse the link: unknown → ``unrecognized_link``, a host in
@@ -65,6 +66,7 @@ from .ports import (
     Room,
     SpawnOutcome,
     SpawnPort,
+    RecordedStop,
     StopPort,
 )
 from .rules import (
@@ -78,6 +80,7 @@ from .rules import (
 )
 from .settings import IntakeSettings
 from .status import Outcome, StatusConflict
+from .stop import record_stop
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
 __all__ = ["IntakeService", "is_merge_target"]
@@ -96,6 +99,10 @@ _REMOVE_RESULT = {
     "stopping": "bot_stopping",
     "finished": "entry_removed",
 }
+
+
+#: Errors that mean a bug, not an outage: a failed leave command is logged, these are raised.
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, KeyError, AssertionError, NameError)
 
 
 def is_merge_target(meeting: MeetingView) -> bool:
@@ -120,12 +127,12 @@ def _utcnow() -> datetime:
 
 @dataclass
 class _Work:
-    """One locked transaction's writes: the events to publish after it commits and the live
-    meetings to stop after that."""
+    """One locked transaction's writes: the events to publish after it commits and the stops it
+    recorded, whose bots are sent the leave command after that."""
 
     tx: IntakeTx
     events: list[str] = field(default_factory=list)
-    stops: list[tuple[int, Outcome]] = field(default_factory=list)
+    stops: list[RecordedStop] = field(default_factory=list)
 
     async def event(self, meeting_id: int, event_type: str) -> None:
         written = await self.tx.event(meeting_id, event_type)
@@ -135,10 +142,15 @@ class _Work:
         written = await self.tx.status(meeting_id, to_status, **kwargs)
         self.events.append(written.event_id)
 
-    async def stop_after_commit(self, meeting_id: int, outcome: Outcome) -> None:
-        """R5: the meeting lost its last entry while live; its bot is stopped after the commit."""
+    async def stop(self, meeting_id: int, outcome: Outcome) -> None:
+        """R5: the meeting lost its last entry while live. Its stop is recorded here, in this
+        transaction under the link lock (§1.7 steps 1–4, ``record_stop``), so the removal and the
+        stop commit together; the bot is sent the leave command after the commit."""
         await self.event(meeting_id, "meeting.updated")
-        self.stops.append((meeting_id, outcome))
+        recorded = await record_stop(self.tx, meeting_id, outcome)
+        if recorded is not None:
+            self.events.extend(recorded.events)
+            self.stops.append(recorded)
 
 
 @dataclass(frozen=True)
@@ -300,11 +312,31 @@ class IntakeService:
                 "the entry's meeting link changed during the request; retry",
             )
         await self._publish(work.events)
-        for meeting_id, outcome in work.stops:
-            await self._stop.stop_live(user_id, meeting_id, outcome=outcome)
+        for stop in work.stops:
+            await self._leave(user_id, stop)
         if work.stops and done is not None:
             done = replace(done, meeting=await self._read(user_id, done.meeting.id))
         return done
+
+    async def _leave(self, user_id: int, stop: RecordedStop) -> None:
+        """§1.7 steps 5–6 for a stop this request recorded and committed. A failure is logged and
+        doesn't fail the request: the stop is recorded, and the stale-stopping reconcile sweep
+        ends the bot (a retried remove answers ``already_removed`` and sends nothing).
+        """
+        try:
+            await self._stop.leave(user_id, stop)
+        except _PROGRAMMING_ERRORS:
+            raise
+        except Exception as exc:
+            log_event(
+                "intake_stop_leave_failed",
+                audience="operator",
+                level="warning",
+                span="meetings.intake",
+                user_id=user_id,
+                meeting_id=str(stop.meeting_id),
+                fields={"error": type(exc).__name__},
+            )
 
     async def _publish(self, event_ids: Sequence[str]) -> None:
         """Hand committed events to the publisher. A failure is logged and doesn't fail the
@@ -575,7 +607,7 @@ class IntakeService:
         if meeting.status == "scheduled":
             ended = await self._end_planned(w, meeting, outcome)
         else:
-            await w.stop_after_commit(meeting.id, outcome)
+            await w.stop(meeting.id, outcome)
             ended = "stopping"
         return _Done(_REMOVE_RESULT[ended], await tx.meeting(meeting.id))
 
@@ -591,7 +623,7 @@ class IntakeService:
     ) -> str:
         """R8: a scheduled meeting with no entries left ends ``failed``, ``stopped``, with the
         outcome (``meeting.removed``). Conditional: ``"removed"``; ``"stopping"`` when it went
-        live meanwhile (its bot is stopped after the commit, R5); ``"finished"`` when it ended
+        live meanwhile (its stop is recorded in this transaction, R5); ``"finished"`` when it ended
         meanwhile."""
         try:
             await w.status(
@@ -607,7 +639,7 @@ class IntakeService:
         except StatusConflict:
             current = await w.tx.meeting(meeting.id)
             if is_live(current.status):
-                await w.stop_after_commit(meeting.id, outcome)
+                await w.stop(meeting.id, outcome)
                 return "stopping"
             return "finished"
 

@@ -304,6 +304,9 @@ def create_app(
     # upstream's completed-meeting erasure. Reached only through the gateway, which checks the scope
     # and sets x-user-id. ---
     app.state.intake_service = intake_service
+    wired = [port is not None for port in (intake_service, intake_reads, intake_stop)]
+    if any(wired) and not all(wired):
+        raise ValueError("the /v2 intake routes need intake_service, intake_reads and intake_stop")
     if intake_service is not None and intake_reads is not None and intake_stop is not None:
         from .intake import build_intake_router
         from .intake.settings import auto_join_lead_s
