@@ -5,11 +5,13 @@ Four groups:
   * the guard (offline) — nothing in ``src/meeting_api`` outside ``intake/status.py`` writes
     ``meetings.status``. The rule it enforces, over every production source file (AST, not text):
       - no assignment to an attribute named ``status`` (``row.status = …``, ``+=``, annotated);
-      - no ``setattr(…, "status", …)``;
+      - no ``setattr`` whose attribute name is ``"status"`` or not a constant;
       - no ``Meeting(…)`` constructor call (a new row is written with a status, the column
         default included);
-      - no ``update(Meeting)`` / ``insert(Meeting)`` and no ``.values(status=…)``;
-      - no string literal holding ``UPDATE meetings`` / ``INSERT INTO meetings``.
+      - no ``update(Meeting)`` / ``insert(Meeting)`` (``Meeting.__table__`` counts as
+        ``Meeting``, ``Meeting.__table__.update()`` too) and no ``.values(status=…)``;
+      - no string literal, or f-string's constant parts, holding ``UPDATE`` / ``INSERT INTO`` the
+        ``meetings`` table, bare, quoted or schema-qualified.
     ``ALLOWED`` names the only exemptions, each with its reason. In-memory fakes keep rows as dicts
     (``row["status"] = …``); a dict subscript is not a ``meetings`` write, so the rule doesn't match
     them, and the fakes are test doubles (``intake/fakes.py`` models the writer's sequence and
@@ -19,8 +21,10 @@ Four groups:
   * Postgres: each writer — the bot-spawn repo (create, guarded insert and claim, reopen, the
     session-keyed lifecycle write, ``fail_meeting``, the service-authority stop), the collector
     store (planned create, ``set_intent``, planned edit) and the lifecycle callback — records one
-    outbox row per change, sequence + 1, and nothing for a write that doesn't change the status;
-    ``requested`` and ``stopping`` reach the outbox; each writer takes the link lock first.
+    outbox row per change, sequence + 1, typed where a typed event exists (Ruling R25), and nothing
+    for a write that doesn't change the status; ``requested`` and ``stopping`` reach the outbox;
+    each writer takes the link lock first; the lifecycle write changes the status only from its
+    caller's predecessors and never off a finished status (a stale stop or replica writes nothing).
   * Postgres: the carries — the spawn recovery never writes over a live workload and a spawn failure
     has one terminal event; an R5 stop's terminal event (the bot's completion through the lifecycle
     callback) carries ``cancelled_by_calendar`` with ``completion_reason: "stopped"``; the legacy
@@ -71,8 +75,10 @@ ALLOWED: dict[str, tuple[frozenset[str], str]] = {
     ),
 }
 
+#: ``UPDATE`` / ``INSERT INTO`` the ``meetings`` table, bare, quoted or schema-qualified.
 _RAW_SQL = re.compile(
-    r"\b(update\s+meetings|insert\s+into\s+meetings)\b", re.IGNORECASE
+    r'\b(?:update|insert\s+into)\s+(?:"?\w+"?\s*\.\s*)?"?meetings"?(?!\w)',
+    re.IGNORECASE,
 )
 
 
@@ -81,6 +87,25 @@ def _callee(node: ast.expr) -> Optional[str]:
         return node.id
     if isinstance(node, ast.Attribute):
         return node.attr
+    return None
+
+
+def _is_meeting(node: ast.expr) -> bool:
+    """``Meeting``, ``models.Meeting``, or either one's ``__table__``."""
+    if isinstance(node, ast.Attribute) and node.attr == "__table__":
+        return _is_meeting(node.value)
+    return _callee(node) == "Meeting"
+
+
+def _sql_text(node: ast.AST) -> Optional[str]:
+    """A string literal's text; an f-string's constant parts, each placeholder standing in as
+    ``x`` (so ``f"UPDATE {schema}.meetings"`` reads ``UPDATE x.meetings``)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            str(v.value) if isinstance(v, ast.Constant) else "x" for v in node.values
+        )
     return None
 
 
@@ -111,25 +136,32 @@ def status_writes(source: str) -> list[tuple[int, str]]:
         if isinstance(node, ast.Call):
             name = _callee(node.func)
             args = node.args
+            # A computed attribute name may be "status": only a constant other name is safe.
             if (
                 name == "setattr"
                 and len(args) >= 2
-                and isinstance(args[1], ast.Constant)
-                and args[1].value == "status"
+                and not (
+                    isinstance(args[1], ast.Constant) and args[1].value != "status"
+                )
             ):
                 found.append((node.lineno, "setattr"))
             if name == "Meeting":
                 found.append((node.lineno, "create"))
-            if name in ("update", "insert") and args and _callee(args[0]) == "Meeting":
+            if name in ("update", "insert") and args and _is_meeting(args[0]):
+                found.append((node.lineno, "sql"))
+            if (
+                name in ("update", "insert")
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "__table__"
+                and _is_meeting(node.func.value)
+            ):
                 found.append((node.lineno, "sql"))
             if name == "values" and any(kw.arg == "status" for kw in node.keywords):
                 found.append((node.lineno, "values"))
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and _RAW_SQL.search(node.value)
-        ):
-            found.append((node.lineno, "raw_sql"))
+        text = _sql_text(node)
+        if text is not None and _RAW_SQL.search(text):
+            found.append((getattr(node, "lineno", 0), "raw_sql"))
     return found
 
 
@@ -148,6 +180,18 @@ def status_writes(source: str) -> list[tuple[int, str]]:
         ("stmt = table.update().values(status='failed')", "values"),
         ("text('UPDATE meetings SET status = :s WHERE id = :m')", "raw_sql"),
         ("text('insert  into meetings (status) values (1)')", "raw_sql"),
+        ("setattr(m, name, 'failed')", "setattr"),
+        ("setattr(m, f'sta{x}', 'failed')", "setattr"),
+        ("text('UPDATE public.meetings SET status = :s')", "raw_sql"),
+        ("text('UPDATE \"meetings\" SET status = :s')", "raw_sql"),
+        ('text(\'update "public"."meetings" set status = 1\')', "raw_sql"),
+        ("text('INSERT INTO public.meetings (status) VALUES (1)')", "raw_sql"),
+        ("text(f'UPDATE {schema}.meetings SET status = :s')", "raw_sql"),
+        ("text(f'INSERT INTO meetings (status, x) VALUES ({a}, 1)')", "raw_sql"),
+        ("await db.execute(update(Meeting.__table__).values(data={}))", "sql"),
+        ("await db.execute(insert(models.Meeting.__table__))", "sql"),
+        ("await db.execute(Meeting.__table__.update().where(x))", "sql"),
+        ("await db.execute(Meeting.__table__.insert())", "sql"),
     ],
 )
 def test_the_guard_catches_every_kind_of_status_write(snippet, rule):
@@ -162,6 +206,10 @@ def test_the_guard_catches_every_kind_of_status_write(snippet, rule):
         "DeliveryResult(status='failed')",
         "select(Meeting.status).where(Meeting.status == 'active')",
         "text(\"SELECT status FROM meetings WHERE status = 'scheduled'\")",
+        "text('UPDATE meeting_aw_state SET event_seq = 1')",
+        "text('INSERT INTO meetings_archive (x) VALUES (1)')",
+        "setattr(m, 'title', 'x')",
+        "await db.execute(update(Transcription.__table__))",
     ],
 )
 def test_the_guard_ignores_reads_and_dicts(snippet):
@@ -222,6 +270,61 @@ def test_the_sealed_set_is_the_schemas():
     from meeting_api.lifecycle.receiver import SEALED_COMPLETION_REASONS
 
     assert SEALED_COMPLETION_REASONS == {r.value for r in CompletionReason}
+
+
+@pytest.mark.parametrize(
+    "to,outcome_kind,expected",
+    [
+        ("active", None, "meeting.started"),
+        ("completed", None, "meeting.completed"),
+        ("completed", "cancelled_by_calendar", "meeting.completed"),
+        ("failed", None, "bot.failed"),
+        ("failed", "cancelled_by_calendar", "bot.failed"),
+        ("failed", "not_sent", "meeting.not_sent"),
+        ("requested", None, "meeting.status_change"),
+        ("joining", None, "meeting.status_change"),
+        ("awaiting_admission", None, "meeting.status_change"),
+        ("needs_help", None, "meeting.status_change"),
+        ("stopping", "cancelled_by_calendar", "meeting.status_change"),
+        ("scheduled", None, "meeting.status_change"),
+        ("idle", None, "meeting.status_change"),
+    ],
+)
+def test_a_status_changes_event_is_typed_where_a_typed_event_exists(
+    to, outcome_kind, expected
+):
+    """Ruling R25: one event per change, typed where §2.7 has a typed event."""
+    from meeting_api.intake.status import typed_event
+
+    assert typed_event(to, outcome_kind) == expected
+
+
+def test_every_typed_event_is_a_sealed_webhook_v1_event_type():
+    from meeting_api.lifecycle.webhook import _SCHEMA
+
+    sealed = set(_SCHEMA["$defs"]["EventType"]["enum"])
+    from meeting_api.intake.status import typed_event
+
+    for to in ("active", "completed", "failed", "joining"):
+        for kind in (None, "not_sent"):
+            assert typed_event(to, kind) in sealed
+
+
+async def test_an_intake_created_meetings_first_event_records_its_status():
+    """The fake store models the writer: ``meeting.scheduled`` carries ``change`` too."""
+    from intake_builders import make_harness
+
+    h = make_harness()
+    await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T10:30:00Z")
+    first = h.store.events[0]
+    assert first.event_type == "meeting.scheduled"
+    assert first.change is not None
+    assert (first.change["from"], first.change["to"], first.change["reason"]) == (
+        None,
+        "scheduled",
+        None,
+    )
+    assert first.change["at"].endswith("Z")
 
 
 def test_the_projection_renders_an_unparseable_scheduled_at_as_no_time():
@@ -355,6 +458,15 @@ async def _before(pg: _Pg, mid: int) -> _Before:
     return _Before(len(await pg.events(mid)), await pg.seq(mid))
 
 
+#: Ruling R25: the event type of a status change without an explicit one (``failed`` with a
+#: ``not_sent`` outcome is ``meeting.not_sent``, passed explicitly by those tests).
+TYPED = {
+    "active": "meeting.started",
+    "completed": "meeting.completed",
+    "failed": "bot.failed",
+}
+
+
 async def _one_change(
     pg: _Pg,
     mid: int,
@@ -369,7 +481,7 @@ async def _one_change(
     assert len(events) == before.events + 1, [e["event_type"] for e in events]
     last = events[-1]
     assert last["sequence"] == before.seq + 1 == await pg.seq(mid)
-    assert last["event_type"] == (event_type or "meeting.status_change")
+    assert last["event_type"] == (event_type or TYPED.get(to, "meeting.status_change"))
     payload = last["payload"]
     assert payload["data"]["change"]["from"] == frm
     assert payload["data"]["change"]["to"] == to
@@ -394,6 +506,40 @@ async def test_pg_create_meeting_records_requested(pg):
     assert payload["data"]["meeting"]["id"] == str(
         await pg.scalar("SELECT uuid FROM meetings WHERE id = :m", m=row["id"])
     )
+
+
+async def test_pg_create_meeting_without_a_link_takes_no_link_lock(pg):
+    async with pg.engine.connect() as holder:
+        tx = await holder.begin()
+        await _hold_link(holder, f"aw-intake:{USER}:{PLAT}:None")
+        row = await asyncio.wait_for(
+            pg.repo.create_meeting(
+                user_id=USER, platform=PLAT, native_meeting_id=None, data={}
+            ),
+            timeout=5,
+        )
+        await tx.rollback()
+    await _one_change(pg, row["id"], _Before(0, 0), "requested", frm=None)
+
+
+async def test_pg_an_intake_created_meetings_first_event_records_its_status(pg):
+    from intake_builders import entry_body, make_settings
+
+    from meeting_api.intake import IntakeService, PostgresIntakeStore
+    from meeting_api.intake.sweeps import NoStop, OutboxOnly
+
+    store = PostgresIntakeStore(pg.session_factory)
+    service = IntakeService(
+        store, _NoSpawnPort(), NoStop(), OutboxOnly(), make_settings()
+    )
+    await service.put_entry(
+        USER, entry_body(start="2026-10-20T09:00:00Z", end="2026-10-20T09:30:00Z")
+    )
+    mid = await pg.only_meeting()
+    [first] = await pg.events(mid)
+    assert (first["event_type"], first["sequence"]) == ("meeting.scheduled", 1)
+    change = first["payload"]["data"]["change"]
+    assert (change["from"], change["to"], change["reason"]) == (None, "scheduled", None)
 
 
 async def test_pg_post_bots_insert_records_requested(pg):
@@ -611,12 +757,14 @@ async def test_pg_a_planned_edit_that_moves_the_link_locks_both_links(pg):
 # ── Postgres: the lifecycle callback ────────────────────────────────────────────────────────
 
 
-async def _callback(repo: Any, *events: dict, sink: Any = None) -> None:
+async def _callback(
+    repo: Any, *events: dict, sink: Any = None, store: Any = None
+) -> None:
     import httpx
 
     from meeting_api import create_app
 
-    app = create_app(meeting_repo=repo, system_webhook_sink=sink)
+    app = create_app(meeting_repo=repo, system_webhook_sink=sink, meeting_store=store)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         for event in events:
@@ -645,12 +793,113 @@ async def test_pg_the_lifecycle_callback_records_one_event_per_step(pg):
         ),  # the bot's retry
     )
     events = await pg.events(mid)
-    assert [(e["sequence"], e["payload"]["data"]["change"]["to"]) for e in events] == [
-        (1, "joining"),
-        (2, "active"),
-        (3, "completed"),
+    assert [
+        (e["sequence"], e["event_type"], e["payload"]["data"]["change"]["to"])
+        for e in events
+    ] == [
+        (1, "meeting.status_change", "joining"),
+        (2, "meeting.started", "active"),
+        (3, "meeting.completed", "completed"),
     ]
     assert await pg.seq(mid) == 3
+
+
+async def test_pg_a_stale_stop_never_reopens_a_completed_meeting(pg):
+    """The upstream stop acts on a row it read before any lock; the meeting completed meanwhile.
+    The stop's ``stopping`` is refused: no change, no event."""
+    from meeting_api.lifecycle.stop_router import _mark_stop_requested
+
+    mid = await pg.seed("active", session_uid="sess-stale")
+    stale = await pg.repo.get_meeting(mid)
+    await pg.repo.update_meeting_status(
+        session_uid="sess-stale", status="completed", completion_reason="left_alone"
+    )
+    before = await _before(pg, mid)
+    await _mark_stop_requested(pg.repo, stale)
+    await _no_change(pg, mid, before)
+    assert await pg.status(mid) == "completed"
+
+
+async def test_pg_a_stale_reconcile_failed_after_completed_writes_nothing(pg):
+    """A replica whose in-process record still says ``active`` posts the reconcile sweep's
+    ``failed`` after the meeting completed: no second terminal event, entries not re-closed.
+    """
+    from meeting_api.lifecycle.machine import MeetingStore
+
+    mid = await pg.seed("active", session_uid="sess-cb")
+    await pg.exec(
+        "INSERT INTO meeting_entries (user_id, source_user, external_id, meeting_id, "
+        "meeting_url, platform, native_meeting_id, start_at, state, attendees, join_now, "
+        "content_hash) VALUES (:u, 'a@abroadworks.com', 'google:x', :m, :url, :p, :n, "
+        "now() - interval '1 hour', 'active', '{}', false, 'h')",
+        u=USER,
+        m=mid,
+        url=f"https://meet.google.com/{NID}",
+        p=PLAT,
+        n=NID,
+    )
+    await _callback(pg.repo, _event("completed", completion_reason="left_alone"))
+    closed_at = await pg.scalar(
+        "SELECT closed_at FROM meeting_entries WHERE meeting_id = :m", m=mid
+    )
+    assert closed_at is not None
+    before = await _before(pg, mid)
+
+    store = MeetingStore()
+    store.rehydrate("sess-cb", "active", {})
+    await _callback(
+        pg.repo,
+        _event("failed", completion_reason="join_failure", reason="workload gone"),
+        store=store,
+    )
+    await _no_change(pg, mid, before)
+    assert await pg.status(mid) == "completed"
+    assert (
+        await pg.scalar(
+            "SELECT closed_at FROM meeting_entries WHERE meeting_id = :m", m=mid
+        )
+        == closed_at
+    )
+
+
+async def test_pg_a_stale_replicas_edge_changes_only_from_its_own_from(pg):
+    """The callback passes the edge's ``from`` as the predecessors: a replica that last saw
+    ``joining`` can't move a meeting another replica already moved to ``stopping``."""
+    from meeting_api.lifecycle.machine import MeetingStore
+
+    mid = await pg.seed("stopping", session_uid="sess-cb")
+    store = MeetingStore()
+    store.rehydrate("sess-cb", "joining", {})
+    before = await _before(pg, mid)
+    await _callback(pg.repo, _event("active"), store=store)
+    await _no_change(pg, mid, before)
+    assert await pg.status(mid) == "stopping"
+
+
+async def test_pg_the_lifecycle_write_takes_the_callers_predecessors(pg):
+    mid = await pg.seed("joining", session_uid="sess-p")
+    before = await _before(pg, mid)
+    row = await pg.repo.update_meeting_status(
+        session_uid="sess-p", status="active", expected_from={"awaiting_admission"}
+    )
+    assert row is None
+    await _no_change(pg, mid, before)
+    await pg.repo.update_meeting_status(
+        session_uid="sess-p", status="active", expected_from={"joining"}
+    )
+    await _one_change(pg, mid, before, "active", frm="joining")
+
+
+async def test_pg_a_finished_meeting_never_changes_status_again(pg):
+    """Even a caller naming the finished status as a predecessor can't reopen it."""
+    mid = await pg.seed("completed", session_uid="sess-f")
+    before = await _before(pg, mid)
+    row = await pg.repo.update_meeting_status(
+        session_uid="sess-f", status="active", expected_from={"completed"}
+    )
+    assert row is None
+    await _no_change(pg, mid, before)
+    assert await pg.status(mid) == "completed"
 
 
 # ── Postgres: every writer takes the link lock first ────────────────────────────────────────
@@ -896,7 +1145,7 @@ async def test_pg_a_stop_fenced_spawn_keeps_an_r5_outcome(pg):
         (e["event_type"], e["payload"]["data"]["change"]["to"]) for e in events
     ] == [
         ("meeting.status_change", "requested"),
-        ("meeting.status_change", "failed"),
+        ("bot.failed", "failed"),
     ]
     terminal = events[-1]["payload"]["data"]["meeting"]
     assert terminal["outcome"]["kind"] == "cancelled_by_calendar"
@@ -931,9 +1180,15 @@ async def test_pg_an_r5_stopped_meetings_terminal_event_carries_the_outcome(pg):
             u=reply["meeting"]["id"],
         )
     )
-    # The bot is sent and reaches the meeting (each step through the writer).
+    # The bot is sent (the exact-row claim) and reaches the meeting (the lifecycle callback).
+    await pg.repo.create_meeting_guarded(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        data={},
+        claim_meeting_id=mid,
+    )
     await pg.session(mid, "sess-cb")
-    await pg.repo.update_meeting_status(session_uid="sess-cb", status="requested")
     await _callback(pg.repo, _event("joining"), _event("active"))
 
     removed = await service.remove_entry(
@@ -951,13 +1206,13 @@ async def test_pg_an_r5_stopped_meetings_terminal_event_carries_the_outcome(pg):
         (e["event_type"], e["payload"]["data"].get("change", {}).get("to"))
         for e in events
     ] == [
-        ("meeting.scheduled", None),
+        ("meeting.scheduled", "scheduled"),
         ("meeting.status_change", "requested"),
         ("meeting.status_change", "joining"),
-        ("meeting.status_change", "active"),
+        ("meeting.started", "active"),
         ("meeting.updated", None),  # the entry removed
         ("meeting.status_change", "stopping"),
-        ("meeting.status_change", "completed"),
+        ("meeting.completed", "completed"),
     ]
     terminal = events[-1]["payload"]["data"]
     assert terminal["change"]["from"] == "stopping"

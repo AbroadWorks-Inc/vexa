@@ -434,7 +434,7 @@ def _mount_lifecycle(
     """
     import jsonschema
 
-    from .lifecycle.machine import IllegalTransition, TransitionSource
+    from .lifecycle.machine import IllegalTransition, TransitionSource, persisted_statuses_for
     from .lifecycle.provenance import build_service_provenance
     from .lifecycle.receiver import conforms
     from .lifecycle.webhook import build_status_change_envelope, build_typed_envelope
@@ -582,6 +582,13 @@ def _mount_lifecycle(
                     failure_stage=rec.failure_stage.value if rec.failure_stage else None,
                     data=rec.data if isinstance(rec.data, dict) else None,
                     change_reason=change.reason,
+                    # §1.4: the row changes only from the edge's `from`. A runtime-confirmed destroy
+                    # is terminal evidence for any live row, whatever this process last saw.
+                    expected_from=(
+                        None
+                        if change.transition_source is TransitionSource.RUNTIME_DESTROY
+                        else persisted_statuses_for(change.old_status)
+                    ),
                 )
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",

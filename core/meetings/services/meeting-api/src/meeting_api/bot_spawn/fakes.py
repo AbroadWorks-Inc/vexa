@@ -368,7 +368,7 @@ class InMemoryMeetingRepo:
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
-        change_reason=None,
+        change_reason=None, expected_from=None,
     ) -> None:
         sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
         if sess is None:
@@ -376,6 +376,13 @@ class InMemoryMeetingRepo:
         row = self._meetings.get(sess["meeting_id"])
         if row is None:
             return
+        # The adapter's conditional write: only from a predecessor, never off a finished status.
+        from .auto_join import LIVE_STATUSES
+
+        predecessors = set(LIVE_STATUSES if expected_from is None else expected_from)
+        predecessors -= {"completed", "failed"}
+        if row["status"] != status and row["status"] not in predecessors:
+            return None
         row["status"] = status
         if completion_reason is not None:
             row["data"]["completion_reason"] = completion_reason

@@ -69,12 +69,12 @@ from .rules import (
     meeting_start,
 )
 from .status import (
-    STATUS_CHANGE_EVENT,
     Outcome,
     StatusConflict,
     WrittenEvent,
     check_event_data,
     derive_event_id_v2,
+    typed_event,
 )
 from .validation import EntryIn, IntakeError
 
@@ -340,8 +340,9 @@ class InMemoryIntakeStore:
             "reason": change_reason,
             "at": iso_utc(now.replace(microsecond=0)),
         }
+        typed = typed_event(to_status, self.aw[meeting_id].get("outcome_kind"))
         written = self.write_event(
-            meeting_id, event_type or STATUS_CHANGE_EVENT, change, event_data=event_data
+            meeting_id, event_type or typed, change, event_data=event_data
         )
         return WrittenEvent(written.event_id, written.sequence, tuple(rerun))
 

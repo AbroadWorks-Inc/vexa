@@ -16,6 +16,10 @@ writing nothing, if the status isn't expected), writes the status and data patch
 `meeting_aw_state` (created if missing) to set the outcome and bump `event_seq`, closes the active
 entries on `completed`/`failed` (returning a future, non-overlapping entry's id for re-run, R7), and
 inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelope that gets sent.
+Its event type is the caller's, else `typed_event` of the change (Ruling R25): `meeting.started`
+on `active`, `meeting.completed` on `completed`, `meeting.not_sent` / `bot.failed` on `failed`
+(by whether the outcome is `not_sent`), `meeting.status_change` otherwise; `data.change` is always
+there, a meeting's first event included (`creation_change`).
 `write_event(db, meeting_id, event_type, change)` records a non-status event the same way.
 `write_status(..., event_data=...)` adds keys to the envelope's `data` next to `meeting` and
 `change` (`merged_into` on a merge's `meeting.removed`, §2.7), never replacing those two.
@@ -23,7 +27,9 @@ inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelop
 event (a new row's status is its first change). Every writer of `meetings.status` in meeting-api
 goes through these two (intake, the bot-spawn repo's claim, reopen, `fail_meeting`, lifecycle and
 service-authority writes, the collector's planned create, `set_intent` and planned edit), holding
-the meeting's link lock first (`adapters.take_link_lock`, or `lock_meeting_on_its_link` for a
+the meeting's link lock first. The lifecycle write changes a status only from its caller's
+predecessors (the edge's `from` for the callback, the live statuses otherwise) and never off
+`completed`/`failed` (`adapters.take_link_lock`, or `lock_meeting_on_its_link` for a
 writer that knows the meeting by id); `tests/test_status_writers_all.py` fails on any other write.
 A `data` patch whose `completion_reason` is outside the sealed `lifecycle.v1` set is refused before
 anything is written (`check_completion_reason`; upstream's `start_failed` on a `failed` row is the

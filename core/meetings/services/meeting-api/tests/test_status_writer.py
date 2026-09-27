@@ -488,11 +488,11 @@ async def test_fake_payload_is_the_canonical_envelope(orm, monkeypatch):
     envelope = json.loads(text)
     assert _canonical(envelope) == text  # the stored text round-trips byte for byte
     assert row.event_id == written.event_id == envelope["event_id"]
-    assert row.event_type == envelope["event_type"] == "meeting.status_change"
+    assert row.event_type == envelope["event_type"] == "meeting.started"
     assert row.sequence == written.sequence == 7
     assert row.meeting_id == 11
     assert written.event_id == derive_event_id_v2(
-        str(meeting.uuid), "meeting.status_change", 7
+        str(meeting.uuid), "meeting.started", 7
     )
     assert envelope["api_version"] == "2026-09-25"
     change = envelope["data"]["change"]
@@ -870,7 +870,7 @@ async def test_pg_payload_round_trips_byte_for_byte(pg_schema):
         ).scalar_one()
     assert envelope["data"]["meeting"]["id"] == str(meeting_uuid)
     assert written.event_id == derive_event_id_v2(
-        str(meeting_uuid), "meeting.status_change", 1
+        str(meeting_uuid), "meeting.not_sent", 1
     )
     assert envelope["data"]["meeting"]["outcome"]["message"] == "Ünïcode ✓"
     _webhook_schema_conforms(envelope)

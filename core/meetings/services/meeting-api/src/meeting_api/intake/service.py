@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
 from ..collector.meeting_link import parse_meeting_url
@@ -79,7 +79,7 @@ from .rules import (
     recompute,
 )
 from .settings import IntakeSettings
-from .status import Outcome, StatusConflict
+from .status import Outcome, StatusConflict, creation_change
 from .stop import record_stop
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
@@ -134,8 +134,13 @@ class _Work:
     events: list[str] = field(default_factory=list)
     stops: list[RecordedStop] = field(default_factory=list)
 
-    async def event(self, meeting_id: int, event_type: str) -> None:
-        written = await self.tx.event(meeting_id, event_type)
+    async def event(
+        self,
+        meeting_id: int,
+        event_type: str,
+        change: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        written = await self.tx.event(meeting_id, event_type, change)
         self.events.append(written.event_id)
 
     async def status(self, meeting_id: int, to_status: str, **kwargs: Any) -> None:
@@ -472,7 +477,9 @@ class IntakeService:
             user_id, room, recompute([entry]), join_now=entry.join_now
         )
         await w.tx.save_entry(user_id, entry, room, meeting.id)
-        await w.event(meeting.id, "meeting.scheduled")
+        await w.event(
+            meeting.id, "meeting.scheduled", creation_change("scheduled", self._clock())
+        )
         return meeting.id
 
     async def _join(

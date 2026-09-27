@@ -70,18 +70,38 @@ __all__ = [
     "WrittenEvent",
     "check_completion_reason",
     "check_event_data",
+    "creation_change",
     "derive_event_id_v2",
     "insert_meeting",
     "lock_aw_state",
     "lock_meeting",
     "project_stored",
     "row_mapping",
+    "typed_event",
     "write_event",
     "write_status",
 ]
 
 API_VERSION = "2026-09-25"
 STATUS_CHANGE_EVENT = "meeting.status_change"
+
+#: The typed §2.7 event of a status change, where one exists (Ruling R25).
+_TYPED_EVENTS = {"active": "meeting.started", "completed": "meeting.completed"}
+
+
+def typed_event(to_status: str, outcome_kind: Optional[str]) -> str:
+    """The event type of a change to ``to_status`` (Ruling R25): ``meeting.started`` on ``active``,
+    ``meeting.completed`` on ``completed``, and on ``failed`` ``meeting.not_sent`` when the
+    meeting's outcome (the one written with the change, else the one stored) is ``not_sent``, else
+    ``bot.failed``. Every other step is ``meeting.status_change``."""
+    if to_status == "failed":
+        return "meeting.not_sent" if outcome_kind == "not_sent" else "bot.failed"
+    return _TYPED_EVENTS.get(to_status, STATUS_CHANGE_EVENT)
+
+
+def creation_change(status: str, at: datetime) -> dict[str, Any]:
+    """The ``change`` of a meeting's first event: it came into being in ``status``."""
+    return {"from": None, "to": status, "reason": None, "at": iso_utc(_stamp(at))}
 
 
 class StatusConflict(Exception):
@@ -274,8 +294,8 @@ async def write_status(
 ) -> WrittenEvent:
     """Move meeting ``meeting_id`` to ``to_status`` if it is currently in ``expected_from`` and
     record the event (§1.4 steps 1–5). Raises ``StatusConflict`` otherwise, having written
-    nothing. The event type is ``event_type`` or ``meeting.status_change``; its ``change`` is
-    ``{from, to, reason, at}``. ``event_data`` adds keys to the envelope's ``data`` next to
+    nothing. The event type is ``event_type``, else ``typed_event`` of the change (Ruling R25);
+    its ``change`` is ``{from, to, reason, at}``. ``event_data`` adds keys to the envelope's ``data`` next to
     ``meeting`` and ``change`` (``merged_into``, §2.7); it may not name either of those. A
     ``data_patch`` whose ``completion_reason`` is outside the sealed set raises ``ValueError``
     before anything is written (``check_completion_reason``).
@@ -334,7 +354,7 @@ async def write_status(
         meeting,
         aw,
         entries,
-        event_type or STATUS_CHANGE_EVENT,
+        event_type or typed_event(to_status, aw.outcome_kind),
         change,
         now=now,
         event_data=event_data,
@@ -386,12 +406,7 @@ async def insert_meeting(
     await db.flush()
     if first_event is not None:
         aw.event_seq = 1
-        change = {
-            "from": None,
-            "to": status,
-            "reason": None,
-            "at": iso_utc(_stamp(now)),
-        }
+        change = creation_change(status, now)
         await _insert_outbox(db, meeting, aw, [], first_event, change, now=now)
     return meeting
 

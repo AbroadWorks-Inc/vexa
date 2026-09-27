@@ -699,7 +699,7 @@ async def test_2_6_15_cancel_while_live():
     assert h.events(mark) == [
         (uuid, "meeting.updated"),
         (uuid, "meeting.status_change"),
-        (uuid, "meeting.status_change"),
+        (uuid, "meeting.completed"),
     ]
     assert h.spawn.calls == []
 
@@ -801,7 +801,7 @@ async def test_r7_moved_while_live_reruns_at_finish():
     )
     assert projected["entries"][0]["user"] == A
     assert h.events(mark) == [
-        (uuid, "meeting.status_change"),
+        (uuid, "meeting.completed"),
         (new.uuid, "meeting.scheduled"),
     ]
     assert h.published()[-1] == h.store.events[-1].event_id

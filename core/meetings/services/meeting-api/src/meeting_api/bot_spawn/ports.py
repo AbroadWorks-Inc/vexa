@@ -252,6 +252,7 @@ class MeetingRepo(Protocol):
         failure_stage: Optional[str] = None,
         data: Optional[dict] = None,
         change_reason: Optional[str] = None,
+        expected_from: Optional[Any] = None,
     ) -> Optional[dict]:
         """Persist a bot ``lifecycle.v1`` advance to the DB meeting row + RETURN the updated row dict
         (incl. ``data`` — so the lifecycle callback can deliver the per-user webhook from
@@ -261,7 +262,9 @@ class MeetingRepo(Protocol):
         ``meeting_sessions``; a no-op for an unknown session (e.g. a self-host bot). So the live FSM is
         DURABLE + QUERYABLE (``GET /meetings`` reflects it, survives a restart) — not only the
         in-process ``MeetingStore``. A status change is recorded through the status writer (§1.4),
-        its event's ``change.reason`` being ``change_reason``."""
+        its event's ``change.reason`` being ``change_reason``. The status changes only from one of
+        ``expected_from`` (default: the live statuses), and a finished meeting never changes
+        status again: such a write changes nothing and returns ``None``."""
         ...
 
 

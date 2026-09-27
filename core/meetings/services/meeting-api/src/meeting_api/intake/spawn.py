@@ -17,9 +17,11 @@ that won the race) would leave a claimed meeting with no bot and no reason, so t
 ``not_sent`` itself (Ruling R17), under the link lock: a row still ``requested`` goes ``failed``
 through the status writer with the outcome (``meeting.not_sent``). A row the spawn flow already
 ended (a runtime spawn failure, the stop fence) is left alone: the flow wrote its ``failed``
-through the status writer with that same outcome, in one ``meeting.not_sent`` event. A row still
+through the status writer with that same outcome, in one terminal event (``meeting.not_sent``; or
+``bot.failed`` when an outcome recorded before it, such as R5's, stands). A row still
 ``requested`` whose workload exists (``bot_container_id`` set: the failure came after the workload
-was recorded) is left alone too, and logged: its bot is live and the lifecycle ends it. The events
+was recorded) is left alone too, and logged: its bot is live and the lifecycle ends it. If a raced
+stop already tore that workload down, the nonterminal reconcile sweep ends the row. The events
 are handed to ``publisher`` after the commit, when one is given; the outbox holds them either way.
 
 A row whose link changed between the read and the claim (``ClaimTargetMoved``) is read again and

@@ -312,14 +312,16 @@ class SqlAlchemyMeetingRepo:
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
-        change_reason=None,
+        change_reason=None, expected_from=None,
     ) -> None:
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
         from ..intake.adapters import lock_meeting_on_its_link
-        from ..intake.status import project_stored, write_status
+        from ..intake.status import FINISHED_STATUSES, project_stored, write_status
+        from ..obs import log_event
         from ..sessions.models import MeetingSession
+        from .auto_join import LIVE_STATUSES
 
         async with self._session_factory() as db:
             sess = (
@@ -333,6 +335,19 @@ class SqlAlchemyMeetingRepo:
             m = await lock_meeting_on_its_link(db, sess.meeting_id)
             if m is None:
                 return
+            # §1.4's conditional write: the status changes only from one of the caller's
+            # predecessors (the live statuses by default), and a finished meeting never changes
+            # status again. A refused write changes nothing (a stale stop, a stale replica's edge).
+            predecessors = set(LIVE_STATUSES if expected_from is None else expected_from)
+            predecessors -= set(FINISHED_STATUSES)
+            if m.status != status and m.status not in predecessors:
+                log_event(
+                    "lifecycle_status_refused", audience="system", level="warning",
+                    span="lifecycle.persist", meeting_id=str(m.id),
+                    fields={"status": m.status, "to": status,
+                            "expected_from": sorted(predecessors)},
+                )
+                return None
             merged = {}
             if completion_reason is not None:
                 merged["completion_reason"] = completion_reason
@@ -365,7 +380,7 @@ class SqlAlchemyMeetingRepo:
                 # flushed first so its event shows them).
                 await db.flush()
                 await write_status(
-                    db, m.id, status, expected_from={m.status}, data_patch=merged,
+                    db, m.id, status, expected_from=predecessors, data_patch=merged,
                     change_reason=change_reason,
                 )
             else:
@@ -488,7 +503,8 @@ class SqlAlchemyMeetingRepo:
         from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting
 
         async with self._session_factory() as db:
-            await take_link_lock(db, user_id, Room(platform, native_meeting_id))
+            if native_meeting_id is not None:
+                await take_link_lock(db, user_id, Room(platform, native_meeting_id))
             m = await insert_meeting(
                 db, user_id=user_id, platform=platform, native_meeting_id=native_meeting_id,
                 status="requested", data=dict(data or {}), first_event=STATUS_CHANGE_EVENT,
@@ -1036,9 +1052,10 @@ class SqlAlchemyMeetingRepo:
         directly, stamping the reason into ``data`` so ``GET /meetings`` and the terminal show WHY
         instead of leaving a ``requested`` row for the 5-minute reaper to flip reason-less. Link- and
         row-locked; a missing row is a no-op, and so is a row that already finished (its terminal is
-        written once). Through the status writer: the ``failed`` event is ``meeting.not_sent``
-        carrying ``outcome`` when one is given and the meeting has none yet (an outcome recorded
-        before, such as R5's ``cancelled_by_calendar``, stands), else ``meeting.status_change``."""
+        written once). Through the status writer, with ``outcome`` when one is given and the
+        meeting has none yet (an outcome recorded before, such as R5's ``cancelled_by_calendar``,
+        stands); the writer types the event (``meeting.not_sent`` for a ``not_sent`` outcome, else
+        ``bot.failed``)."""
         from ..intake.adapters import lock_meeting_on_its_link
         from ..intake.status import FINISHED_STATUSES, write_status
         from ..sessions.models import MeetingAwState
@@ -1071,7 +1088,6 @@ class SqlAlchemyMeetingRepo:
                 db, m.id, "failed", expected_from={m.status}, data_patch=merged,
                 outcome=outcome,
                 change_reason=None if outcome is None else outcome.detail,
-                event_type=None if outcome is None else "meeting.not_sent",
             )
             await db.commit()
             await db.refresh(m)
