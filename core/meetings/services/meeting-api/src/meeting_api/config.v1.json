@@ -123,7 +123,7 @@
     "secret",
     "<REPLACE_ME>"
    ],
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "DEFAULT_BOT_NAME",
@@ -168,9 +168,7 @@
    "class": "defaulted",
    "default": "",
    "description": "Comma-separated additional Jitsi deployment hostnames (a self-hosted instance whose name carries neither 'jitsi' nor a 'meet' label, e.g. calls.example.org) recognized when parsing pasted meeting links AND calendar (ICS) links; meet.jit.si, *jitsi* hosts, and (for pasted links) meet-labelled hosts are always recognized — unset ⇒ no extra hosts",
-   "targets": [
-    "compose"
-   ]
+   "targets": ["compose", "helm"]
   },
   {
    "key": "RECORDING_ENABLED",
@@ -385,7 +383,7 @@
    "class": "defaulted",
    "default": "portal.notetaker.svc.cluster.local",
    "description": "webhooks (§2.7): comma-separated hosts a subscription delivery may target although they are private (compared case-insensitively, never resolved); the send-time SSRF guard (webhooks/ssrf.py) refuses every other private, loopback, link-local or internal target. admin-api applies the same list on save.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_SECRET_ENC_KEYS",
@@ -393,28 +391,28 @@
    "default": "(unset — with WEBHOOK_SECRET_ENC_ACTIVE_KEY also unset, no subscription delivery is signed or sent; deliveries wait in webhook_deliveries)",
    "secret": true,
    "description": "webhooks (§2.7): the key ring subscription secrets are encrypted under, JSON {\"<id>\": \"<32 bytes, base64>\"} (AES-256-GCM; webhooks/secret_box.py), the same ring admin-api holds. meeting-api only decrypts, at signing time. Set with a malformed ring, a key that is not exactly 32 bytes, or without WEBHOOK_SECRET_ENC_ACTIVE_KEY, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_SECRET_ENC_ACTIVE_KEY",
    "class": "defaulted",
    "default": "(unset — see WEBHOOK_SECRET_ENC_KEYS)",
    "description": "webhooks (§2.7): the id in WEBHOOK_SECRET_ENC_KEYS admin-api encrypts new secrets under. meeting-api decrypts with each row's own key id; this must still name a key in the ring, or meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_PUBLISH_INTERVAL_S",
    "class": "defaulted",
    "default": "1",
    "description": "webhooks (§1.8): cadence (s) of the outbox publisher (intake/outbox.py), single-flight across replicas: each tick turns up to 500 unpublished webhook_outbox rows into webhook_deliveries rows, one per matching active subscriber. It runs only with Postgres and ADMIN_API_URL + INTERNAL_API_SECRET (the subscription read); without them outbox rows stay unpublished.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_SEND_INTERVAL_S",
    "class": "defaulted",
    "default": "1",
    "description": "webhooks (§1.8): cadence (s) of the subscription sender, one loop per replica (not single-flight: due webhook_deliveries rows are claimed FOR UPDATE SKIP LOCKED with a 60 s lease, so replicas share them). It runs only with Postgres, ADMIN_API_URL + INTERNAL_API_SECRET (the subscription read) and the WEBHOOK_SECRET_ENC_* key ring.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SCHEDULER_TICK_INTERVAL",
@@ -587,7 +585,7 @@
    "class": "defaulted",
    "default": "120",
    "description": "auto-join lead (s) — the bot is sent this long before data.scheduled_at, so it is standing in the lobby at the scheduled start rather than setting out then (#1208). Deploy values may override.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "AUTO_JOIN_GRACE_S",
@@ -608,7 +606,7 @@
    "class": "defaulted",
    "default": "30",
    "description": "not-sent sweep cadence (s, §1.5) — how often scheduled meetings that entries manage are checked for an end passed without a bot (they end failed, outcome not_sent)",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "AUTO_JOIN_ALLOW_UNCAPPED",
@@ -622,28 +620,28 @@
    "class": "defaulted",
    "default": "30",
    "description": "intake (§1.1 R3): PUT /v2/entries refuses an entry starting more than this many days ahead with too_far_ahead",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "JOIN_NOW_ADOPT_AHEAD_S",
    "class": "defaulted",
    "default": "3600",
    "description": "intake (§1.1 R1) and POST /bots (§1.5): a join_now entry, or a POST /bots without a row id, adopts the earliest non-finished meeting on its link that hasn't ended and starts within this many seconds",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "ENTRY_BLOCKED_HOSTS",
    "class": "defaulted",
    "default": "meet.abroadworks.com",
    "description": "intake (§1.3): comma-separated meeting-link hostnames refused with platform_not_enabled; empty ⇒ none refused",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "INTAKE_MAX_ACTIVE_ENTRIES",
    "class": "defaulted",
    "default": "100000",
    "description": "intake (§1.13): per-account quota of active entries (entries of unfinished meetings); a write that would add one past it is refused with 429 quota_exceeded",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "CALENDAR_SYNC_INTERVAL_S",

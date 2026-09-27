@@ -46,6 +46,14 @@ global:
 # VEXA_SERVICE_AUTHORITY_SECRET, VEXA_SYSTEM_WEBHOOK_SECRET, VEXA_DISPATCH_SIGNING_KEY,
 # VEXA_BOT_API_KEY, ANTHROPIC_API_KEY,
 # ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN.
+# Three keys are read ONLY from the Secret existingSecretName names and have no value here, so the
+# chart-managed Secret never carries them:
+#   GATEWAY_IDENTITY_SECRET — the key the gateway signs x-user-id with; gateway, meeting-api and
+#     admin-api hold the same value. The gateway refuses to start without it (its reference is not
+#     optional); meeting-api and admin-api then refuse every client request.
+#   WEBHOOK_SECRET_ENC_KEYS + WEBHOOK_SECRET_ENC_ACTIVE_KEY — the key ring webhook subscription
+#     secrets are encrypted under (JSON {"<id>": "<32 bytes base64>"} + the active id), on
+#     meeting-api and admin-api. Unset, webhook subscriptions can't store secrets or send.
 # The deployment profile, the same word the mcp and transcription services read. Anything but
 # `production` (including unset) is a development posture; `production` makes an empty
 # `secrets.secretsKey` a boot refusal instead of a silently generated key (R-E08).
@@ -134,6 +142,9 @@ gateway:
     ipBlacklist: ""           # comma-separated IPs to block (403)
     trustedProxies: ""        # comma-separated trusted proxy IPs (enables X-Forwarded-For)
     trustXForwardedProto: false
+  # Entry writes (PUT /v2/entries + POST /v2/entries/remove) allowed per account per minute,
+  # counted in Redis across every gateway replica (INTAKE_RATE_LIMIT_PER_MIN).
+  intakeRateLimitPerMin: 600
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 512Mi }
@@ -170,6 +181,13 @@ adminApi:
     ipBlacklist: ""           # comma-separated IPs to block (403)
     trustedProxies: ""        # comma-separated trusted proxy IPs (enables X-Forwarded-For)
     trustXForwardedProto: false
+  # Webhook subscriptions (admin-api side).
+  webhookMaxSubscriptions: "20"         # WEBHOOK_MAX_SUBSCRIPTIONS — per-account quota
+  webhookDeliveryRetentionDays: "30"    # WEBHOOK_DELIVERY_RETENTION_DAYS — daily sweep of final deliveries
+  webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — comma-separated private hosts a
+                                        # subscription URL may name; empty ⇒ every private target refused
+  # Merged over global.podAnnotations for admin-api's pods; a key set here wins.
+  podAnnotations: {}
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 512Mi }
@@ -219,6 +237,20 @@ meetingApi:
   botS3SecretKey: ""
   minioSecure: "false"
   logLevel: "info"
+  # Meeting intake (PUT /v2/entries) and auto-join.
+  entryMaxDaysAhead: "30"               # ENTRY_MAX_DAYS_AHEAD — an entry further ahead is refused
+  joinNowAdoptAheadSeconds: "3600"      # JOIN_NOW_ADOPT_AHEAD_S — a pasted link adopts a meeting starting within this
+  entryBlockedHosts: ""                 # ENTRY_BLOCKED_HOSTS — comma-separated link hosts refused; empty ⇒ none
+  intakeMaxActiveEntries: "100000"      # INTAKE_MAX_ACTIVE_ENTRIES — per-account quota of active entries
+  autoJoinLeadSeconds: "120"            # AUTO_JOIN_LEAD_S — the bot is sent this long before the meeting starts
+  notSentSweepIntervalSeconds: "30"     # NOT_SENT_SWEEP_INTERVAL_S — cadence of the not-sent sweep
+  jitsiHosts: ""                        # VEXA_JITSI_HOSTS — comma-separated self-hosted Jitsi hostnames
+  # Webhook subscriptions (meeting-api side: the outbox publisher and the sender).
+  webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — same list as adminApi's, applied on send
+  webhookPublishIntervalSeconds: "1"    # WEBHOOK_PUBLISH_INTERVAL_S
+  webhookSendIntervalSeconds: "1"       # WEBHOOK_SEND_INTERVAL_S
+  # Merged over global.podAnnotations for meeting-api's pods; a key set here wins.
+  podAnnotations: {}
   resources:
     requests: { cpu: 200m, memory: 512Mi }
     limits:   { cpu: 1000m, memory: 1Gi }

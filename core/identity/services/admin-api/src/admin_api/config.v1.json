@@ -33,7 +33,7 @@
     "secret",
     "<REPLACE_ME>"
    ],
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "ADMIN_API_TOKEN",
@@ -158,28 +158,28 @@
    "class": "defaulted",
    "default": "http://meeting-api:8080",
    "description": "meeting-api base URL for the one call admin-api makes to it: POST /internal/webhooks/test (with INTERNAL_API_SECRET), which queues the webhook.test send behind POST /v2/webhooks/{id}/test (§2.7). Unreachable, that route answers 503 unavailable; nothing else depends on it.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_MAX_SUBSCRIPTIONS",
    "class": "defaulted",
    "default": "20",
    "description": "webhooks (§1.13): per-account quota of webhook subscriptions; POST /v2/webhooks past it is refused with 429 quota_exceeded (no Retry-After). Not a whole number of at least 1, admin-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_DELIVERY_RETENTION_DAYS",
    "class": "defaulted",
    "default": "30",
    "description": "webhooks (§1.13): the daily retention sweep (app/retention.py, single-flight) deletes deliveries in a final state (delivered, failed, dead, cancelled) older than this many days, their attempts with them, then published outbox rows with no deliveries left; unpublished outbox rows are never pruned. Not a positive whole number, admin-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_PRIVATE_HOST_ALLOWLIST",
    "class": "defaulted",
    "default": "portal.notetaker.svc.cluster.local",
    "description": "webhooks (§2.7): comma-separated hosts a subscription URL may name although they are private (compared case-insensitively, never resolved); every other private, loopback, link-local or internal target is refused on save. meeting-api applies the same list on every send.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_SECRET_ENC_KEYS",
@@ -187,14 +187,14 @@
    "default": "(unset — with WEBHOOK_SECRET_ENC_ACTIVE_KEY also unset, the webhook routes that store or read a secret answer 503 unavailable)",
    "secret": true,
    "description": "webhooks (§2.7): the key ring subscription secrets are encrypted under, JSON {\"<id>\": \"<32 bytes, base64>\"} (AES-256-GCM; app/secret_box.py). Set with a malformed ring, a key that is not exactly 32 bytes, or without WEBHOOK_SECRET_ENC_ACTIVE_KEY, admin-api refuses to start. meeting-api holds the same ring to decrypt at signing time.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_SECRET_ENC_ACTIVE_KEY",
    "class": "defaulted",
    "default": "(unset — see WEBHOOK_SECRET_ENC_KEYS)",
    "description": "webhooks (§2.7): the id in WEBHOOK_SECRET_ENC_KEYS new secrets are encrypted under; rows under another id are re-encrypted under it on their next internal read. Must name a key in the ring, or admin-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "HOST",

@@ -61,6 +61,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
+            # Signs x-user-id for meeting-api and admin-api. From the Secret secrets.existingSecretName
+            # names (the chart-managed Secret never carries it), and not optional: the gateway refuses
+            # to start without it.
+            - name: GATEWAY_IDENTITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_SECRET
+            - name: INTAKE_RATE_LIMIT_PER_MIN
+              value: {{ .Values.gateway.intakeRateLimitPerMin | default 600 | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.gateway.logLevel | default "info" | quote }}
             # fastapi-guard edge layer (edge_guard.py): per-IP throttle + auto-ban at the edge.

@@ -18,7 +18,7 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: admin-api
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        {{- toYaml (merge (deepCopy (.Values.adminApi.podAnnotations | default dict)) (.Values.global.podAnnotations | default dict)) | nindent 8 }}
     spec:
       securityContext:
         {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
@@ -65,8 +65,36 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
+            # From the Secret secrets.existingSecretName names; the chart-managed Secret never carries it.
+            - name: GATEWAY_IDENTITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_SECRET
+                  optional: true
+            - name: WEBHOOK_SECRET_ENC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: WEBHOOK_SECRET_ENC_KEYS
+                  optional: true
+            - name: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+                  optional: true
             - name: LOG_LEVEL
               value: {{ .Values.adminApi.logLevel | default "info" | quote }}
+            # POST /v2/webhooks/{id}/test hands the send to meeting-api's internal edge.
+            - name: MEETING_API_URL
+              value: "http://{{ include "vexa.componentName" (list . "meeting-api") }}:{{ .Values.meetingApi.service.port }}"
+            - name: WEBHOOK_MAX_SUBSCRIPTIONS
+              value: {{ .Values.adminApi.webhookMaxSubscriptions | default "20" | quote }}
+            - name: WEBHOOK_DELIVERY_RETENTION_DAYS
+              value: {{ .Values.adminApi.webhookDeliveryRetentionDays | default "30" | quote }}
+            - name: WEBHOOK_PRIVATE_HOST_ALLOWLIST
+              value: {{ .Values.adminApi.webhookPrivateHostAllowlist | default "" | quote }}
             {{- with .Values.adminApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

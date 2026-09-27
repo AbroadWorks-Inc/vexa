@@ -58,6 +58,14 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 | `terminal.enabled` | `true` | The web UI. Set `terminal.publicUrl` (NEXTAUTH_URL/TERMINAL_URL) when fronted by ingress; add OAuth via `terminal.extraEnv`. |
 | `ingress.enabled` | `false` | Fronts the **terminal** by default; set `host`/`className`/`tls`. Add a second path to `gateway` to also expose the raw API. |
 | `minio.service.type` | `ClusterIP` | `NodePort` to reach presigned download URLs browser-side on dev clusters. |
+| `GATEWAY_IDENTITY_SECRET`, `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | none | Read only from the `secrets.existingSecretName` Secret (the chart-managed Secret never carries them). The gateway refuses to start without `GATEWAY_IDENTITY_SECRET`; meeting-api and admin-api hold the same value. The webhook key ring goes on meeting-api and admin-api. |
+| `meetingApi.entryMaxDaysAhead` / `joinNowAdoptAheadSeconds` / `entryBlockedHosts` / `intakeMaxActiveEntries` | `30` / `3600` / `""` / `100000` | Meeting intake (`ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES`). |
+| `meetingApi.autoJoinLeadSeconds` / `notSentSweepIntervalSeconds` / `jitsiHosts` | `120` / `30` / `""` | `AUTO_JOIN_LEAD_S`, `NOT_SENT_SWEEP_INTERVAL_S`, `VEXA_JITSI_HOSTS`. |
+| `meetingApi.webhookPrivateHostAllowlist` / `adminApi.webhookPrivateHostAllowlist` | `""` | `WEBHOOK_PRIVATE_HOST_ALLOWLIST`: private hosts a webhook may target; empty refuses every private target. Set both the same. |
+| `meetingApi.webhookPublishIntervalSeconds` / `webhookSendIntervalSeconds` | `1` / `1` | `WEBHOOK_PUBLISH_INTERVAL_S`, `WEBHOOK_SEND_INTERVAL_S`. |
+| `adminApi.webhookMaxSubscriptions` / `webhookDeliveryRetentionDays` | `20` / `30` | `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS`. |
+| `gateway.intakeRateLimitPerMin` | `600` | `INTAKE_RATE_LIMIT_PER_MIN`: entry writes per account per minute. |
+| `meetingApi.podAnnotations` / `adminApi.podAnnotations` | `{}` | Merged over `global.podAnnotations` for that service's pods; a key set here wins (e.g. `prometheus.io/scrape`). |
 
 ## Known boundaries (v0.12)
 
