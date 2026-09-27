@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from meeting_api import create_app
 from meeting_api import config_preflight as cp
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
+from gateway_identity import via_gateway
 
 HEADERS = {"x-user-id": "7"}
 
@@ -30,7 +31,7 @@ def _fresh_probe_cache():
 
 
 def _client(repo=None):
-    return TestClient(create_app(meeting_repo=repo or InMemoryMeetingRepo(), runtime=FakeRuntimeClient()))
+    return TestClient(via_gateway(create_app(meeting_repo=repo or InMemoryMeetingRepo(), runtime=FakeRuntimeClient())))
 
 
 # ── the declaration itself ───────────────────────────────────────────────────────────────────────

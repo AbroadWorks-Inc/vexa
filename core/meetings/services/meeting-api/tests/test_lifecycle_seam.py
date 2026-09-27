@@ -36,6 +36,7 @@ from meeting_api.lifecycle.machine import (
     MeetingStore,
     can_transition,
 )
+from gateway_identity import via_gateway
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
 
@@ -1262,7 +1263,7 @@ def _stop_then_destroy(status: str):
     repo, pub = _ReconcileRepo(), InMemoryCommandPublisher()
     m = _seed(repo, status=status)
     repo._meetings[m["id"]]["bot_container_id"] = "wl-stopped"
-    client = TestClient(create_app(meeting_repo=repo, command_publisher=pub))
+    client = TestClient(via_gateway(create_app(meeting_repo=repo, command_publisher=pub)))
 
     r = client.delete("/bots/google_meet/m1", headers={"x-user-id": "1"})
     assert r.status_code == 200, r.text

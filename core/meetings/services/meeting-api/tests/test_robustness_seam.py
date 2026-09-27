@@ -32,6 +32,7 @@ from meeting_api.bot_spawn import MaxBotsExceeded, SpawnFailed, request_bot
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.ingest import consume_segments, ingest
+from gateway_identity import via_gateway
 
 SECRET = "test-admin-token"
 USER = 7
@@ -129,7 +130,7 @@ def test_lifecycle_publish_failure_is_surfaced_but_not_fatal():
     runtime = FakeRuntimeClient()
     bad_redis = ExplodingRedis()
     app = create_app(meeting_repo=repo, runtime=runtime, command_publisher=bad_redis, redis=bad_redis)
-    client = TestClient(app)
+    client = TestClient(via_gateway(app))
 
     # Spawn so the session_uid → meeting mapping exists (the callback persists by session_uid).
     spawn = client.post(
@@ -788,7 +789,7 @@ def test_duplicate_spawn_sequential_is_409():
     (only one bot per meeting). This is the sequential idempotency contract."""
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     app = create_app(meeting_repo=repo, runtime=runtime)
-    client = TestClient(app)
+    client = TestClient(via_gateway(app))
     body = {"platform": "google_meet", "native_meeting_id": "idem"}
     r1 = client.post("/bots", headers={"x-user-id": str(USER)}, json=body)
     assert r1.status_code == 201, r1.text
@@ -884,7 +885,7 @@ def test_stop_of_booting_bot_tears_down_workload_no_orphan():
     workload down — else the bot boots, joins, and orphans. Asserts the workload was deleted."""
     repo = InMemoryMeetingRepo()
     runtime = FakeRuntimeClient()
-    client = TestClient(create_app(meeting_repo=repo, runtime=runtime))
+    client = TestClient(via_gateway(create_app(meeting_repo=repo, runtime=runtime)))
     spawn = client.post("/bots", headers={"x-user-id": str(USER)},
                         json={"platform": "google_meet", "native_meeting_id": "orphan-race"})
     assert spawn.status_code == 201, spawn.text
@@ -908,7 +909,7 @@ def test_spawn_reconciles_a_stop_that_raced_the_boot():
             self._meetings[meeting_id]["status"] = "stopping"  # a concurrent DELETE raced in
             return row
 
-    client = TestClient(create_app(meeting_repo=_StopRacesRepo(), runtime=runtime))
+    client = TestClient(via_gateway(create_app(meeting_repo=_StopRacesRepo(), runtime=runtime)))
     r = client.post("/bots", headers={"x-user-id": str(USER)},
                     json={"platform": "google_meet", "native_meeting_id": "raced-spawn"})
     assert r.status_code == 201, r.text

@@ -36,6 +36,8 @@ from meeting_api.intake.service import IntakeService
 from meeting_api.intake.settings import IntakeSettings
 from meeting_api.intake.status import Outcome, WrittenEvent
 
+from gateway_identity import via_gateway
+
 UTC = timezone.utc
 A = "a@abroadworks.com"
 B = "b@abroadworks.com"
@@ -286,8 +288,9 @@ def intake_app(
 
 
 def http(app: FastAPI) -> httpx.AsyncClient:
+    """A client for ``app`` whose requests come through the stand-in gateway (§1.10)."""
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        transport=httpx.ASGITransport(app=via_gateway(app), raise_app_exceptions=False),
         base_url="http://meeting-api",
     )
 

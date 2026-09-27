@@ -37,6 +37,7 @@ from meeting_api.collector.db_writer import (
     segments_hash_key,
 )
 from meeting_api.collector.fakes import FakeRedisBus, InMemoryTranscriptStore
+from gateway_identity import via_gateway
 
 USER = 7
 NATIVE = "abc-defg-hij"
@@ -187,7 +188,7 @@ async def test_flipped_incident_redis_wiped_after_flush_get_transcript_survives(
 
     await redis_c.flushall()  # redis is GONE — the pre-fix stack lost the transcript here
 
-    client = TestClient(create_app(transcript_store=store))
+    client = TestClient(via_gateway(create_app(transcript_store=store)))
     r = client.get(f"/transcripts/google_meet/{NATIVE}", headers={"x-user-id": str(USER)})
     assert r.status_code == 200
     assert [s["text"] for s in r.json()["segments"]] == ["Hello", "world"]
@@ -329,7 +330,7 @@ async def _terminal_app_and_stores(redis_c):
         await finalize_meeting(redis_c, store, meeting_id)
 
     app = create_app(transcript_store=store, meeting_repo=repo, transcript_finalizer=_finalizer)
-    return TestClient(app), store
+    return TestClient(via_gateway(app)), store
 
 
 async def test_completed_meeting_transcript_is_flushed_immediately(redis_c, goldens):
@@ -502,7 +503,7 @@ async def test_pending_redrain_gives_up_at_deadline_keeping_what_arrived(store, 
 def _rest(store):
     from meeting_api import create_app
 
-    return TestClient(create_app(transcript_store=store))
+    return TestClient(via_gateway(create_app(transcript_store=store)))
 
 
 async def test_rest_mid_meeting_serves_merged_postgres_plus_redis_tail(store, bus, redis_c):

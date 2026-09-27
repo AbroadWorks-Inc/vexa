@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.webhooks import WebhookSink
+from gateway_identity import via_gateway
 
 USER = 7
 SECRET = "test-admin-token"
@@ -72,11 +73,11 @@ def test_full_meeting_lifecycle_cascade():
     webhook = _CapturingWebhookTransport()
     # Stub DNS to a PUBLIC ip so the SSRF guard (WH2: resolves + pins) passes for the test host without
     # any real DNS — the cascade is about delivery wiring, not the SSRF guard (covered in test_webhook_ssrf).
-    client = TestClient(create_app(
+    client = TestClient(via_gateway(create_app(
         meeting_repo=repo, runtime=runtime, redis=redis,
         webhook_sink=WebhookSink(webhook, resolver=lambda host: ["93.184.216.34"]),
         token_secret=SECRET,
-    ))
+    )))
 
     # ── 1. spawn through the real front door, with a per-user webhook that opts in to status_change ──
     r = client.post(
@@ -151,9 +152,9 @@ def test_stop_cascade_tears_down_a_booting_bot_no_orphan():
     repo = InMemoryMeetingRepo()
     runtime = FakeRuntimeClient()
     publisher = InMemoryCommandPublisher()
-    client = TestClient(create_app(
+    client = TestClient(via_gateway(create_app(
         meeting_repo=repo, runtime=runtime, command_publisher=publisher, token_secret=SECRET,
-    ))
+    )))
 
     r = client.post("/bots", headers={"x-user-id": str(USER)},
                     json={"platform": "google_meet", "native_meeting_id": "stop-cascade"})

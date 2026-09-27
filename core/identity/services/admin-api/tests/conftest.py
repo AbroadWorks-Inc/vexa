@@ -20,6 +20,16 @@ def _docker_ok() -> bool:
 requires_docker = pytest.mark.skipif(not _docker_ok(), reason="docker daemon not available")
 
 
+@pytest.fixture(autouse=True)
+def _gateway_identity(monkeypatch):
+    """§1.10: client routes believe x-user-id only with the gateway's signature. The suite runs with
+    the stand-in gateway's key (``gateway_identity.SECRET``); a route test reaches the app through
+    ``gateway_identity.via_gateway``, and a test of the unconfigured case clears it."""
+    from gateway_identity import SECRET
+
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET", SECRET)
+
+
 @pytest.fixture(scope="session")
 def pg_url():
     """Ephemeral Postgres → sync psycopg URL. Session-scoped (one container for the suite)."""

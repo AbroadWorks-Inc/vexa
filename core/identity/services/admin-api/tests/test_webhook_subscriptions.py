@@ -35,6 +35,7 @@ from admin_api.app.webhook_subscriptions import (
     WebhookSettings,
     WebhookTestUnavailable,
 )
+from gateway_identity import via_gateway
 
 CONTRACTS = Path(__file__).resolve().parents[3] / "contracts" / "webhook-subscriptions"
 SECRET_VECTORS = json.loads((CONTRACTS / "secret-box.vectors.json").read_text())
@@ -344,7 +345,7 @@ def env(sync_engine, monkeypatch):
         clock=clock,
     )
     app_db.configure(PG_URL)
-    with TestClient(create_app(webhooks=deps)) as client:
+    with TestClient(via_gateway(create_app(webhooks=deps))) as client:
         yield {
             "client": client,
             "deps": deps,

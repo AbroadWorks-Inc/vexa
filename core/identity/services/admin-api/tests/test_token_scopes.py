@@ -21,6 +21,7 @@ from admin_api.token_scope import (
     generate_prefixed_token,
     parse_token_scope,
 )
+from gateway_identity import via_gateway
 
 PG_URL = os.getenv("MEETING_API_TEST_DATABASE_URL")
 ADMIN_TOKEN = "test-admin-token"
@@ -90,7 +91,7 @@ def client(monkeypatch):
     monkeypatch.setenv("ADMIN_API_TOKEN", ADMIN_TOKEN)
     monkeypatch.setenv("INTERNAL_API_SECRET", INTERNAL_SECRET)
     app_db.configure(PG_URL)
-    with TestClient(create_app()) as c:
+    with TestClient(via_gateway(create_app())) as c:
         yield c
     loop = asyncio.new_event_loop()
     try:
@@ -171,5 +172,5 @@ def test_the_user_tier_refuses_a_key_with_only_least_privilege_scopes(
     client, scopes, status
 ):
     token = _mint(client, json={"scopes": scopes}).json()["token"]
-    r = client.get("/user/webhook", headers={"X-API-Key": token})
+    r = client.get("/user/webhook", headers={"X-API-Key": token, "x-user-id": "1"})
     assert r.status_code == status, r.text

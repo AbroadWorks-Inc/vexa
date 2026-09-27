@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from meeting_api import create_app
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.recordings.fakes import InMemoryStorage
+from gateway_identity import via_gateway
 
 
 OWNER = 7
@@ -55,7 +56,7 @@ def _fixture(*, status: str = "completed", storage_cls=InMemoryStorage):
     storage.blobs[f"{PREFIX}000000.wav"] = b"chunk"
     storage.blobs[f"{PREFIX}master.wav"] = b"master"
     return store, storage, TestClient(
-        create_app(transcript_store=store, storage=storage),
+        via_gateway(create_app(transcript_store=store, storage=storage)),
         raise_server_exceptions=False,
     )
 

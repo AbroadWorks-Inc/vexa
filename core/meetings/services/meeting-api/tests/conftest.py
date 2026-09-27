@@ -23,6 +23,16 @@ def _stt_configured(monkeypatch):
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "test-stt-token")
 
 
+@pytest.fixture(autouse=True)
+def _gateway_identity(monkeypatch):
+    """§1.10: client routes believe x-user-id only with the gateway's signature. The suite runs with
+    the stand-in gateway's key (``gateway_identity.SECRET``); a route test reaches the app through
+    ``gateway_identity.via_gateway``, and a test of the unconfigured case clears it."""
+    from gateway_identity import SECRET
+
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET", SECRET)
+
+
 # --- lifecycle.v1 goldens (the seam) ---------------------------------------------------
 
 def _repo_root() -> Path:

@@ -40,6 +40,7 @@ from meeting_api.service_authority.models import (
     clean_action_url,
     clean_message,
 )
+from gateway_identity import via_gateway
 
 
 UTC = timezone.utc
@@ -89,12 +90,12 @@ def _refuse(decision: ServiceAuthorityDecision) -> dict:
     """Drive `POST /bots` into the refusal and hand back the `detail` object."""
     repo = InMemoryMeetingRepo()
     runtime = FakeRuntimeClient()
-    client = TestClient(create_app(
+    client = TestClient(via_gateway(create_app(
         meeting_repo=repo,
         runtime=runtime,
         service_authority=DenyingAuthority(decision),
         token_secret="fixture-token-secret",
-    ))
+    )))
     response = client.post(
         "/bots",
         headers={"x-user-id": "41"},

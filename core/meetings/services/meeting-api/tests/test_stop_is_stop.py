@@ -38,6 +38,7 @@ from meeting_api.bot_spawn.service import request_bot
 from meeting_api.lifecycle.machine import dominant_completion_reason
 from meeting_api.lifecycle.occurrence import Disposition, disposition, may_dispatch_again
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+from gateway_identity import via_gateway
 
 USER = 7
 PLATFORM = "google_meet"
@@ -69,7 +70,7 @@ def _app(repo, runtime=None, publisher=None):
 def _client(app) -> httpx.AsyncClient:
     """An ASGI client usable from INSIDE a running loop — the race tests fire the DELETE from within
     the spawn path, which ``TestClient`` (sync, spins its own loop) cannot do."""
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=via_gateway(app)), base_url="http://t")
 
 
 async def _seed_scheduled(repo, *, native=NATIVE, data=None) -> dict:

@@ -25,6 +25,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from meeting_api.app import create_app
+from gateway_identity import via_gateway
 
 
 class _DeadRedis:
@@ -115,6 +116,6 @@ def test_stop_route_fails_narrowly_503_when_command_bus_down():
             return None
 
     app = create_app(meeting_repo=_Repo(), command_publisher=_DeadRedis())
-    with TestClient(app) as c:
+    with TestClient(via_gateway(app)) as c:
         r = c.delete("/bots/google_meet/abc-defg-hij", headers={"x-user-id": "7"})
     assert r.status_code == 503, "a down command bus must fail narrowly per-request, not 500 process-wide"

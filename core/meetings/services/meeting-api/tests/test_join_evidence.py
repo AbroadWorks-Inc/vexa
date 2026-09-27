@@ -50,6 +50,7 @@ from meeting_api.lifecycle.join_evidence import (
     normalize_evidence,
 )
 from meeting_api.lifecycle.machine import LifecycleSink, MeetingStore
+from gateway_identity import via_gateway
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
 
@@ -520,7 +521,7 @@ def test_evidence_surfaces_on_the_list_endpoints(endpoint):
             "bot_logs": ["noise"] * 100,
         },
     )
-    client = TestClient(create_app(transcript_store=store, meeting_repo=InMemoryMeetingRepo()))
+    client = TestClient(via_gateway(create_app(transcript_store=store, meeting_repo=InMemoryMeetingRepo())))
     r = client.get(endpoint, headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
     row = r.json()["meetings"][0]

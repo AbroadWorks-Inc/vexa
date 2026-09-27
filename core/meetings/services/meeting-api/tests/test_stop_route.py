@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+from gateway_identity import via_gateway
 
 
 def _seed(repo, *, user_id, platform, native, status="active"):
@@ -42,7 +43,7 @@ def test_delete_bots_stops_active_meeting():
     app = create_app(meeting_repo=repo, command_publisher=pub)
     m = _seed_active(repo, user_id=7, platform="google_meet", native="m1")
 
-    r = TestClient(app).delete("/bots/google_meet/m1", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/m1", headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "stopping"
@@ -73,7 +74,7 @@ def test_stopping_a_pre_active_bot_preserves_the_stage_it_died_in():
         app = create_app(meeting_repo=repo, command_publisher=pub)
         _seed(repo, user_id=7, platform="google_meet", native=f"m-{stage}", status=stage)
 
-        r = TestClient(app).delete(f"/bots/google_meet/m-{stage}", headers={"x-user-id": "7"})
+        r = TestClient(via_gateway(app)).delete(f"/bots/google_meet/m-{stage}", headers={"x-user-id": "7"})
         assert r.status_code == 200, r.text
 
         latest = asyncio.run(repo.find_latest(7, "google_meet", f"m-{stage}"))
@@ -91,7 +92,7 @@ def test_stop_still_moves_a_live_bot_to_stopping():
         app = create_app(meeting_repo=repo, command_publisher=pub)
         _seed(repo, user_id=7, platform="google_meet", native=f"live-{stage}", status=stage)
 
-        r = TestClient(app).delete(f"/bots/google_meet/live-{stage}", headers={"x-user-id": "7"})
+        r = TestClient(via_gateway(app)).delete(f"/bots/google_meet/live-{stage}", headers={"x-user-id": "7"})
         assert r.status_code == 200, r.text
         latest = asyncio.run(repo.find_latest(7, "google_meet", f"live-{stage}"))
         assert latest["status"] == "stopping"
@@ -99,7 +100,7 @@ def test_stop_still_moves_a_live_bot_to_stopping():
 
 def test_delete_bots_404_when_no_active_meeting():
     repo, pub = InMemoryMeetingRepo(), InMemoryCommandPublisher()
-    r = TestClient(create_app(meeting_repo=repo, command_publisher=pub)).delete(
+    r = TestClient(via_gateway(create_app(meeting_repo=repo, command_publisher=pub))).delete(
         "/bots/google_meet/nope", headers={"x-user-id": "7"}
     )
     assert r.status_code == 404
@@ -108,7 +109,7 @@ def test_delete_bots_404_when_no_active_meeting():
 
 def test_delete_bots_401_without_identity():
     r = TestClient(
-        create_app(meeting_repo=InMemoryMeetingRepo(), command_publisher=InMemoryCommandPublisher())
+        via_gateway(create_app(meeting_repo=InMemoryMeetingRepo(), command_publisher=InMemoryCommandPublisher()))
     ).delete("/bots/google_meet/m1")
     assert r.status_code == 401
 
@@ -124,11 +125,11 @@ def test_second_delete_never_re_stops_a_pre_active_bot():
         app = create_app(meeting_repo=repo, command_publisher=pub)
         _seed(repo, user_id=7, platform="google_meet", native=f"once-{stage}", status=stage)
 
-        first = TestClient(app).delete(f"/bots/google_meet/once-{stage}", headers={"x-user-id": "7"})
+        first = TestClient(via_gateway(app)).delete(f"/bots/google_meet/once-{stage}", headers={"x-user-id": "7"})
         assert first.status_code == 200, first.text
         published = len(pub.published)
 
-        second = TestClient(app).delete(f"/bots/google_meet/once-{stage}", headers={"x-user-id": "7"})
+        second = TestClient(via_gateway(app)).delete(f"/bots/google_meet/once-{stage}", headers={"x-user-id": "7"})
         assert second.status_code == 404, f"{stage}: a redelivered stop must not re-trigger"
         assert len(pub.published) == published, f"{stage}: second DELETE re-published a leave command"
 
@@ -157,7 +158,7 @@ def test_stop_evicts_a_sibling_waiting_in_the_lobby():
     waiting = _seed(repo, user_id=7, platform="google_meet", native="mjm",
                     status="awaiting_admission")
 
-    r = TestClient(app).delete("/bots/google_meet/mjm", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/mjm", headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
 
     stopped_ids = {row["id"] for row in _stopped(repo, 7, "google_meet", "mjm")}
@@ -187,7 +188,7 @@ def test_stop_evicts_every_pre_active_sibling_and_preserves_each_stage():
         for stage in ("requested", "joining", "awaiting_admission")
     }
 
-    r = TestClient(app).delete("/bots/google_meet/multi", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/multi", headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
 
     rows = {row["id"]: row for row in asyncio.run(repo.find_active_rows(7, "google_meet", "multi"))}
@@ -209,7 +210,7 @@ def test_stopped_siblings_never_re_dispatch_the_occurrence():
     _seed(repo, user_id=7, platform="google_meet", native="reborn", status="active")
     _seed(repo, user_id=7, platform="google_meet", native="reborn", status="awaiting_admission")
 
-    assert TestClient(app).delete(
+    assert TestClient(via_gateway(app)).delete(
         "/bots/google_meet/reborn", headers={"x-user-id": "7"}
     ).status_code == 200
 
@@ -230,20 +231,20 @@ def test_a_sibling_spawned_after_the_stop_is_still_evicted():
     app = create_app(meeting_repo=repo, command_publisher=pub)
     _seed(repo, user_id=7, platform="google_meet", native="late", status="active")
 
-    assert TestClient(app).delete(
+    assert TestClient(via_gateway(app)).delete(
         "/bots/google_meet/late", headers={"x-user-id": "7"}
     ).status_code == 200
     published = len(pub.published)
 
     # nothing new → the redelivery guard holds
-    assert TestClient(app).delete(
+    assert TestClient(via_gateway(app)).delete(
         "/bots/google_meet/late", headers={"x-user-id": "7"}
     ).status_code == 404
     assert len(pub.published) == published
 
     # a fresh sibling arrives → the stop reaches it
     latecomer = _seed(repo, user_id=7, platform="google_meet", native="late", status="joining")
-    r = TestClient(app).delete("/bots/google_meet/late", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/late", headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
     assert (chan := f"bot_commands:meeting:{latecomer['id']}") in {c for c, _ in pub.published}, chan
 
@@ -260,7 +261,7 @@ def test_stop_tears_down_an_evicted_siblings_workload():
     booting = _seed(repo, user_id=7, platform="google_meet", native="tear", status="joining")
     asyncio.run(repo.set_bot_container(meeting_id=booting["id"], bot_container_id="wl-booting"))
 
-    assert TestClient(app).delete(
+    assert TestClient(via_gateway(app)).delete(
         "/bots/google_meet/tear", headers={"x-user-id": "7"}
     ).status_code == 200
     assert "wl-booting" in runtime.deleted, (
@@ -278,7 +279,7 @@ def test_stop_marks_a_row_that_has_no_session_yet():
         user_id=7, platform="google_meet", native_meeting_id="nosess", data={}
     ))
 
-    r = TestClient(app).delete("/bots/google_meet/nosess", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/nosess", headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
     rows = {row["id"]: row for row in asyncio.run(repo.find_active_rows(7, "google_meet", "nosess"))}
     assert (rows[sessionless["id"]]["data"] or {}).get("stop_requested") is True
@@ -307,7 +308,7 @@ def test_stop_takes_the_live_meeting_and_leaves_the_plans_on_the_link():
     live = _seed_active(repo, user_id=7, platform="google_meet", native="plans")
     plans = [_seed_plan(repo, native="plans", days=d) for d in (1, 8)]
 
-    r = TestClient(app).delete("/bots/google_meet/plans", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/plans", headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
     assert r.json()["meeting_id"] == live["id"]
     assert r.json()["also_stopped"] == [] and r.json()["cancelled"] == []
@@ -327,7 +328,7 @@ def test_stop_without_a_live_meeting_404s_and_never_cancels_a_plan():
     repo.set_status(past["id"], "completed")
     plans = [_seed_plan(repo, native="history", days=d) for d in (1, 8)]
 
-    r = TestClient(app).delete("/bots/google_meet/history", headers={"x-user-id": "7"})
+    r = TestClient(via_gateway(app)).delete("/bots/google_meet/history", headers={"x-user-id": "7"})
     assert r.status_code == 404, r.text
     assert r.json() == {"detail": "No active meeting for this bot"}
     assert pub.published == []
