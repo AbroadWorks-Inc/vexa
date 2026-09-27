@@ -44,6 +44,7 @@ from .obs import TraceMiddleware
 
 if TYPE_CHECKING:
     from .intake import IntakeReads, IntakeService, StopPort
+    from .intake.outbox import WebhookTests
 
 #: In-process capture of the last N emitted webhook envelopes — an eval/introspection seam, never a
 #: durable store (the DB meeting row is the durable record; the WebhookSink is the delivery path).
@@ -191,6 +192,9 @@ def create_app(
     intake_service: Optional["IntakeService"] = None,
     intake_reads: Optional["IntakeReads"] = None,
     intake_stop: Optional["StopPort"] = None,
+    # admin-api's webhook.test hand-off (§2.7): writes the test event and its one delivery. None →
+    # POST /internal/webhooks/test answers 503 (the app factory / tests have no Postgres).
+    webhook_tests: Optional["WebhookTests"] = None,
 ) -> FastAPI:
     """Build the unified meeting-api app from the injected ports.
 
@@ -327,6 +331,13 @@ def create_app(
 
     # --- webhooks: GET /webhooks/deliveries — the per-user delivery history the dashboard reads (#841) ---
     app.include_router(_build_webhooks_router(delivery_ledger))
+
+    # --- webhooks: POST /internal/webhooks/test — admin-api's webhook.test hand-off (§1.8, §2.7).
+    # Internal secret only; the gateway routes nothing here. ---
+    from .intake.outbox import build_webhook_test_router
+
+    app.state.webhook_tests = webhook_tests
+    app.include_router(build_webhook_test_router(webhook_tests))
 
     return app
 

@@ -144,6 +144,18 @@ else `room_busy` ("another bot was still on this meeting link when the meeting e
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.
 
+`OutboxPublisher` (`outbox.py`, §1.8) turns unpublished `webhook_outbox` rows into
+`webhook_deliveries` rows: single-flight, every `WEBHOOK_PUBLISH_INTERVAL_S`, up to 500 rows oldest
+first. Each account's subscriptions come from admin-api's internal read (cached 30 s; an account
+whose read fails waits for the next tick). In one transaction per batch it re-reads
+`webhook_subscriptions.active` under `FOR SHARE`, inserts one `pending` delivery per matching active
+subscriber (`ON CONFLICT (event_id, subscription_id) DO NOTHING`) and sets `published_at`, so a
+crash before the commit is redone without duplicates and a concurrent pause in admin-api is either
+seen or cancels what was inserted. `webhook.test` rows are never fanned out.
+`PostgresWebhookTests` backs `POST /internal/webhooks/test` (`build_webhook_test_router`, internal
+secret): one `webhook.test` outbox row (sequence 0, `evt_test_<uuid4 hex>`, already published) and
+one delivery for that subscription, in one transaction; the reply is `{event_id}`.
+
 ## Front door
 - `project_meeting` — `projection.py`.
 - `parse_entry`, `parse_remove`, `EntryIn`, `RemoveIn`, `IntakeError` — `validation.py`.
@@ -157,4 +169,5 @@ else `room_busy` ("another bot was still on this meeting link when the meeting e
 - `PostgresIntakeStore` — `adapters.py`.
 - `build_intake_router` — `router.py`; `IntakeReads`, `MeetingQuery`, `ErasedRows` — `ports.py`;
   `PostgresIntakeReads` — `reads.py`.
+- `OutboxPublisher`, `fan_out`, `PostgresWebhookTests`, `build_webhook_test_router` — `outbox.py`.
 - The matching rules — `rules.py` (used inside the package).

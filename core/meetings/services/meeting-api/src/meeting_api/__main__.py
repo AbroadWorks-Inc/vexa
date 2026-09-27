@@ -12,6 +12,8 @@ control-plane background loops alongside the HTTP app via the FastAPI lifespan:
     write) and drains the copilot's ``proc:meeting:{id}`` notes into ``meeting.data`` JSONB.
   * **webhook retry-drain** — one ``drain_retry_queue`` sweep per interval over the redis retry
     queue (failed ``meeting.status_change`` deliveries are retried with backoff).
+  * **webhook publisher** (§1.8) — single-flight: turns unpublished ``webhook_outbox`` rows into
+    ``webhook_deliveries`` rows, one per matching active subscriber (``intake.outbox``).
   * **webhook sender** (§1.8) — one per replica: claims due ``webhook_deliveries`` rows with a lease
     and posts each signed subscription delivery (``webhooks.sender``). No Redis.
 
@@ -234,6 +236,7 @@ def build_production_app():
 
     # The entry service (§1.3) over Postgres, ONE instance behind the /v2 routes and the scheduler.
     from .intake import PostgresIntakeReads
+    from .intake.outbox import PostgresWebhookTests
 
     intake = _build_intake(
         session_factory, meeting_repo, runtime_client,
@@ -261,6 +264,7 @@ def build_production_app():
         intake_service=intake.service,
         intake_reads=PostgresIntakeReads(session_factory),
         intake_stop=intake.stop,
+        webhook_tests=PostgresWebhookTests(session_factory),
     )
 
     _attach_background_loops(
@@ -663,7 +667,8 @@ def _attach_background_loops(
                 log.exception("not-sent sweep tick failed")
             await asyncio.sleep(not_sent_interval)
 
-    # Subscription webhooks (§1.8). The sender runs on EVERY replica, unguarded: rows are claimed
+    # Subscription webhooks (§1.8). The publisher and the sender share one subscription read
+    # (admin-api's internal door, cached 30 s). The sender runs on EVERY replica, unguarded: rows are claimed
     # with FOR UPDATE SKIP LOCKED and a 60 s lease, so the replicas share the work instead of
     # taking turns. It needs Postgres, the admin edge (the subscription read, cached 30 s) and the
     # secret key ring; without them deliveries wait in webhook_deliveries (no Redis anywhere here).
@@ -675,6 +680,36 @@ def _attach_background_loops(
         os.getenv("WEBHOOK_PRIVATE_HOST_ALLOWLIST", DEFAULT_PRIVATE_HOST_ALLOWLIST)
     )
     webhook_subscriptions = AdminSubscriptions(admin_api_url, internal_secret)
+
+    # The publisher is single-flight, every WEBHOOK_PUBLISH_INTERVAL_S: one replica fans the outbox
+    # out per tick (a second one would only find the rows already published). It needs Postgres and
+    # the admin edge; without the edge the rows stay unpublished (and alert), never published empty.
+    webhook_publish_interval = float(os.getenv("WEBHOOK_PUBLISH_INTERVAL_S", "1"))
+
+    async def _webhook_publish_loop() -> None:
+        if session_factory is None:
+            return
+        if not webhook_subscriptions.configured:
+            log.warning(
+                "webhook publisher off: it needs ADMIN_API_URL + INTERNAL_API_SECRET; "
+                "outbox rows stay unpublished"
+            )
+            return
+        from .intake.outbox import OutboxPublisher
+
+        publisher = OutboxPublisher(session_factory, webhook_subscriptions)
+
+        async def _tick():
+            await publisher.run_once()
+
+        while True:
+            try:
+                await _guarded("webhook-publisher", _tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("webhook publisher tick failed")
+            await asyncio.sleep(webhook_publish_interval)
 
     async def _webhook_send_loop() -> None:
         if session_factory is None:
@@ -852,6 +887,7 @@ def _attach_background_loops(
             ),
             asyncio.create_task(_auto_join_loop(), name="auto-join"),
             asyncio.create_task(_not_sent_loop(), name="not-sent"),
+            asyncio.create_task(_webhook_publish_loop(), name="webhook-publisher"),
             asyncio.create_task(_webhook_send_loop(), name="webhook-sender"),
             asyncio.create_task(_calendar_sync_loop(), name="calendar-sync"),
             asyncio.create_task(_signal_tape_janitor_loop(), name="signal-tape-janitor"),

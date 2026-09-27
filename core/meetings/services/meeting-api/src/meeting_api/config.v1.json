@@ -385,6 +385,13 @@
    "targets": []
   },
   {
+   "key": "WEBHOOK_PUBLISH_INTERVAL_S",
+   "class": "defaulted",
+   "default": "1",
+   "description": "webhooks (§1.8): cadence (s) of the outbox publisher (intake/outbox.py), single-flight across replicas: each tick turns up to 500 unpublished webhook_outbox rows into webhook_deliveries rows, one per matching active subscriber. It runs only with Postgres and ADMIN_API_URL + INTERNAL_API_SECRET (the subscription read); without them outbox rows stay unpublished.",
+   "targets": []
+  },
+  {
    "key": "WEBHOOK_SEND_INTERVAL_S",
    "class": "defaulted",
    "default": "1",
