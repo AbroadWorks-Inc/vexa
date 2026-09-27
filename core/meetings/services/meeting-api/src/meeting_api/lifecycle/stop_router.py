@@ -13,8 +13,9 @@ composition, P2), behaviour-matched to the parent ``meetings.stop_bot``:
      link, and a duplicate bot still waiting in the lobby is taken down with it.
   3. For those rows: mark them ``stopping`` + ``stop_requested`` (so each exit is
      later attributed to a user stop, never a silent failure — and so ``lifecycle.occurrence`` never
-     lets the calendar re-dispatch the occurrence), then PUBLISH ``bot_commands:meeting:{id}``
-     ``{"action":"leave"}`` per row.
+     lets the calendar re-dispatch the occurrence), then ``stop_meeting_row`` per row: PUBLISH
+     ``bot_commands:meeting:{id}`` ``{"action":"leave"}``, and tear down a still-booting bot's
+     workload. ``stop_meeting_row`` is the one stop of a row whose stop is recorded.
   4. The bot honours the command, leaves, and emits its terminal ``lifecycle.v1`` event — which the
      existing ``/bots/internal/callback/lifecycle`` handler classifies (→ ``completed``/``failed``,
      ``meeting.status_change`` webhook fires). This route TRIGGERS the stop; it never jumps the FSM itself.
@@ -136,9 +137,8 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
         for row in pending:
             await _mark_stop_requested(repo, row)
 
-        # Publish the leave command — an ACTIVE (listening) bot honours it, leaves, emits its terminal
-        # event. One command per row: each bot listens on its OWN meeting-scoped channel, so evicting a
-        # sibling means addressing it by its own id, never the primary's.
+        # One leave command per row: each bot listens on its OWN meeting-scoped channel, so evicting
+        # a sibling means addressing it by its own id, never the primary's.
         # #809: this is a GENUINELY Redis-dependent path (pub/sub is the only delivery). During a Redis
         # outage it must fail NARROWLY per-request (503, retryable) — not as an opaque 500 stack trace,
         # and never process-wide. The `stopping` marks above are already persisted to Postgres, so the
@@ -146,10 +146,7 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
         # retry the leave once the cache is back.
         try:
             for row in pending:
-                await publisher.publish(
-                    leave_command_channel(row["id"]),
-                    json.dumps(leave_command_payload(row["id"])),
-                )
+                await stop_meeting_row(repo, publisher, runtime, row)
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001 — Redis unreachable → narrow, retryable failure
@@ -158,30 +155,6 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
                 detail="stop command bus (redis) unavailable; the stop is recorded and will "
                        "reconcile when redis returns — retry to re-issue the leave",
             ) from e
-
-        # GUARANTEE no orphan: a stop must not rely solely on a fire-and-forget command the bot may never
-        # receive. A BOOTING bot (status in _BOOTING_STATUSES) has likely not subscribed yet → directly
-        # tear its workload down (it has nothing to finalize). Best-effort: logged, never fails the stop.
-        # A waiting SIBLING is almost always in exactly that state, which is why it outlived the stop.
-        #
-        # RE-READ the row before deciding. `rows` above is a snapshot taken BEFORE this request
-        # wrote anything, and a spawn racing this stop writes `bot_container_id` after it — so the
-        # snapshot's `bot_container_id=None` is exactly what let rev 193's pod survive (F2). Reading
-        # it fresh, AFTER the `stop_requested` write is committed, is the read half of the interlock:
-        #
-        #     stop:   write stop_requested → read bot_container_id   (here)
-        #     spawn:  write bot_container_id → read stop_requested   (bot_spawn.service)
-        #
-        # Each side publishes before it reads, so no interleaving lets both miss.
-        if runtime is not None:
-            for row in pending:
-                fresh = await _reread(repo, row)
-                container = fresh.get("bot_container_id")
-                if container and fresh.get("status") in _BOOTING_STATUSES:
-                    try:
-                        await runtime.delete_workload(container)
-                    except Exception as e:  # noqa: BLE001 — best-effort; reconcile backstops
-                        _log_stop_teardown_failed(row["id"], container, e)
 
         if siblings:
             _log_stop_evicted(meeting_id, [row["id"] for row in siblings], native_meeting_id)
@@ -199,6 +172,44 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
         }
 
     return router
+
+
+async def stop_meeting_row(repo, publisher: CommandPublisher, runtime, row: dict) -> None:
+    """Stop the bot of one meeting row whose stop the caller has already recorded on the row
+    (``stop_requested``, and ``stopping`` over a status the bot reached the meeting in).
+
+    1. PUBLISH ``bot_commands:meeting:{id}`` ``{"action":"leave"}`` — an ACTIVE (listening) bot
+       honours it, leaves, and emits its terminal ``lifecycle.v1`` event. A publish failure
+       propagates to the caller, and nothing is torn down.
+    2. GUARANTEE no orphan: a stop must not rely solely on a fire-and-forget command the bot may
+       never receive. A BOOTING bot (status in ``_BOOTING_STATUSES``) has likely not subscribed yet
+       → directly tear its workload down (it has nothing to finalize), when a ``runtime`` is given.
+       Best-effort: logged, never fails the stop. A sibling waiting in the lobby is almost always
+       in exactly that state.
+
+    The row is RE-READ before deciding. ``row`` is a snapshot taken BEFORE the caller wrote
+    anything, and a spawn racing this stop writes ``bot_container_id`` after it — so the snapshot's
+    ``bot_container_id=None`` is exactly what let rev 193's pod survive (F2). Reading it fresh,
+    AFTER the ``stop_requested`` write is committed, is the read half of the interlock:
+
+        stop:   write stop_requested → read bot_container_id   (here)
+        spawn:  write bot_container_id → read stop_requested   (bot_spawn.service)
+
+    Each side publishes before it reads, so no interleaving lets both miss. ``repo`` needs only
+    ``get_meeting``."""
+    await publisher.publish(
+        leave_command_channel(row["id"]),
+        json.dumps(leave_command_payload(row["id"])),
+    )
+    if runtime is None:
+        return
+    fresh = await _reread(repo, row)
+    container = fresh.get("bot_container_id")
+    if container and fresh.get("status") in _BOOTING_STATUSES:
+        try:
+            await runtime.delete_workload(container)
+        except Exception as e:  # noqa: BLE001 — best-effort; reconcile backstops
+            _log_stop_teardown_failed(row["id"], container, e)
 
 
 async def _live_rows(repo, user_id: int, platform: str, native_meeting_id: str) -> list:
