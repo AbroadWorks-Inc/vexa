@@ -1,7 +1,7 @@
 # AW Bots: meeting intake and webhooks — design and implementation plan
 
 - **Date:** 2026-09-25, revised 2026-09-26.
-- **Status:** **final for build, revision V11.** This is the only document for this work: the design (Parts 0–4), the rollout order (Part 5) and the step-by-step build plan (Part 6).
+- **Status:** **final for build, revision V12.** This is the only document for this work: the design (Parts 0–4), the rollout order (Part 5) and the step-by-step build plan (Part 6).
 - **Scope:** handoff §6 A (`aw-notetaker/docs/handoffs/2026-09-24-aw-bots-handoff.md`). It covers how any app sends meetings to aw-bots, and how aw-bots reports every result back.
 - **Where the work happens:** in the existing checkouts, with no extra folders or worktrees.
   - aw-bots: `aw-notetaker/vexa-fork`, branch `feat/meeting-intake` (from `development`).
@@ -50,6 +50,24 @@
   22. Alerts live in aw-notetaker `deployment/base/aw-bots/alerts.yml`, with per-service scrape annotations.
   23. The bot limit stays at 45.
   24. Link choice is the sender's job.
+- **V12 — findings during the build (2026-09-27).**
+  1. The gateway has to be taught each `/v2` route and the new scopes: its routes are registered one by one and its scope list is fixed. Owner decision: each task adds its own. A8 adds the meeting routes and the scopes, A14 `/v2/webhooks`, A17 the export route.
+  2. The `/v2` routes are mounted in meeting-api's production app only from A12 on (owner decision).
+  3. The `webhook.v1` additions were sealed in A4, so the push hook's `contract-version` gate stays green. `intake.v1` is sealed in A8. The upstream `flows.v1`, never sealed, stays out of our seals.
+  4. `intake.v1` was added to the architecture model early: A4 made the folder and the push hook runs `dataflow`. A21 adds the rest.
+  5. The new schema must be copied into the meeting-api image, because the Dockerfile copies contract schemas one by one. A test now guards this.
+  6. `bot_joins_at` once the bot is sent is `data.auto_join_last_attempt`. A9 stamps it for instant joins too.
+  7. A finished meeting lists its closed entries; any other meeting lists its active ones. The §2.7 events carry the same entries.
+  8. A finished meeting's window ends when it actually finished. An entry that starts no later than the meeting belongs to it. An entry re-runs only when it is later, doesn't overlap, and is in the future.
+  9. A pasted link can adopt a scheduled meeting that has other entries and then fail to send. The pasted entry is then removed with reason `not_sent`, the error is recorded, and the meeting stays scheduled.
+  10. For `join_now` adoption, a live meeting counts as running past its planned end.
+  11. Entries join only live meetings, or unfinished meetings that have entries. Rows planned through upstream routes keep upstream behaviour.
+  12. The entry limit is a soft cap: concurrent writes on different links can pass it by a few.
+  13. When several users reschedule a shared invite one `PUT` at a time, the meeting gets a new UUID and the old one ends `cancelled`/`entry_moved`.
+  14. `meeting.removed` on a merge carries `data.merged_into`.
+  15. The real-Postgres tests install the Dockerfile's `sqlalchemy`/`asyncpg` pins for the run; meeting-api's test setup doesn't declare them.
+  16. §6.1 correction: admin-api measured 154 passed / 0 skipped on this machine.
+  17. The `readme` and `dataflow` gates count gitignored local build folders (`exporter.egg-info`, `__pycache__`). Delete them before a push.
 
 ---
 
@@ -470,7 +488,7 @@ Metrics are labelled by `user_id`.
 | `POST /v2/meetings/{id}/export` | `export` | The exporter reports its result (§1.9) |
 | `/v2/webhooks…` | `webhooks` | Manage webhook subscriptions (§2.7) |
 
-`routes.v1.json` (meetings) and `core/identity/routes.v1.json` (webhooks) carry these rows. The contract is sealed as `core/meetings/contracts/intake.v1/`.
+`routes.v1.json` (meetings) and `core/identity/routes.v1.json` (webhooks) carry these rows, and the gateway registers a forwarding route for each: its routes are registered one by one, and a scope must be in its fixed list (`routes_manifest.SCOPES`). The task that adds a route adds its gateway route too (V12). The contract is sealed as `core/meetings/contracts/intake.v1/`.
 
 ## 2.2 Entry fields (`PUT /v2/entries`)
 
@@ -833,7 +851,7 @@ Run it in a window with no meeting in progress. The step numbers continue the ru
 | Package | Command | Result |
 |---|---|---|
 | meeting-api | `cd $V/$MA && PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider` | 1424 passed, 5 skipped |
-| admin-api | same, in `$V/$AA` | 67 passed, 87 skipped |
+| admin-api | same, in `$V/$AA` | 154 passed, 0 skipped (corrected in V12) |
 | gateway | same, in `$V/$GW` | 367 passed, 1 xfailed |
 | exporter | same, in `$V/$EX` | 197 passed, 1 deselected |
 | calendar-dispatcher | pytest (Python 3.11) | 524 passed |
@@ -935,11 +953,11 @@ Run it in a window with no meeting in progress. The step numbers continue the ru
 ```python
 def project_meeting(meeting: Mapping[str, Any], aw: Optional[Mapping[str, Any]],
                     entries: Sequence[Mapping[str, Any]], *, lead_s: int) -> dict[str, Any]
-# exactly the §2.4 "meeting" keys; outcome = {kind, detail, message, at} | None; entries = active only
+# exactly the §2.4 "meeting" keys; outcome = {kind, detail, message, at} | None; entries = closed ones when finished, else active ones
 ```
 
 - `completion_reason` and `failure_stage` come from `data`, where upstream writes them.
-- `bot_joins_at`: `scheduled_at − lead` while scheduled; the spawn time once sent; `null` for an unsent instant join.
+- `bot_joins_at`: `scheduled_at − lead` while scheduled; once sent, `data.auto_join_last_attempt` (A9 stamps it for instant joins too); `null` for an unsent instant join.
 - The projection never contains `user_id`, the integer id, secrets or tokens.
 - [ ] Tests:
   - every key;
@@ -1120,10 +1138,12 @@ The behaviour is exactly §1.3. `test_intake_use_cases.py` has one test per §2.
 ### A8 — `/v2` routes, `GET /v2/entries`, erasure; seal the contracts (§2.1, §1.13)
 
 **Files:**
-- New `$MAS/intake/router.py` and `$MAS/intake/reads.py`.
+- New `$MAS/intake/router.py` (`build_intake_router(...)`) and `$MAS/intake/reads.py`.
 - `$MAS/collector/app.py`: extract `_apply_meeting_delete`'s terminal branch (`:588-628`) into `delete_completed_artifacts(store, deleter, user_id, meeting_id) -> dict`, used by both routes.
-- `$MAS/app.py`, `core/meetings/routes.v1.json`.
+- `core/meetings/routes.v1.json` (the seven meeting rows).
+- Gateway: `$GW/src/gateway/routes_manifest.py` (`SCOPES` + `erase`, `webhooks`, `export`), `$GW/src/gateway/app.py` (forward the seven meeting routes), the pinned counts and the scope matrix in its tests, `docs/docs/authentication.mdx`. Own commit.
 - Tests: `test_intake_routes.py`, `test_intake_delete.py`.
+- The router is not mounted in `$MAS/app.py` here; A12 mounts it (V12).
 
 **Behaviour:**
 - Every route and scope is as §2.1.
@@ -1196,7 +1216,7 @@ WHERE m.status = 'scheduled' AND meeting_event_time(m.data, m.start_time, m.crea
 
 ### A12 — Stop the bot in the call (§1.7)
 
-**Files:** `lifecycle/stop_router.py` (extract `stop_meeting_row`), new `$MAS/intake/stop.py`; test `test_intake_stop.py`.
+**Files:** `lifecycle/stop_router.py` (extract `stop_meeting_row`), new `$MAS/intake/stop.py`; `$MAS/app.py` and `$MAS/__main__.py`: mount `build_intake_router` with the real spawn (A9) and stop ports (V12); test `test_intake_stop.py`.
 
 - [ ] Tests:
   - booting vs active;
@@ -1227,6 +1247,7 @@ WHERE m.status = 'scheduled' AND meeting_event_time(m.data, m.start_time, m.crea
 **Files:**
 - New `$AAS/app/webhook_subscriptions.py`, `secret_box.py`, `url_guard.py`, `retention.py`.
 - `$AAS/token_scope.py` (`VALID_SCOPES` + `webhooks`, `erase`, `export`), `$AAS/app/main.py`, `core/identity/routes.v1.json`, `$AAS/config.v1.json`.
+- Gateway: forward the `/v2/webhooks…` routes in `$GW/src/gateway/app.py`, with the pinned counts and the scope matrix (V12).
 - `$AA/pyproject.toml` + Dockerfile: `cryptography==50.0.1`.
 - Tests: `test_webhook_subscriptions.py`, `test_secret_box.py`, `test_webhook_retention.py`, `test_token_scopes.py`.
 
@@ -1305,6 +1326,7 @@ WHERE m.status = 'scheduled' AND meeting_event_time(m.data, m.start_time, m.crea
 **Files:**
 - Exporter: `job.py:98-100`, `notetaker.py:37-42`, the id fields in `attribution.py`/`schemas.py`, `vexa_client.py` (`GATEWAY_URL` + `EXPORTER_API_KEY`), new `export_result.py`, `config.py`.
 - meeting-api: `POST /v2/meetings/{id}/export` (scope `export`).
+- Gateway: forward `POST /v2/meetings/{id}/export` in `$GW/src/gateway/app.py`, with its row in `core/meetings/routes.v1.json`, the pinned counts and the scope matrix (V12).
 - Tests: `$EX/tests/test_job.py`, `test_export_result.py`, `$MA/tests/test_export_route.py`.
 
 - [ ] Tests:
