@@ -97,6 +97,7 @@ def build_production_app():
     from .app import db as app_db
     from .app.events import FLOWS_API_URL_ENV, deprecated_flows_url_env_in_use
     from .app.main import create_app
+    from .app.retention import attach_retention
     from .config_preflight import preflight
     from .schema.models import Base
     from .schema.sync import ensure_schema
@@ -144,6 +145,10 @@ def build_production_app():
         # absent must not be served by a process that assumes it. Not retried (see
         # _is_transient_connect_error) — it needs an operator, not a backoff.
         await _connect_with_retry(lambda: ensure_schema(app_db.get_engine(), Base))
+
+    # §1.13: the daily webhook delivery retention sweep (single-flight across replicas), started
+    # after the schema convergence above because startup hooks run in registration order.
+    attach_retention(app, app_db.get_engine)
 
     return app
 

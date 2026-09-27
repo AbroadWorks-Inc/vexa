@@ -150,6 +150,13 @@
    "targets": []
   },
   {
+   "key": "WEBHOOK_DELIVERY_RETENTION_DAYS",
+   "class": "defaulted",
+   "default": "30",
+   "description": "webhooks (§1.13): the daily retention sweep (app/retention.py, single-flight) deletes deliveries in a final state (delivered, failed, dead, cancelled) older than this many days, their attempts with them, then published outbox rows with no deliveries left; unpublished outbox rows are never pruned. Not a positive whole number, admin-api refuses to start.",
+   "targets": []
+  },
+  {
    "key": "WEBHOOK_PRIVATE_HOST_ALLOWLIST",
    "class": "defaulted",
    "default": "portal.notetaker.svc.cluster.local",

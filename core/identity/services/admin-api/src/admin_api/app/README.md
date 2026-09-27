@@ -9,5 +9,7 @@ Webhook subscriptions (§2.7): `webhook_subscriptions.py` serves `/v2/webhooks` 
 `secret_box.py` encrypts each signing secret (AES-256-GCM under the `WEBHOOK_SECRET_ENC_*` key ring);
 `url_guard.py` refuses private targets on save. The byte layout and the URL rules are pinned as
 shared vectors in `core/identity/contracts/webhook-subscriptions/`.
+`retention.py` is the daily single-flight sweep (§1.13) that deletes final deliveries older than
+`WEBHOOK_DELIVERY_RETENTION_DAYS`, then published outbox rows with no deliveries left.
 
 _Governed by `docs/docs/governance/architecture.mdx` (P1–P12). This folder owns one concern; its public surface is its `index`/contract; it may depend only on what the dependency-rules allow._
