@@ -12,7 +12,7 @@ exercises:
   email, plus webhook_url/secret/events from user.data; rejects expired tokens; bumps
   last_used_at; FAILS CLOSED when INTERNAL_API_SECRET is unset (503) and on a bad secret (403).
 
-  Token mint: scoped {bot,tx,browser}. Scopes via JSON body `{"scopes":["bot","tx"]}` or
+  Token mint: scoped {bot,tx,browser,webhooks,erase,export}. Scopes via JSON body `{"scopes":["bot","tx"]}` or
   query `?scopes=bot,tx` / `?scope=bot` (body wins when present). Optional `name` /
   `expires_in` in body or query; an invalid scope → 422. A JSON body with unknown fields
   is refused (422) — never silently dropped (#922).

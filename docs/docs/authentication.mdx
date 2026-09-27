@@ -79,15 +79,15 @@ is refused with `422` — never silently dropped.
 
 `/recordings*`, `/user/webhook*`, `/user/models`, `/user/transcription`, `/agent/*` and `/mcp` accept
 either `bot` or `tx`. Most keys want both: `{"scopes":["bot","tx"]}`. `erase`, `webhooks` and
-`export` are least-privilege scopes: a `bot`+`tx` key does not reach their routes. A key can hold
-them only once admin-api accepts them when minting. The three `/user/*` routes in
+`export` are least-privilege scopes: a `bot`+`tx` key does not reach their routes. The three `/user/*` routes in
 that list are the [Settings API](/api/settings) — model credentials, transcription backend, and
 webhook delivery, stored per key owner.
 
 Every route requires a scope. A key that holds none of the scopes a route accepts gets `403`,
 whichever route it is.
 
-Keys are prefixed by their primary scope — `vxa_bot_…`, `vxa_tx_…`, `vxa_browser_…`. A key without a
+Keys are prefixed by their primary scope — `vxa_bot_…`, `vxa_tx_…`, `vxa_browser_…`, `vxa_webhooks_…`,
+`vxa_erase_…`, `vxa_export_…`. A key without a
 recognized scope is rejected.
 
 ## Rotating and revoking
