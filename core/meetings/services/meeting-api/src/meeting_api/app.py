@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -41,6 +41,9 @@ from .collector.app import build_router as _build_collector_router
 from .collector.ports import RedisBus, TranscriptStore
 from .lifecycle.machine import LifecycleSink, MeetingStore
 from .obs import TraceMiddleware
+
+if TYPE_CHECKING:
+    from .intake import IntakeReads, IntakeService, StopPort
 
 #: In-process capture of the last N emitted webhook envelopes — an eval/introspection seam, never a
 #: durable store (the DB meeting row is the durable record; the WebhookSink is the delivery path).
@@ -183,6 +186,11 @@ def create_app(
     # calendar-sync user edges (async callables from the composition root; None → routes 503)
     calendar_sync_now: Optional["object"] = None,
     calendar_sync_status: Optional["object"] = None,
+    # the /v2 meeting intake routes (§2.1): the entry service, its reads and the stop port. None →
+    # not mounted (the app factory / tests have no Postgres intake store).
+    intake_service: Optional["IntakeService"] = None,
+    intake_reads: Optional["IntakeReads"] = None,
+    intake_stop: Optional["StopPort"] = None,
 ) -> FastAPI:
     """Build the unified meeting-api app from the injected ports.
 
@@ -290,6 +298,24 @@ def create_app(
                                             calendar_sync_now=calendar_sync_now,
                                             calendar_sync_status=calendar_sync_status,
                                             artifact_object_deleter=_delete_recording_objects))
+
+    # --- intake: the /v2 meeting routes (§2.1, intake.v1) — entries in, the meetings they make, stop
+    # and erasure. Erasure deletes through the same transcript store and recording-object deleter as
+    # upstream's completed-meeting erasure. Reached only through the gateway, which checks the scope
+    # and sets x-user-id. ---
+    app.state.intake_service = intake_service
+    if intake_service is not None and intake_reads is not None and intake_stop is not None:
+        from .intake import build_intake_router
+        from .intake.settings import auto_join_lead_s
+
+        app.include_router(build_intake_router(
+            intake_service,
+            intake_reads,
+            intake_stop,
+            artifact_store=transcript_store,
+            artifact_deleter=_delete_recording_objects,
+            lead_s=auto_join_lead_s(),
+        ))
 
     # --- recordings: chunk upload + finalize → meeting.data JSONB (recording.v1) ---
     if recording_repo is None:

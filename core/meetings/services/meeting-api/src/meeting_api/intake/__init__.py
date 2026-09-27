@@ -35,8 +35,8 @@ Public surface:
     leave command and deletes a booting bot's workload.
   * ``check_room`` / ``not_sent_tick`` — ``sweeps.py``. The scheduler's intake side (§1.5): the
     link check under the link lock before a bot is sent to an entry-managed meeting (wait, or merge
-    into an open-ended live meeting, R2), and the not-sent sweep (R6). ``OutboxOnly`` / ``NoStop``
-    are the scheduler's publisher and stop ports.
+    into an open-ended live meeting, R2), and the not-sent sweep (R6). ``OutboxOnly`` is the
+    outbox-only publisher; ``NoStop`` a stop port that refuses.
   * ``PostgresIntakeStore(session_factory)`` — ``adapters.py``. The ``IntakeStore`` over Postgres:
     one transaction per ``room_lock`` holding the links' advisory locks (§1.4), status changes and
     events through ``write_status`` / ``write_event`` in that transaction.

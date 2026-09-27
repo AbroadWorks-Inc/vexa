@@ -30,9 +30,9 @@ detail and message:
 Entries the finish kept active re-run (``IntakeService.rerun_entries``, R7). One meeting's failure
 is logged with its stack and the sweep goes on to the next.
 
-``OutboxOnly`` and ``NoStop`` are the scheduler's ports for the ``IntakeService`` it merges and
-re-runs through: events stay in ``webhook_outbox`` for the outbox publisher (§1.8), and neither a
-merge nor a re-run stops a bot.
+``OutboxOnly`` is the ``EventPublisher`` of the production ``IntakeService`` the scheduler merges
+and re-runs through (and the ``/v2`` routes use): events stay in ``webhook_outbox`` for the outbox
+publisher (§1.8). ``NoStop`` is a ``StopPort`` for an ``IntakeService`` that must never stop a bot.
 """
 
 from __future__ import annotations
@@ -80,8 +80,8 @@ class OutboxOnly:
 
 
 class NoStop:
-    """``StopPort`` for the scheduler's ``IntakeService``: a merge and a re-run never stop a bot,
-    so a call here is a fault."""
+    """``StopPort`` for an ``IntakeService`` that must never stop a bot (a merge and a re-run never
+    do), so a call here is a fault."""
 
     async def stop_live(
         self, user_id: int, meeting_id: int, *, outcome: Optional[Outcome]

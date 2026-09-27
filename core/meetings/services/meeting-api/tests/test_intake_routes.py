@@ -1,7 +1,7 @@
 """§2.1–§2.5 — the ``/v2`` meeting routes (``meeting_api.intake.router.build_intake_router``).
 
-Driven over HTTP on a bare app that mounts only the intake router (meeting-api's production app
-mounts it once the real spawn and stop exist). The service runs on the in-memory fakes; every
+Driven over HTTP on a bare app that mounts only the intake router (``test_intake_mounted.py``
+covers meeting-api's production app mounting it). The service runs on the in-memory fakes; every
 success and error body is validated against ``intake.v1``. The last group runs the same routes on
 the real Postgres store (skipped unless ``MEETING_API_TEST_DATABASE_URL`` is set).
 """

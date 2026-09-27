@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Any, NamedTuple
 
 log = logging.getLogger("meeting_api.entrypoint")
 
@@ -224,6 +225,14 @@ def build_production_app():
         from .calendar_sync import read_stamp
         return await read_stamp(redis_client, user_id, calendar_id)
 
+    # The entry service (§1.3) over Postgres, ONE instance behind the /v2 routes and the scheduler.
+    from .intake import PostgresIntakeReads
+
+    intake = _build_intake(
+        session_factory, meeting_repo, runtime_client,
+        service_authority=service_authority, commands=redis_client,
+    )
+
     app = create_app(
         transcript_store=transcript_store,
         redis=segment_bus,
@@ -242,6 +251,9 @@ def build_production_app():
         transcript_finalizer=_transcript_finalizer,
         calendar_sync_now=_calendar_sync_now,
         calendar_sync_status=_calendar_sync_status,
+        intake_service=intake.service,
+        intake_reads=PostgresIntakeReads(session_factory),
+        intake_stop=intake.stop,
     )
 
     _attach_background_loops(
@@ -250,6 +262,7 @@ def build_production_app():
         system_webhook_sink=system_webhook_sink,
         session_factory=session_factory,
         storage=storage,
+        intake=intake,
     )
     return app
 
@@ -266,8 +279,12 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
+    intake=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
+
+    ``intake`` is the entry service ``build_production_app`` also mounts behind the ``/v2`` routes
+    (``_build_intake``); without it one is built here over ``session_factory``.
 
     #637 — single-flight sweeps: at ``replicaCount>1`` every replica runs these same loops, so each
     live tick body is wrapped in a per-loop Postgres advisory lock (``_guarded``) — the real work runs
@@ -559,30 +576,17 @@ def _attach_background_loops(
 
     # The scheduler's intake side (§1.5): the store (link locks, the link check, typed failure
     # codes) and the entry service it merges (R2) and re-runs entries (R7) through. Its events stay
-    # in the outbox for the outbox publisher (§1.8); neither a merge nor a re-run stops a bot.
+    # in the outbox for the outbox publisher (§1.8).
     intake_store = intake_service = scheduler_publisher = None
-    if session_factory is not None and meeting_repo is not None and runtime is not None:
-        from .intake import ExactRowSpawn, IntakeService, IntakeSettings, PostgresIntakeStore
-        from .intake.sweeps import NoStop, OutboxOnly
-
-        intake_store = PostgresIntakeStore(session_factory)
-        scheduler_publisher = OutboxOnly()
-        intake_service = IntakeService(
-            intake_store,
-            ExactRowSpawn(
-                meeting_repo, runtime,
-                store=intake_store,
-                fetch_bot_context=fetch_bot_context,
-                publisher=scheduler_publisher,
-                authority=service_authority,
-                token_secret=os.getenv("ADMIN_TOKEN") or None,
-                redis_url=os.getenv("REDIS_URL"),
-                allow_uncapped=auto_join_allow_uncapped,
-            ),
-            NoStop(),
-            scheduler_publisher,
-            IntakeSettings.from_env(),
+    if intake is None and session_factory is not None and meeting_repo is not None \
+            and runtime is not None:
+        intake = _build_intake(
+            session_factory, meeting_repo, runtime,
+            service_authority=service_authority, commands=redis_client,
         )
+    if intake is not None:
+        intake_store, intake_service = intake.store, intake.service
+        scheduler_publisher = intake.publisher
 
     async def _auto_join_loop() -> None:
         if intake_store is None or not hasattr(meeting_repo, "list_due_meetings"):
@@ -831,12 +835,57 @@ def __getattr__(name: str):
 
 
 
+class _Intake(NamedTuple):
+    store: Any
+    service: Any
+    stop: Any
+    publisher: Any
+
+
+def _build_intake(session_factory, meeting_repo, runtime, *, service_authority, commands):
+    """The entry service over Postgres (§1.3), with the production ports: the exact-row spawn
+    (§1.5) under the same service authority ``POST /bots`` uses and the auto-join sweep's spawn
+    context (``_bot_context_fetcher``, its ``AUTO_JOIN_ALLOW_UNCAPPED`` opt-in), the stop of the
+    bot in the call (§1.7) over the bot command bus and the runtime, and ``OutboxOnly``: every
+    event is already in ``webhook_outbox``, where the outbox publisher picks it up."""
+    from .bot_spawn.env_flags import env_flag
+    from .intake import (
+        ExactRowSpawn,
+        IntakeService,
+        IntakeSettings,
+        IntakeStop,
+        PostgresIntakeStore,
+    )
+    from .intake.sweeps import OutboxOnly
+
+    store = PostgresIntakeStore(session_factory)
+    publisher = OutboxOnly()
+    stop = IntakeStop(store, commands, runtime, publisher=publisher)
+    spawn = ExactRowSpawn(
+        meeting_repo, runtime,
+        store=store,
+        fetch_bot_context=_bot_context_fetcher(
+            (os.getenv("ADMIN_API_URL") or "").rstrip("/"),
+            os.getenv("INTERNAL_API_SECRET") or "",
+        ),
+        publisher=publisher,
+        authority=service_authority,
+        token_secret=os.getenv("ADMIN_TOKEN") or None,
+        redis_url=os.getenv("REDIS_URL"),
+        allow_uncapped=env_flag("AUTO_JOIN_ALLOW_UNCAPPED", default=False),
+    )
+    service = IntakeService(store, spawn, stop, publisher, IntakeSettings.from_env())
+    return _Intake(store, service, stop, publisher)
+
+
 def _bot_context_fetcher(admin_api_url: str, internal_secret: str):
-    """The per-user spawn context from identity for the AUTO-JOIN SWEEP, or None when no identity
-    edge is configured.
+    """The per-user spawn context from identity for the AUTO-JOIN SWEEP and the exact-row spawn
+    (``intake.ExactRowSpawn``, behind the sweep and the ``/v2`` instant join), or None when no
+    identity edge is configured.
 
     The sweep needs its own fetcher because it spawns bots OUTSIDE a request — it stands in for the
     headers the gateway would have injected, and it caches one answer per user across a whole tick.
+    The ``/v2`` routes receive no such headers either, so the exact-row spawn reads the same door.
 
     NOT USED BY `POST /bots` any more. The direct path used to be handed this same builder so the
     person's default name reached it too, which made that one request fetch

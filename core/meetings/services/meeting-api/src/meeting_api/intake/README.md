@@ -78,8 +78,10 @@ meeting row and `meeting_aw_state` stay and no event is written. The reads and e
 `IntakeReads` (`ports.py`): `PostgresIntakeReads` (`reads.py`) over Postgres, `InMemoryIntakeReads`
 in `fakes.py`. `GET /v2/entries` pages by `external_id` (served by
 `uq_meeting_entries_user_source_external`); `GET /v2/meetings` pages by `(meeting_event_time, id)`,
-newest first. meeting-api's production app mounts the router once the real spawn and stop ports
-exist (A12).
+newest first. meeting-api's production app (`__main__.build_production_app` → `create_app`) mounts
+the router over `PostgresIntakeStore`, `PostgresIntakeReads`, `ExactRowSpawn`, `IntakeStop` and the
+outbox-only publisher; the same entry service is the scheduler's. The routes are reached only
+through the gateway, which checks the scope and sets `x-user-id`.
 `ExactRowSpawn` (`spawn.py`) is the production `SpawnPort` (§1.5): `spawn_exact(user_id, meeting_id)`
 runs `bot_spawn.request_bot` with `claim_meeting_id`, so the spawn claims exactly that row
 (`scheduled` → `requested` through `write_status`, under the link lock, then the per-user lock, then
