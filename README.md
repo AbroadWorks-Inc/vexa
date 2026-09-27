@@ -245,6 +245,8 @@ docker push $REG/aw-bots-exporter:$TAG
 # gateway (context: the repo root) and admin-api (context: its own folder): build as CI does.
 docker build --platform linux/amd64 -f core/gateway/services/gateway/Dockerfile -t $REG/aw-bots-gateway:$TAG .
 docker build --platform linux/amd64 -t $REG/aw-bots-admin-api:$TAG core/identity/services/admin-api
+docker push $REG/aw-bots-gateway:$TAG
+docker push $REG/aw-bots-admin-api:$TAG
 ```
 
 Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our change adds one small source file and
