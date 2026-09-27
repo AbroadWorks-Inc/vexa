@@ -12,6 +12,35 @@ Spec: [`docs/2026-09-23-aw-rearchitecture-design.md`](docs/2026-09-23-aw-rearchi
 (§4), [`docs/2026-09-23-speaker-activity-design.md`](docs/2026-09-23-speaker-activity-design.md).
 Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.md).
 
+## Through the gateway (design §1.9, §1.10)
+- **Reads.** `GET /recordings`, `GET /recordings/{id}/master` and `GET /transcripts/by-id/{id}` go to
+  `GATEWAY_URL` with `X-API-Key: <EXPORTER_API_KEY>`. The key is the `exporter` key (scopes `tx` +
+  `export`, Secret `aw-bots-key-exporter`). The gateway checks the scope and tells meeting-api which
+  account is calling, so the exporter reads the meetings of its key's account. meeting-api refuses a
+  direct call that names a user itself, so there is no direct path.
+- **UUIDs.** The meeting's UUID (`data.meeting.uuid` in the webhook) is the id in
+  `speaker_timeline.json`, `participants.json` and the `/process` `meeting_id` and
+  `idempotency_key`. `_export.json` keeps the UUID (`meeting_id`) and the integer Vexa id
+  (`vexa_meeting_id`); the integer is used only to read recordings and the transcript. The folder
+  name `<platform>_<room>_<startUTC>` is unchanged. A webhook without a UUID is moved to
+  `aw-exporter/failed/` on its first attempt and writes nothing to the export bucket.
+- **Export result.** After `_export.json` records the outcome, the exporter reports it with
+  `POST /v2/meetings/{uuid}/export` `{"state": "handed_off" | "failed", "s3_path": "s3://…/", "error": "…"}`
+  (`error` only on `failed`): `handed_off` after `/process`, `failed` when the meeting has no audio
+  or its export is quarantined. meeting-api stores it on the meeting and sends `export.handed_off`
+  / `export.failed`; repeating a report changes nothing. A report that isn't accepted fails the job
+  step, and the queue retries it with its normal backoff.
+
+## Rollout (design Part 5)
+1. **Drain the queue with the old exporter** before anything else changes: `aw-exporter/pending/`
+   must be empty. Queued items from before the rollout have no meeting UUID.
+2. **Deploy meeting-api and the gateway, and mint the `exporter` key into `aw-bots-key-exporter`,
+   before the new exporter.** The new exporter needs `GATEWAY_URL`, `EXPORTER_API_KEY` and the new
+   export route.
+3. **Don't re-enqueue items in `aw-exporter/failed/` from before the rollout as they are.** They
+   have no UUID, and `notetaker-worker` would see a new `idempotency_key` (the UUID instead of
+   `vexa-<n>`) for a meeting it may already have.
+
 ## Config (names only — see spec §4.4)
 `GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `VEXA_WEBHOOK_SECRET`,
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
