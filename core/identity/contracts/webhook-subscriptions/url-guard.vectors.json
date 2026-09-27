@@ -1,5 +1,5 @@
 {
-  "description": "Test vectors for the webhook URL guard (design §2.7): admin-api checks a subscription URL on save, meeting-api again on every send (webhooks/ssrf.py). Rules: only http and https; a host is required; the internal hostnames and the private, loopback, link-local and multicast ranges are refused; a DNS name is resolved and refused if it resolves to nothing or if ANY address it resolves to is refused. A host in the allow-list (WEBHOOK_PRIVATE_HOST_ALLOWLIST, compared case-insensitively) is accepted without those checks and without resolving it. 'resolves_to' is what the test resolver returns for the URL's host.",
+  "description": "Test vectors for the webhook URL guard (design §2.7): admin-api checks a subscription URL on save, meeting-api again on every send (webhooks/ssrf.py). Rules: only http and https; a host is required; the internal hostnames and the private, loopback, link-local and multicast ranges are refused, an IPv4-mapped IPv6 address (::ffff:a.b.c.d) being judged as the IPv4 address it maps; a DNS name is resolved and refused if it resolves to nothing or if ANY address it resolves to is refused. A host in the allow-list (WEBHOOK_PRIVATE_HOST_ALLOWLIST, compared case-insensitively) is accepted without those checks and without resolving it. 'resolves_to' is what the test resolver returns for the URL's host.",
   "vectors": [
     {"url": "https://hooks.example.com/aw", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "allow"},
     {"url": "https://93.184.216.34/hook", "resolves_to": null, "allowlist": [], "expect": "allow"},
@@ -14,6 +14,12 @@
     {"url": "http://[::1]/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
     {"url": "http://[fd00::1]/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
     {"url": "http://[fe80::1]/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
+    {"url": "http://[::ffff:169.254.169.254]/latest/meta-data", "resolves_to": null, "allowlist": [], "expect": "refuse"},
+    {"url": "http://[::ffff:10.0.0.1]/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
+    {"url": "http://[::ffff:127.0.0.1]/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
+    {"url": "http://[::ffff:7f00:1]/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
+    {"url": "http://[::ffff:93.184.216.34]/hook", "resolves_to": null, "allowlist": [], "expect": "allow"},
+    {"url": "https://mapped.example.com/aw", "resolves_to": ["::ffff:192.168.1.5"], "allowlist": [], "expect": "refuse"},
     {"url": "http://localhost:8080/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
     {"url": "http://meeting-api/internal", "resolves_to": null, "allowlist": [], "expect": "refuse"},
     {"url": "http://metadata.google.internal/", "resolves_to": null, "allowlist": [], "expect": "refuse"},

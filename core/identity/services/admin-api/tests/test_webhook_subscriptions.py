@@ -12,6 +12,8 @@ import base64
 import json
 import logging
 import os
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +22,12 @@ import httpx
 import pytest
 
 from admin_api.app.secret_box import KeyRingError, SecretBox
-from admin_api.app.url_guard import UrlRefused, check_subscription_url, parse_allowlist
+from admin_api.app.url_guard import (
+    UrlRefused,
+    check_subscription_url,
+    check_subscription_url_off_loop,
+    parse_allowlist,
+)
 from admin_api.app.webhook_subscriptions import (
     EVENT_TYPES,
     HttpWebhookTestSender,
@@ -123,16 +130,16 @@ def test_the_test_hand_off_posts_to_meeting_api_with_the_internal_secret():
         seen["url"] = str(request.url)
         seen["secret"] = request.headers.get("x-internal-secret")
         seen["body"] = json.loads(request.content)
-        return httpx.Response(202, json={"event_id": "evt_test_1"})
+        return httpx.Response(202, json={"event_id": "evt_test_1", "extra": "dropped"})
 
     sender = HttpWebhookTestSender(
         "http://meeting-api:8080/",
         INTERNAL_SECRET,
         transport=httpx.MockTransport(handler),
     )
-    reply = asyncio.run(sender.send_test(7, "sub-1"))
+    event_id = asyncio.run(sender.send_test(7, "sub-1"))
 
-    assert reply == {"event_id": "evt_test_1"}
+    assert event_id == "evt_test_1"
     assert seen == {
         "url": "http://meeting-api:8080/internal/webhooks/test",
         "secret": INTERNAL_SECRET,
@@ -149,6 +156,90 @@ def test_the_test_hand_off_fails_on_a_refusal(status):
     )
     with pytest.raises(WebhookTestUnavailable):
         asyncio.run(sender.send_test(7, "sub-1"))
+
+
+@pytest.mark.parametrize("reply", [{}, {"event_id": ""}, {"event_id": 7}, ["evt_x"]])
+def test_the_test_hand_off_fails_on_a_reply_without_an_event_id(reply):
+    sender = HttpWebhookTestSender(
+        "http://meeting-api:8080",
+        INTERNAL_SECRET,
+        transport=httpx.MockTransport(lambda r: httpx.Response(202, json=reply)),
+    )
+    with pytest.raises(WebhookTestUnavailable):
+        asyncio.run(sender.send_test(7, "sub-1"))
+
+
+def test_the_url_check_runs_off_the_event_loop():
+    """A resolver that blocks holds up only its own check: another coroutine on the same loop
+    runs meanwhile."""
+    entered, release = threading.Event(), threading.Event()
+    order: list[str] = []
+
+    def resolver(host):
+        entered.set()
+        release.wait(5)
+        order.append("resolved")
+        return ["93.184.216.34"]
+
+    async def scenario():
+        check = asyncio.create_task(
+            check_subscription_url_off_loop(
+                "https://slow.example.com/aw",
+                allowlist=(),
+                resolver=resolver,
+                timeout_s=5,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        order.append("other coroutine ran")
+        release.set()
+        await check
+
+    asyncio.run(scenario())
+    assert order == ["other coroutine ran", "resolved"]
+
+
+def test_a_url_check_past_its_timeout_is_refused():
+    release = threading.Event()
+
+    def resolver(host):
+        release.wait(5)
+        return ["93.184.216.34"]
+
+    try:
+        with pytest.raises(UrlRefused) as ei:
+            asyncio.run(
+                check_subscription_url_off_loop(
+                    "https://slow.example.com/aw",
+                    allowlist=(),
+                    resolver=resolver,
+                    timeout_s=0.1,
+                )
+            )
+        assert "slow.example.com" not in str(ei.value)
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "many"])
+def test_a_subscription_quota_below_one_is_refused_at_load(monkeypatch, value):
+    from admin_api.app.main import create_app
+
+    monkeypatch.setenv("WEBHOOK_MAX_SUBSCRIPTIONS", value)
+    with pytest.raises(ValueError):
+        WebhookSettings.from_env()
+    with pytest.raises(ValueError):
+        create_app()
+
+
+def test_a_constraint_violation_is_not_retryable():
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    from admin_api.app.webhook_subscriptions import _retryable
+
+    assert _retryable(IntegrityError("INSERT", {}, Exception("dup"))) is False
+    assert _retryable(OperationalError("SELECT", {}, Exception("down"))) is True
 
 
 def test_the_test_hand_off_fails_without_the_internal_secret():
@@ -170,11 +261,11 @@ class FakeTestSender:
         self.calls: list[tuple[int, str]] = []
         self.fail = False
 
-    async def send_test(self, user_id: int, subscription_id: str) -> dict:
+    async def send_test(self, user_id: int, subscription_id: str) -> str:
         if self.fail:
             raise WebhookTestUnavailable("meeting-api answered 503")
         self.calls.append((user_id, subscription_id))
-        return {"event_id": f"evt_test_{len(self.calls)}"}
+        return f"evt_test_{len(self.calls)}"
 
 
 class Clock:
@@ -720,27 +811,120 @@ def test_a_row_under_the_old_key_is_read_and_rewrapped_after_the_active_key_chan
 
 
 @needs_pg
-def test_a_row_under_a_key_missing_from_the_ring_is_returned_unchanged_and_logged(
+def test_rows_under_a_key_missing_from_the_ring_are_left_alone_logged_once_unlocked(
     env, caplog
 ):
-    sid = _create(env).json()["id"]
-    before = bytes(_row(env, sid)["secret_enc"])
-    _sql(
-        env["engine"],
-        "UPDATE webhook_subscriptions SET enc_key_id = 'k0' WHERE id = :id",
-        id=sid,
-    )
+    """A key id the ring doesn't hold can't be re-sealed, so such a row isn't stale: it is
+    returned as stored, the read logs it once, and it takes no row lock — a writer holding one
+    doesn't block the read."""
+    first = _create(env).json()["id"]
+    second = _create(env, url="https://other.example.com/aw").json()["id"]
+    before = bytes(_row(env, first)["secret_enc"])
+    _sql(env["engine"], "UPDATE webhook_subscriptions SET enc_key_id = 'k0'")
 
-    with caplog.at_level(logging.ERROR, logger="admin_api.webhooks"):
-        r = _internal(env)
+    from sqlalchemy import text
 
+    holder = env["engine"].connect()
+    tx = holder.begin()
+    holder.execute(text("SELECT id FROM webhook_subscriptions FOR UPDATE"))
+    result: dict = {}
+
+    def read():
+        result["response"] = _internal(env)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="admin_api.webhooks"):
+            reader = threading.Thread(target=read)
+            reader.start()
+            reader.join(10)
+            finished = not reader.is_alive()
+    finally:
+        tx.rollback()
+        holder.close()
+    reader.join(10)
+
+    assert finished, "the read waited on a row lock"
+    r = result["response"]
     assert r.status_code == 200
-    (sub,) = r.json()["subscriptions"]
-    assert sub["enc_key_id"] == "k0"
-    assert bytes(_row(env, sid)["secret_enc"]) == before
-    assert any(
-        "k0" in rec.getMessage() and sid in rec.getMessage() for rec in caplog.records
-    )
+    assert {s["enc_key_id"] for s in r.json()["subscriptions"]} == {"k0"}
+    assert bytes(_row(env, first)["secret_enc"]) == before
+    missing = [rec for rec in caplog.records if "k0" in rec.getMessage()]
+    assert len(missing) == 1
+    assert first in missing[0].getMessage() and second in missing[0].getMessage()
+
+
+@needs_pg
+def test_a_blocked_resolver_does_not_freeze_other_requests(env):
+    """admin-api is the gateway's validation oracle: a slow DNS answer on one save must not stall
+    any other request on the loop."""
+    entered, release = threading.Event(), threading.Event()
+
+    def resolver(host):
+        if host == "slow.example.com":
+            entered.set()
+            release.wait(10)
+            return ["93.184.216.34"]
+        return _resolver(host)
+
+    env["deps"].resolver = resolver
+    result: dict = {}
+
+    def create():
+        result["response"] = _create(env, url="https://slow.example.com/aw")
+
+    writer = threading.Thread(target=create)
+    writer.start()
+    try:
+        assert entered.wait(5)
+        started = time.monotonic()
+        assert env["client"].get("/health").status_code == 200
+        assert env["client"].get("/v2/webhooks", headers=_as(2)).status_code == 200
+        assert time.monotonic() - started < 2
+        assert writer.is_alive(), "the slow save finished before the others ran"
+    finally:
+        release.set()
+        writer.join(10)
+    assert result["response"].status_code == 201
+
+
+@needs_pg
+def test_a_resolver_past_the_timeout_refuses_the_url(env):
+    release = threading.Event()
+
+    def resolver(host):
+        release.wait(10)
+        return ["93.184.216.34"]
+
+    env["deps"].resolver = resolver
+    env["deps"].url_check_timeout_s = 0.2
+    try:
+        r = _create(env, url="https://slow.example.com/aw")
+    finally:
+        release.set()
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+    assert r.json()["error"]["message"].startswith("url:")
+
+
+@needs_pg
+def test_an_account_without_a_users_row_is_refused(env):
+    r = _create(env, user=3)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "account_not_found"
+    assert _sql(env["engine"], "SELECT count(*) FROM webhook_subscriptions")[0][0] == 0
+
+
+@needs_pg
+def test_a_constraint_violation_on_save_is_not_reported_as_retryable(env, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    async def failing_commit(self):
+        raise IntegrityError("INSERT INTO webhook_subscriptions", {}, Exception("dup"))
+
+    monkeypatch.setattr(AsyncSession, "commit", failing_commit)
+    with pytest.raises(IntegrityError):
+        _create(env)
 
 
 @needs_pg

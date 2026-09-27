@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from admin_api.token_scope import (
+    USER_TIER_SCOPES,
     VALID_SCOPES,
     generate_prefixed_token,
     parse_token_scope,
@@ -32,6 +33,12 @@ WEBHOOK_ROUTES = [r for r in ROUTES if r["path"].startswith("/v2/webhooks")]
 
 def test_the_scope_vocabulary_holds_the_least_privilege_scopes():
     assert VALID_SCOPES == {"bot", "tx", "browser", "webhooks", "erase", "export"}
+
+
+def test_the_user_tier_keeps_its_own_scopes():
+    """§1.10 least privilege: the /user/* tier answers bot, tx and browser keys only."""
+    assert USER_TIER_SCOPES == {"bot", "tx", "browser"}
+    assert USER_TIER_SCOPES < VALID_SCOPES
 
 
 @pytest.mark.parametrize("scope", ["webhooks", "erase", "export"])
@@ -154,3 +161,15 @@ def test_a_webhooks_key_reaches_the_webhook_routes_and_a_bot_tx_key_does_not(cli
     for route in ROUTES:
         if route not in WEBHOOK_ROUTES:
             assert not webhooks_scopes & set(route["scopes"]), route
+
+
+@needs_pg
+@pytest.mark.parametrize(
+    "scopes,status", [(["webhooks"], 403), (["erase", "export"], 403), (["bot"], 200)]
+)
+def test_the_user_tier_refuses_a_key_with_only_least_privilege_scopes(
+    client, scopes, status
+):
+    token = _mint(client, json={"scopes": scopes}).json()["token"]
+    r = client.get("/user/webhook", headers={"X-API-Key": token})
+    assert r.status_code == status, r.text

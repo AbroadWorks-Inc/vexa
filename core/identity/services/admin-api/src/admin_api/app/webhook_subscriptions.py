@@ -14,15 +14,18 @@
 The gateway checks the ``webhooks`` scope and sets ``x-user-id`` (the account). Every failure is
 the §2.5 body ``{"error": {"code", "message"}}``: a request that fails validation is 400
 ``invalid_request``, an id that isn't one of the account's subscriptions is 404
-``webhook_not_found``, the 21st subscription is 429 ``quota_exceeded`` (no ``Retry-After``), and a
-database that can't be reached, a missing secret key ring or a failed test hand-off is 503
-``unavailable``.
+``webhook_not_found``, an account with no ``users`` row adding one is 404 ``account_not_found``,
+the 21st subscription is 429 ``quota_exceeded`` (no ``Retry-After``), and a database that can't be
+reached, a missing secret key ring or a failed test hand-off is 503 ``unavailable``. A constraint
+violation is a bug and stays a 500.
 
 - A secret the caller omits is generated and returned once, in that response only. A secret the
   caller supplies is never echoed. Secrets are stored sealed by ``SecretBox``; responses and logs
   carry ``secret_last4`` at most.
 - ``events: []`` means every event; each listed event must be a ``webhook.v1`` ``EventType``.
-- The URL passes ``url_guard`` on every save.
+- The URL passes ``url_guard`` on every save, in a worker thread under ``URL_CHECK_TIMEOUT_S``: a
+  slow resolver never stalls the event loop that also answers ``/internal/validate``, and a check
+  that times out refuses the URL.
 - Pausing (``active: false``) and deleting cancel the subscription's pending deliveries in the
   same transaction: ``UPDATE webhook_deliveries SET state='cancelled' WHERE subscription_id=:id
   AND state IN ('pending','sending')``.
@@ -31,9 +34,11 @@ database that can't be reached, a missing secret key ring or a failed test hand-
 - The internal read returns ``secret_enc`` / ``previous_secret_enc`` as base64 of the stored bytes
   with their key ids, ``previous_*`` only while unexpired; a row still sealed under a key other than
   the active one is re-sealed under the active key in the same request (compare
-  ``secret_box.py``).
+  ``secret_box.py``). A row under a key id the ring doesn't hold can't be re-sealed: it is returned
+  as stored, without a row lock, and the read logs such rows once.
 - ``webhook.test`` is handed to meeting-api's ``POST /internal/webhooks/test`` with
-  ``{"user_id", "subscription_id"}`` and the internal secret; meeting-api writes and sends it.
+  ``{"user_id", "subscription_id"}`` and the internal secret; meeting-api writes and sends it, and
+  replies with the ``event_id`` it queued. The route answers ``{"subscription_id", "event_id"}``.
 """
 
 from __future__ import annotations
@@ -68,7 +73,7 @@ from .url_guard import (
     DEFAULT_PRIVATE_HOST_ALLOWLIST,
     Resolver,
     UrlRefused,
-    check_subscription_url,
+    check_subscription_url_off_loop,
     parse_allowlist,
 )
 
@@ -110,6 +115,8 @@ EVENT_TYPES = frozenset(
 )
 
 PREVIOUS_SECRET_TTL = timedelta(hours=24)
+#: The whole URL check on save, DNS included; a check that takes longer refuses the URL.
+URL_CHECK_TIMEOUT_S = 5.0
 MAX_URL = 2048
 MIN_SECRET, MAX_SECRET = 16, 512
 MAX_DESCRIPTION = 500
@@ -134,8 +141,18 @@ class WebhookSettings:
 
     @classmethod
     def from_env(cls) -> "WebhookSettings":
+        """``ValueError`` unless ``WEBHOOK_MAX_SUBSCRIPTIONS`` is a whole number of at least 1."""
+        raw = os.getenv("WEBHOOK_MAX_SUBSCRIPTIONS", "20")
+        try:
+            max_subscriptions = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "WEBHOOK_MAX_SUBSCRIPTIONS must be a whole number"
+            ) from exc
+        if max_subscriptions < 1:
+            raise ValueError("WEBHOOK_MAX_SUBSCRIPTIONS must be at least 1")
         return cls(
-            max_subscriptions=int(os.getenv("WEBHOOK_MAX_SUBSCRIPTIONS", "20")),
+            max_subscriptions=max_subscriptions,
             private_host_allowlist=parse_allowlist(
                 os.getenv(
                     "WEBHOOK_PRIVATE_HOST_ALLOWLIST", DEFAULT_PRIVATE_HOST_ALLOWLIST
@@ -149,9 +166,9 @@ class WebhookTestUnavailable(Exception):
 
 
 class WebhookTestSender(Protocol):
-    """Hands a ``webhook.test`` send to meeting-api; returns its JSON reply."""
+    """Hands a ``webhook.test`` send to meeting-api; returns the event id it queued."""
 
-    async def send_test(self, user_id: int, subscription_id: str) -> dict[str, Any]: ...
+    async def send_test(self, user_id: int, subscription_id: str) -> str: ...
 
 
 class HttpWebhookTestSender:
@@ -177,7 +194,7 @@ class HttpWebhookTestSender:
             os.environ.get("INTERNAL_API_SECRET", ""),
         )
 
-    async def send_test(self, user_id: int, subscription_id: str) -> dict[str, Any]:
+    async def send_test(self, user_id: int, subscription_id: str) -> str:
         import httpx
 
         if not self._internal_secret:
@@ -198,8 +215,11 @@ class HttpWebhookTestSender:
         try:
             body = resp.json()
         except ValueError:
-            return {}
-        return body if isinstance(body, dict) else {}
+            body = None
+        event_id = body.get("event_id") if isinstance(body, dict) else None
+        if not isinstance(event_id, str) or not event_id:
+            raise WebhookTestUnavailable("meeting-api's reply carries no event_id")
+        return event_id
 
 
 @dataclass
@@ -212,6 +232,7 @@ class WebhookDeps:
     settings: WebhookSettings = field(default_factory=WebhookSettings)
     resolver: Optional[Resolver] = None
     clock: Callable[[], datetime] = _utcnow
+    url_check_timeout_s: float = URL_CHECK_TIMEOUT_S
 
     @classmethod
     def from_env(cls) -> "WebhookDeps":
@@ -230,6 +251,7 @@ class WebhookError(Exception):
         "invalid_request": 400,
         "unauthorized": 401,
         "webhook_not_found": 404,
+        "account_not_found": 404,
         "quota_exceeded": 429,
         "unavailable": 503,
     }
@@ -259,7 +281,8 @@ def _validation_message(exc: RequestValidationError) -> str:
 
 
 def _retryable(exc: BaseException) -> bool:
-    """The database couldn't be reached, or a write lost a race."""
+    """The database couldn't be reached. A constraint violation is not retryable: it is a bug,
+    and stays a 500."""
     if isinstance(exc, (OSError, TimeoutError)):
         return True
     from sqlalchemy import exc as sa_exc
@@ -273,7 +296,6 @@ def _retryable(exc: BaseException) -> bool:
             sa_exc.InterfaceError,
             sa_exc.DisconnectionError,
             sa_exc.TimeoutError,
-            sa_exc.IntegrityError,
         ),
     )
 
@@ -401,12 +423,13 @@ def build_webhook_router(
             )
         return deps.secret_box
 
-    def _check_url(url: str) -> None:
+    async def _check_url(url: str) -> None:
         try:
-            check_subscription_url(
+            await check_subscription_url_off_loop(
                 url,
                 allowlist=deps.settings.private_host_allowlist,
                 resolver=deps.resolver,
+                timeout_s=deps.url_check_timeout_s,
             )
         except UrlRefused as exc:
             raise WebhookError("invalid_request", f"url: {exc}") from exc
@@ -452,11 +475,16 @@ def build_webhook_router(
     ) -> JSONResponse:
         user_id = _account(x_user_id)
         box = _box()
-        _check_url(body.url)
+        await _check_url(body.url)
         generated = body.secret is None
         secret = secrets.token_urlsafe(32) if body.secret is None else body.secret
         # One writer per account at a time, so two adds can't both take the last slot.
-        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        account = await db.execute(
+            select(User.id).where(User.id == user_id).with_for_update()
+        )
+        if account.first() is None:
+            await db.rollback()
+            raise WebhookError("account_not_found", "no such account")
         count = len(
             (
                 await db.execute(
@@ -529,7 +557,7 @@ def build_webhook_router(
             if name in fields and getattr(body, name) is None:
                 raise WebhookError("invalid_request", f"{name}: may not be null")
         if body.url is not None:
-            _check_url(body.url)
+            await _check_url(body.url)
         sub = await _owned(db, user_id, subscription_id, for_update=True)
         if body.url is not None:
             sub.url = body.url
@@ -614,7 +642,7 @@ def build_webhook_router(
         sid = str(sub.id)
         await db.rollback()
         try:
-            reply = await deps.test_sender.send_test(user_id, sid)
+            event_id = await deps.test_sender.send_test(user_id, sid)
         except WebhookTestUnavailable as exc:
             log.warning(
                 "webhook test hand-off failed: id=%s user=%s (%s)", sid, user_id, exc
@@ -623,7 +651,9 @@ def build_webhook_router(
                 "unavailable", "the test send could not be queued; retry"
             ) from exc
         log.info("webhook test queued: id=%s user=%s", sid, user_id)
-        return JSONResponse({"subscription_id": sid, **reply}, status_code=202)
+        return JSONResponse(
+            {"subscription_id": sid, "event_id": event_id}, status_code=202
+        )
 
     @router.get("/v2/webhooks/{subscription_id}/deliveries")
     async def list_deliveries(
@@ -717,10 +747,23 @@ def build_webhook_router(
                 expires = expires.replace(tzinfo=timezone.utc)
             return expires > now
 
-        def _stale(sub: WebhookSubscription) -> bool:
-            return sub.enc_key_id != box.active_key_id or (
-                _previous_live(sub) and sub.previous_enc_key_id != box.active_key_id
+        def _rewrappable(key_id: Optional[str]) -> bool:
+            return (
+                key_id is not None
+                and key_id != box.active_key_id
+                and box.has_key(key_id)
             )
+
+        def _stale(sub: WebhookSubscription) -> bool:
+            return _rewrappable(sub.enc_key_id) or (
+                _previous_live(sub) and _rewrappable(sub.previous_enc_key_id)
+            )
+
+        def _unknown_keys(sub: WebhookSubscription) -> list[str]:
+            ids = [sub.enc_key_id]
+            if _previous_live(sub):
+                ids.append(str(sub.previous_enc_key_id))
+            return [key_id for key_id in ids if not box.has_key(key_id)]
 
         query = (
             select(WebhookSubscription)
@@ -747,21 +790,25 @@ def build_webhook_router(
             rewrapped = 0
             for sub in rows:
                 try:
-                    current = box.rewrap(bytes(sub.secret_enc), sub.enc_key_id)
-                    if current is not None:
+                    if _rewrappable(sub.enc_key_id):
+                        current = box.encrypt(
+                            box.decrypt(bytes(sub.secret_enc), sub.enc_key_id)
+                        )
                         sub.secret_enc, sub.enc_key_id = (
                             current.ciphertext,
                             current.key_id,
                         )
                         rewrapped += 1
-                    if _previous_live(sub):
-                        previous = box.rewrap(
-                            bytes(sub.previous_secret_enc), str(sub.previous_enc_key_id)
+                    if _previous_live(sub) and _rewrappable(sub.previous_enc_key_id):
+                        previous = box.encrypt(
+                            box.decrypt(
+                                bytes(sub.previous_secret_enc),
+                                str(sub.previous_enc_key_id),
+                            )
                         )
-                        if previous is not None:
-                            sub.previous_secret_enc = previous.ciphertext
-                            sub.previous_enc_key_id = previous.key_id
-                            rewrapped += 1
+                        sub.previous_secret_enc = previous.ciphertext
+                        sub.previous_enc_key_id = previous.key_id
+                        rewrapped += 1
                 except SecretBoxError as exc:
                     log.error(
                         "webhook secret could not be re-sealed: id=%s user=%s (%s)",
@@ -776,6 +823,16 @@ def build_webhook_router(
                     user_id,
                     rewrapped,
                 )
+        unknown = [
+            f"{sub.id}:{key_id}" for sub in rows for key_id in _unknown_keys(sub)
+        ]
+        if unknown:
+            log.warning(
+                "webhook secrets under a key id the ring doesn't hold, returned as stored: "
+                "user=%s rows=%s",
+                user_id,
+                ",".join(unknown),
+            )
         payload = []
         for sub in rows:
             live = _previous_live(sub)

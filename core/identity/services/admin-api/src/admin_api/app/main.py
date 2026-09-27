@@ -32,7 +32,7 @@ from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..schema.models import APIToken, PlatformSetting, User
-from ..token_scope import VALID_SCOPES, generate_prefixed_token
+from ..token_scope import USER_TIER_SCOPES, VALID_SCOPES, generate_prefixed_token
 from .db import get_db
 from . import events as events_mod
 from . import person_settings as person_settings_mod
@@ -91,7 +91,7 @@ async def get_current_user(api_key: str = Security(USER_KEY_HEADER),
     if not row:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid API Key")
     token_scopes = set(row.scopes) if row.scopes else set()
-    if not token_scopes & VALID_SCOPES:
+    if not token_scopes & USER_TIER_SCOPES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Token scope not authorized for this endpoint")
     user = (await db.execute(select(User).where(User.id == row.user_id))).scalars().first()
     if not user:

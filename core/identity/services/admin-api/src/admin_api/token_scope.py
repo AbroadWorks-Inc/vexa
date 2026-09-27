@@ -14,6 +14,9 @@ TOKEN_PREFIX = "vxa"
 TOKEN_PATTERN = re.compile(r"^vxa_([a-z]+)_(.+)$")
 
 VALID_SCOPES: Set[str] = {"bot", "tx", "browser", "webhooks", "erase", "export"}
+#: The scopes the /user/* self-serve tier answers. The least-privilege scopes open their own routes
+#: only (§1.10), so they are mintable but never reach this tier.
+USER_TIER_SCOPES: Set[str] = {"bot", "tx", "browser"}
 
 
 def generate_prefixed_token(scope: str, length: int = 32) -> str:

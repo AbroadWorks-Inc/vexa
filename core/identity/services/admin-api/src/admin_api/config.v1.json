@@ -146,7 +146,7 @@
    "key": "WEBHOOK_MAX_SUBSCRIPTIONS",
    "class": "defaulted",
    "default": "20",
-   "description": "webhooks (§1.13): per-account quota of webhook subscriptions; POST /v2/webhooks past it is refused with 429 quota_exceeded (no Retry-After)",
+   "description": "webhooks (§1.13): per-account quota of webhook subscriptions; POST /v2/webhooks past it is refused with 429 quota_exceeded (no Retry-After). Not a whole number of at least 1, admin-api refuses to start.",
    "targets": []
   },
   {

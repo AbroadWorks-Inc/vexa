@@ -115,10 +115,11 @@ async def run_single_flight(
                 {"key": RETENTION_LOCK_KEY},
             )
     log.info(
-        "webhook retention: deleted %d deliveries and %d outbox rows older than %d days",
+        "webhook retention: deleted %d deliveries in a final state older than %d days, "
+        "then %d published outbox rows with no deliveries left",
         result.deliveries,
-        result.outbox,
         retention_days,
+        result.outbox,
     )
     return result
 

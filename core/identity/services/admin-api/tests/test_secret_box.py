@@ -159,3 +159,9 @@ def test_the_box_never_shows_its_keys():
     for value in VECTORS["key_ring"].values():
         assert value not in text
     assert "k1" in repr(box)
+
+
+def test_the_box_says_which_key_ids_it_holds():
+    box = _box()
+    assert box.has_key("k1") and box.has_key("k2")
+    assert not box.has_key("k0")

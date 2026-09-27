@@ -166,6 +166,10 @@ class SecretBox:
             ) from exc
         return plain.decode("utf-8")
 
+    def has_key(self, key_id: str) -> bool:
+        """Whether the ring holds ``key_id``."""
+        return key_id in self._ring
+
     def rewrap(self, ciphertext: bytes, key_id: str) -> Optional[Sealed]:
         """The same secret sealed under the active key, or ``None`` when it already is."""
         if key_id == self._active:

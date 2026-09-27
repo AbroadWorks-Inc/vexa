@@ -9,15 +9,21 @@ private-host allow-list; the two services share no code, so both test suites rea
   accepted as is, without resolving it;
 - the internal hostnames below are refused;
 - a literal address is refused when it is private, loopback, link-local, multicast or "this
-  network";
+  network"; an IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) is judged as the IPv4 address it
+  maps;
 - a DNS name is resolved, and refused when it resolves to nothing or when ANY of its addresses
   is refused.
 
 A refusal says why in words, never echoing the URL.
+
+Resolving a name blocks, so request handlers call ``check_subscription_url_off_loop``: the check
+runs in a worker thread under a total timeout, and a check that outlasts it is a refusal. admin-api
+also answers the gateway's token validation, which a resolver hanging on the event loop would stall.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from typing import Callable, Collection, List, Optional
@@ -29,6 +35,7 @@ __all__ = [
     "Resolver",
     "parse_allowlist",
     "check_subscription_url",
+    "check_subscription_url_off_loop",
 ]
 
 DEFAULT_PRIVATE_HOST_ALLOWLIST = "portal.notetaker.svc.cluster.local"
@@ -88,6 +95,8 @@ def _is_blocked_ip(address: str) -> bool:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
     return any(ip.version == net.version and ip in net for net in _BLOCKED_NETWORKS)
 
 
@@ -131,3 +140,22 @@ def check_subscription_url(
         addresses = [hostname]
     if any(_is_blocked_ip(address) for address in addresses):
         raise UrlRefused(_PRIVATE)
+
+
+async def check_subscription_url_off_loop(
+    url: str,
+    *,
+    allowlist: Collection[str],
+    resolver: Optional[Resolver] = None,
+    timeout_s: float,
+) -> None:
+    """``check_subscription_url`` in a worker thread; past ``timeout_s`` the URL is refused."""
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                check_subscription_url, url, allowlist=allowlist, resolver=resolver
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError as exc:
+        raise UrlRefused("the URL's host could not be resolved in time") from exc

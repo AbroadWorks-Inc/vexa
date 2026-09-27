@@ -285,7 +285,7 @@ def test_the_retention_window_is_the_setting(db):
 
 
 @needs_pg
-def test_only_one_sweep_runs_at_a_time(db):
+def test_only_one_sweep_runs_at_a_time(db, caplog):
     """Single flight: while another session holds the retention lock, a run does nothing."""
     from sqlalchemy import text
 
@@ -315,8 +315,14 @@ def test_only_one_sweep_runs_at_a_time(db):
         finally:
             await engine.dispose()
 
-    skipped, ran = asyncio.run(scenario())
+    with caplog.at_level(logging.INFO, logger="admin_api.retention"):
+        skipped, ran = asyncio.run(scenario())
 
     assert skipped is None
     assert ran == RetentionResult(deliveries=1, outbox=1)
     assert _ids(db, "webhook_outbox", "event_id") == set()
+    (line,) = [r.getMessage() for r in caplog.records if "deleted" in r.getMessage()]
+    assert line == (
+        "webhook retention: deleted 1 deliveries in a final state older than 30 days, "
+        "then 1 published outbox rows with no deliveries left"
+    )
