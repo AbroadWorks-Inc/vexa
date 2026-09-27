@@ -23,7 +23,7 @@ service stays out of the identity business. Python because it carves the parent 
 ## Contracts
 
 **Owns:** [`core/identity/contracts/identity.v1`](../../contracts/identity.v1) — `ScopedToken`
-(`subject`, `scopes[]` ∈ `{bot,tx,browser}`, `expires_at`), `AccessDecision` (default-deny verdict),
+(`subject`, `scopes[]` ∈ `{bot,tx,browser,webhooks,erase,export}`, `expires_at`), `AccessDecision` (default-deny verdict),
 `ResourceKind`. Sealed in [`contracts.seal.json`](../../../../contracts.seal.json).
 Token prefix/scope rules live in `src/admin_api/token_scope.py` (`VALID_SCOPES`, `vxa_<scope>_…`).
 
