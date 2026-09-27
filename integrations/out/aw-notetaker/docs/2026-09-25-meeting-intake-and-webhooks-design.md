@@ -68,6 +68,8 @@
   15. The real-Postgres tests install the Dockerfile's `sqlalchemy`/`asyncpg` pins for the run; meeting-api's test setup doesn't declare them.
   16. §6.1 correction: admin-api measured 154 passed / 0 skipped on this machine.
   17. The `readme` and `dataflow` gates count gitignored local build folders (`exporter.egg-info`, `__pycache__`). Delete them before a push.
+  18. Paging as built: `GET /v2/entries` pages by `external_id`, which the unique index `uq_meeting_entries_user_source_external` serves. `GET /v2/meetings` pages by meeting time, then id, newest first. No index serves that query as a whole, because who may see a meeting is decided through its entries.
+  19. `GET /v2/meetings/{id}` without `user=` returns any meeting of the account. With `user=` it returns only a meeting the user owns or is invited to (§2.1).
 
 ---
 
@@ -482,11 +484,13 @@ Metrics are labelled by `user_id`.
 | `POST /v2/entries/remove` | `bot` | Remove one entry |
 | `GET /v2/entries?user=&cursor=&limit=` | `bot` | The sender's active entries for one user, with `content_hash`, so a sender can compare its view with aw-bots' and send only the differences |
 | `GET /v2/meetings?user=&from=&to=&status=&external_id=&cursor=&limit=` | `tx` | Meetings a user may see (owner or invited, over entries in any state); cursor paging, `limit` ≤ 200 |
-| `GET /v2/meetings/{id}?user=` | `tx` | One meeting by UUID. With `user=`, the same owner-or-invited check; otherwise `meeting_not_found` |
+| `GET /v2/meetings/{id}?user=` | `tx` | One meeting by UUID. Without `user=`: any meeting of the account. With `user=`: only a meeting that user owns or is invited to; otherwise `meeting_not_found` |
 | `POST /v2/meetings/{id}/stop` | `bot` | The bot in the call leaves now; no live bot → `no_live_bot` |
 | `DELETE /v2/meetings/{id}` | `erase` | Erase a finished meeting's aw-bots data (§1.13) |
 | `POST /v2/meetings/{id}/export` | `export` | The exporter reports its result (§1.9) |
 | `/v2/webhooks…` | `webhooks` | Manage webhook subscriptions (§2.7) |
+
+**Reading one meeting.** `GET /v2/meetings/{id}` without `user=` returns the meeting if it belongs to the calling account. With `user=`, it returns the meeting only if that user owns it or is invited to it (through any of its entries, in any state). Otherwise the answer is `meeting_not_found`, exactly as for another account's meeting or an unknown UUID.
 
 `routes.v1.json` (meetings) and `core/identity/routes.v1.json` (webhooks) carry these rows, and the gateway registers a forwarding route for each: its routes are registered one by one, and a scope must be in its fixed list (`routes_manifest.SCOPES`). The task that adds a route adds its gateway route too (V12). The contract is sealed as `core/meetings/contracts/intake.v1/`.
 
@@ -1147,7 +1151,7 @@ The behaviour is exactly §1.3. `test_intake_use_cases.py` has one test per §2.
 
 **Behaviour:**
 - Every route and scope is as §2.1.
-- **Cursor:** base64 `(meeting_event_time, id)`, the order `ix_meeting_user_event_order` serves.
+- **Paging:** `GET /v2/entries` pages by `external_id` (served by `uq_meeting_entries_user_source_external`). `GET /v2/meetings` pages by `(meeting_event_time, id)`, newest first, with a base64 cursor of that pair. No index is claimed for it, because visibility goes through the entries (V12).
 - **Errors:** the §2.5 shape. Validation failures on `/v2` are 400 (a route-scoped handler; upstream keeps 422). DB down → 503. Another account's uuid → 404.
 - **DELETE:** the upstream function first, then one transaction deleting deliveries (attempts cascade), outbox and entries. Reply `{meeting, deleted: {objects, entries, outbox, deliveries}}`.
 
@@ -1161,7 +1165,7 @@ The behaviour is exactly §1.3. `test_intake_use_cases.py` has one test per §2.
   - a storage failure aborts before any row is removed;
   - no call to the exporter or `aw-chatworks-transcribe`.
 - [ ] Commits: `refactor(meetings): completed-artifact deletion as one callable` (upstream tests unchanged), `feat(intake): /v2 routes, entry reconciliation list, erasure (§2.1)`.
-- [ ] `pnpm seal:contracts` → `chore(seal): intake.v1 and webhook.v1 (lane:contract)`; `contract-version` green.
+- [ ] `pnpm seal:contracts` → `chore(seal): intake.v1 (lane:contract)` (`webhook.v1` was sealed in A4, V12); `contract-version` green.
 
 **M2:** verify, then push both branches.
 
