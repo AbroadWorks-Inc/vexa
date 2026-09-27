@@ -310,15 +310,27 @@ def test_an_export_key_reaches_only_the_export_route():
 
 def test_the_exporter_key_reaches_its_reads_and_its_result_route():
     """The exporter's key is ``tx`` + ``export`` (§1.10): its reads (the recording list, the master
-    and the transcript by id) and its result route are all open to it."""
-    client = _client(["tx", "export"])
+    and the transcript by id) and its result route are all open to it, and each is forwarded to
+    meeting-api at the same path."""
+    downstream = FakeDownstream(status_code=200, body={"ok": True})
+    client = TestClient(create_app(
+        FakeAuthorizer(user={"user_id": 7, "scopes": ["tx", "export"], "max_concurrent": 3,
+                             "email": "u@example.com"}),
+        downstream,
+        FakeRedis(),
+    ))
     for method, url in [
         ("GET", "/recordings"),
         ("GET", "/recordings/42/master"),
         ("GET", "/transcripts/by-id/42"),
         ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/export"),
     ]:
-        assert _request(client, method, url).status_code != 403, f"{method} {url}"
+        downstream.last = None
+        r = _request(client, method, url)
+        assert r.status_code == 200, f"{method} {url} -> {r.status_code}"
+        assert downstream.last is not None, f"{method} {url} was not forwarded"
+        assert downstream.last["method"] == method
+        assert downstream.last["url"].endswith(url), f"{method} {url}"
 
 
 # --- deny by default -----------------------------------------------------------------------------
