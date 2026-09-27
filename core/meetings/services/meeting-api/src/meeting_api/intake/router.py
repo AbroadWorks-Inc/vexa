@@ -31,6 +31,7 @@ delivery rows, outbox rows and entries (``IntakeReads.erase``). The meeting row 
 from __future__ import annotations
 
 import re
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -39,6 +40,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 
+from ..bot_spawn.auto_join import LIVE_STATUSES
 from ..collector.app import delete_completed_artifacts
 from ..collector.ports import TranscriptStore
 from ..obs import log_event
@@ -54,11 +56,19 @@ from .rules import FINISHED_STATUSES, is_live
 from .service import IntakeService
 from .validation import IntakeError
 
-__all__ = ["build_intake_router", "MAX_LIMIT", "DEFAULT_LIMIT"]
+__all__ = ["build_intake_router", "MAX_LIMIT", "DEFAULT_LIMIT", "MEETING_STATUSES"]
 
 #: §2.1: ``limit`` ≤ 200 on the paged reads.
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 100
+
+#: The statuses a meeting can have, so the ones ``status=`` may name: upstream's planned ones,
+#: every live one, and the finished ones.
+MEETING_STATUSES = frozenset(
+    {"idle", "scheduled", "completed", "failed", *LIVE_STATUSES}
+)
+#: Errors that mean a bug, not an outage: they stay 500s wherever a failure is otherwise mapped.
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, KeyError, AssertionError, NameError)
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _NO_LIVE_BOT = "no bot in this meeting; to cancel it, remove the entry"
@@ -277,6 +287,11 @@ def build_intake_router(
         x_user_id: Optional[str] = Header(default=None),
     ) -> JSONResponse:
         user_id = _account(x_user_id)
+        if status is not None and status not in MEETING_STATUSES:
+            raise IntakeError(
+                "invalid_request",
+                f"status: must be one of {sorted(MEETING_STATUSES)}",
+            )
         query = MeetingQuery(
             user=_user(user),
             start_from=_time(start_from, "from"),
@@ -339,6 +354,8 @@ def build_intake_router(
                 exc.status_code, "unavailable"
             )
             raise IntakeError(code, str(exc.detail)) from exc
+        except _PROGRAMMING_ERRORS:
+            raise
         except Exception as exc:
             # Storage first: whatever failed, no row has been removed yet, and the same call can
             # be retried with the original object keys.
@@ -349,7 +366,10 @@ def build_intake_router(
                 span="meetings.intake.erase",
                 user_id=user_id,
                 meeting_id=str(meeting.id),
-                fields={"error": type(exc).__name__},
+                fields={
+                    "error": type(exc).__name__,
+                    "traceback": traceback.format_exc(),
+                },
             )
             raise IntakeError(
                 "unavailable",

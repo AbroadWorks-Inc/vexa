@@ -315,6 +315,23 @@ async def test_a_storage_failure_aborts_before_any_row_is_removed():
     assert world.events() == 0
 
 
+async def test_a_bug_in_the_deleter_is_a_500_not_unavailable():
+    """A programming error is not a storage outage: it stays a 500 (and nothing is removed)."""
+
+    class Broken(InMemoryStorage):
+        async def delete(self, key: str) -> None:
+            raise TypeError("delete() got an unexpected keyword argument")
+
+    world = _World(storage_cls=Broken)
+    uuid = await world.setup("completed")
+    events_before = world.events()
+    async with world.client() as client:
+        r = await client.delete(f"/v2/meetings/{uuid}", headers=ACCOUNT)
+    assert r.status_code == 500
+    assert world.events() == events_before
+    assert world.h.store.entries_of(world.mid, "closed") != []
+
+
 async def test_erase_another_accounts_or_an_unknown_meeting_is_404():
     world = _World()
     uuid = await world.setup("completed")

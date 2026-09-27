@@ -415,6 +415,11 @@ async def test_meeting_list_visibility_order_and_filters():
             **{"from": "2026-09-30T00:00:00Z", "to": "2026-10-01T00:00:00+00:00"},
         )
         before = await listing(user=A, to="2026-09-30T00:00:00Z")
+        unknown_status = await client.get(
+            "/v2/meetings",
+            params={"user": A, "status": "cancelled"},
+            headers=ACCOUNT,
+        )
         naive = await client.get(
             "/v2/meetings",
             params={"user": A, "from": "2026-09-30T00:00:00"},
@@ -431,6 +436,7 @@ async def test_meeting_list_visibility_order_and_filters():
     assert before == [ids["owned"]]
     _error(naive, 400, "invalid_request")
     _error(no_user, 400, "invalid_request")
+    _error(unknown_status, 400, "invalid_request")
 
 
 async def test_meeting_list_cursor_pages_newest_first_without_gaps():
@@ -675,14 +681,17 @@ async def test_pg_reads_visibility_paging_and_entries(pg_routes):
     service, reads, stop, _ = pg_routes
     async with http(intake_app(service, reads, stop)) as client:
         ids = await _visibility_world(client, None)
+        days = []
         for day in range(1, 5):
-            await _put(
+            reply = await _put(
                 client,
                 f"google:day{day}",
                 start=f"2026-10-0{day}T09:00:00.123456Z",
                 end=f"2026-10-0{day}T09:30:00Z",
             )
-        seen, cursor = [], None
+            days.append(reply["meeting"]["id"])
+        pages: list[list[str]] = []
+        cursor = None
         while True:
             params: dict[str, Any] = {"user": A, "limit": 2}
             if cursor:
@@ -690,7 +699,7 @@ async def test_pg_reads_visibility_paging_and_entries(pg_routes):
             r = await client.get("/v2/meetings", params=params, headers=ACCOUNT)
             assert r.status_code == 200, r.text
             conforms(r.json(), "MeetingPage")
-            seen.append(len(r.json()["meetings"]))
+            pages.append([m["id"] for m in r.json()["meetings"]])
             cursor = r.json()["next_cursor"]
             if cursor is None:
                 break
@@ -711,7 +720,13 @@ async def test_pg_reads_visibility_paging_and_entries(pg_routes):
             params={"user": A, "limit": 3, "cursor": entries.json()["next_cursor"]},
             headers=ACCOUNT,
         )
-    assert seen == [2, 2, 2]
+    # Newest meeting time first, across pages, with nothing skipped or repeated: the four
+    # October meetings (microsecond times), then Sep 30 ("removed"), then Sep 29 ("owned").
+    assert pages == [
+        [days[3], days[2]],
+        [days[1], days[0]],
+        [ids["removed"], ids["owned"]],
+    ]
     assert [m["id"] for m in attendee.json()["meetings"]] == [ids["owned"]]
     _error(stranger, 404, "meeting_not_found")
     assert removed.status_code == 200
