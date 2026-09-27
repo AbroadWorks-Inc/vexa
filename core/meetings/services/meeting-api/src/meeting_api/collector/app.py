@@ -115,6 +115,61 @@ def _resolve_user_id(x_user_id: Optional[str]) -> int:
         raise HTTPException(status_code=401, detail="Invalid user identity")
 
 
+async def delete_completed_artifacts(
+    store: TranscriptStore,
+    deleter: Optional[Callable],
+    user_id: int,
+    meeting_id: int,
+    *,
+    log_event: Callable[..., dict] = _default_log_event,
+) -> dict:
+    """Erase a finished (``completed``/``failed``) meeting's artifacts, keeping the meeting row.
+
+    Storage first: every recording's objects go through ``deleter``, and only then are the
+    transcript rows and recording metadata removed (``finalize_completed_artifact_deletion``). Any
+    exception from ``deleter`` aborts before the database is touched, so the same owner-scoped call
+    can retry with the original keys. Raises ``HTTPException`` 404 (unknown or another account's
+    meeting), 409 (the lifecycle isn't terminal) or 503 (recordings but no ``deleter``). Returns
+    ``{"kind": "artifacts", "objects_deleted", "already_deleted"}``.
+    """
+    plan = await store.prepare_completed_artifact_deletion(user_id, meeting_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if plan.get("error") == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail="Meeting artifacts can only be deleted after the lifecycle is terminal",
+        )
+
+    recordings = list(plan.get("recordings") or [])
+    if recordings and deleter is None:
+        raise HTTPException(status_code=503, detail="Artifact storage deletion unavailable")
+    deleted_objects = 0
+    for recording in recordings:
+        # Storage FIRST. Any exception deliberately aborts before DB paths/transcripts are
+        # scrubbed, so the same owner-scoped request can retry with the original keys.
+        deleted_objects += len(await deleter(recording))
+
+    finalized = await store.finalize_completed_artifact_deletion(user_id, meeting_id)
+    if finalized is None:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if finalized is False:
+        raise HTTPException(
+            status_code=409,
+            detail="Meeting artifacts can only be deleted after the lifecycle is terminal",
+        )
+    log_event(
+        "meeting_artifacts_deleted", audience="user", span="meetings.artifacts.delete",
+        user_id=user_id, meeting_id=str(meeting_id),
+        fields={"recordings": len(recordings), "objects": deleted_objects,
+                "already_deleted": bool(plan.get("already_deleted"))},
+    )
+    return {
+        "kind": "artifacts", "objects_deleted": deleted_objects,
+        "already_deleted": bool(plan.get("already_deleted")),
+    }
+
+
 def build_router(
     store: TranscriptStore,
     redis: RedisBus,
@@ -590,42 +645,9 @@ def build_router(
         if result is None:
             raise HTTPException(status_code=404, detail="Meeting not found")
         if result is False:
-            plan = await store.prepare_completed_artifact_deletion(user_id, meeting_id)
-            if plan is None:
-                raise HTTPException(status_code=404, detail="Meeting not found")
-            if plan.get("error") == "conflict":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Meeting artifacts can only be deleted after the lifecycle is terminal",
-                )
-
-            recordings = list(plan.get("recordings") or [])
-            if recordings and artifact_object_deleter is None:
-                raise HTTPException(status_code=503, detail="Artifact storage deletion unavailable")
-            deleted_objects = 0
-            for recording in recordings:
-                # Storage FIRST. Any exception deliberately aborts before DB paths/transcripts are
-                # scrubbed, so the same owner-scoped request can retry with the original keys.
-                deleted_objects += len(await artifact_object_deleter(recording))
-
-            finalized = await store.finalize_completed_artifact_deletion(user_id, meeting_id)
-            if finalized is None:
-                raise HTTPException(status_code=404, detail="Meeting not found")
-            if finalized is False:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Meeting artifacts can only be deleted after the lifecycle is terminal",
-                )
-            log_event(
-                "meeting_artifacts_deleted", audience="user", span="meetings.artifacts.delete",
-                user_id=user_id, meeting_id=str(meeting_id),
-                fields={"recordings": len(recordings), "objects": deleted_objects,
-                        "already_deleted": bool(plan.get("already_deleted"))},
+            return await delete_completed_artifacts(
+                store, artifact_object_deleter, user_id, meeting_id, log_event=log_event
             )
-            return {
-                "kind": "artifacts", "objects_deleted": deleted_objects,
-                "already_deleted": bool(plan.get("already_deleted")),
-            }
         log_event(
             "meeting_plan_deleted", audience="user", span="meetings.plan.delete",
             user_id=user_id, meeting_id=str(meeting_id), fields={},
