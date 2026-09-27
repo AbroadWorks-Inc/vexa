@@ -1,6 +1,6 @@
 # AW Bots: meeting intake and webhooks — design and implementation plan
 
-- **Date:** 2026-09-25, revised 2026-09-26.
+- **Date:** 2026-09-25, revised 2026-09-27.
 - **Status:** **final for build, revision V12.** This is the only document for this work: the design (Parts 0–4), the rollout order (Part 5) and the step-by-step build plan (Part 6).
 - **Scope:** handoff §6 A (`aw-notetaker/docs/handoffs/2026-09-24-aw-bots-handoff.md`). It covers how any app sends meetings to aw-bots, and how aw-bots reports every result back.
 - **Where the work happens:** in the existing checkouts, with no extra folders or worktrees.
@@ -74,6 +74,28 @@
   21. Recording uploads carry the internal secret as `Authorization: Bearer`, not `x-internal-secret`. Their existing check (the internal secret or a MeetingToken) stays; the secret comparison is now constant-time (§1.10).
   22. Bots started before that deploy carry callback URLs without a token, so the rollout runs with no meeting in progress (§1.10, Part 5).
   23. As built: the signed `<path>` is the forwarded path, percent-decoded, without the query. admin-api's `/admin/*` (the admin-token surface where the operator mints keys and the web console signs in) takes no caller from the gateway and needs no signature, like `/internal/*`. Without `GATEWAY_IDENTITY_SECRET` the gateway refuses to start, and meeting-api and admin-api refuse every client request (§1.10).
+  24. A spawn that fails **after** it claimed the row ends that meeting `failed`, outcome `not_sent`, with the typed code and exact message, adopted or not. It is never turned back to `scheduled`: a bot pod may already exist. Item 9 covers failures before the claim only (§1.3).
+  25. Upstream `POST /bots` without a row id takes the R1 `join_now` rule over meetings with entries. Otherwise it keeps upstream's claim rule (the newest planned row) over rows without entries, skipping any that starts later than now + `JOIN_NOW_ADOPT_AHEAD_S`. Otherwise it inserts (§1.5).
+  26. Rows without entries spawn through the same exact-row path and keep upstream's live-bot check, backoff and `AUTO_JOIN_ALLOW_UNCAPPED`. One that fails after its claim also gets outcome `not_sent` and `meeting.not_sent` (§1.5).
+  27. A pasted meeting that was never sent (no end time) is given up after one hour: it ends `not_sent` once its start + `JOIN_NOW_ADOPT_AHEAD_S` passes (§1.5).
+  28. The planned-meeting store (`update_planned_meeting`, `delete_planned_meeting`, used by upstream's calendar sync and routes) refuses rows that have entries, whoever calls it (§1.6).
+  29. Only timed plans go stale. A link lookup for a planned edit skips a row without entries that is `scheduled`, has a readable `scheduled_at` and is past `AUTO_JOIN_GRACE_S`; `idle` and untimed plans never go stale. With no live or planned row it takes the most recent started one. `scheduled` includes `idle` there, `share` stays a planned edit, and upstream routes answer 409 as `{"detail": "<code>"}` (§1.6).
+  30. A stopped bot that is still joining (`requested`, `joining`, `awaiting_admission`) keeps its stage: it gets `stop_requested` and the outcome, no event, and its workload is deleted. Only a bot that reached the meeting goes `stopping`. Its final event carries the outcome (§1.7).
+  31. R5 records the stop in the removal's own transaction: the removed last entry and its stop commit together or not at all. The leave command follows the commit; if it fails, the stale-stopping sweep ends the bot. A calendar removal after a user's stop changes nothing, and the outcome stays empty (§1.3, §1.7).
+  32. The status writer also accepts upstream's existing `start_failed`, on `failed` rows only (the auto-join retry rule reads it); intake never writes it. §1.1's "ten values" is the sealed set, not every value in the code.
+  33. Typed lifecycle events, one per change: → `active` is `meeting.started`, → `completed` is `meeting.completed`, → `failed` is `bot.failed` (`meeting.not_sent` when the outcome is `not_sent`), and every other step is `meeting.status_change`. A change that has its own event keeps it (`meeting.scheduled` for a new meeting, `meeting.removed` for R8 and merges). Each has `sequence` +1 and `data.change`. A receiver that wants every step accepts the typed events too (§2.7).
+  34. admin-api keeps a checked copy of the event list: its image builds from its own folder, so it can't read the sealed `webhook.v1` file. A test fails if the copy drifts.
+  35. Sealed `identity.v1` lists the new scopes `webhooks`, `erase` and `export`, re-sealed in its own commit (§1.12). admin-api's `/user/*` routes keep the three user-tier scopes (`bot`, `tx`, `browser`), so a key holding only the new scopes can't use them (§1.10).
+  36. Compose, Lite and the chart's own Secret (no `existingSecretName`) supply `GATEWAY_IDENTITY_SECRET`, each in its usual way. They don't need the webhook key ring: without it, subscriptions are off and the services log why (§1.11).
+  37. The scheduler waits without the 5-minute retry pause, and never merges into a bot that is stopping: a leaving bot holds the link, so the due meeting waits. The account's bot limit counts upstream's statuses; only the duplicate check uses the full live set (§1.5).
+  38. Send-time outcomes: a URL the guard refuses at send time → `failed`; a 3xx → `failed` (redirects are never followed). A subscription that can't be read, a DNS failure or a secret that can't be opened → retry as usual, so a broken key ring ends `dead` after about 2.6 h and the dead-delivery alert fires. The publisher is off without admin-api's internal read, and the sender without the key ring; both log it once and the rows wait (§1.8).
+  39. The export route: a meeting with no audio gets a `failed` report ("no audio recording"); a quarantined item's report gets one try (an operator re-enqueue retries it); the same state and path again is unchanged even if the error differs; an unfinished meeting → `meeting_not_finished`. The exporter reads as its key's account (§1.9).
+  40. Every `/v2` error the gateway itself returns uses §2.5's shape: 503 `unavailable` when the identity secret is unset or the key check can't be made, 400 `invalid_request` for a bad path value, and `unavailable` for an upstream 502/504 (§2.5).
+  41. Metrics as built: the `not_sent` counter moves inside the status writer before commit (a rare over-count on rollback); database gauges are read at scrape time with a 2 s cut-off; per-request counters, per-account gauges and key expiry carry `user_id` (§1.13).
+  42. The signature covers `<t>.<user_id>.<METHOD>.<path>` only, not the query, body or other forwarded headers; a captured request could be replayed within 60 s with another query or body. Left for an owner decision (Part 9 #9). `/docs` and `/openapi.json` need a signature too (§1.10).
+  43. A removed entry sent again with the same hash is re-activated, not `unchanged`. A link change of a meeting's only entry keeps the UUID (the meeting moves); `entry_moved` applies when the entry joins another meeting (§1.3, §2.6.9).
+  44. Rollout corrections (Part 5): the gateway and admin-api need our images, because upstream's lack the `/v2` routes, the scopes and the signature. `aw-bots-secrets` gains `GATEWAY_IDENTITY_SECRET` and the webhook key ring before the `helm upgrade`. The new admin-api refuses direct `/user/*` calls with a key, so a runbook step that calls it over a port-forward goes through the gateway. The exporter queue drains with the old exporter; meeting-api, the gateway and the exporter key go live before the new exporter; failed items from before the rollout are not re-enqueued as they are.
+  45. Upstream behaviour found during the build and left as it is: Part 9 #4–#8.
 
 ---
 
@@ -155,7 +177,7 @@ Portal ──instant join / stop / read (always "for whom")───────
 **R8: Removed meetings are kept as history.** A meeting whose last entry is removed before its bot was sent ends `failed`, `completion_reason: "stopped"`, outcome `cancelled_by_calendar`, with `meeting.removed`. The row is kept.
 
 **Reasons: the sealed enum stays, and AW's cause is additive.**
-- `completion_reason` is the sealed `lifecycle.v1` set: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded`. `lifecycle/retry.py` classifies on it, so it is never extended.
+- `completion_reason` is the sealed `lifecycle.v1` set: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded`. `lifecycle/retry.py` classifies on it, so it is never extended. The one other value already in the code, upstream's `start_failed` on a `failed` row (a workload that never started; the auto-join retry rule reads it), stays as it is. Intake never writes it (V12).
 - Every meeting object carries an additive **`outcome`**, `null` until set:
 
 ```json
@@ -238,8 +260,8 @@ The module talks to storage through one narrow port, `IntakeStore`, with an in-m
 **`PUT /v2/entries`**, under the lock of the entry's meeting link (both links, in sorted order, when the link changes):
 1. Validate the fields and parse the link (`collector/meeting_link.py`, the one parser). An unknown link → `unrecognized_link`. A host in `ENTRY_BLOCKED_HOSTS` → `platform_not_enabled`.
 2. Read the entry by (`user_id`, `source_user`, `external_id`) **under the lock**. If its link changed since the lock was chosen, restart once.
-3. **An unchanged entry** (same `content_hash`) → `unchanged`.
-4. **A `removed` or `closed` entry comes back** → it becomes active and takes the R1 path (`created`/`joined_existing`, with `previous_meeting_id`). A `closed` entry does this only if R7's future-time rule applies. Otherwise → `not_changed_finished`.
+3. **An unchanged active entry** (same `content_hash`) → `unchanged`.
+4. **A `removed` or `closed` entry comes back**, even with the same `content_hash` → it becomes active and takes the R1 path (`created`/`joined_existing`, with `previous_meeting_id`). A `closed` entry does this only if R7's future-time rule applies. Otherwise → `not_changed_finished`.
 5. **Its meeting is live** → store the change on the entry and reply `not_changed_live` (applied at finish, R7).
 6. Otherwise, match R1. Found → attach. Not found → create a meeting (`scheduled`, `data.auto_join=true`).
 7. A meeting left with no active entries is removed (R8, detail `entry_moved`).
@@ -251,11 +273,11 @@ The module talks to storage through one narrow port, `IntakeStore`, with an in-m
 **`join_now`.** After commit, the handler calls the spawn path for that exact row (§1.5):
 - sent → `requested`;
 - the scheduler got there first, or a bot is already live → `joined_existing`, never `not_sent`;
-- a real failure → the meeting ends `not_sent` with the typed code and exact message, and the reply shows it.
+- a real failure → the meeting ends `not_sent` with the typed code and exact message, and the reply shows it. The one exception: a failure **before** the claim, on an adopted scheduled meeting that has other entries, removes only the pasted entry (reason `not_sent`), records the error and leaves the meeting `scheduled` (V12). A failure **after** the claim always ends the meeting, adopted or not: a bot pod may already exist.
 
 **`POST /v2/entries/remove`.** Mark the entry `removed`. If it was the last active entry:
 - scheduled → R8;
-- live → stop that meeting (§1.7) with outcome `cancelled_by_calendar`.
+- live → stop that meeting (§1.7) with outcome `cancelled_by_calendar`. The stop is recorded in the removal's own transaction, so both commit or neither does. If the user already stopped the bot, nothing changes and the outcome stays empty.
 
 All status changes are conditional (§1.4). If a scheduled meeting went live meanwhile, the live branch is taken.
 
@@ -284,14 +306,14 @@ A guard test fails if anything else in meeting-api writes `meetings.status`.
 
 ## 1.5 Scheduler (auto-join)
 
-- **Reads only what is due.** Every 30 s it asks the database only for `status='scheduled'` meetings whose join time is within the next `AUTO_JOIN_LEAD_S` (300 s) or already past. The partial index `ix_meeting_scheduled_due` serves this. Meetings with entries are due until `scheduled_end_at`. Entry-less rows (planned through Vexa's own routes) keep upstream's grace window.
-- **Spawns the exact row.** It passes the row id, and the spawn claims exactly that row under the link lock.
-- **Upstream `POST /bots`** has no row id. It claims by the R1 `join_now` rule, else inserts: never a future occurrence.
-- **Dedup** checks the full live set.
-- **Link busy.** If the busy link holds an open-ended `join_now` meeting → merge (R2 exception). Otherwise → `meeting.waiting_for_room` once, with no retry pause: the bot goes on the first tick after the link is free.
-- **A real spawn failure** stores `last_error_code` and `last_error_message` and backs off as upstream does (`AUTO_JOIN_RETRY_BACKOFF_S`).
-- **Not-sent sweep** (every 30 s, single-flight). Scheduled meetings whose `scheduled_end_at` has passed end `not_sent` with detail = `last_error_code`, else `room_busy` if waiting, else `ended_before_sent`, plus the last message.
-- **Settings:** sweep 30 s (`AUTO_JOIN_SWEEP_INTERVAL_S`), lead 300 s (`AUTO_JOIN_LEAD_S`), backoff 300 s, grace `AUTO_JOIN_GRACE_S` (entry-less rows only).
+- **Reads only what is due.** Every 30 s it asks the database only for `status='scheduled'` meetings whose join time is within the next `AUTO_JOIN_LEAD_S` (300 s) or already past. The partial index `ix_meeting_scheduled_due` serves this. Meetings with entries are due until `scheduled_end_at`; an open-ended one never sent is due until its start + `JOIN_NOW_ADOPT_AHEAD_S`. Entry-less rows (planned through Vexa's own routes) keep upstream's grace window.
+- **Spawns the exact row.** It passes the row id, and the spawn claims exactly that row under the link lock. Entry-less rows go the same way, keeping upstream's live-bot check, backoff and `AUTO_JOIN_ALLOW_UNCAPPED`.
+- **Upstream `POST /bots`** has no row id. It claims by the R1 `join_now` rule among meetings with entries; else by upstream's rule (the newest planned row) among entry-less rows, skipping any that starts later than now + `JOIN_NOW_ADOPT_AHEAD_S`; else it inserts: never a future occurrence.
+- **Dedup** checks the full live set. The account's bot limit keeps counting upstream's statuses.
+- **Link busy.** If the busy link holds an open-ended `join_now` meeting whose bot is staying → merge (R2 exception). Otherwise, a leaving (`stopping`) bot included → `meeting.waiting_for_room` once, with no retry pause: the bot goes on the first tick after the link is free.
+- **A real spawn failure** stores `last_error_code` and `last_error_message` and backs off as upstream does (`AUTO_JOIN_RETRY_BACKOFF_S`). A failure after the claim ends the meeting `failed`, outcome `not_sent`, and is never turned back to `scheduled`; an entry-less row gets the same outcome and `meeting.not_sent`.
+- **Not-sent sweep** (every 30 s, single-flight). Scheduled meetings with entries whose `scheduled_end_at` has passed (for an open-ended one, start + `JOIN_NOW_ADOPT_AHEAD_S`) end `not_sent` with detail = `last_error_code`, else `room_busy` if waiting, else `ended_before_sent`, plus the last message.
+- **Settings:** sweep 30 s (`AUTO_JOIN_SWEEP_INTERVAL_S`), lead 300 s (`AUTO_JOIN_LEAD_S`; the code and chart default is 120, our values file sets 300), backoff 300 s, grace `AUTO_JOIN_GRACE_S` (entry-less rows only).
 
 **Spawn failures map to typed codes, never a bare 500:**
 
@@ -314,10 +336,10 @@ Upstream routes that take a link (platform + room code) used to pick the newest 
 | Route kind | Resolves to |
 |---|---|
 | Reads (`GET /transcripts/{p}/{n}`, participants, `POST /ws/authorize-subscribe`) and `annotate` | the live meeting, else the most recent that has started; never a future one |
-| Planned edits (`PATCH`/`DELETE /meetings/{p}/{n}`, `PUT …/intent`, `POST …/workspace`, `POST …/share`) | the live meeting, or the single scheduled one; several scheduled → 409 `ambiguous_room` |
+| Planned edits (`PATCH`/`DELETE /meetings/{p}/{n}`, `PUT …/intent`, `POST …/workspace`, `POST …/share`) | the live meeting, or the single scheduled (or `idle`) one; several → 409 `ambiguous_room`; none → the most recent that has started. A stale entry-less plan (`scheduled`, a readable `scheduled_at`, past `AUTO_JOIN_GRACE_S`) doesn't count; `idle` and untimed plans never go stale |
 | Stop (`DELETE /bots/{p}/{n}`) | the live meeting only; it never cancels future plans |
 
-**Entry-managed meetings are edited only through `/v2/entries`.** Upstream `PATCH`/`DELETE /meetings/{id}`, their native forms and `PUT …/intent` answer 409 `managed_by_entries`. A direct edit would otherwise be undone by recomputation, and a hard delete would orphan entries (hence `ON DELETE RESTRICT`). Reads, `annotate` and `share` stay open. The bot's callbacks and recordings are keyed by session and don't change.
+**Entry-managed meetings are edited only through `/v2/entries`.** Upstream `PATCH`/`DELETE /meetings/{id}`, their native forms and `PUT …/intent` answer 409 `managed_by_entries` (upstream's body shape, `{"detail": "<code>"}`). The planned-meeting store itself (`update_planned_meeting`, `delete_planned_meeting`) refuses such rows, so upstream's calendar sync can't touch them either. A direct edit would otherwise be undone by recomputation, and a hard delete would orphan entries (hence `ON DELETE RESTRICT`). Reads, `annotate` and `share` stay open. The bot's callbacks and recordings are keyed by session and don't change.
 
 ## 1.7 Stopping
 
@@ -325,9 +347,11 @@ Upstream routes that take a link (platform + room code) used to pick the newest 
 1. link lock;
 2. meeting row;
 3. if given, the outcome (on `meeting_aw_state`, so the final webhook carries it);
-4. `write_status(stopping)`;
-5. the leave command on `bot_commands:meeting:{id}`;
+4. a bot that reached the meeting → `write_status(stopping)`; a bot still booting (`requested`, `joining`, `awaiting_admission`) keeps its stage and gets only `stop_requested` (and the outcome), with no event;
+5. after the commit, the leave command on `bot_commands:meeting:{id}`;
 6. a workload delete while the bot is still booting.
+
+Either way the final event carries the outcome. R5 runs steps 2–4 in the removal's own transaction. If the leave command fails, the stop is already recorded and the stale-stopping sweep ends the bot.
 
 A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to cancel it, remove the entry"). A user's stop keeps upstream's `stopped` reason.
 
@@ -337,14 +361,14 @@ A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to ca
 - **Publisher** (single-flight, every 1 s). In one transaction per batch of ≤ 500 unpublished outbox rows, it inserts one `webhook_deliveries` row per matching subscriber (`pending`, due now, `ON CONFLICT DO NOTHING`) and sets `published_at`. A crash before commit means the next tick redoes it: nothing lost, nothing duplicated.
 - **Senders** (one loop per meeting-api replica, every 1 s):
   1. Claim due rows with `FOR UPDATE SKIP LOCKED`, set `sending` with a 60 s lease, and commit.
-  2. Re-check that the subscription is active (else `cancelled`) and that its URL passes the SSRF guard.
+  2. Re-check that the subscription is active (else `cancelled`) and that its URL passes the SSRF guard (else `failed`).
   3. Sign the stored payload text and post it with a 10 s total timeout.
   4. Write an attempt row, then:
      - 2xx → `delivered`;
-     - 5xx, 429, timeout or connection error → retry at +60 s, +300 s, +1800 s, +7200 s, then `dead`;
-     - any other 4xx → `failed`.
+     - 5xx, 429, timeout or connection error, or a subscription, secret or DNS name that can't be read → retry at +60 s, +300 s, +1800 s, +7200 s, then `dead`;
+     - any other answer, a 3xx included (redirects are never followed) → `failed`.
 
-  A crashed replica's lease expires and another replica takes the row.
+  A crashed replica's lease expires and another replica takes the row. Without the key ring the senders are off, and without admin-api's internal read the publisher is off; each logs it once and the rows wait.
 - **Redis is not used for webhooks.** Its eviction policy (`allkeys-lru`, 1 GB) makes it unsafe for anything that must not be lost.
 - **Deleting or pausing a subscription** cancels its pending deliveries in the same transaction.
 - **Ordering:** at-least-once, not in order. Receivers order by `sequence` and dedupe on `event_id`.
@@ -367,13 +391,15 @@ A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to ca
 - **Clients go through the gateway only.** The gateway checks the key's scope, sets `x-user-id`, and **signs** it: `x-gateway-signature: t=<unix>,v1=<hex HMAC-SHA256(GATEWAY_IDENTITY_SECRET, "<t>.<user_id>.<METHOD>.<path>")>`. `<path>` is the path of the forwarded request, percent-decoded, without the query. meeting-api and admin-api reject any client request whose signature is missing, wrong, for a different user, or more than 60 s old (or ahead). A pod calling meeting-api directly with `x-user-id: 1` gets 401. (Network policies are not enforced in this cluster: runbook "Security", checked 2026-09-24.)
   - No signature is needed on `/internal/*`, the bot and runtime callbacks, `/health*`, `/metrics`, and admin-api's `/admin/*`, which checks the admin token (the operator mints keys there).
   - Without `GATEWAY_IDENTITY_SECRET` the gateway refuses to start, and meeting-api and admin-api refuse every client request.
+  - Every other route needs the signature, `/docs` and `/openapi.json` included. So does admin-api's `/user/*`: a direct call with an API key, for example over a port-forward, gets 401.
+  - The signature covers the user, the method and the path, not the query, the body or other forwarded headers (Part 9 #9).
 - **The one direct path is the bots and the runtime**, as Vexa does.
   - **Status callbacks** (`POST /bots/internal/callback/lifecycle`) carry `x-internal-secret`, the internal secret meeting-api puts in each bot's invocation (`services/bot/src/adapters/lifecycle-http.ts:68`). meeting-api compares it in constant time and rejects a missing or wrong one with 401.
   - **Recording uploads** (`POST /internal/recordings/upload`) carry the same secret as `Authorization: Bearer`, or a MeetingToken. That check stays as it was; the secret comparison is now constant-time.
   - **The runtime sends no secret.** It posts each workload event to the `callbackUrl` it was given, verbatim. So meeting-api gives it `<MEETING_API_URL>/runtime/callback?t=<hex HMAC-SHA256(INTERNAL_API_SECRET, "aw-runtime-callback.<workloadId>")>`, a token per bot. `/runtime/callback` recomputes the token from the event's `workloadId` and rejects a missing or wrong one with 401. This is the owner's decision: no runtime change and no runtime image. The token is never logged.
   - **Rollout:** a bot started before this deploy carries a callback URL without a token. Once the new meeting-api runs, that bot's runtime events are refused, so if the bot dies without sending its own final status, the runtime can't close its meeting. That is why the rollout (Part 5) runs with no meeting in progress.
 - **Service-to-service calls** (meeting-api ↔ admin-api internal routes) keep the internal secret, as Vexa has them.
-- **One key per consumer, least privilege.** Keys are created, rotated and revoked by name and id. New scopes: `webhooks`, `erase`, `export` (`admin_api/token_scope.py`).
+- **One key per consumer, least privilege.** Keys are created, rotated and revoked by name and id. New scopes: `webhooks`, `erase`, `export` (`admin_api/token_scope.py`, and the sealed `identity.v1`). admin-api's `/user/*` routes accept only the user-tier scopes `bot`, `tx` and `browser`.
 
 | Key name | Scopes | Where it lives |
 |---|---|---|
@@ -397,8 +423,8 @@ A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to ca
 | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` | `portal.notetaker.svc.cluster.local` | meeting-api, admin-api |
 | `WEBHOOK_MAX_SUBSCRIPTIONS` | 20 | admin-api |
 | `WEBHOOK_DELIVERY_RETENTION_DAYS` | 30 | admin-api |
-| `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | Secret: key ring `{"<id>": "<32 bytes base64>"}` + active id | meeting-api, admin-api |
-| `GATEWAY_IDENTITY_SECRET` | Secret | gateway, meeting-api, admin-api |
+| `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | Secret: key ring `{"<id>": "<32 bytes base64>"}` + active id. Unset → webhook subscriptions are off and the services log why | meeting-api, admin-api |
+| `GATEWAY_IDENTITY_SECRET` | Secret, required. Compose, Lite and the chart's own Secret supply it too | gateway, meeting-api, admin-api |
 | `INTAKE_RATE_LIMIT_PER_MIN` | 600 | gateway |
 | `GUARD_IP_WHITELIST` (chart `gateway.guard.ipWhitelist`) | our VPC's address range, so our own apps are never blocked by the gateway's per-IP limit (600 a minute per address). Today every caller is inside the VPC, so the per-IP limit has nothing to act on; it starts acting on outside callers once an entrance exists | gateway |
 | `GUARD_TRUSTED_PROXIES` (chart `gateway.guard.trustedProxies`) | empty today (no load balancer in front of the gateway). **Set to the load balancer's addresses in the same change that adds any entrance** (Cloudflare or a private link); otherwise outside traffic arrives from an address inside the VPC and skips the per-IP limit | gateway |
@@ -413,7 +439,7 @@ A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to ca
 | Sealed artefact | Change | Step |
 |---|---|---|
 | `schema.seal.json` (gate `db-schema`) | `meetings.uuid`; tables `meeting_entries`, `meeting_aw_state`, `webhook_subscriptions`, `webhook_outbox`, `webhook_deliveries`, `webhook_delivery_attempts` | `pnpm seal:schema`, own commit |
-| `contracts.seal.json` (gate `contract-version`) | new `intake.v1`; `webhook.v1`: new `EventType` values and the optional `X-Webhook-Signature-Previous` header (back-compatible: every existing golden still validates). `lifecycle.v1` untouched | `pnpm seal:contracts` after the routes are built, own commit |
+| `contracts.seal.json` (gate `contract-version`) | new `intake.v1`; `webhook.v1`: new `EventType` values and the optional `X-Webhook-Signature-Previous` header (back-compatible: every existing golden still validates). `identity.v1`: the scopes `webhooks`, `erase`, `export` (additive). `lifecycle.v1` untouched | `pnpm seal:contracts` after the routes are built, own commit |
 | `architecture.calm.json` / `architecture.seal.json` (P23) | node `meeting-api-intake`; flows calendar module → gateway, portal → gateway, exporter → gateway, meeting-api → subscribers, admin-api → meeting-api (`webhook.test`) | `pnpm seal:arch`, own commit |
 
 `contract-conformance` drives the golden webhook examples, which are regenerated from the real builders, never hand-edited.
@@ -572,7 +598,7 @@ Every error has the body `{ "error": { "code": "...", "message": "..." } }`. The
 
 | HTTP | `code` | When | Client should |
 |---|---|---|---|
-| 400 | `invalid_request` | missing or wrong field; naive time; `end` ≤ `start`; metadata too big | fix and resend |
+| 400 | `invalid_request` | missing or wrong field; naive time; `end` ≤ `start`; metadata too big; a bad id in the path | fix and resend |
 | 400 | `unrecognized_link` | aw-bots can't parse `meeting_url` | not retry until the link changes |
 | 400 | `platform_not_enabled` | the host is blocked (`ENTRY_BLOCKED_HOSTS`) | not retry until it changes |
 | 400 | `too_far_ahead` | `start` > now + 30 days | send later |
@@ -584,7 +610,7 @@ Every error has the body `{ "error": { "code": "...", "message": "..." } }`. The
 | 409 | `no_live_bot` | stop on a meeting with no bot in it | to cancel a future meeting, remove its entry |
 | 429 | `rate_limited` | the account's write rate was hit; `Retry-After` set | wait, then resend |
 | 429 | `quota_exceeded` | a standing quota is full (entries, subscriptions); no `Retry-After` | stop; free entries or ask for a higher quota |
-| 503 | `unavailable` | database down | retry with backoff |
+| 503 | `unavailable` | database down; the gateway can't check the key, has no identity secret, or meeting-api or admin-api fails (502/504) | retry with backoff |
 
 ## 2.6 Every use case: what is sent and the reply
 
@@ -673,7 +699,7 @@ Reply: `joined_existing`, **the same UUID**, with `entries` listing A and B. The
 - Either way, the bot joins on 25 Sep at 11:25 UTC.
 
 **2.6.19 Stop.** `POST /v2/meetings/{id}/stop`:
-- live → 200, the bot leaves, status `stopping`, then `completed` with `stopped`;
+- live → 200, the bot leaves: a bot in the meeting goes `stopping`, then `completed` with `stopped`; a bot still joining keeps its stage until it ends (§1.7);
 - scheduled or finished → 409 `no_live_bot`. A future meeting is cancelled with a remove (2.6.6).
 
 **2.6.20 Other senders and platforms.** Nothing above depends on the sender or the platform. Examples:
@@ -716,8 +742,8 @@ Each is handled by the same rules; the platform comes from parsing `meeting_url`
 | `meeting.removed` | removed before its bot was sent (R8), or merged into a live meeting (`data.merged_into`) |
 | `meeting.waiting_for_room` | due, but another bot is on the link (R2) |
 | `meeting.not_sent` | ended with no bot; `outcome` carries the typed code and exact message |
-| `meeting.status_change` | every bot step (`requested`, `joining`, `awaiting_admission`, `active`, `needs_help`, `stopping`, `completed`, `failed`), with `from`, `to`, `reason` |
-| `meeting.started` / `meeting.completed` / `bot.failed` | the existing typed events, enriched |
+| `meeting.status_change` | every bot step without a typed event (`requested`, `joining`, `awaiting_admission`, `needs_help`, `stopping`) |
+| `meeting.started` / `meeting.completed` / `bot.failed` | the existing typed events, enriched: the step to `active`, to `completed`, and to `failed` (`meeting.not_sent` instead when the outcome is `not_sent`) |
 | `export.handed_off` / `export.failed` | the exporter's result |
 | `webhook.test` | a test send |
 | `bot.retry` | reserved for the lobby-timeout retry (handoff §6 B9); not emitted by this work |
@@ -729,7 +755,7 @@ Each is handled by the same rules; the platform comes from parsing `meeting_url`
 ```json
 {
   "event_id": "evt_7c1e0b0a4d2f4b8e9a3c5d6e7f8a9b0c1d2e3f405162738495a6b7c8d9e0f1a2",
-  "event_type": "meeting.status_change",
+  "event_type": "meeting.started",
   "api_version": "2026-09-25",
   "created_at": "2026-09-29T04:26:12Z",
   "data": {
@@ -739,6 +765,7 @@ Each is handled by the same rules; the platform comes from parsing `meeting_url`
 }
 ```
 
+- Every status change is exactly one event, with `data.change` (`from`, `to`, `reason`, `at`) whatever its type. A change that has its own event keeps it (`meeting.scheduled`, `meeting.removed`). A receiver that follows every step accepts the typed events as well as `meeting.status_change`.
 - `event_id` is unique per event and identical across retries; receivers dedupe on it.
 - `sequence` rises by 1 with every event of a meeting; receivers ignore an event older than one they have already applied.
 
@@ -751,7 +778,7 @@ Each is handled by the same rules; the platform comes from parsing `meeting_url`
 
 **Delivery.**
 - 10 s timeout.
-- Retried on 5xx, 429, timeout or connection error at 1 min, 5 min, 30 min and 2 h, then `dead`. Any other 4xx is `failed`.
+- Retried on 5xx, 429, timeout or connection error at 1 min, 5 min, 30 min and 2 h, then `dead`. Any other answer, a redirect included, is `failed`.
 - Every attempt is logged (`GET …/deliveries`).
 - Delivery is at-least-once and not in order.
 
@@ -833,11 +860,11 @@ Run it in a window with no meeting in progress: a bot started before step 14 has
 | Step | Action |
 |---|---|
 | 9 | **MIGRATION-0008 step 1:** the six new tables, the three-step `uuid`, the live-link index and the due index, all `CONCURRENTLY`. |
-| 10 | **Secrets:** add `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` and `GATEWAY_IDENTITY_SECRET` to `aw-bots-secrets`, generated without display (the step 4d pattern). |
-| 11 | **Deploy admin-api and gateway** (new scopes, signing). The old meeting-api ignores the signature header, so nothing breaks. |
+| 10 | **Secrets, before any `helm upgrade`:** add `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` and `GATEWAY_IDENTITY_SECRET` to `aw-bots-secrets`, generated without display (the step 4d pattern). The new gateway refuses to start without the identity secret. |
+| 11 | **Deploy our admin-api and gateway images** (`aw-bots-admin-api`, `aw-bots-gateway`; upstream's images lack the `/v2` routes, the new scopes and the signing): one `helm upgrade` with this branch's chart, our values pointing `adminApi.image` and `gateway.image` at our images, and meeting-api still on its current image. The old meeting-api ignores the signature header, so meetings keep working. The new admin-api, though, refuses a direct `/user/*` call with a key: from here on, operators and runbook steps that called it directly (for example `PUT /user/calendar` over a port-forward) go through the gateway. |
 | 12 | **Keys:** revoke tokens 1 and 2. Mint `calendar-dispatcher`, `portal`, `exporter` and `operator` with the scopes in §1.10. The first three go into their Secrets; the operator key goes into the operator vault. |
-| 13 | **Drain the exporter queue:** `aw-exporter/pending/` must be empty. |
-| 14 | **Deploy meeting-api, bot and exporter together:** one `helm upgrade`, plus `kubectl apply -k deployment/base/aw-exporter`. |
+| 13 | **Drain the exporter queue with the old exporter:** `aw-exporter/pending/` must be empty (its items have no meeting UUID). Items in `aw-exporter/failed/` from before the rollout are not re-enqueued as they are: they have no UUID, and `notetaker-worker` would see a new `idempotency_key` (the UUID instead of `vexa-<n>`). |
+| 14 | **Deploy meeting-api and the bot** with one `helm upgrade`; **then**, once meeting-api is ready, **the new exporter** with `kubectl apply -k deployment/base/aw-exporter` (`GATEWAY_URL`, `EXPORTER_API_KEY` from `aw-bots-key-exporter`). The new exporter needs meeting-api's export route, the gateway and its key; the old exporter can't read the new meeting-api, which refuses its direct `X-User-Id` calls. With no meeting in progress, no meeting finishes in between. |
 | 15 | **MIGRATION-0008 step 3:** drop `uq_meeting_active_user_platform_native` `CONCURRENTLY`. |
 | 16 | **Alerts:** load `alerts.yml` into talke's Prometheus values, then `helm upgrade prometheus`. |
 | 17 | **Subscription:** create the portal's webhook subscription with the operator key and a portal-supplied secret (Secret `aw-bots-portal-webhook`). |
@@ -1523,6 +1550,7 @@ V=/Applications/XAMPP/xamppfiles/htdocs/mike/aw-notetaker/vexa-fork; N=/Applicat
 export PYTHONDONTWRITEBYTECODE=1
 for d in core/meetings/services/meeting-api core/identity/services/admin-api core/gateway/services/gateway integrations/out/aw-notetaker; do (cd $V/$d && uv run pytest -q -p no:cacheprovider | tail -1); done
 docker run -d --rm --name aw-intake-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:17     # testing only
+(cd $V/core/meetings/services/meeting-api && uv pip install "sqlalchemy[asyncio]==2.0.36" "asyncpg==0.30.0")   # the Dockerfile's pins, for this run only (V12)
 (cd $V/core/meetings/services/meeting-api && MEETING_API_TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@localhost:55432/postgres uv run pytest -q -p no:cacheprovider | tail -1)
 docker stop aw-intake-pg
 for g in readme docs-version dataflow isolation isolation-py exports graph graph-py schema contract-version config-contract db-schema db-budget python node health access tracing replay telemetry licenses image-licenses runtime-parity execution-env test-isolation arch-report parity contract-conformance lite-makefile; do (cd $V && node scripts/gates.mjs $g >/dev/null 2>&1 && echo "PASS $g" || echo "FAIL $g"); done
@@ -1617,5 +1645,11 @@ cd $N/portal && npx vitest run && npx tsc --noEmit && npx next lint
 1. `PUT /meetings/{p}/{n}/intent` never checks the status (`collector/adapters.py:1117-1162`). Covered here for entry-managed meetings (§1.6); otherwise unchanged.
 2. `PUT /user/webhook` doesn't validate the URL on save (`admin_api/app/main.py:633-649`). Unchanged.
 3. `needs_human_help` appears in some status lists (`auto_join.py:135`, `collector/app.py:246`), but the state machine emits only `needs_help`. So `GET /meetings?exclude_planned=true` hides `needs_help` rows. Unchanged.
+4. Without `VEXA_SERVICE_AUTHORITY_CONFIG`, the service authority allows everything (`build_service_authority_from_env`), for `POST /bots` and intake alike. Unchanged.
+5. The legacy system webhook fires when the in-process state machine moves, even if the database write is then refused. Unchanged.
+6. A stale stop of a booting bot can move an `active` meeting back to `joining` (`lifecycle/stop_router.py`). A terminal write to the same status merges its data and sends no event. Writes keyed by session can land on a reopened meeting. Unchanged.
+7. `PUT …/intent` can still overwrite a live status (item 1); it now sends an event like every other change. Failing an already finished meeting does nothing. A free-text `scheduled_at` shows no time in the meeting object.
+8. The guard test that finds status writes outside the writer reads the source, so it can miss a write made through an alias, `dict.values()`, `UPDATE ONLY` or SQL built with `%` or string joining.
+9. **Open for the owner:** the gateway signature covers `<t>.<user_id>.<METHOD>.<path>` only (§1.10). A request captured inside the cluster could be replayed within 60 s with another query or body, and the forwarded scope and limit headers are not signed.
 
 (The unchecked bot callback and the incomplete spawn dedup list, listed here in V10, are fixed by this design: §1.10 and §1.5.)
