@@ -61,7 +61,7 @@ it is sealed as `core/meetings/contracts/intake.v1/`.
 | `POST /v2/entries/remove` | `bot` | Remove one entry, with an optional reason |
 | `GET /v2/entries?user=` | `bot` | The sender's active entries for one user, with a hash of each, so a sender can send only the differences |
 | `GET /v2/meetings?user=`, `GET /v2/meetings/{id}?user=` | `tx` | The meetings a user owns or is invited to |
-| `POST /v2/meetings/{id}/stop` | `bot` | The bot in the call leaves now (no bot in the call → `no_live_bot`) |
+| `POST /v2/meetings/{id}/stop` | `bot` | The live bot, in the call or still joining, leaves now (no live bot at all → `no_live_bot`) |
 | `DELETE /v2/meetings/{id}` | `erase` | Erase a finished meeting's AW Bots data (recording copies in `aw-bots`, transcript rows, entries, webhook rows). Nothing in `aw-chatworks-transcribe` is deleted |
 | `POST /v2/meetings/{id}/export` | `export` | The exporter reports its result |
 
@@ -102,8 +102,9 @@ it is sealed as `core/meetings/contracts/intake.v1/`.
 - **Every client goes through the gateway.** The gateway checks the key's scope, sets `x-user-id`
   and signs it with `GATEWAY_IDENTITY_SECRET`. meeting-api and admin-api refuse a client request
   whose signature is missing, wrong or older than 60 s, so a direct call with `x-user-id` gets 401.
-  Only the bots and the runtime call meeting-api directly: bot status callbacks carry the internal
-  secret, and each bot's runtime callback URL carries its own token.
+  Only the bots, the runtime and service-to-service calls reach meeting-api directly: bot status
+  callbacks carry the internal secret, each bot's runtime callback URL carries its own token, and
+  the `/internal/*` routes between admin-api and meeting-api check the internal secret.
 - **One key per consumer**, all under the service user, with only the scopes it needs:
 
   | Key name | Scopes | Where it lives |
@@ -265,14 +266,14 @@ Every setting lives in configuration, not code:
 | Storage | `MINIO_BUCKET` + `S3_ENDPOINT` (IAM role on EKS, no static keys) | bucket `aw-bots` |
 | meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
 | "Meeting finished" webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (+ `…_ALLOW_PRIVATE_HTTP=true`) | the exporter's in-cluster URL |
-| How early the bot joins | `AUTO_JOIN_LEAD_S` (the chart's default is 120) | `300` |
+| How early the bot joins | Helm `meetingApi.autoJoinLeadSeconds` → env `AUTO_JOIN_LEAD_S` (the chart's default is 120) | `300` |
 | Services on Karpenter | Helm `global.nodeSelector` / `global.tolerations` | the `aw-bots-services` NodePool |
 | Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the `aw-bots-meetings` NodePool |
 | Postgres / Redis disks | Helm `postgres.persistence.storageClassName`, `redis.persistence.storageClassName` | `ebs-sc-gp3` (any zone, expandable) |
 | Vexa's AI agents | Helm `agentApi.enabled` | `false` |
 | Postgres password | Helm `postgres.existingCredentialsSecret` → pre-created Secret `postgres-credentials` | `true` (the chart then creates no Secret at all) |
 | Bot size | Helm `runtime.workloadResources.meetingBot` | 1 CPU / 2560 MiB |
-| Our images | Helm `meetingApi.image.*`, `runtime.browserImage` | our GHCR tags |
+| Our images | Helm `meetingApi.image.*`, `gateway.image.*`, `adminApi.image.*`, `runtime.browserImage` | our GHCR tags |
 | Debug tape off | admin-api platform setting `capture_signal=false` | off (turn on only to debug a meeting) |
 | Where the exporter sends meetings | exporter env `NOTETAKER_URL` | `http://notetaker-api.notetaker.svc.cluster.local:8080` |
 | Exporter buckets | `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX` | `aw-bots`, `aw-chatworks-transcribe`, `recordings/` |
