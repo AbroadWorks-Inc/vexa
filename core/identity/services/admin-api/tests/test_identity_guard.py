@@ -30,6 +30,7 @@ GUARD_BODY = {"detail": "the caller's identity must come from the gateway"}
 #: Every route of the app that takes no caller from the gateway.
 EXEMPT = {
     "/health",
+    "/metrics",
     "/admin/instance",
     "/admin/tokens/{token_id}",
     "/admin/users",

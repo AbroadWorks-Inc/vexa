@@ -11,6 +11,9 @@ Webhook subscriptions (§2.7): `webhook_subscriptions.py` serves `/v2/webhooks` 
 shared vectors in `core/identity/contracts/webhook-subscriptions/`.
 `retention.py` is the daily single-flight sweep (§1.13) that deletes final deliveries older than
 `WEBHOOK_DELIVERY_RETENTION_DAYS`, then published outbox rows with no deliveries left.
+`metrics.py` (§1.13) serves `GET /metrics` from its own registry: the time left on each named key
+(`aw_api_token_expires_seconds{name,user_id}`, read from `api_tokens` at scrape time) and the
+retention sweep's last run (`aw_sweep_last_run_timestamp_seconds{sweep}`).
 `identity_guard.py` (§1.10) answers 401 to any client request whose `x-user-id` doesn't carry the
 gateway's fresh `x-gateway-signature` (`GATEWAY_IDENTITY_SECRET`); `/admin/*`, `/internal/*`,
 `/health*` and `/metrics` are exempt. The signing rule is pinned as shared vectors in

@@ -36,6 +36,7 @@ from ..token_scope import USER_TIER_SCOPES, VALID_SCOPES, generate_prefixed_toke
 from .db import get_db
 from .identity_guard import IdentityGuard
 from . import events as events_mod
+from . import metrics as metrics_mod
 from . import person_settings as person_settings_mod
 from .webhook_subscriptions import WebhookDeps, build_webhook_router
 
@@ -416,10 +417,18 @@ def _resolve_capture_signal(user_data: dict, platform_diagnostics: dict) -> bool
     return True
 
 
-def create_app(*, webhooks: Optional[WebhookDeps] = None) -> FastAPI:
+def create_app(*, webhooks: Optional[WebhookDeps] = None,
+               token_expiry: Optional[metrics_mod.TokenExpiry] = None) -> FastAPI:
     app = FastAPI(title="Vexa Admin API (v0.12)")
     # §1.10: a client route believes x-user-id only with the gateway's signature.
     app.add_middleware(IdentityGuard)
+
+    # --- metrics (§1.13): exempt from the identity guard and in no gateway route table. The key
+    # expiry gauge reads `token_expiry` at scrape time; None → served without samples.
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics() -> Response:
+        body, content_type = await metrics_mod.render(token_expiry)
+        return Response(body, media_type=content_type)
 
     # --- liveness probe (gate:health): process-up, no DB dependency. Readiness (DB reachable)
     # is a separate concern — keeping /health a pure liveness check makes it green without a

@@ -16,7 +16,8 @@ The key's high 32 bits are this sweep's own namespace, so it can't meet meeting-
 or the per-user locks on the shared database.
 
 ``attach_retention`` starts the loop on application startup (a run at start, then every 24 hours)
-and cancels it on shutdown.
+and cancels it on shutdown. A run that swept (not one skipped for the lock, not a failed one) stamps
+``aw_sweep_last_run_timestamp_seconds{sweep="webhook-retention"}`` (§1.13).
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from sqlalchemy import text
+
+from .metrics import sweep_ran
 
 __all__ = [
     "FINAL_STATES",
@@ -152,9 +155,11 @@ def attach_retention(
     days = retention_days_from_env(environ)
 
     async def _run() -> None:
-        await run_single_flight(
+        result = await run_single_flight(
             get_engine(), now=datetime.now(timezone.utc), retention_days=days
         )
+        if result is not None:
+            sweep_ran("webhook-retention")
 
     @app.on_event("startup")
     async def _start_retention() -> None:
