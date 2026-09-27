@@ -26,12 +26,21 @@ Only the resolve step touches the network (`socket.getaddrinfo`) — it is skipp
 literal-IP and blocked-hostname URLs, which is the only path the autonomous eval
 exercises (no DNS, no live receiver). The eval can also pass `resolver=...` to stub
 resolution deterministically.
+
+Subscription deliveries (§2.7)
+------------------------------
+An IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) is judged as the IPv4 address it maps, on every
+path. The subscription sender also passes ``allowlist`` (``WEBHOOK_PRIVATE_HOST_ALLOWLIST``, parsed
+by ``parse_allowlist``): a host in it is accepted without the address checks and without resolving
+it, at validate time and at connect time. Callers that pass no allow-list get none. The rules are
+the ones admin-api applies on save; both test suites read
+``core/identity/contracts/webhook-subscriptions/url-guard.vectors.json``.
 """
 from __future__ import annotations
 
 import ipaddress
 import socket
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Collection, List, Optional
 from urllib.parse import urlparse
 
 # Blocked IP ranges per OWASP (localhost, private, link-local, multicast).
@@ -69,8 +78,24 @@ _BLOCKED_HOSTNAMES = frozenset([
 ])
 
 
+DEFAULT_PRIVATE_HOST_ALLOWLIST = "portal.notetaker.svc.cluster.local"
+
+
 class SSRFError(ValueError):
     """Raised when a webhook URL is rejected by the SSRF guard."""
+
+
+class UnresolvableHost(SSRFError):
+    """The URL's hostname resolved to no address (a DNS failure, not a private target)."""
+
+
+def parse_allowlist(value: Optional[str]) -> frozenset:
+    """``WEBHOOK_PRIVATE_HOST_ALLOWLIST`` (comma-separated) as a set of lower-cased hosts."""
+    return frozenset(host.strip().lower() for host in (value or "").split(",") if host.strip())
+
+
+def _is_allowlisted(hostname: str, allowlist: Collection[str]) -> bool:
+    return hostname.lower() in {host.strip().lower() for host in allowlist}
 
 
 class PinnedURL:
@@ -115,6 +140,8 @@ def _is_blocked_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return True  # not a valid IP — block
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
     nets = _BLOCKED_IPV4_NETWORKS if ip.version == 4 else _BLOCKED_IPV6_NETWORKS
     return any(ip in net for net in nets)
 
@@ -140,13 +167,18 @@ def _resolve_host(hostname: str) -> List[str]:
 def _validate_resolved_ips(ips: List[str]) -> None:
     """Reject if resolution failed or ANY resolved IP is in the blocklist (anti-rebinding)."""
     if not ips:
-        raise SSRFError("Webhook URL hostname could not be resolved")
+        raise UnresolvableHost("Webhook URL hostname could not be resolved")
     for ip_str in ips:
         if _is_blocked_ip(ip_str):
             raise SSRFError("Webhook URL cannot target internal or private networks")
 
 
-def validate_webhook_url(url: str, resolver: Callable[[str], List[str]] | None = None) -> PinnedURL:
+def validate_webhook_url(
+    url: str,
+    resolver: Callable[[str], List[str]] | None = None,
+    *,
+    allowlist: Collection[str] = (),
+) -> PinnedURL:
     """Validate a webhook URL is safe (not SSRF-vulnerable). Return a ``PinnedURL`` if valid.
 
     - Only http:// and https:// schemes.
@@ -156,6 +188,7 @@ def validate_webhook_url(url: str, resolver: Callable[[str], List[str]] | None =
     - Return a ``PinnedURL`` carrying the resolved-and-validated IP(s) so delivery can PIN
       the connection (rather than re-resolving an attacker-controlled hostname at connect
       time — the TOCTOU window). The string value is the original URL (Host/SNI preserved).
+    - A host in ``allowlist`` is accepted as is, unresolved (``pinned_ips`` empty).
 
     Raises `SSRFError` (a ValueError) with a user-friendly message when blocked.
     """
@@ -168,6 +201,9 @@ def validate_webhook_url(url: str, resolver: Callable[[str], List[str]] | None =
     if not hostname:
         raise SSRFError("Webhook URL must have a valid hostname")
 
+    if _is_allowlisted(hostname, allowlist):
+        return PinnedURL(url, host=hostname, port=parsed.port, scheme=parsed.scheme, pinned_ips=[])
+
     if _is_blocked_hostname(hostname):
         raise SSRFError("Webhook URL cannot target internal or private networks")
 
@@ -175,33 +211,43 @@ def validate_webhook_url(url: str, resolver: Callable[[str], List[str]] | None =
     # Literal IP — check directly, no DNS. The "resolved" set is the literal itself.
     try:
         ipaddress.ip_address(hostname)
+    except ValueError:
+        pass  # not a literal IP — resolve below
+    else:
         if _is_blocked_ip(hostname):
             raise SSRFError("Webhook URL cannot target internal or private networks")
         return PinnedURL(url, host=hostname, port=port, scheme=parsed.scheme, pinned_ips=[hostname])
-    except ValueError:
-        pass  # not a literal IP — resolve below
 
     ips = (resolver or _resolve_host)(hostname)
     _validate_resolved_ips(ips)
     return PinnedURL(url, host=hostname, port=port, scheme=parsed.scheme, pinned_ips=ips)
 
 
-def revalidate_at_connect(hostname: str, resolver: Callable[[str], List[str]] | None = None) -> List[str]:
+def revalidate_at_connect(
+    hostname: str,
+    resolver: Callable[[str], List[str]] | None = None,
+    *,
+    allowlist: Collection[str] = (),
+) -> List[str]:
     """Re-resolve + re-validate a host at connect time, returning the validated IP(s).
 
     This is the second half of the WH2 defence: even with a `PinnedURL` from submit-time,
     the connection layer re-checks at the moment it dials, so a freshly-flipped A-record is
-    caught. Raises `SSRFError` if the host now resolves to a blocked IP (or won't resolve).
+    caught. Raises `SSRFError` if the host now resolves to a blocked IP (or won't resolve). A host
+    in ``allowlist`` passes unresolved (``[]``).
     """
+    if _is_allowlisted(hostname, allowlist):
+        return []
     if _is_blocked_hostname(hostname):
         raise SSRFError("Webhook URL cannot target internal or private networks")
     try:
         ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
         if _is_blocked_ip(hostname):
             raise SSRFError("Webhook URL cannot target internal or private networks")
         return [hostname]
-    except ValueError:
-        pass
     ips = (resolver or _resolve_host)(hostname)
     _validate_resolved_ips(ips)
     return ips
@@ -210,6 +256,8 @@ def revalidate_at_connect(hostname: str, resolver: Callable[[str], List[str]] | 
 def build_pinned_transport(
     inner: "Any" = None,
     resolver: Callable[[str], List[str]] | None = None,
+    *,
+    allowlist: Collection[str] = (),
 ) -> "Any":
     """Wrap an httpx async transport so every dial re-validates + PINS the resolved IP (WH2).
 
@@ -219,6 +267,8 @@ def build_pinned_transport(
       2. rewrites the request URL host to a validated IP while preserving the original Host
          header and setting TLS SNI to the original hostname (`sni_hostname` extension), so
          certificate verification still matches the real host.
+
+    A host in ``allowlist`` is dialled as is.
 
     Returns an `httpx.AsyncBaseTransport`. Import is local so merely importing this module
     never requires httpx (it is not in the offline gate venv).
@@ -241,8 +291,8 @@ def build_pinned_transport(
             except ValueError:
                 is_literal = False
 
-            validated_ips = revalidate_at_connect(host, resolver=self._resolver)
-            if is_literal:
+            validated_ips = revalidate_at_connect(host, resolver=self._resolver, allowlist=allowlist)
+            if is_literal or not validated_ips:
                 # Already an IP and already validated — dial as-is.
                 return await self._base.handle_async_request(request)
 

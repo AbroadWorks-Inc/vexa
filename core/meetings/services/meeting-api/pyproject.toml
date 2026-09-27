@@ -16,6 +16,7 @@ dependencies = [
     "pytest-asyncio>=0.23,<2",
     "icalendar>=6,<7",
     "python-dateutil>=2.9,<3",
+    "cryptography==50.0.1",      # webhook secrets: AES-256-GCM decrypt at signing time (§2.7)
 ]
 
 [tool.uv]
