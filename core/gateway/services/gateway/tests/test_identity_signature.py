@@ -124,6 +124,22 @@ def test_a_forward_to_admin_api_is_signed_over_the_admin_api_path(signing):
     )
 
 
+def test_the_export_result_is_signed_over_its_meeting_api_path(signing):
+    downstream = FakeDownstream()
+    exporter = FakeAuthorizer(user={**VALID_USER, "scopes": ["tx", "export"]})
+    client = TestClient(create_app(exporter, downstream, FakeRedis()))
+    uuid = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
+    r = client.post(f"/v2/meetings/{uuid}/export", headers=AUTH, json={})
+    assert r.status_code == 200
+    _verify(
+        downstream.last["headers"][SIGNATURE_HEADER],
+        SECRET,
+        "7",
+        "POST",
+        f"/v2/meetings/{uuid}/export",
+    )
+
+
 def test_a_path_parameter_is_signed_decoded(signing):
     client, downstream = _client()
     r = client.get("/transcripts/teams/room%20one", headers=AUTH)

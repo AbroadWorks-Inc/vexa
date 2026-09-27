@@ -680,6 +680,13 @@ def create_app(
             return error
         return await _forward("DELETE", _meeting(f"/v2/meetings/{segment}"), request)
 
+    @app.post("/v2/meetings/{meeting_id}/export")
+    async def export_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id)
+        if error is not None:
+            return error
+        return await _forward("POST", _meeting(f"/v2/meetings/{segment}/export"), request)
+
     # User-owned scheduling intent (schedule/cancel) — the Meetings surface's Schedule/Cancel action
     # PUTs here; forwards to meeting-api's PUT /meetings/{platform}/{native}/intent (owner-scoped).
     # Mint an INDEPENDENT transcript share link for a meeting (owner) — Lane A / M0.

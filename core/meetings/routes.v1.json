@@ -319,6 +319,13 @@
       "scopes": [
         "erase"
       ]
+    },
+    {
+      "method": "POST",
+      "path": "/v2/meetings/{meeting_id}/export",
+      "scopes": [
+        "export"
+      ]
     }
   ]
 }

@@ -12,7 +12,7 @@ from gateway import ROUTE_SCOPES, create_app, routes_manifest
 
 AUTH = {"x-api-key": VALID_KEY}
 UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
-ALL_SCOPES = ["bot", "tx", "erase"]
+ALL_SCOPES = ["bot", "tx", "erase", "export"]
 
 
 def _gateway():
@@ -45,6 +45,7 @@ def _gateway():
         ("GET", f"/v2/meetings/{UUID}", f"/v2/meetings/{UUID}", None),
         ("POST", f"/v2/meetings/{UUID}/stop", f"/v2/meetings/{UUID}/stop", None),
         ("DELETE", f"/v2/meetings/{UUID}", f"/v2/meetings/{UUID}", None),
+        ("POST", f"/v2/meetings/{UUID}/export", f"/v2/meetings/{UUID}/export", None),
     ],
 )
 def test_each_v2_route_is_forwarded_verbatim(method, url, downstream_path, params):
@@ -59,6 +60,14 @@ def test_each_v2_route_is_forwarded_verbatim(method, url, downstream_path, param
     assert downstream.last["params"] == params
     assert downstream.last["content"] == body
     assert downstream.last["headers"]["x-user-id"] == "7"
+
+
+def test_the_export_meeting_id_is_forwarded_as_one_opaque_segment():
+    client, downstream = _gateway()
+    r = client.post("/v2/meetings/a%3Fuser%3Dother/export", headers=AUTH, content=b"{}")
+    assert r.status_code == 200
+    assert downstream.last["url"].endswith("/v2/meetings/a%3Fuser%3Dother/export")
+    assert downstream.last["params"] is None
 
 
 def test_the_meeting_id_is_forwarded_as_one_opaque_segment():
@@ -77,6 +86,7 @@ def test_the_v2_scopes_are_as_section_2_1():
     assert ROUTE_SCOPES[("GET", "/v2/meetings/{meeting_id}")] == {"tx"}
     assert ROUTE_SCOPES[("POST", "/v2/meetings/{meeting_id}/stop")] == {"bot"}
     assert ROUTE_SCOPES[("DELETE", "/v2/meetings/{meeting_id}")] == {"erase"}
+    assert ROUTE_SCOPES[("POST", "/v2/meetings/{meeting_id}/export")] == {"export"}
 
 
 def test_the_scope_vocabulary_names_the_least_privilege_scopes():

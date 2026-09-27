@@ -72,6 +72,8 @@ CASES = [
     ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/stop",
      "/v2/meetings/{meeting_id}/stop"),
     ("DELETE", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/export",
+     "/v2/meetings/{meeting_id}/export"),
 
     ("POST", "/v2/webhooks", "/v2/webhooks"),
     ("GET", "/v2/webhooks", "/v2/webhooks"),
@@ -246,6 +248,7 @@ def test_bot_scope_still_runs_the_bot_lifecycle():
 #: of bot/tx turns the test below red instead of redefining what it expects.
 LEAST_PRIVILEGE = frozenset({
     ("DELETE", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/{meeting_id}/export"),
     ("POST", "/v2/webhooks"),
     ("GET", "/v2/webhooks"),
     ("PATCH", "/v2/webhooks/{subscription_id}"),
@@ -291,6 +294,31 @@ def test_a_webhooks_key_reaches_only_the_webhook_routes():
             assert status != 403, f"{method} {url} refused a webhooks key"
         else:
             assert status == 403, f"{method} {url} let a webhooks key in"
+
+
+def test_an_export_key_reaches_only_the_export_route():
+    """``export`` (§1.10) is least privilege: it opens POST /v2/meetings/{id}/export and nothing
+    else."""
+    client = _client(["export"])
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) == ("POST", "/v2/meetings/{meeting_id}/export"):
+            assert status != 403, f"{method} {url} refused an export key"
+        else:
+            assert status == 403, f"{method} {url} let an export key in"
+
+
+def test_the_exporter_key_reaches_its_reads_and_its_result_route():
+    """The exporter's key is ``tx`` + ``export`` (§1.10): its reads (the recording list, the master
+    and the transcript by id) and its result route are all open to it."""
+    client = _client(["tx", "export"])
+    for method, url in [
+        ("GET", "/recordings"),
+        ("GET", "/recordings/42/master"),
+        ("GET", "/transcripts/by-id/42"),
+        ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/export"),
+    ]:
+        assert _request(client, method, url).status_code != 403, f"{method} {url}"
 
 
 # --- deny by default -----------------------------------------------------------------------------

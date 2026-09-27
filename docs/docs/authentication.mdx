@@ -75,7 +75,7 @@ is refused with `422` — never silently dropped.
 | `browser` | browser-tool capabilities. **Reaches no API route today** — a browser-only key can call [`/auth/me`](/api/settings#identity) and nothing else |
 | `erase` | erase a finished meeting's data — `DELETE /v2/meetings/{id}` and nothing else |
 | `webhooks` | manage webhook subscriptions — `POST`/`GET /v2/webhooks`, `PATCH`/`DELETE /v2/webhooks/{id}`, `POST /v2/webhooks/{id}/rotate-secret`, `POST /v2/webhooks/{id}/test`, `GET /v2/webhooks/{id}/deliveries` — and nothing else |
-| `export` | reserved for the exporter reporting its result; its route arrives with later work |
+| `export` | report an export result — `POST /v2/meetings/{id}/export` and nothing else. The exporter's key holds `tx` + `export` |
 
 `/recordings*`, `/user/webhook*`, `/user/models`, `/user/transcription`, `/agent/*` and `/mcp` accept
 either `bot` or `tx`. Most keys want both: `{"scopes":["bot","tx"]}`. `erase`, `webhooks` and
