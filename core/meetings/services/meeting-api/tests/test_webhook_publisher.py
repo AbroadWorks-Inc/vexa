@@ -36,6 +36,7 @@ from intake_builders import http
 from meeting_api import create_app
 from meeting_api.intake.outbox import (
     BATCH_SIZE,
+    FAILED_READ_BACKOFF_S,
     OutboxPublisher,
     OutboxRow,
     PostgresWebhookTests,
@@ -255,6 +256,14 @@ async def unpublished(engine: Any) -> set[str]:
     }
 
 
+class Mono:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
 class Clock:
     def __init__(self, now: datetime = T0) -> None:
         self.now = now
@@ -389,6 +398,49 @@ async def test_a_batch_is_at_most_500_rows_oldest_first(pg):
     assert len(await deliveries(pg)) == 501
 
 
+async def seed_many(
+    engine: Any, meeting: int, count: int, *, prefix: str = "evt_"
+) -> list[str]:
+    from sqlalchemy import text
+
+    ids = [f"{prefix}{n:05d}" for n in range(count)]
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO webhook_outbox (event_id, meeting_id, event_type, sequence, "
+                "payload_text, created_at) VALUES (:e, :m, 'meeting.updated', :s, '{}', :c)"
+            ),
+            [
+                {"e": e, "m": meeting, "s": n, "c": T0 + timedelta(milliseconds=n)}
+                for n, e in enumerate(ids)
+            ],
+        )
+    return ids
+
+
+async def test_a_full_batch_to_nine_subscribers_publishes_in_one_tick(pg):
+    """500 rows x 9 subscribers = 4,500 deliveries, 36,000 values: past asyncpg's 32,767-argument
+    limit for one statement, so the insert must go in chunks inside the one transaction.
+    """
+    source = StaticSubscriptions()
+    subs = [await seed_subscription(pg, source, 1) for _ in range(9)]
+    events = await seed_many(pg, await seed_meeting(pg, 1), BATCH_SIZE)
+
+    result = await OutboxPublisher(sessions(pg), source).run_once()
+
+    assert (result.published, result.deliveries) == (500, 4500)
+    assert await unpublished(pg) == set()
+    got = await deliveries(pg)
+    assert len(got) == 4500
+    assert {(d[0], d[1]) for d in got} == {(e, s.id) for e in events for s in subs}
+
+    # a redo of the same batch (a crash after the inserts, before the publish) adds nothing
+    await execute(pg, "UPDATE webhook_outbox SET published_at = NULL")
+    again = await OutboxPublisher(sessions(pg), source).run_once()
+    assert (again.published, again.deliveries) == (500, 0)
+    assert len(await deliveries(pg)) == 4500
+
+
 async def test_an_account_whose_subscriptions_cannot_be_read_waits(pg):
     source = StaticSubscriptions()
     await seed_subscription(pg, source, 1)
@@ -406,6 +458,41 @@ async def test_an_account_whose_subscriptions_cannot_be_read_waits(pg):
     source.unavailable.clear()
     assert (await OutboxPublisher(sessions(pg), source).run_once()).published == 1
     assert await unpublished(pg) == set()
+
+
+async def test_one_accounts_failing_read_never_stalls_the_others(pg):
+    """Account A's read keeps failing with more than a batch of rows queued ahead of account B's:
+    the same tick reads past A's rows and publishes B's."""
+    source = StaticSubscriptions()
+    await seed_subscription(pg, source, 1)
+    theirs = await seed_subscription(pg, source, 2)
+    stuck = await seed_many(
+        pg, await seed_meeting(pg, 1), BATCH_SIZE + 1, prefix="evt_a"
+    )
+    m2 = await seed_meeting(pg, 2, "abc-defg-hij")
+    going = [
+        await seed_event(pg, m2, "meeting.updated", created=T0 + timedelta(hours=1))
+        for _ in range(3)
+    ]
+    source.unavailable.add(1)
+    clock = Mono()
+    publisher = OutboxPublisher(sessions(pg), source, monotonic=clock)
+
+    result = await publisher.run_once()
+
+    assert (result.published, result.deferred) == (3, 1)
+    assert await unpublished(pg) == set(stuck)
+    assert await deliveries(pg) == {(e, theirs.id, 2, "pending") for e in going}
+    assert source.reads.count(1) == 1  # read once, then read past
+
+    # the next ticks read past A without asking admin-api again, until the backoff ends
+    clock.t += FAILED_READ_BACKOFF_S - 1
+    assert (await publisher.run_once()).published == 0
+    assert source.reads.count(1) == 1
+    source.unavailable.clear()
+    clock.t += 1
+    assert (await publisher.run_once()).published == BATCH_SIZE
+    assert source.reads.count(1) == 2
 
 
 async def test_a_pause_committed_first_blocks_new_deliveries(pg):

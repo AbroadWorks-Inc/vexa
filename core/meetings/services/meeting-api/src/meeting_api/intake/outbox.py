@@ -8,12 +8,14 @@ rows into ``webhook_deliveries`` rows, which the senders (``webhooks/sender.py``
 
 1. read up to ``BATCH_SIZE`` (500) unpublished rows, oldest first (the
    ``ix_webhook_outbox_unpublished`` order), each with its meeting's account;
-2. read each account's subscriptions from admin-api (``webhooks/subscriptions.py``, cached 30 s).
-   An account whose read fails keeps its rows unpublished for the next tick;
+2. read each account's subscriptions from admin-api (``webhooks/subscriptions.py``, cached 30 s),
+   up to ``READ_CONCURRENCY`` at once. An account whose read fails keeps its rows unpublished, is
+   read past (its rows left out of the query) for ``FAILED_READ_BACKOFF_S``, and the same tick reads
+   the next rows, so one account's failing read never stalls the others;
 3. in ONE transaction for the rest of the batch: re-read ``webhook_subscriptions.active`` for the
    matching subscriptions under ``FOR SHARE``, insert one ``pending`` delivery due now per matching
-   active subscriber (``ON CONFLICT (event_id, subscription_id) DO NOTHING``), and set
-   ``published_at``.
+   active subscriber (``ON CONFLICT (event_id, subscription_id) DO NOTHING``, ``INSERT_CHUNK``
+   rows per statement), and set ``published_at``.
 
 "Matching" is ``fan_out``: the subscription belongs to the meeting's account and wants the event
 (``events == []`` or the event type is listed). ``webhook.test`` rows are never fanned out: they
@@ -39,11 +41,13 @@ Redis is not used anywhere here.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence
 
 from ..obs import log_event
 from ..webhooks.subscriptions import (
@@ -56,6 +60,7 @@ from .status import API_VERSION
 
 __all__ = [
     "BATCH_SIZE",
+    "INSERT_CHUNK",
     "TEST_EVENT",
     "Fanout",
     "OutboxPublisher",
@@ -68,6 +73,13 @@ __all__ = [
 ]
 
 BATCH_SIZE = 500
+#: Deliveries per INSERT statement (8 values each): asyncpg refuses a statement with more than
+#: 32,767 arguments, and a full batch fans out to up to 500 x 20 subscribers.
+INSERT_CHUNK = 1000
+#: How long an account whose subscription read failed is read past before it is tried again (the
+#: read cache's own lifetime), and how many accounts are read at once.
+FAILED_READ_BACKOFF_S = 30.0
+READ_CONCURRENCY = 8
 TEST_EVENT = "webhook.test"
 _SPAN = "webhooks.publish"
 
@@ -93,6 +105,9 @@ class Fanout:
 
 @dataclass(frozen=True)
 class PublishResult:
+    """Rows published and deliveries inserted this tick; ``deferred`` = accounts whose rows wait
+    because their subscription read failed."""
+
     published: int
     deliveries: int
     deferred: int
@@ -129,61 +144,86 @@ class OutboxPublisher:
         *,
         batch_size: int = BATCH_SIZE,
         clock: Callable[[], datetime] = _utcnow,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session_factory = session_factory
         self._subscriptions = subscriptions
         self._batch_size = batch_size
         self._clock = clock
+        self._monotonic = monotonic
+        self._reads = asyncio.Semaphore(READ_CONCURRENCY)
+        #: account → monotonic instant its failed subscription read may be retried
+        self._waiting: dict[int, float] = {}
 
-    async def _unpublished(self) -> list[OutboxRow]:
-        from sqlalchemy import select
+    async def _unpublished(self, exclude: Collection[int]) -> list[OutboxRow]:
+        from sqlalchemy import or_, select
 
         from ..sessions.models import Meeting, WebhookOutbox
 
+        query = (
+            select(
+                WebhookOutbox.event_id,
+                WebhookOutbox.event_type,
+                WebhookOutbox.meeting_id,
+                Meeting.user_id,
+            )
+            .outerjoin(Meeting, Meeting.id == WebhookOutbox.meeting_id)
+            .where(WebhookOutbox.published_at.is_(None))
+        )
+        if exclude:
+            query = query.where(
+                or_(Meeting.user_id.is_(None), Meeting.user_id.notin_(sorted(exclude)))
+            )
         async with self._session_factory() as db:
             result = await db.execute(
-                select(
-                    WebhookOutbox.event_id,
-                    WebhookOutbox.event_type,
-                    WebhookOutbox.meeting_id,
-                    Meeting.user_id,
-                )
-                .outerjoin(Meeting, Meeting.id == WebhookOutbox.meeting_id)
-                .where(WebhookOutbox.published_at.is_(None))
-                .order_by(WebhookOutbox.created_at)
-                .limit(self._batch_size)
+                query.order_by(WebhookOutbox.created_at).limit(self._batch_size)
             )
             return [OutboxRow(*row) for row in result.all()]
 
-    async def run_once(self) -> PublishResult:
-        rows = await self._unpublished()
-        if not rows:
-            return PublishResult(0, 0, 0)
-        accounts = {
-            row.user_id
-            for row in rows
-            if row.user_id is not None and row.event_type != TEST_EVENT
-        }
-        subs: dict[int, list[Subscription]] = {}
-        waiting: set[int] = set()
-        for user_id in sorted(accounts):
+    async def _read(self, user_id: int) -> Optional[list[Subscription]]:
+        async with self._reads:
             try:
-                subs[user_id] = await self._subscriptions.for_account(user_id)
+                return await self._subscriptions.for_account(user_id)
             except SubscriptionsUnavailable as exc:
-                waiting.add(user_id)
                 log_event(
                     "webhook_publish_deferred",
                     audience="operator",
                     level="warning",
                     span=_SPAN,
                     user_id=user_id,
-                    fields={"error": str(exc)},
+                    fields={"error": str(exc), "retry_in_s": FAILED_READ_BACKOFF_S},
                 )
-        ready = [row for row in rows if row.user_id not in waiting]
-        if not ready:
-            return PublishResult(0, 0, len(rows))
-        inserted = await self._publish(ready, fan_out(ready, subs))
-        return PublishResult(len(ready), inserted, len(rows) - len(ready))
+                return None
+
+    async def run_once(self) -> PublishResult:
+        now = self._monotonic()
+        waiting = {uid for uid, until in self._waiting.items() if until > now}
+        self._waiting = {uid: self._waiting[uid] for uid in waiting}
+        published = inserted = 0
+        while True:
+            rows = await self._unpublished(waiting)
+            if not rows:
+                break
+            accounts = sorted(
+                {
+                    row.user_id
+                    for row in rows
+                    if row.user_id is not None and row.event_type != TEST_EVENT
+                }
+            )
+            answers = await asyncio.gather(*(self._read(uid) for uid in accounts))
+            subs = {uid: got for uid, got in zip(accounts, answers) if got is not None}
+            failed = {uid for uid, got in zip(accounts, answers) if got is None}
+            for uid in failed:
+                self._waiting[uid] = now + FAILED_READ_BACKOFF_S
+            waiting |= failed
+            ready = [row for row in rows if row.user_id not in failed]
+            if ready:
+                inserted += await self._publish(ready, fan_out(ready, subs))
+                published += len(ready)
+            if not failed:
+                break
+        return PublishResult(published, inserted, len(waiting))
 
     async def _publish(
         self, rows: Sequence[OutboxRow], wanted: Sequence[Fanout]
@@ -231,15 +271,15 @@ class OutboxPublisher:
                     for w in wanted
                     if (str(ids[w.subscription_id]), w.user_id) in active
                 ]
-                if values:
+                for start in range(0, len(values), INSERT_CHUNK):
                     result = await db.execute(
                         insert(WebhookDelivery.__table__)
-                        .values(values)
+                        .values(values[start : start + INSERT_CHUNK])
                         .on_conflict_do_nothing(
                             index_elements=["event_id", "subscription_id"]
                         )
                     )
-                    inserted = int(getattr(result, "rowcount", 0) or 0)
+                    inserted += int(getattr(result, "rowcount", 0) or 0)
             await db.execute(
                 update(WebhookOutbox)
                 .where(

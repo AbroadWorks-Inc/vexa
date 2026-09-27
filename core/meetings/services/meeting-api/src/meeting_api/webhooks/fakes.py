@@ -3,34 +3,40 @@
   * ``InMemoryDeliveryStore`` — a dict-backed ``DeliveryStore`` with the same guards as
     ``PostgresDeliveryStore``: due rows claimed in ``(next_attempt_at, id)`` order, every move out
     of ``sending`` refused unless the row is still ``sending`` under the claim's own lease, and the
-    attempt row kept even when the move is refused.
+    attempt row kept even when the move is refused. Its ``clock`` is what the database's ``now()``
+    is to ``PostgresDeliveryStore``.
 
 These carry NO production logic; they stand in for Postgres so the sender's scenarios run offline.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Optional
 
 from .sender import Claim, DeliveryResult
 
 __all__ = ["InMemoryDeliveryStore"]
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class InMemoryDeliveryStore:
     """``DeliveryStore`` over dicts, with the same guards as the Postgres adapter."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], datetime] = _utcnow) -> None:
+        self._clock = clock
         self.deliveries: dict[int, dict[str, Any]] = {}
         self.attempts: list[dict[str, Any]] = []
         self.outbox: dict[str, dict[str, Any]] = {}
         self.active: dict[str, bool] = {}
         self._next_id = 1
 
-    async def claim(
-        self, *, now: datetime, lease_until: datetime, limit: int
-    ) -> list[Claim]:
+    async def claim(self, *, lease_s: int, limit: int) -> list[Claim]:
+        now = self._clock()
+        lease_until = now + timedelta(seconds=lease_s)
         due = sorted(
             (
                 d
@@ -68,16 +74,15 @@ class InMemoryDeliveryStore:
             return d
         return None
 
-    async def cancel(self, claim: Claim, *, now: datetime) -> bool:
+    async def cancel(self, claim: Claim) -> bool:
         d = self._owned(claim)
         if d is None:
             return False
-        d.update(state="cancelled", lease_until=None, updated_at=now)
+        d.update(state="cancelled", lease_until=None, updated_at=self._clock())
         return True
 
-    async def record(
-        self, claim: Claim, result: DeliveryResult, *, now: datetime
-    ) -> bool:
+    async def record(self, claim: Claim, result: DeliveryResult) -> bool:
+        now = self._clock()
         if claim.id in self.deliveries:
             self.attempts.append(
                 {
@@ -100,6 +105,6 @@ class InMemoryDeliveryStore:
             last_error=result.error,
             updated_at=now,
         )
-        if result.next_attempt_at is not None:
-            d["next_attempt_at"] = result.next_attempt_at
+        if result.retry_in_s is not None:
+            d["next_attempt_at"] = now + timedelta(seconds=result.retry_in_s)
         return True

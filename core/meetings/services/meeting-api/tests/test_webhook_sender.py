@@ -37,8 +37,10 @@ import pytest
 from meeting_api.webhooks.fakes import InMemoryDeliveryStore
 from meeting_api.webhooks.secret_box import SecretBox
 from meeting_api.webhooks.sender import (
+    LEASE_MARGIN_S,
     LEASE_S,
     RETRY_SCHEDULE_S,
+    SEND_TIMEOUT_S,
     DeliveryResult,
     HttpxPoster,
     PostgresDeliveryStore,
@@ -126,6 +128,7 @@ class StaticSubscriptions:
     def __init__(self) -> None:
         self.by_user: dict[int, list[Subscription]] = {}
         self.unavailable = False
+        self.on_find: Optional[Callable[[], None]] = None
 
     def put(self, user_id: int, sub: Subscription) -> None:
         subs = [s for s in self.by_user.get(user_id, []) if s.id != sub.id]
@@ -137,6 +140,8 @@ class StaticSubscriptions:
         return list(self.by_user.get(user_id, []))
 
     async def find(self, user_id: int, subscription_id: str) -> Optional[Subscription]:
+        if self.on_find is not None:
+            self.on_find()
         for sub in await self.for_account(user_id):
             if sub.id == subscription_id:
                 return sub
@@ -181,7 +186,8 @@ class MemoryHarness:
     kind = "memory"
 
     def __init__(self) -> None:
-        self.store = InMemoryDeliveryStore()
+        self.clock = Clock()
+        self.store = InMemoryDeliveryStore(clock=self.clock)
 
     async def add_subscription(
         self, sub_id: str, user_id: int, active: bool = True
@@ -240,7 +246,9 @@ class PgHarness:
 
         self.engine = engine
         self.session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        self.store = PostgresDeliveryStore(self.session_factory)
+        self.clock = Clock()
+        # the test clock stands in for the database's now() (production passes none)
+        self.store = PostgresDeliveryStore(self.session_factory, clock=self.clock)
 
     async def _exec(self, sql: str, **params: Any) -> Any:
         from sqlalchemy import text
@@ -416,7 +424,7 @@ def resolve_public(host: str) -> list[str]:
 
 @pytest.fixture
 def world(h) -> World:
-    clock = Clock()
+    clock = h.clock
     subs = StaticSubscriptions()
     receiver = Receiver()
     allowlist = parse_allowlist(DEFAULT_PRIVATE_HOST_ALLOWLIST)
@@ -504,7 +512,7 @@ async def test_the_retry_schedule_then_dead_with_byte_identical_payloads(world):
 
 
 async def test_a_timeout_is_retried(h):
-    clock = Clock()
+    clock = h.clock
     subs = StaticSubscriptions()
     receiver = Receiver(delay_s=0.2)
     sender = WebhookSender(
@@ -624,11 +632,7 @@ async def test_an_expired_lease_is_reclaimed_and_the_old_claim_cannot_write(worl
     did, _ = await world.event(sub)
 
     # a replica claims the row and dies before it answers
-    (stale,) = await world.h.store.claim(
-        now=world.clock.now,
-        lease_until=world.clock.now + timedelta(seconds=LEASE_S),
-        limit=10,
-    )
+    (stale,) = await world.h.store.claim(lease_s=LEASE_S, limit=10)
     assert (await world.h.delivery(did))["state"] == "sending"
 
     world.clock.advance(30)
@@ -644,18 +648,123 @@ async def test_an_expired_lease_is_reclaimed_and_the_old_claim_cannot_write(worl
         status_code=400,
         error=None,
         duration_ms=1,
-        next_attempt_at=None,
+        retry_in_s=None,
     )
-    assert await world.h.store.record(stale, late, now=world.clock.now) is False
-    assert await world.h.store.cancel(stale, now=world.clock.now) is False
+    assert await world.h.store.record(stale, late) is False
+    assert await world.h.store.cancel(stale) is False
     row = await world.h.delivery(did)
     assert (row["state"], row["attempts"]) == ("delivered", 1)
     assert len(world.receiver.posted) == 1
 
 
+async def test_a_claim_whose_lease_is_nearly_spent_is_left_for_reclaim(h):
+    """Before it posts, the sender checks the claim still has SEND_TIMEOUT_S + LEASE_MARGIN_S of
+    its lease left (measured on the monotonic clock from before the claim, so no wall clock is
+    involved). If not, it sends nothing and writes nothing: the lease runs out and the row is
+    claimed again."""
+    mono = Monotonic()
+    subs = StaticSubscriptions()
+    receiver = Receiver()
+    sender = WebhookSender(
+        h.store,
+        subs,
+        box(),
+        receiver,
+        allowlist=frozenset(),
+        resolver=resolve_public,
+        clock=h.clock,
+        monotonic=mono,
+    )
+    w = World(h, h.clock, subs, receiver, sender)
+    did, body = await w.event(await w.subscribe())
+    budget = LEASE_S - SEND_TIMEOUT_S - LEASE_MARGIN_S
+
+    def slow_read() -> None:
+        mono.t += budget + 0.5
+
+    subs.on_find = slow_read
+    assert await sender.run_once() == 1
+    assert receiver.posted == []
+    assert await h.attempt_rows(did) == []
+    row = await h.delivery(did)
+    assert (row["state"], row["attempts"]) == ("sending", 0)
+
+    subs.on_find = None
+    h.clock.advance(30)
+    assert await sender.run_once() == 0  # still leased
+    h.clock.advance(LEASE_S - 30 + 1)
+    assert await sender.run_once() == 1
+    assert [p.body for p in receiver.posted] == [body]
+    row = await h.delivery(did)
+    assert (row["state"], row["attempts"]) == ("delivered", 1)
+
+    # a read that leaves exactly the budget still sends
+    did2, _ = await w.event(await w.subscribe())
+    subs.on_find = lambda: setattr(mono, "t", mono.t + budget - 0.5)
+    await sender.run_once()
+    assert (await h.delivery(did2))["state"] == "delivered"
+
+
+async def test_claims_leases_and_retries_run_on_the_database_clock(pg_engine):
+    """Production passes no clock: the claim predicate, lease_until, the retry time and the stamps
+    are the database's now(), so a replica whose own clock is off can't shorten a lease or claim a
+    row early."""
+    from sqlalchemy import text
+
+    h = PgHarness(pg_engine)
+    store = PostgresDeliveryStore(h.session_factory)  # the database clock
+    s = str(uuid.uuid4())
+    await h.add_subscription(s, USER)
+    await h.add_event("evt_due", "meeting.updated", "{}")
+    await h.add_event("evt_later", "meeting.updated", "{}")
+    async with pg_engine.begin() as conn:
+        for event_id, offset in (("evt_due", "-1 second"), ("evt_later", "30 seconds")):
+            await conn.execute(
+                text(
+                    "INSERT INTO webhook_deliveries (event_id, subscription_id, user_id, state, "
+                    "attempts, next_attempt_at) VALUES (:e, CAST(:s AS uuid), :u, 'pending', 0, "
+                    f"now() + interval '{offset}')"
+                ),
+                {"e": event_id, "s": s, "u": USER},
+            )
+
+    (claim,) = await store.claim(lease_s=LEASE_S, limit=10)
+    assert claim.event_id == "evt_due"
+    async with pg_engine.connect() as conn:
+        db_now = (await conn.execute(text("SELECT now()"))).scalar_one()
+    assert 59 <= (claim.lease_until - db_now).total_seconds() <= 61
+
+    retry = DeliveryResult(
+        state="pending",
+        outcome="retry",
+        status_code=503,
+        error="HTTP 503",
+        duration_ms=3,
+        retry_in_s=RETRY_SCHEDULE_S[0],
+    )
+    assert await store.record(claim, retry) is True
+    row = await h.delivery(claim.id)
+    async with pg_engine.connect() as conn:
+        db_now = (await conn.execute(text("SELECT now()"))).scalar_one()
+    assert 59 <= (row["next_attempt_at"] - db_now).total_seconds() <= 61
+
+    # a sender whose own clock runs an hour ahead still claims nothing early
+    subs = StaticSubscriptions()
+    ahead = WebhookSender(
+        store,
+        subs,
+        box(),
+        Receiver(),
+        allowlist=frozenset(),
+        resolver=resolve_public,
+        clock=lambda: datetime.now(UTC) + timedelta(hours=1),
+    )
+    assert await ahead.run_once() == 0
+
+
 async def test_two_senders_never_send_the_same_delivery(pg_engine):
     h = PgHarness(pg_engine)
-    clock = Clock()
+    clock = h.clock
     subs = StaticSubscriptions()
     receiver = Receiver(delay_s=0.01)
     w = World(h, clock, subs, receiver, None)  # type: ignore[arg-type]
@@ -664,7 +773,7 @@ async def test_two_senders_never_send_the_same_delivery(pg_engine):
 
     def sender() -> WebhookSender:
         return WebhookSender(
-            PostgresDeliveryStore(h.session_factory),
+            PostgresDeliveryStore(h.session_factory, clock=h.clock),
             subs,
             box(),
             receiver,
@@ -752,7 +861,7 @@ async def test_the_allowlist_lets_the_portal_through_and_blocks_10_0_0_1(world):
 
 
 async def test_a_host_that_does_not_resolve_is_retried(h):
-    clock = Clock()
+    clock = h.clock
     subs = StaticSubscriptions()
     receiver = Receiver()
     sender = WebhookSender(

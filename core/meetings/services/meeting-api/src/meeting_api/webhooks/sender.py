@@ -7,11 +7,14 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    'sending') AND next_attempt_at <= now AND (lease_until IS NULL OR lease_until < now)``) with
    ``FOR UPDATE SKIP LOCKED``, set ``state = 'sending'`` and ``lease_until = now + LEASE_S``, and
    commit. Two replicas never claim the same row; a crashed replica's row is claimed again once its
-   lease has passed.
+   lease has passed. Every instant here is the database's ``now()``, never a replica's clock.
 2. **Re-check** each claim, concurrently: the subscription is still active in
    ``webhook_subscriptions`` (else the row is ``cancelled``, with no attempt), and its URL passes
    the SSRF guard (``ssrf.validate_webhook_url`` with ``WEBHOOK_PRIVATE_HOST_ALLOWLIST``, resolved
    in a worker thread under ``URL_CHECK_TIMEOUT_S``).
+   Before posting, the claim must still have ``SEND_TIMEOUT_S + LEASE_MARGIN_S`` of its lease left,
+   measured on the monotonic clock from just before the claim. If it hasn't (a slow subscription
+   read or DNS), nothing is sent or written and the row is left for the next claim.
 3. **Sign** the stored ``payload_text`` (``signing.signed_headers``; the secret opened by
    ``secret_box.py``, the previous one too while it is still valid) and post those exact bytes,
    under ``SEND_TIMEOUT_S`` in total, to the address the guard validated.
@@ -45,7 +48,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Collection, List, Mapping, Optional, Protocol
 
 from ..obs import log_event
@@ -77,6 +80,7 @@ __all__ = [
 ]
 
 LEASE_S = 60
+LEASE_MARGIN_S = 5.0
 SEND_TIMEOUT_S = 10.0
 URL_CHECK_TIMEOUT_S = 5.0
 RETRY_SCHEDULE_S = (60, 300, 1800, 7200)
@@ -108,21 +112,20 @@ class DeliveryResult:
     status_code: Optional[int]
     error: Optional[str]
     duration_ms: Optional[int]
-    next_attempt_at: Optional[datetime]
+    retry_in_s: Optional[int]
 
 
 class DeliveryStore(Protocol):
-    async def claim(
-        self, *, now: datetime, lease_until: datetime, limit: int
-    ) -> list[Claim]: ...
+    """Delivery rows. The store owns the clock: the claim predicate, ``lease_until``, the retry
+    time and every stamp are its ``now`` (Postgres: the database's ``now()``)."""
+
+    async def claim(self, *, lease_s: int, limit: int) -> list[Claim]: ...
 
     async def is_active(self, subscription_id: str) -> bool: ...
 
-    async def cancel(self, claim: Claim, *, now: datetime) -> bool: ...
+    async def cancel(self, claim: Claim) -> bool: ...
 
-    async def record(
-        self, claim: Claim, result: DeliveryResult, *, now: datetime
-    ) -> bool: ...
+    async def record(self, claim: Claim, result: DeliveryResult) -> bool: ...
 
 
 class TransportError(Exception):
@@ -140,21 +143,18 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _retry(claim: Claim, now: datetime, **fields: Any) -> DeliveryResult:
+def _retry(claim: Claim, **fields: Any) -> DeliveryResult:
     if claim.attempt <= len(RETRY_SCHEDULE_S):
-        wait = RETRY_SCHEDULE_S[claim.attempt - 1]
         return DeliveryResult(
             state="pending",
             outcome="retry",
-            next_attempt_at=now + timedelta(seconds=wait),
+            retry_in_s=RETRY_SCHEDULE_S[claim.attempt - 1],
             **fields,
         )
-    return DeliveryResult(state="dead", outcome="dead", next_attempt_at=None, **fields)
+    return DeliveryResult(state="dead", outcome="dead", retry_in_s=None, **fields)
 
 
-def _answered(
-    claim: Claim, now: datetime, code: int, duration_ms: int
-) -> DeliveryResult:
+def _answered(claim: Claim, code: int, duration_ms: int) -> DeliveryResult:
     fields: dict[str, Any] = {
         "status_code": code,
         "duration_ms": duration_ms,
@@ -162,20 +162,20 @@ def _answered(
     }
     if 200 <= code < 300:
         return DeliveryResult(
-            state="delivered", outcome="delivered", next_attempt_at=None, **fields
+            state="delivered", outcome="delivered", retry_in_s=None, **fields
         )
     if code >= 500 or code == 429:
-        return _retry(claim, now, **{**fields, "error": f"HTTP {code}"})
+        return _retry(claim, **{**fields, "error": f"HTTP {code}"})
     return DeliveryResult(
         state="failed",
         outcome="failed",
-        next_attempt_at=None,
+        retry_in_s=None,
         **{**fields, "error": f"HTTP {code}"},
     )
 
 
-def _unsent(claim: Claim, now: datetime, error: str) -> DeliveryResult:
-    return _retry(claim, now, status_code=None, error=error, duration_ms=None)
+def _unsent(claim: Claim, error: str) -> DeliveryResult:
+    return _retry(claim, status_code=None, error=error, duration_ms=None)
 
 
 class WebhookSender:
@@ -191,6 +191,7 @@ class WebhookSender:
         allowlist: Collection[str],
         resolver: Optional[Callable[[str], List[str]]] = None,
         clock: Callable[[], datetime] = _utcnow,
+        monotonic: Callable[[], float] = time.monotonic,
         claim_limit: int = CLAIM_LIMIT,
         send_timeout_s: float = SEND_TIMEOUT_S,
         url_check_timeout_s: float = URL_CHECK_TIMEOUT_S,
@@ -202,30 +203,28 @@ class WebhookSender:
         self._allowlist = frozenset(allowlist)
         self._resolver = resolver
         self._clock = clock
+        self._monotonic = monotonic
         self._claim_limit = claim_limit
         self._send_timeout_s = send_timeout_s
         self._url_check_timeout_s = url_check_timeout_s
 
     async def run_once(self) -> int:
         """One tick: claim what is due and deliver it. Returns how many rows were claimed."""
-        now = self._clock()
-        claims = await self._store.claim(
-            now=now,
-            lease_until=now + timedelta(seconds=LEASE_S),
-            limit=self._claim_limit,
-        )
+        # Read before the claim, so the lease measured from here is never longer than the one the
+        # store granted.
+        claimed_at = self._monotonic()
+        claims = await self._store.claim(lease_s=LEASE_S, limit=self._claim_limit)
         if claims:
-            await asyncio.gather(*(self._deliver(claim) for claim in claims))
+            await asyncio.gather(*(self._deliver(c, claimed_at) for c in claims))
         return len(claims)
 
-    async def _deliver(self, claim: Claim) -> None:
+    async def _deliver(self, claim: Claim, claimed_at: float) -> None:
         try:
-            await self._deliver_claim(claim)
+            await self._deliver_claim(claim, claimed_at)
         except asyncio.CancelledError:
             raise
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 — the lease expires and the row is retried
+        # the lease expires and the row is claimed again
+        except Exception as exc:  # noqa: BLE001
             log_event(
                 "webhook_delivery_crashed",
                 audience="operator",
@@ -235,10 +234,10 @@ class WebhookSender:
                 fields={**self._ids(claim), "error": type(exc).__name__},
             )
 
-    async def _deliver_claim(self, claim: Claim) -> None:
+    async def _deliver_claim(self, claim: Claim, claimed_at: float) -> None:
         now = self._clock()
         if not await self._store.is_active(claim.subscription_id):
-            cancelled = await self._store.cancel(claim, now=now)
+            cancelled = await self._store.cancel(claim)
             self._log(claim, "cancelled" if cancelled else "superseded", None)
             return
         try:
@@ -249,7 +248,7 @@ class WebhookSender:
         else:
             error = "subscription not in the account's read"
         if sub is None:
-            await self._finish(claim, _unsent(claim, now, error))
+            await self._finish(claim, _unsent(claim, error))
             return
 
         try:
@@ -263,10 +262,10 @@ class WebhookSender:
                 timeout=self._url_check_timeout_s,
             )
         except UnresolvableHost:
-            await self._finish(claim, _unsent(claim, now, "host could not be resolved"))
+            await self._finish(claim, _unsent(claim, "host could not be resolved"))
             return
         except asyncio.TimeoutError:
-            await self._finish(claim, _unsent(claim, now, "host resolution timed out"))
+            await self._finish(claim, _unsent(claim, "host resolution timed out"))
             return
         except SSRFError as exc:
             refused = DeliveryResult(
@@ -275,7 +274,7 @@ class WebhookSender:
                 status_code=None,
                 error=f"url refused: {exc}",
                 duration_ms=None,
-                next_attempt_at=None,
+                retry_in_s=None,
             )
             await self._finish(claim, refused)
             return
@@ -283,7 +282,7 @@ class WebhookSender:
         try:
             secret = self._box.decrypt(sub.secret_enc, sub.enc_key_id)
         except SecretBoxError:
-            await self._finish(claim, _unsent(claim, now, "secret could not be opened"))
+            await self._finish(claim, _unsent(claim, "secret could not be opened"))
             return
         previous = None
         previous_enc, previous_key = sub.previous_secret_enc, sub.previous_enc_key_id
@@ -300,6 +299,14 @@ class WebhookSender:
                     fields=self._ids(claim),
                 )
 
+        if (
+            self._monotonic() - claimed_at + self._send_timeout_s + LEASE_MARGIN_S
+            > LEASE_S
+        ):
+            # Too little lease left to post and record inside it: send nothing, write nothing,
+            # and let the lease run out so the row is claimed again.
+            self._log(claim, "lease_short", None)
+            return
         body = claim.payload_text.encode("utf-8")
         headers = signed_headers(
             body,
@@ -313,14 +320,14 @@ class WebhookSender:
                 self._poster.post(target, body, headers), timeout=self._send_timeout_s
             )
         except asyncio.TimeoutError:
-            result = _unsent(claim, now, "timeout")
+            result = _unsent(claim, "timeout")
         except TransportError as exc:
-            result = _unsent(claim, now, f"connection error ({exc})")
+            result = _unsent(claim, f"connection error ({exc})")
         except SSRFError:
-            result = _unsent(claim, now, "address refused at connect")
+            result = _unsent(claim, "address refused at connect")
         else:
             elapsed = int((time.monotonic() - started) * 1000)
-            result = _answered(claim, now, code, elapsed)
+            result = _answered(claim, code, elapsed)
         if result.duration_ms is None:
             result = DeliveryResult(
                 state=result.state,
@@ -328,12 +335,12 @@ class WebhookSender:
                 status_code=result.status_code,
                 error=result.error,
                 duration_ms=int((time.monotonic() - started) * 1000),
-                next_attempt_at=result.next_attempt_at,
+                retry_in_s=result.retry_in_s,
             )
         await self._finish(claim, result)
 
     async def _finish(self, claim: Claim, result: DeliveryResult) -> None:
-        moved = await self._store.record(claim, result, now=self._clock())
+        moved = await self._store.record(claim, result)
         self._log(claim, result.state if moved else "superseded", result)
 
     @staticmethod
@@ -407,25 +414,33 @@ class HttpxPoster:
 
 class PostgresDeliveryStore:
     """``DeliveryStore`` over ``webhook_deliveries`` / ``webhook_delivery_attempts`` /
-    ``webhook_outbox`` / ``webhook_subscriptions`` (one short transaction per call)."""
+    ``webhook_outbox`` / ``webhook_subscriptions`` (one short transaction per call).
 
-    _CLAIM = """
+    Time is the database's ``now()``: the claim predicate, ``lease_until = now() + lease``, the
+    retry time and every stamp, so a replica whose clock is off can neither shorten a lease nor
+    claim a row early. ``clock`` replaces ``now()`` for tests only."""
+
+    _NOW = "COALESCE(CAST(:now AS timestamptz), now())"
+
+    _CLAIM = f"""
         WITH due AS (
             SELECT id FROM webhook_deliveries
             WHERE state IN ('pending', 'sending')
-              AND next_attempt_at <= :now
-              AND (lease_until IS NULL OR lease_until < :now)
+              AND next_attempt_at <= {_NOW}
+              AND (lease_until IS NULL OR lease_until < {_NOW})
             ORDER BY next_attempt_at, id
             LIMIT :limit
             FOR UPDATE SKIP LOCKED
         ), claimed AS (
             UPDATE webhook_deliveries AS d
-            SET state = 'sending', lease_until = :lease, updated_at = :now
+            SET state = 'sending',
+                lease_until = {_NOW} + make_interval(secs => CAST(:lease_s AS double precision)),
+                updated_at = {_NOW}
             FROM due
             WHERE d.id = due.id
-            RETURNING d.id, d.event_id, d.subscription_id, d.user_id, d.attempts
+            RETURNING d.id, d.event_id, d.subscription_id, d.user_id, d.attempts, d.lease_until
         )
-        SELECT c.id, c.event_id, c.subscription_id, c.user_id, c.attempts,
+        SELECT c.id, c.event_id, c.subscription_id, c.user_id, c.attempts, c.lease_until,
                o.event_type, o.payload_text
         FROM claimed AS c
         JOIN webhook_outbox AS o ON o.event_id = c.event_id
@@ -434,19 +449,26 @@ class PostgresDeliveryStore:
 
     _OWNED = "id = :id AND state = 'sending' AND lease_until = :lease"
 
-    def __init__(self, session_factory: Any) -> None:
+    def __init__(
+        self,
+        session_factory: Any,
+        *,
+        clock: Optional[Callable[[], datetime]] = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._clock = clock
 
-    async def claim(
-        self, *, now: datetime, lease_until: datetime, limit: int
-    ) -> list[Claim]:
+    def _now(self) -> Optional[datetime]:
+        return None if self._clock is None else self._clock()
+
+    async def claim(self, *, lease_s: int, limit: int) -> list[Claim]:
         from sqlalchemy import text
 
         async with self._session_factory() as db:
             rows = (
                 await db.execute(
                     text(self._CLAIM),
-                    {"now": now, "lease": lease_until, "limit": limit},
+                    {"now": self._now(), "lease_s": lease_s, "limit": limit},
                 )
             ).all()
             await db.commit()
@@ -458,7 +480,7 @@ class PostgresDeliveryStore:
                 subscription_id=str(row.subscription_id),
                 user_id=int(row.user_id),
                 attempt=int(row.attempts) + 1,
-                lease_until=lease_until,
+                lease_until=row.lease_until,
                 payload_text=row.payload_text,
             )
             for row in rows
@@ -479,25 +501,24 @@ class PostgresDeliveryStore:
             ).scalar_one_or_none()
         return bool(active)
 
-    async def cancel(self, claim: Claim, *, now: datetime) -> bool:
+    async def cancel(self, claim: Claim) -> bool:
         from sqlalchemy import text
 
         async with self._session_factory() as db:
             result = await db.execute(
                 text(
                     "UPDATE webhook_deliveries SET state = 'cancelled', lease_until = NULL, "
-                    f"updated_at = :now WHERE {self._OWNED}"
+                    f"updated_at = {self._NOW} WHERE {self._OWNED}"
                 ),
-                {"now": now, "id": claim.id, "lease": claim.lease_until},
+                {"now": self._now(), "id": claim.id, "lease": claim.lease_until},
             )
             await db.commit()
         return int(getattr(result, "rowcount", 0) or 0) == 1
 
-    async def record(
-        self, claim: Claim, result: DeliveryResult, *, now: datetime
-    ) -> bool:
+    async def record(self, claim: Claim, result: DeliveryResult) -> bool:
         from sqlalchemy import text
 
+        now = self._now()
         async with self._session_factory() as db:
             await db.execute(
                 text(
@@ -505,7 +526,7 @@ class PostgresDeliveryStore:
                     "(delivery_id, attempt, outcome, status_code, error, duration_ms, created_at) "
                     "SELECT CAST(:id AS bigint), CAST(:attempt AS integer), CAST(:outcome AS text), "
                     "CAST(:status_code AS integer), CAST(:error AS text), "
-                    "CAST(:duration_ms AS integer), CAST(:now AS timestamptz) "
+                    f"CAST(:duration_ms AS integer), {self._NOW} "
                     "WHERE EXISTS (SELECT 1 FROM webhook_deliveries WHERE id = CAST(:id AS bigint))"
                 ),
                 {
@@ -521,14 +542,16 @@ class PostgresDeliveryStore:
             moved = await db.execute(
                 text(
                     "UPDATE webhook_deliveries SET state = :state, attempts = :attempt, "
-                    "next_attempt_at = COALESCE(CAST(:next AS timestamptz), next_attempt_at), "
+                    "next_attempt_at = CASE WHEN CAST(:retry_in AS double precision) IS NULL "
+                    f"THEN next_attempt_at ELSE {self._NOW} + "
+                    "make_interval(secs => CAST(:retry_in AS double precision)) END, "
                     "lease_until = NULL, last_status_code = :status_code, last_error = :error, "
-                    f"updated_at = :now WHERE {self._OWNED}"
+                    f"updated_at = {self._NOW} WHERE {self._OWNED}"
                 ),
                 {
                     "state": result.state,
                     "attempt": claim.attempt,
-                    "next": result.next_attempt_at,
+                    "retry_in": result.retry_in_s,
                     "status_code": result.status_code,
                     "error": result.error,
                     "now": now,
