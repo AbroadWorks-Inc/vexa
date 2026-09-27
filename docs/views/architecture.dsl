@@ -5,6 +5,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   service desktop
   service meeting-api
   service mcp
+  service exporter
   module buffer
   module capture-codec
   module gmeet-capture
@@ -81,6 +82,18 @@ system service-authority-system  # optional operator-owned admission and active-
 system system-webhook-system  # optional operator-owned terminal-event consumer; absent in stock OSS and never selected from customer or meeting data
   service system-webhook
 
+system calendar-dispatcher-system  # external calendar module (calendar-dispatcher, aw-notetaker repo); absent from the self-hosted core; owns Google calendar reads and per-user tokens, never sends or stops a bot itself
+  service calendar-dispatcher
+
+system portal-system  # external portal client (aw-notetaker repo); absent from the self-hosted core; owns sign-in, per-user visibility and its own webhook receiver
+  service portal
+
+system webhook-subscriber-system  # optional account-registered webhook receivers (§2.7); absent in stock OSS and never selected from customer or meeting data; distinct from the single boot-frozen system-webhook
+  service webhook-subscriber
+
+system prometheus-system  # optional operator-owned metrics scraper; absent in stock OSS
+  service prometheus
+
 system platform  # shared infra backing the services
   service redis
   database postgres
@@ -124,6 +137,10 @@ edges:
   meeting-api -req-> admin-api  # GET /internal/calendar-configs discovers secret-gated calendar connections for sync and disconnect cleanup
   meeting-api -req-> service-authority  # optional signed service-authority.v1 admit/continue decision; unset is explicit OSS allow-all, configured failure is closed
   meeting-api -req-> system-webhook  # optional signed terminal webhook.v1 delivery to a boot-frozen operator destination; customer webhook SSRF policy remains separate
+  meeting-api -req-> webhook-subscriber  # signed webhook.v1 delivery to every account's active subscriptions registered over POST /v2/webhooks; X-Webhook-Signature (+ X-Webhook-Signature-Previous during a rotation), retried at 1m/5m/30m/2h then dead (§1.8, §2.7)
+  admin-api -req-> meeting-api  # POST /internal/webhooks/test, INTERNAL_API_SECRET: admin-api's hand-off of POST /v2/webhooks/{id}/test, queuing the webhook.test send (§1.8, §2.7)
+  prometheus -req-> meeting-api  # GET /metrics scrape, unsigned — no gateway signature is required on /metrics (§1.10, §1.13, A19)
+  prometheus -req-> admin-api  # GET /metrics scrape, unsigned — no gateway signature is required on /metrics (§1.10, §1.13, A19)
   agent-api -read-> segments-stream  # XREADGROUP agent_copilot (proactive watcher)
   agent-api -req-> runtime  # POST /workloads spawn agent-worker
   agent-api -read-> out-stream  # SSE relay (/api/chat, /api/meeting/stream)
@@ -131,10 +148,13 @@ edges:
   agent-worker -write-> out-stream  # XADD cards/notes/deltas
   agent-worker -read-> unit-in  # chat path XREADs interactive input
   mcp -req-> gateway  # every MCP tool forwards the caller's X-API-Key to the public REST surface
-  gateway -req-> meeting-api  # proxy /bots /transcripts /meetings /recordings and per-calendar sync
+  gateway -req-> meeting-api  # proxy /bots /transcripts /meetings /recordings /v2/entries /v2/meetings and per-calendar sync; every forwarded client request carries the gateway's signed identity (x-gateway-signature: t=<unix>,v1=HMAC-SHA256(GATEWAY_IDENTITY_SECRET, t.user_id.method.path)), which meeting-api verifies and rejects if missing, wrong, for a different user, or stale (§1.10)
   gateway -req-> agent-api  # proxy /agent/*
   gateway -req-> mcp  # proxy /mcp — POST buffered, GET relayed unbuffered (SSE stream)
-  gateway -req-> admin-api  # POST /internal/validate (authz oracle) plus user calendar connection CRUD
+  gateway -req-> admin-api  # POST /internal/validate (authz oracle) plus user calendar connection CRUD and /v2/webhooks subscription management (§2.7); the same signed gateway identity that meeting-api verifies is verified here too (§1.10)
+  calendar-dispatcher -req-> gateway  # PUT /v2/entries, POST /v2/entries/remove — keeps aw-bots current with each connected user's calendar (§1.1, §2.1, Part 3); key scope `bot`
+  portal -req-> gateway  # GET /v2/meetings(?user=), GET /v2/meetings/{id}?user= (reads); PUT /v2/entries {join_now:true} (instant join); POST /v2/meetings/{id}/stop (§2.1, Part 4); key scopes `bot`+`tx`
+  exporter -req-> gateway  # GET /recordings, /recordings/{id}/master, the transcript; POST /v2/meetings/{id}/export reports the export result (§1.9, §2.1); key scopes `tx`+`export`. The exporter no longer calls meeting-api directly — no such edge existed in this chart to remove
   gateway -read-> bm-status  # WS fan-out
   gateway -read-> u-meetings  # WS auto-subscribe
   gateway -read-> va-chat  # WS fan-out

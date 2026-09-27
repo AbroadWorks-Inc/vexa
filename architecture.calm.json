@@ -88,6 +88,30 @@
    "description": "optional operator-owned terminal-event consumer; absent in stock OSS and never selected from customer or meeting data"
   },
   {
+   "unique-id": "calendar-dispatcher-system",
+   "node-type": "system",
+   "name": "calendar module",
+   "description": "external calendar module (calendar-dispatcher, aw-notetaker repo); absent from the self-hosted core; owns Google calendar reads and per-user tokens, never sends or stops a bot itself"
+  },
+  {
+   "unique-id": "portal-system",
+   "node-type": "system",
+   "name": "portal",
+   "description": "external portal client (aw-notetaker repo); absent from the self-hosted core; owns sign-in, per-user visibility and its own webhook receiver"
+  },
+  {
+   "unique-id": "webhook-subscriber-system",
+   "node-type": "system",
+   "name": "webhook subscribers",
+   "description": "optional account-registered webhook receivers (§2.7); absent in stock OSS and never selected from customer or meeting data; distinct from the single boot-frozen system-webhook"
+  },
+  {
+   "unique-id": "prometheus-system",
+   "node-type": "system",
+   "name": "Prometheus",
+   "description": "optional operator-owned metrics scraper; absent in stock OSS"
+  },
+  {
    "unique-id": "agent-api",
    "node-type": "service",
    "name": "agent-api",
@@ -226,6 +250,17 @@
    ]
   },
   {
+   "unique-id": "meeting-api-intake",
+   "node-type": "module",
+   "name": "meeting-api-intake",
+   "description": "meeting-api-intake — atomic module in meeting-api (§1.12): entry/removal handling behind IntakeStore, R1-R8, the one status writer + outbox, the scheduler and stop paths (§1.3-§1.7)",
+   "metadata": [
+    {
+     "path": "core/meetings/services/meeting-api/src/meeting_api/intake"
+    }
+   ]
+  },
+  {
    "unique-id": "service-authority",
    "node-type": "service",
    "name": "external service authority",
@@ -250,6 +285,36 @@
    ]
   },
   {
+   "unique-id": "calendar-dispatcher",
+   "node-type": "service",
+   "name": "calendar module",
+   "description": "calendar module (calendar-dispatcher, aw-notetaker repo): external client that reads each connected user's Google calendar and keeps aw-bots' entries current — PUT /v2/entries, POST /v2/entries/remove; owns calendar tokens; never sends or stops a bot itself; outside the self-hosted core (§0.3, Part 3)"
+  },
+  {
+   "unique-id": "portal",
+   "node-type": "service",
+   "name": "portal",
+   "description": "portal (aw-notetaker repo): external client for sign-in, meeting list/detail, instant join, stop and its own webhook receiver — GET /v2/meetings(?user=), GET /v2/meetings/{id}?user=, PUT /v2/entries (join_now instant join), POST /v2/meetings/{id}/stop; holds nothing about meetings of its own; outside the self-hosted core (§0.3, Part 4)"
+  },
+  {
+   "unique-id": "webhook-subscriber",
+   "node-type": "service",
+   "name": "webhook subscriber",
+   "description": "any receiver an account registered via POST /v2/webhooks (§2.7, at most 20 per account); meeting-api delivers every event it subscribed to, signed and retried on failure; outside the self-hosted core. Distinct from the legacy single boot-frozen system-webhook",
+   "interfaces": [
+    {
+     "unique-id": "webhook-subscriber-rest",
+     "type": "api"
+    }
+   ]
+  },
+  {
+   "unique-id": "prometheus",
+   "node-type": "service",
+   "name": "Prometheus",
+   "description": "the operator's metrics scraper, outside the self-hosted core: scrapes meeting-api and admin-api /metrics, unsigned (§1.10, §1.13, A19)"
+  },
+  {
    "unique-id": "mcp",
    "node-type": "service",
    "name": "mcp",
@@ -263,6 +328,17 @@
     {
      "unique-id": "mcp-http",
      "type": "api"
+    }
+   ]
+  },
+  {
+   "unique-id": "exporter",
+   "node-type": "service",
+   "name": "exporter",
+   "description": "exporter (part of aw-bots, integrations/out/aw-notetaker/exporter): on meeting.completed builds the S3 folder, calls notetaker-worker /process, and reports the result to meeting-api through the gateway (POST /v2/meetings/{id}/export); deletes only its own S3 queue markers, never meeting data (§0.3, §1.9)",
+   "metadata": [
+    {
+     "path": "integrations/out/aw-notetaker/exporter"
     }
    ]
   },
@@ -1409,6 +1485,7 @@
       "desktop",
       "meeting-api",
       "mcp",
+      "exporter",
       "buffer",
       "capture-codec",
       "gmeet-capture",
@@ -1464,6 +1541,61 @@
      "container": "system-webhook-system",
      "nodes": [
       "system-webhook"
+     ]
+    }
+   }
+  },
+  {
+   "unique-id": "meeting-api-composed",
+   "relationship-type": {
+    "composed-of": {
+     "container": "meeting-api",
+     "nodes": [
+      "meeting-api-intake"
+     ]
+    }
+   }
+  },
+  {
+   "unique-id": "calendar-dispatcher-composed",
+   "relationship-type": {
+    "composed-of": {
+     "container": "calendar-dispatcher-system",
+     "nodes": [
+      "calendar-dispatcher"
+     ]
+    }
+   }
+  },
+  {
+   "unique-id": "portal-composed",
+   "relationship-type": {
+    "composed-of": {
+     "container": "portal-system",
+     "nodes": [
+      "portal"
+     ]
+    }
+   }
+  },
+  {
+   "unique-id": "webhook-subscriber-composed",
+   "relationship-type": {
+    "composed-of": {
+     "container": "webhook-subscriber-system",
+     "nodes": [
+      "webhook-subscriber"
+     ]
+    }
+   }
+  },
+  {
+   "unique-id": "prometheus-composed",
+   "relationship-type": {
+    "composed-of": {
+     "container": "prometheus-system",
+     "nodes": [
+      "prometheus"
      ]
     }
    }
@@ -2015,6 +2147,70 @@
    "protocol": "HTTP(S)"
   },
   {
+   "unique-id": "ma-subscribers",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "meeting-api"
+     },
+     "destination": {
+      "node": "webhook-subscriber",
+      "interface": "webhook-subscriber-rest"
+     }
+    }
+   },
+   "description": "signed webhook.v1 delivery to every account's active subscriptions registered over POST /v2/webhooks; X-Webhook-Signature (+ X-Webhook-Signature-Previous during a rotation), retried at 1m/5m/30m/2h then dead (§1.8, §2.7)",
+   "protocol": "HTTP(S)"
+  },
+  {
+   "unique-id": "aa-ma-webhook-test",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "admin-api"
+     },
+     "destination": {
+      "node": "meeting-api",
+      "interface": "meeting-api-rest"
+     }
+    }
+   },
+   "description": "POST /internal/webhooks/test, INTERNAL_API_SECRET: admin-api's hand-off of POST /v2/webhooks/{id}/test, queuing the webhook.test send (§1.8, §2.7)",
+   "protocol": "HTTPS"
+  },
+  {
+   "unique-id": "prom-ma",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "prometheus"
+     },
+     "destination": {
+      "node": "meeting-api",
+      "interface": "meeting-api-rest"
+     }
+    }
+   },
+   "description": "GET /metrics scrape, unsigned — no gateway signature is required on /metrics (§1.10, §1.13, A19)",
+   "protocol": "HTTPS"
+  },
+  {
+   "unique-id": "prom-admin",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "prometheus"
+     },
+     "destination": {
+      "node": "admin-api",
+      "interface": "admin-api-rest"
+     }
+    }
+   },
+   "description": "GET /metrics scrape, unsigned — no gateway signature is required on /metrics (§1.10, §1.13, A19)",
+   "protocol": "HTTPS"
+  },
+  {
    "unique-id": "aa-watch",
    "relationship-type": {
     "connects": {
@@ -2154,7 +2350,7 @@
      }
     }
    },
-   "description": "proxy /bots /transcripts /meetings /recordings and per-calendar sync",
+   "description": "proxy /bots /transcripts /meetings /recordings /v2/entries /v2/meetings and per-calendar sync; every forwarded client request carries the gateway's signed identity (x-gateway-signature: t=<unix>,v1=HMAC-SHA256(GATEWAY_IDENTITY_SECRET, t.user_id.method.path)), which meeting-api verifies and rejects if missing, wrong, for a different user, or stale (§1.10)",
    "protocol": "HTTPS"
   },
   {
@@ -2202,7 +2398,55 @@
      }
     }
    },
-   "description": "POST /internal/validate (authz oracle) plus user calendar connection CRUD",
+   "description": "POST /internal/validate (authz oracle) plus user calendar connection CRUD and /v2/webhooks subscription management (§2.7); the same signed gateway identity that meeting-api verifies is verified here too (§1.10)",
+   "protocol": "HTTPS"
+  },
+  {
+   "unique-id": "cal-gw",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "calendar-dispatcher"
+     },
+     "destination": {
+      "node": "gateway",
+      "interface": "gateway-rest"
+     }
+    }
+   },
+   "description": "PUT /v2/entries, POST /v2/entries/remove — keeps aw-bots current with each connected user's calendar (§1.1, §2.1, Part 3); key scope `bot`",
+   "protocol": "HTTPS"
+  },
+  {
+   "unique-id": "portal-gw",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "portal"
+     },
+     "destination": {
+      "node": "gateway",
+      "interface": "gateway-rest"
+     }
+    }
+   },
+   "description": "GET /v2/meetings(?user=), GET /v2/meetings/{id}?user= (reads); PUT /v2/entries {join_now:true} (instant join); POST /v2/meetings/{id}/stop (§2.1, Part 4); key scopes `bot`+`tx`",
+   "protocol": "HTTPS"
+  },
+  {
+   "unique-id": "exporter-gw",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "exporter"
+     },
+     "destination": {
+      "node": "gateway",
+      "interface": "gateway-rest"
+     }
+    }
+   },
+   "description": "GET /recordings, /recordings/{id}/master, the transcript; POST /v2/meetings/{id}/export reports the export result (§1.9, §2.1); key scopes `tx`+`export`. The exporter no longer calls meeting-api directly — no such edge existed in this chart to remove",
    "protocol": "HTTPS"
   },
   {
