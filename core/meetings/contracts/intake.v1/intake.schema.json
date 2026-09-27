@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://vexa.ai/schemas/intake.v1",
   "title": "intake.v1",
-  "description": "The DRAFT contract for the intake surface (§2, task A4): request bodies for PUT /v2/entries and POST /v2/entries/remove, the shared success Reply envelope (§2.4, ten results), the Meeting object every reply/read/webhook renders (meeting_api.intake.projection.project_meeting), the EntryState row GET /v2/entries returns, and the Error envelope (§2.5). UNSEALED — not yet in contracts.seal.json; sealed in task A8 once the routes are built against it. `start`/`end`/timestamp-shaped fields intentionally use a loose ISO-8601 `pattern`, not `format: date-time`, so a NAIVE timestamp (no offset) still conforms at the schema layer — rejecting it is validation.py's own step 2 (§2, validation order), kept distinct from the schema step so the two produce the SAME invalid_request code from two different, testable causes.",
+  "description": "The contract for the intake surface (§2): request bodies for PUT /v2/entries and POST /v2/entries/remove, the shared success Reply envelope (§2.4, ten results), the Meeting object every reply/read/webhook renders (meeting_api.intake.projection.project_meeting), the EntryState rows of GET /v2/entries (EntryPage), the meeting list of GET /v2/meetings (MeetingPage), the erase reply of DELETE /v2/meetings/{id} (Erased), and the Error envelope (§2.5). `start`/`end`/timestamp-shaped fields intentionally use a loose ISO-8601 `pattern`, not `format: date-time`, so a NAIVE timestamp (no offset) still conforms at the schema layer — rejecting it is validation.py's own step 2 (§2, validation order), kept distinct from the schema step so the two produce the SAME invalid_request code from two different, testable causes.",
   "$defs": {
     "Entry": {
       "description": "PUT /v2/entries request body (§2.2). start/end are required unless join_now is true (§2.2: 'Instant join is decided by this flag only, never by the external_id').",
@@ -84,7 +84,7 @@
       "properties": {
         "external_id": { "type": "string" },
         "user": { "type": "string" },
-        "state": { "type": "string", "description": "'active' | 'removed' — this entry's own state after the operation." }
+        "state": { "enum": ["active", "removed", "closed"], "description": "This entry's own state after the operation (meeting_entries.state)." }
       }
     },
     "Outcome": {
@@ -193,7 +193,47 @@
         "join_now": { "type": "boolean" },
         "metadata": { "type": ["object", "null"] },
         "content_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "state": { "type": "string", "description": "'active' | 'removed' | 'closed' (meeting_entries.state)." }
+        "state": { "enum": ["active", "removed", "closed"], "description": "meeting_entries.state; GET /v2/entries lists active entries only." }
+      }
+    },
+    "EntryPage": {
+      "description": "GET /v2/entries?user=&cursor=&limit= (§2.1): one page of the sender's active entries for one user, ordered by external_id. next_cursor is null on the last page; pass it back as `cursor` for the next one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "next_cursor"],
+      "properties": {
+        "entries": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/EntryState" } },
+        "next_cursor": { "type": ["string", "null"] }
+      }
+    },
+    "MeetingPage": {
+      "description": "GET /v2/meetings?user=&from=&to=&status=&external_id=&cursor=&limit= (§2.1): one page of the meetings the user may see (owner or invited, over entries in any state), newest meeting time first. next_cursor is null on the last page.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meetings", "next_cursor"],
+      "properties": {
+        "meetings": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/Meeting" } },
+        "next_cursor": { "type": ["string", "null"] }
+      }
+    },
+    "Erased": {
+      "description": "DELETE /v2/meetings/{id} (§1.13): the finished meeting after erasure (its row and meeting_aw_state stay) and what was removed: recording objects, entries, outbox rows and delivery rows.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting", "deleted"],
+      "properties": {
+        "meeting": { "$ref": "#/$defs/Meeting" },
+        "deleted": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["objects", "entries", "outbox", "deliveries"],
+          "properties": {
+            "objects": { "type": "integer", "minimum": 0 },
+            "entries": { "type": "integer", "minimum": 0 },
+            "outbox": { "type": "integer", "minimum": 0 },
+            "deliveries": { "type": "integer", "minimum": 0 }
+          }
+        }
       }
     },
     "Error": {

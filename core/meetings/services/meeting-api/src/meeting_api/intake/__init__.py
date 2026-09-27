@@ -27,6 +27,11 @@ Public surface:
   * ``PostgresIntakeStore(session_factory)`` — ``adapters.py``. The ``IntakeStore`` over Postgres:
     one transaction per ``room_lock`` holding the links' advisory locks (§1.4), status changes and
     events through ``write_status`` / ``write_event`` in that transaction.
+  * ``build_intake_router(service, reads, stop, *, artifact_store, artifact_deleter, lead_s)`` —
+    ``router.py``. The ``/v2`` meeting routes (§2.1): entries in, reads, stop and erasure, every
+    body an ``intake.v1`` shape and every failure the §2.5 body. ``IntakeReads`` (``ports.py``) is
+    what the reads and erasure need; ``PostgresIntakeReads(session_factory)`` (``reads.py``)
+    implements it over Postgres.
 """
 
 from __future__ import annotations
@@ -34,9 +39,12 @@ from __future__ import annotations
 from .adapters import PostgresIntakeStore
 from .ports import (
     EntryView,
+    ErasedRows,
     EventPublisher,
+    IntakeReads,
     IntakeStore,
     IntakeTx,
+    MeetingQuery,
     MeetingView,
     Room,
     SpawnOutcome,
@@ -44,6 +52,8 @@ from .ports import (
     StopPort,
 )
 from .projection import project_meeting
+from .reads import PostgresIntakeReads
+from .router import build_intake_router
 from .service import IntakeService
 from .settings import IntakeSettings
 from .status import (
@@ -63,6 +73,11 @@ __all__ = [
     "IntakeStore",
     "IntakeTx",
     "PostgresIntakeStore",
+    "PostgresIntakeReads",
+    "IntakeReads",
+    "MeetingQuery",
+    "ErasedRows",
+    "build_intake_router",
     "EntryView",
     "MeetingView",
     "Room",

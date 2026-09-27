@@ -9,6 +9,9 @@ by `meeting-api/tests/test_intake_contract.py` through the Python `jsonschema` p
 - `Remove.with-reason.json` / `Remove.no-reason.json` — a `POST /v2/entries/remove` body.
 - `Meeting.scheduled.json` — the §2.4 meeting object.
 - `EntryState.active.json` — a `GET /v2/entries` row.
+- `EntryPage.first-page.json` — a `GET /v2/entries` page with a `next_cursor`.
+- `MeetingPage.last-page.json` — the last page of `GET /v2/meetings` (`next_cursor: null`).
+- `Erased.finished.json` — the `DELETE /v2/meetings/{id}` reply.
 - `Reply.<result>.json` — one per §2.4 result: `created`, `joined_existing`, `updated`,
   `unchanged`, `not_changed_live`, `not_changed_finished`, `removed`, `entry_removed`,
   `bot_stopping`, `already_removed`.

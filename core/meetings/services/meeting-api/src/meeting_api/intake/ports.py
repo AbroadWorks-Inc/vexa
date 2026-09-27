@@ -5,6 +5,10 @@ in-memory implementation and the Postgres adapter implements the same protocol. 
 stopping go through ``SpawnPort`` / ``StopPort`` (the existing spawn and stop paths), and events
 are handed to ``EventPublisher`` after the transaction that wrote them commits.
 
+The ``/v2`` reads and erasure (§2.1, §1.13) go through ``IntakeReads``: the entries a sender holds
+for one user, the meetings a user may see, one meeting by UUID, and the removal of a finished
+meeting's entries, outbox and delivery rows. ``reads.py`` holds the Postgres implementation.
+
 ``IntakeStore.room_lock(user_id, rooms)`` opens one transaction holding the link lock of every
 room given, taken in the order given (the caller passes them sorted); an empty ``rooms`` is a plain
 transaction with no link lock. The transaction commits when the block exits normally and rolls
@@ -37,9 +41,12 @@ from .validation import EntryIn
 
 __all__ = [
     "EntryView",
+    "ErasedRows",
     "EventPublisher",
+    "IntakeReads",
     "IntakeStore",
     "IntakeTx",
+    "MeetingQuery",
     "MeetingView",
     "Room",
     "SpawnOutcome",
@@ -329,3 +336,60 @@ class StopPort(Protocol):
 
 class EventPublisher(Protocol):
     async def publish(self, event_ids: Sequence[str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class MeetingQuery:
+    """``GET /v2/meetings`` (§2.1): the meetings ``user`` may see, newest meeting time first.
+
+    ``start_from`` / ``start_to`` bound the meeting time (``meeting_event_time``: ``data.scheduled_at``,
+    else ``start_time``, else ``created_at``) as naive UTC, from inclusive, to exclusive. ``after`` is
+    the decoded cursor, ``(meeting time as naive UTC, meetings.id)``: only rows strictly after it in
+    the order are returned. ``limit`` rows at most."""
+
+    user: str
+    start_from: Optional[datetime] = None
+    start_to: Optional[datetime] = None
+    status: Optional[str] = None
+    external_id: Optional[str] = None
+    after: Optional[tuple[datetime, int]] = None
+    limit: int = 100
+
+
+@dataclass(frozen=True)
+class ErasedRows:
+    """What ``IntakeReads.erase`` removed (§1.13)."""
+
+    entries: int
+    outbox: int
+    deliveries: int
+
+
+class IntakeReads(Protocol):
+    async def entries(
+        self, user_id: int, source_user: str, *, after: Optional[str], limit: int
+    ) -> list[EntryView]:
+        """The account's ``active`` entries for ``source_user``, by ``external_id``, only those
+        after ``after``; ``limit`` rows at most."""
+        ...
+
+    async def meetings(self, user_id: int, query: MeetingQuery) -> list[MeetingView]:
+        """The account's meetings ``query.user`` may see: a meeting with an entry of any state
+        whose ``source_user`` is the user or whose ``attendees`` hold them (§2.1)."""
+        ...
+
+    async def meeting_by_uuid(self, user_id: int, uuid: str) -> Optional[MeetingView]:
+        """The account's meeting with this UUID; ``None`` for another account's, an unknown one or
+        a string that isn't a UUID."""
+        ...
+
+    async def visible_to(self, user_id: int, meeting_id: int, user: str) -> bool:
+        """Whether ``user`` owns or is invited to the meeting through one of its entries."""
+        ...
+
+    async def erase(self, user_id: int, meeting_id: int) -> ErasedRows:
+        """In one transaction, under the meeting's link lock and row lock: delete the delivery rows
+        of the meeting's outbox events (their attempts cascade), the outbox rows, then the
+        meeting's entries. The meeting row and ``meeting_aw_state`` stay. Raises
+        ``IntakeError("meeting_not_finished")`` if the meeting isn't finished."""
+        ...

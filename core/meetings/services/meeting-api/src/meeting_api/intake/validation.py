@@ -1,10 +1,9 @@
-"""Request validation for the intake surface (§2, task A4) — the DRAFT `intake.v1` contract.
+"""Request validation for the intake surface (§2) — the `intake.v1` contract.
 
 `parse_entry` and `parse_remove` are the ONLY way a `PUT /v2/entries` / `POST /v2/entries/remove`
 body becomes a typed, normalised value; a route handler never re-implements a field check. Both
-validate AT THE SEAM (jsonschema by path against the sealed-in-shape-but-still-unsealed
-`intake.v1` schema — the same `conforms`-style discipline as `lifecycle/receiver.py`), then run the
-§2 validation order in Python (steps a JSON Schema cannot express: naive-time rejection, UTC
+validate AT THE SEAM (jsonschema by path against the `intake.v1` schema — the same
+`conforms`-style discipline as `lifecycle/receiver.py`), then run the §2 validation order in Python (steps a JSON Schema cannot express: naive-time rejection, UTC
 normalisation, the metadata byte-size cap, `end <= start`, the `join_now` override,
 `already_ended` / `too_far_ahead`, and finally lower-casing + `content_hash`).
 
@@ -48,7 +47,7 @@ _MAX_METADATA_BYTES = 16384
 
 
 def _load_intake_schema() -> dict:
-    """Locate the (unsealed, draft) intake.v1 schema by walking up to the monorepo root — the same
+    """Locate the intake.v1 schema by walking up to the monorepo root — the same
     by-path seam discipline as ``lifecycle/receiver.py``'s ``_load_lifecycle_schema``.
     """
     rel = Path("meetings") / "contracts" / "intake.v1" / "intake.schema.json"

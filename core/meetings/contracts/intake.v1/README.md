@@ -1,15 +1,15 @@
 # intake.v1 — the entry/meeting/webhook wire shape for the intake surface (§2, §2.4, §2.5)
 
-The **request and reply shapes** for `PUT /v2/entries`, `POST /v2/entries/remove` and
-`GET /v2/entries` (§2.1–§2.5): what a client sends, the one Reply envelope every successful call
-returns, the `meeting` object every reply/read/webhook carries, and the `error` envelope every
-failure returns.
+The **request and reply shapes** of the `/v2` meeting routes (§2.1–§2.5): what a client sends to
+`PUT /v2/entries` and `POST /v2/entries/remove`, the one Reply envelope both return, the pages of
+`GET /v2/entries` and `GET /v2/meetings`, the `meeting` object every reply, read and webhook
+carries, the erase reply of `DELETE /v2/meetings/{id}`, and the `error` envelope every failure
+returns.
 
-> **DRAFT — UNSEALED.** Not yet in `contracts.seal.json`; the routes that serve this contract
-> don't exist yet (task A5+). `gate:schema` still validates every golden in [`golden/`](golden/)
-> against [`intake.schema.json`](intake.schema.json) — that part is enforced now. Sealed (frozen
-> under `lane:contract` review, exactly like [`webhook.v1`](../webhook.v1/)) in task A8, once the
-> routes are built against it and any shape gaps this draft has are closed.
+Sealed in `contracts.seal.json` (frozen under `lane:contract` review, like
+[`webhook.v1`](../webhook.v1/)). `gate:schema` validates every golden in [`golden/`](golden/)
+against [`intake.schema.json`](intake.schema.json), and meeting-api's route tests validate real
+responses against the same shapes.
 
 ## Shapes (`$defs`)
 - **`Entry`** — `PUT /v2/entries` request body (§2.2). `start`/`end` are required unless
@@ -19,7 +19,7 @@ failure returns.
   schema step (see "Validation order" below).
 - **`Remove`** — `POST /v2/entries/remove` request body (§2.3).
 - **`ReplyEntry`** — the small `{external_id, user, state}` block inside `Reply` — NOT the full
-  `EntryState` row.
+  `EntryState` row. `state` is always one of `active`, `removed`, `closed`, never `null`.
 - **`Reply`** — every successful call, HTTP 200 (§2.4): `result` (one of the ten outcomes),
   `previous_meeting_id`, `entry` (`ReplyEntry`), `meeting` (`Meeting`, always present —
   `project_meeting` never returns `null`, so every result carries the full projected meeting, even
@@ -35,6 +35,14 @@ failure returns.
 - **`Outcome`** / **`Export`** — `Meeting.outcome` / `Meeting.export`, each `null` until set.
 - **`EntryState`** — `GET /v2/entries` row (§2.1): the entry's own §2.2 fields, plus
   `content_hash` and `state`, so a sender can diff its view against aw-bots'.
+- **`EntryPage`** — `GET /v2/entries?user=&cursor=&limit=`: `{entries: [EntryState], next_cursor}`,
+  the sender's active entries for one user ordered by `external_id`; `next_cursor` is `null` on
+  the last page.
+- **`MeetingPage`** — `GET /v2/meetings?user=&from=&to=&status=&external_id=&cursor=&limit=`:
+  `{meetings: [Meeting], next_cursor}`, newest meeting time first. `GET /v2/meetings/{id}` returns
+  one `Meeting`, and so does `POST /v2/meetings/{id}/stop`.
+- **`Erased`** — `DELETE /v2/meetings/{id}`: `{meeting, deleted: {objects, entries, outbox,
+  deliveries}}`.
 - **`Error`** — every failure (§2.5): `{ "error": { "code", "message" } }`. `message` never echoes
   `metadata` or the URL query string (see "Error messages" below). `code` is one of the fourteen
   §2.5 values.

@@ -597,13 +597,17 @@ class IntakeService:
             ),
             None,
         )
+        if entry is None:
+            raise LookupError(
+                f"entry {external_id!r} of {user!r} is not on meeting {done.meeting.uuid}"
+            )
         return {
             "result": done.result,
             "previous_meeting_id": done.previous,
             "entry": {
                 "external_id": external_id,
                 "user": user,
-                "state": entry.state if entry is not None else None,
+                "state": entry.state,
             },
             "meeting": done.meeting.project(lead_s=self._settings.lead_s),
         }

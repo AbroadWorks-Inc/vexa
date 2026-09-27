@@ -8,8 +8,7 @@ its closed entries, any other meeting its active ones; removed entries are never
 
 `parse_entry(body, *, now, max_days_ahead)` / `parse_remove(body)` turn a `PUT /v2/entries` /
 `POST /v2/entries/remove` body into a normalised `EntryIn` / `RemoveIn`, or raise `IntakeError`
-(§2.5) — validated against the DRAFT `intake.v1` contract
-(`core/meetings/contracts/intake.v1/`, unsealed until task A8).
+(§2.5) — validated against the `intake.v1` contract (`core/meetings/contracts/intake.v1/`).
 
 `write_status(db, meeting_id, to_status, *, expected_from, ...)` is the one writer of
 `meetings.status` (§1.4). In the caller's transaction it locks the meeting row (`StatusConflict`,
@@ -46,6 +45,22 @@ row, then `meeting_aw_state`, and status changes and events go through `write_st
 `write_event` in the same transaction. `room_meetings` returns the link's live meetings and the
 non-finished meetings entries manage, never an entry-less upstream-planned row (Ruling R15);
 `count_active_entries` is an index-only count on `ix_meeting_entries_active_user`.
+`build_intake_router(...)` (`router.py`) is the `/v2` meeting routes of §2.1: `PUT /v2/entries`,
+`POST /v2/entries/remove`, `GET /v2/entries`, `GET /v2/meetings`, `GET /v2/meetings/{id}`,
+`POST /v2/meetings/{id}/stop` and `DELETE /v2/meetings/{id}`. Every success body is an `intake.v1`
+shape and every failure the §2.5 body; the route class scopes that error handling to these routes,
+so a validation failure is 400 `invalid_request` here while upstream routes keep 422, and a
+database that can't be reached (or a write that lost a unique-key race) is 503 `unavailable`. A
+`user=` read sees a meeting when one of its entries, in any state, names the user as its `user` or
+an attendee. Stop calls the `StopPort` for a live meeting and answers 409 `no_live_bot` otherwise.
+Erasure runs upstream's `delete_completed_artifacts` (objects first, then transcripts), then
+`IntakeReads.erase` removes the meeting's delivery, outbox and entry rows in one transaction; the
+meeting row and `meeting_aw_state` stay and no event is written. The reads and erasure go through
+`IntakeReads` (`ports.py`): `PostgresIntakeReads` (`reads.py`) over Postgres, `InMemoryIntakeReads`
+in `fakes.py`. `GET /v2/entries` pages by `external_id` (served by
+`uq_meeting_entries_user_source_external`); `GET /v2/meetings` pages by `(meeting_event_time, id)`,
+newest first. meeting-api's production app mounts the router once the real spawn and stop ports
+exist (A12).
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.
@@ -59,4 +74,6 @@ non-finished meetings entries manage, never an entry-less upstream-planned row (
 - `IntakeStore`, `IntakeTx`, `EntryView`, `MeetingView`, `Room`, `SpawnOutcome`, `SpawnPort`,
   `StopPort`, `EventPublisher` — `ports.py`; the in-memory fakes — `fakes.py`.
 - `PostgresIntakeStore` — `adapters.py`.
+- `build_intake_router` — `router.py`; `IntakeReads`, `MeetingQuery`, `ErasedRows` — `ports.py`;
+  `PostgresIntakeReads` — `reads.py`.
 - The matching rules — `rules.py` (used inside the package).

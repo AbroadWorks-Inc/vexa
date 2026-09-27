@@ -1,13 +1,24 @@
 """Shared builders for the entry-service tests (§1.3, §2.6): a controllable clock, request bodies,
 the settings, the request helpers (``Requests``) and a harness wiring ``IntakeService`` to the
 in-memory fakes. ``test_intake_adapter_pg.py`` builds its Postgres harness from the same pieces.
+
+For the ``/v2`` routes: ``intake_app`` mounts ``build_intake_router`` on a bare FastAPI app,
+``http`` is an in-process client for it (same event loop as the test, so a real Postgres engine
+works too), and ``conforms`` validates a body against an ``intake.v1`` shape.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
+
+import httpx
+import jsonschema
+from fastapi import FastAPI
+from referencing import Registry, Resource
 
 from meeting_api.intake.fakes import (
     FakePublisher,
@@ -15,7 +26,8 @@ from meeting_api.intake.fakes import (
     FakeStop,
     InMemoryIntakeStore,
 )
-from meeting_api.intake.ports import MeetingView, SpawnOutcome
+from meeting_api.intake.ports import IntakeReads, MeetingView, SpawnOutcome, StopPort
+from meeting_api.intake.router import build_intake_router
 from meeting_api.intake.service import IntakeService
 from meeting_api.intake.settings import IntakeSettings
 from meeting_api.intake.status import Outcome, WrittenEvent
@@ -191,3 +203,64 @@ def make_harness(
     publisher = FakePublisher()
     service = IntakeService(store, spawn, stop, publisher, settings, clock=clock)
     return Harness(clock, settings, store, spawn, stop, publisher, service)
+
+
+# ── the /v2 routes ───────────────────────────────────────────────────────────────────────────
+
+
+def _intake_schema() -> dict:
+    for parent in Path(__file__).resolve().parents:
+        candidate = (
+            parent / "meetings" / "contracts" / "intake.v1" / "intake.schema.json"
+        )
+        if candidate.is_file():
+            return json.loads(candidate.read_text())
+    raise FileNotFoundError("intake.v1 schema not found")
+
+
+_SCHEMA = _intake_schema()
+_REGISTRY = Registry().with_resource(_SCHEMA["$id"], Resource.from_contents(_SCHEMA))
+
+
+def conforms(body: Any, shape: str) -> None:
+    """Raise unless ``body`` is a valid ``intake.v1#/$defs/<shape>``."""
+    jsonschema.Draft202012Validator(
+        {"$ref": f"{_SCHEMA['$id']}#/$defs/{shape}"}, registry=_REGISTRY
+    ).validate(body)
+
+
+def intake_app(
+    service: IntakeService,
+    reads: IntakeReads,
+    stop: StopPort,
+    *,
+    artifact_store: Any = None,
+    artifact_deleter: Any = None,
+    lead_s: int = 300,
+    app: Optional[FastAPI] = None,
+) -> FastAPI:
+    from meeting_api.collector.fakes import InMemoryTranscriptStore
+
+    app = app or FastAPI()
+    app.include_router(
+        build_intake_router(
+            service,
+            reads,
+            stop,
+            artifact_store=(
+                artifact_store
+                if artifact_store is not None
+                else InMemoryTranscriptStore()
+            ),
+            artifact_deleter=artifact_deleter,
+            lead_s=lead_s,
+        )
+    )
+    return app
+
+
+def http(app: FastAPI) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://meeting-api",
+    )

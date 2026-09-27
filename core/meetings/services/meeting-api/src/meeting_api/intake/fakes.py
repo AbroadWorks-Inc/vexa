@@ -13,6 +13,10 @@
     ``already_live`` for any other row, or returns the failure it was given.
   * ``FakeStop`` — ``StopPort``: moves a live meeting to ``stopping`` with the outcome given.
   * ``FakePublisher`` — ``EventPublisher``: records each published batch.
+  * ``InMemoryIntakeReads`` — ``IntakeReads`` over an ``InMemoryIntakeStore``: the same visibility,
+    order and cursors as ``reads.PostgresIntakeReads``. The store has no delivery rows, so
+    ``deliveries`` maps an event id to the number of delivery rows a test says it has; ``erase``
+    removes those with the meeting's events.
 
 Rows are replaced, never mutated, so a transaction's rollback restores a shallow copy.
 """
@@ -34,7 +38,14 @@ from typing import (
     Sequence,
 )
 
-from .ports import EntryView, MeetingView, Room, SpawnOutcome
+from .ports import (
+    EntryView,
+    ErasedRows,
+    MeetingQuery,
+    MeetingView,
+    Room,
+    SpawnOutcome,
+)
 from .projection import iso_utc
 from .rules import (
     FINISHED_STATUSES,
@@ -52,12 +63,13 @@ from .status import (
     check_event_data,
     derive_event_id_v2,
 )
-from .validation import EntryIn
+from .validation import EntryIn, IntakeError
 
 __all__ = [
     "FakePublisher",
     "FakeSpawn",
     "FakeStop",
+    "InMemoryIntakeReads",
     "InMemoryIntakeStore",
     "RecordedEvent",
 ]
@@ -474,3 +486,93 @@ class FakePublisher:
 
     async def publish(self, event_ids: Sequence[str]) -> None:
         self.batches.append(tuple(event_ids))
+
+
+class InMemoryIntakeReads:
+    def __init__(self, store: InMemoryIntakeStore) -> None:
+        self._s = store
+        self.deliveries: dict[str, int] = {}
+
+    async def entries(
+        self, user_id: int, source_user: str, *, after: Optional[str], limit: int
+    ) -> list[EntryView]:
+        found = sorted(
+            (
+                e
+                for e in self._s.entries.values()
+                if e.user_id == user_id
+                and e.source_user == source_user
+                and e.state == "active"
+                and (after is None or e.external_id > after)
+            ),
+            key=lambda e: e.external_id,
+        )
+        return found[:limit]
+
+    def _visible(self, user_id: int, meeting_id: int, user: str) -> bool:
+        return any(
+            e.meeting_id == meeting_id
+            and e.user_id == user_id
+            and (e.source_user == user or user in e.attendees)
+            for e in self._s.entries.values()
+        )
+
+    async def meetings(self, user_id: int, query: MeetingQuery) -> list[MeetingView]:
+        from .reads import meeting_time
+
+        rows = []
+        for mid, row in self._s.meetings.items():
+            if row["user_id"] != user_id or not self._visible(user_id, mid, query.user):
+                continue
+            key = (meeting_time(row), mid)
+            if query.start_from is not None and key[0] < query.start_from:
+                continue
+            if query.start_to is not None and key[0] >= query.start_to:
+                continue
+            if query.status is not None and row["status"] != query.status:
+                continue
+            if query.external_id is not None and not any(
+                e.meeting_id == mid
+                and e.user_id == user_id
+                and e.external_id == query.external_id
+                for e in self._s.entries.values()
+            ):
+                continue
+            if query.after is not None and not key < query.after:
+                continue
+            rows.append((key, mid))
+        rows.sort(reverse=True)
+        return [self._s.view(mid) for _, mid in rows[: query.limit]]
+
+    async def meeting_by_uuid(self, user_id: int, uuid: str) -> Optional[MeetingView]:
+        for mid, row in self._s.meetings.items():
+            if row["uuid"] == uuid and row["user_id"] == user_id:
+                return self._s.view(mid)
+        return None
+
+    async def visible_to(self, user_id: int, meeting_id: int, user: str) -> bool:
+        return self._visible(user_id, meeting_id, user)
+
+    async def erase(self, user_id: int, meeting_id: int) -> ErasedRows:
+        row = self._s.meetings.get(meeting_id)
+        if row is None or row["user_id"] != user_id:
+            raise IntakeError("meeting_not_found", "no such meeting")
+        if row["status"] not in FINISHED_STATUSES:
+            raise IntakeError(
+                "meeting_not_finished",
+                "the meeting hasn't finished; remove its entries or stop it first",
+            )
+        events = [e for e in self._s.events if e.meeting_id == meeting_id]
+        deliveries = sum(self.deliveries.pop(e.event_id, 0) for e in events)
+        self._s.events[:] = [e for e in self._s.events if e.meeting_id != meeting_id]
+        gone = [
+            e
+            for e in self._s.entries.values()
+            if e.meeting_id == meeting_id and e.user_id == user_id
+        ]
+        for entry in gone:
+            del self._s.entries[entry.id]
+            del self._s._entry_keys[
+                (entry.user_id, entry.source_user, entry.external_id)
+            ]
+        return ErasedRows(entries=len(gone), outbox=len(events), deliveries=deliveries)
