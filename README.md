@@ -136,7 +136,7 @@ Everything else is upstream Vexa, unchanged.
 | **Webhook subscriptions, scopes and keys.** `/v2/webhooks`, encrypted receiver secrets, new scopes `webhooks`, `erase`, `export`. | `core/identity/services/admin-api`; `core/identity/contracts/identity.v1/` | Each app subscribes on its own; each consumer's key can do only its own job. |
 | **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can no longer act as any user by setting a header. |
 | **Metrics.** `/metrics` on meeting-api and admin-api (not routed through the gateway). | `meeting_api/metrics.py`, `admin_api/app/metrics.py`; Helm `meetingApi.podAnnotations`, `adminApi.podAnnotations` | Prometheus scrapes them; the alerts live in aw-notetaker. |
-| **Image workflow.** Builds and pushes our three images to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
+| **Image workflow.** Builds and pushes our five images (meeting-api, bot, exporter, gateway, admin-api) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
 The design and the reasoning behind each decision live in
@@ -209,11 +209,11 @@ values must point `gateway.image` and `adminApi.image` at them.
 
 | Trigger | Tags pushed |
 |---|---|
-| Push to `development` | `:<commit sha>` for all three images |
+| Push to `development` | `:<commit sha>` for all five images |
 | Manual run (Actions → Run workflow: branch, tag e.g. `v0.1.1`, `all` or one image) | `:<commit sha>` and `:<tag>` |
 
-The workflow does not build the gateway and admin-api images yet; build those two by hand (below)
-until it does.
+To build one image with a version tag, for example the gateway or admin-api, use the manual run
+and pick that image.
 
 There is no `:latest`: the deployment pins exact tags, so a new image reaches the cluster only when
 the tag is changed in aw-notetaker and applied (its runbook, "Upgrading our images"). The workflow
@@ -242,12 +242,9 @@ docker build --platform linux/amd64 -t $REG/aw-bots-exporter:$TAG integrations/o
 docker push $REG/aw-bots-meeting-api:$TAG
 docker push $REG/aw-bots-exporter:$TAG
 
-# gateway (context: the repo root, for the route manifests) and admin-api (context: its own folder).
-docker build --platform linux/amd64 -f core/gateway/services/gateway/Dockerfile \
-  -t $REG/aw-bots-gateway:$TAG .
+# gateway (context: the repo root) and admin-api (context: its own folder): build as CI does.
+docker build --platform linux/amd64 -f core/gateway/services/gateway/Dockerfile -t $REG/aw-bots-gateway:$TAG .
 docker build --platform linux/amd64 -t $REG/aw-bots-admin-api:$TAG core/identity/services/admin-api
-docker push $REG/aw-bots-gateway:$TAG
-docker push $REG/aw-bots-admin-api:$TAG
 ```
 
 Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our change adds one small source file and
