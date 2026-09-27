@@ -63,7 +63,7 @@
   10. For `join_now` adoption, a live meeting counts as running past its planned end.
   11. Entries join only live meetings, or unfinished meetings that have entries. Rows planned through upstream routes keep upstream behaviour.
   12. The entry limit is a soft cap: concurrent writes on different links can pass it by a few.
-  13. When several users reschedule a shared invite one `PUT` at a time, the meeting gets a new UUID and the old one ends `cancelled`/`entry_moved`.
+  13. When several users reschedule a shared invite one `PUT` at a time, the meeting gets a new UUID and the old one ends with outcome `cancelled_by_calendar`, detail `entry_moved`.
   14. `meeting.removed` on a merge carries `data.merged_into`.
   15. The real-Postgres tests install the Dockerfile's `sqlalchemy`/`asyncpg` pins for the run; meeting-api's test setup doesn't declare them.
   16. §6.1 correction: admin-api measured 154 passed / 0 skipped on this machine.
@@ -79,10 +79,10 @@
   26. Rows without entries spawn through the same exact-row path and keep upstream's live-bot check, backoff and `AUTO_JOIN_ALLOW_UNCAPPED`. One that fails after its claim also gets outcome `not_sent` and `meeting.not_sent` (§1.5).
   27. A pasted meeting that was never sent (no end time) is given up after one hour: it ends `not_sent` once its start + `JOIN_NOW_ADOPT_AHEAD_S` passes (§1.5).
   28. The planned-meeting store (`update_planned_meeting`, `delete_planned_meeting`, used by upstream's calendar sync and routes) refuses rows that have entries, whoever calls it (§1.6).
-  29. Only timed plans go stale. A link lookup for a planned edit skips a row without entries that is `scheduled`, has a readable `scheduled_at` and is past `AUTO_JOIN_GRACE_S`; `idle` and untimed plans never go stale. With no live or planned row it takes the most recent started one. `scheduled` includes `idle` there, `share` stays a planned edit, and upstream routes answer 409 as `{"detail": "<code>"}` (§1.6).
+  29. Only timed plans go stale. A link lookup for a planned edit skips a row without entries that is `scheduled`, has a readable `scheduled_at` and is past `AUTO_JOIN_GRACE_S`; `idle` and untimed plans never go stale. With no live or planned row it takes the most recent started one. `scheduled` includes `idle` there, `share` stays a planned edit, and upstream routes answer 409 as `{"detail": "<code>"}`. Docs, chat and the live viewers (`POST /ws/authorize-subscribe`) use the read rule (§1.6).
   30. A stopped bot that is still joining (`requested`, `joining`, `awaiting_admission`) keeps its stage: it gets `stop_requested` and the outcome, no event, and its workload is deleted. Only a bot that reached the meeting goes `stopping`. Its final event carries the outcome (§1.7).
   31. R5 records the stop in the removal's own transaction: the removed last entry and its stop commit together or not at all. The leave command follows the commit; if it fails, the stale-stopping sweep ends the bot. A calendar removal after a user's stop changes nothing, and the outcome stays empty (§1.3, §1.7).
-  32. The status writer also accepts upstream's existing `start_failed`, on `failed` rows only (the auto-join retry rule reads it); intake never writes it. §1.1's "ten values" is the sealed set, not every value in the code.
+  32. The status writer also accepts upstream's existing `start_failed`, on `failed` rows only (the auto-join retry rule reads it); intake never writes it. V1's "ten values" is the sealed set, not every value in the code (§1.1).
   33. Typed lifecycle events, one per change: → `active` is `meeting.started`, → `completed` is `meeting.completed`, → `failed` is `bot.failed` (`meeting.not_sent` when the outcome is `not_sent`), and every other step is `meeting.status_change`. A change that has its own event keeps it (`meeting.scheduled` for a new meeting, `meeting.removed` for R8 and merges). Each has `sequence` +1 and `data.change`. A receiver that wants every step accepts the typed events too (§2.7).
   34. admin-api keeps a checked copy of the event list: its image builds from its own folder, so it can't read the sealed `webhook.v1` file. A test fails if the copy drifts.
   35. Sealed `identity.v1` lists the new scopes `webhooks`, `erase` and `export`, re-sealed in its own commit (§1.12). admin-api's `/user/*` routes keep the three user-tier scopes (`bot`, `tx`, `browser`), so a key holding only the new scopes can't use them (§1.10).
@@ -96,6 +96,8 @@
   43. A removed entry sent again with the same hash is re-activated, not `unchanged`. A link change of a meeting's only entry keeps the UUID (the meeting moves); `entry_moved` applies when the entry joins another meeting (§1.3, §2.6.9).
   44. Rollout corrections (Part 5): the gateway and admin-api need our images, because upstream's lack the `/v2` routes, the scopes and the signature. `aw-bots-secrets` gains `GATEWAY_IDENTITY_SECRET` and the webhook key ring before the `helm upgrade`. The new admin-api refuses direct `/user/*` calls with a key, so a runbook step that calls it over a port-forward goes through the gateway. The exporter queue drains with the old exporter; meeting-api, the gateway and the exporter key go live before the new exporter; failed items from before the rollout are not re-enqueued as they are.
   45. Upstream behaviour found during the build and left as it is: Part 9 #4–#8.
+  46. Alert thresholds: sweep staleness is judged per sweep (about 5 min for meeting-api's 1–30 s loops, about 25 h for admin-api's daily `webhook-retention`), since all of them report on one metric; the outbox alert is `aw_webhook_outbox_unpublished > 0` for 5 min, because that gauge is a count, not an age (§1.13).
+  47. The image workflow (`.github/workflows/aw-images.yml`) now builds and pushes `aw-bots-gateway` and `aw-bots-admin-api` too, with the same triggers as the other three (§1.10, Part 5).
 
 ---
 
@@ -335,7 +337,7 @@ Upstream routes that take a link (platform + room code) used to pick the newest 
 
 | Route kind | Resolves to |
 |---|---|
-| Reads (`GET /transcripts/{p}/{n}`, participants, `POST /ws/authorize-subscribe`) and `annotate` | the live meeting, else the most recent that has started; never a future one |
+| Reads (`GET /transcripts/{p}/{n}`, participants, docs, chat, `POST /ws/authorize-subscribe` for live viewers, `continue_meeting`) and `annotate` | the live meeting, else the most recent that has started; never a future one |
 | Planned edits (`PATCH`/`DELETE /meetings/{p}/{n}`, `PUT …/intent`, `POST …/workspace`, `POST …/share`) | the live meeting, or the single scheduled (or `idle`) one; several → 409 `ambiguous_room`; none → the most recent that has started. A stale entry-less plan (`scheduled`, a readable `scheduled_at`, past `AUTO_JOIN_GRACE_S`) doesn't count; `idle` and untimed plans never go stale |
 | Stop (`DELETE /bots/{p}/{n}`) | the live meeting only; it never cancels future plans |
 
@@ -343,7 +345,7 @@ Upstream routes that take a link (platform + room code) used to pick the newest 
 
 ## 1.7 Stopping
 
-`POST /v2/meetings/{id}/stop` and R5 stop **the bot that is in the call**:
+`POST /v2/meetings/{id}/stop` and R5 stop **the meeting's live bot**, in the call or still joining:
 1. link lock;
 2. meeting row;
 3. if given, the outcome (on `meeting_aw_state`, so the final webhook carries it);
@@ -377,7 +379,7 @@ A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to ca
 
 ## 1.9 Exporter
 
-- **IDs.** The meeting UUID replaces `vexa-<n>` (`exporter/job.py:98-100`) in `speaker_timeline.json`, `participants.json`, and the `/process` `meeting_id` and `idempotency_key`. `_export.json` keeps the integer too. The S3 folder naming `<platform>_<room>_<startUTC>` is unchanged.
+- **IDs.** The meeting UUID replaces `vexa-<n>` (`exporter/job.py`) in `speaker_timeline.json`, `participants.json`, and the `/process` `meeting_id` and `idempotency_key`. `_export.json` keeps the integer too. The S3 folder naming `<platform>_<room>_<startUTC>` is unchanged.
 - **Everything goes through the gateway** with the exporter's own key (§1.10):
   - reads: `GET /recordings`, `/recordings/{id}/master`, the transcript;
   - after `/process`, the result: `POST /v2/meetings/{id}/export` `{state: "handed_off"|"failed", s3_path, error?}`, scope `export`. meeting-api stores it in `meeting_aw_state.export_*` and emits `export.handed_off` / `export.failed`.
@@ -484,11 +486,11 @@ Metrics are labelled by `user_id`.
 - `not_sent` exceeds 1 % of meetings over 1 h;
 - any delivery goes `dead`;
 - more than 1 000 deliveries are due for 5 min;
-- an outbox row stays unpublished for more than 5 min;
+- `aw_webhook_outbox_unpublished` stays above 0 for 5 min (the gauge is a count of unpublished rows, not their age);
 - auto-join lag p95 exceeds 60 s;
 - calendar reads for one user fail for more than 30 min;
 - a key expires within 30 days;
-- a sweep hasn't run for 5 min.
+- a sweep is stale, judged per sweep on the newest `aw_sweep_last_run_timestamp_seconds{sweep}` across replicas (a single-flight sweep runs on one replica per tick): about 5 min for meeting-api's loops, which tick every 1–30 s, and about 25 h for admin-api's daily `webhook-retention` sweep.
 
 **Logs.** Structured JSON (`obs.log_event`). Every line about a meeting carries `meeting_uuid`, `external_id`, `user` and `account`. Logs never carry a key, secret, URL query string or transcript text.
 
@@ -521,7 +523,7 @@ Metrics are labelled by `user_id`.
 | `GET /v2/entries?user=&cursor=&limit=` | `bot` | The sender's active entries for one user, with `content_hash`, so a sender can compare its view with aw-bots' and send only the differences |
 | `GET /v2/meetings?user=&from=&to=&status=&external_id=&cursor=&limit=` | `tx` | Meetings a user may see (owner or invited, over entries in any state); cursor paging, `limit` ≤ 200 |
 | `GET /v2/meetings/{id}?user=` | `tx` | One meeting by UUID. Without `user=`: any meeting of the account. With `user=`: only a meeting that user owns or is invited to; otherwise `meeting_not_found` |
-| `POST /v2/meetings/{id}/stop` | `bot` | The bot in the call leaves now; no live bot → `no_live_bot` |
+| `POST /v2/meetings/{id}/stop` | `bot` | The live bot (in the call or still joining) leaves now; no live bot at all → `no_live_bot` |
 | `DELETE /v2/meetings/{id}` | `erase` | Erase a finished meeting's aw-bots data (§1.13) |
 | `POST /v2/meetings/{id}/export` | `export` | The exporter reports its result (§1.9) |
 | `/v2/webhooks…` | `webhooks` | Manage webhook subscriptions (§2.7) |
@@ -607,7 +609,7 @@ Every error has the body `{ "error": { "code": "...", "message": "..." } }`. The
 | 404 | `entry_not_found` | remove of an entry never sent | drop it |
 | 404 | `meeting_not_found` | unknown UUID, another account's, or not visible to `user=` | — |
 | 409 | `meeting_not_finished` | `DELETE` on a scheduled or live meeting | remove the entries or stop it first |
-| 409 | `no_live_bot` | stop on a meeting with no bot in it | to cancel a future meeting, remove its entry |
+| 409 | `no_live_bot` | stop on a meeting with no live bot (scheduled or finished) | to cancel a future meeting, remove its entry |
 | 429 | `rate_limited` | the account's write rate was hit; `Retry-After` set | wait, then resend |
 | 429 | `quota_exceeded` | a standing quota is full (entries, subscriptions); no `Retry-After` | stop; free entries or ask for a higher quota |
 | 503 | `unavailable` | database down; the gateway can't check the key, has no identity secret, or meeting-api or admin-api fails (502/504) | retry with backoff |
@@ -841,7 +843,7 @@ The portal decides what its users see and how its pages update. aw-bots only sen
 - **Who sees what.** Every read passes the signed-in user: `GET /v2/meetings?user=` and `GET /v2/meetings/{id}?user=`. aw-bots applies owner-or-invited, including declined guests (today's rule). Anything else is "not found".
 - **Transcripts:** read from `meeting.export.s3_path`. With no export yet, the page shows "processing". The transcript files belong to the notetaker.
 - **Join progress:** from `GET /v2/meetings/{id}?user=` and the pushed updates.
-- **Stop:** the button is shown only while a bot is in the call.
+- **Stop:** the button is shown while the meeting has a live bot, in the call or still joining. `no_live_bot` means there is no live bot at all.
 - **Webhook receiver** (`POST /api/webhooks/aw-bots`):
   1. Verify either signature header with the secret the portal supplied when subscribing (Secret `aw-bots-portal-webhook`), and reject more than 300 s of skew.
   2. Publish the event to the portal's Redis (`notetaker-redis`), channel `aw:meeting:<uuid>`.
