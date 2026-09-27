@@ -70,6 +70,10 @@
   17. The `readme` and `dataflow` gates count gitignored local build folders (`exporter.egg-info`, `__pycache__`). Delete them before a push.
   18. Paging as built: `GET /v2/entries` pages by `external_id`, which the unique index `uq_meeting_entries_user_source_external` serves. `GET /v2/meetings` pages by meeting time, then id, newest first. No index serves that query as a whole, because who may see a meeting is decided through its entries.
   19. `GET /v2/meetings/{id}` without `user=` returns any meeting of the account. With `user=` it returns only a meeting the user owns or is invited to (§2.1).
+  20. The runtime sends no secret on its callbacks. It posts each workload event to the `callbackUrl` it was given, verbatim, with no headers of its own. Owner decision: `/runtime/callback` is protected by a per-bot token in that URL, with no runtime change and no runtime image (§1.10).
+  21. Recording uploads carry the internal secret as `Authorization: Bearer`, not `x-internal-secret`. Their existing check (the internal secret or a MeetingToken) stays; the secret comparison is now constant-time (§1.10).
+  22. Bots started before that deploy carry callback URLs without a token, so the rollout runs with no meeting in progress (§1.10, Part 5).
+  23. As built: the signed `<path>` is the forwarded path, percent-decoded, without the query. admin-api's `/admin/*` (the admin-token surface where the operator mints keys and the web console signs in) takes no caller from the gateway and needs no signature, like `/internal/*`. Without `GATEWAY_IDENTITY_SECRET` the gateway refuses to start, and meeting-api and admin-api refuse every client request (§1.10).
 
 ---
 
@@ -360,8 +364,14 @@ A meeting with no live bot → 409 `no_live_bot` ("no bot in this meeting; to ca
 
 ## 1.10 Security, identity and keys
 
-- **Clients go through the gateway only.** The gateway checks the key's scope, sets `x-user-id`, and **signs** it: `x-gateway-signature: t=<unix>,v1=<hex HMAC-SHA256(GATEWAY_IDENTITY_SECRET, "<t>.<user_id>.<METHOD>.<path>")>`. meeting-api and admin-api reject any client request whose signature is missing, wrong, for a different user, or older than 60 s. A pod calling meeting-api directly with `x-user-id: 1` gets 401. (Network policies are not enforced in this cluster: runbook "Security", checked 2026-09-24.)
-- **The one direct path is the bots**, as Vexa does. They send status callbacks (`POST /bots/internal/callback/lifecycle`) and upload recordings straight to meeting-api, which now checks `x-internal-secret` in constant time and rejects a mismatch with 401 (the bot already sends it: `services/bot/src/adapters/lifecycle-http.ts:68`). `/runtime/callback` gets the same check.
+- **Clients go through the gateway only.** The gateway checks the key's scope, sets `x-user-id`, and **signs** it: `x-gateway-signature: t=<unix>,v1=<hex HMAC-SHA256(GATEWAY_IDENTITY_SECRET, "<t>.<user_id>.<METHOD>.<path>")>`. `<path>` is the path of the forwarded request, percent-decoded, without the query. meeting-api and admin-api reject any client request whose signature is missing, wrong, for a different user, or more than 60 s old (or ahead). A pod calling meeting-api directly with `x-user-id: 1` gets 401. (Network policies are not enforced in this cluster: runbook "Security", checked 2026-09-24.)
+  - No signature is needed on `/internal/*`, the bot and runtime callbacks, `/health*`, `/metrics`, and admin-api's `/admin/*`, which checks the admin token (the operator mints keys there).
+  - Without `GATEWAY_IDENTITY_SECRET` the gateway refuses to start, and meeting-api and admin-api refuse every client request.
+- **The one direct path is the bots and the runtime**, as Vexa does.
+  - **Status callbacks** (`POST /bots/internal/callback/lifecycle`) carry `x-internal-secret`, the internal secret meeting-api puts in each bot's invocation (`services/bot/src/adapters/lifecycle-http.ts:68`). meeting-api compares it in constant time and rejects a missing or wrong one with 401.
+  - **Recording uploads** (`POST /internal/recordings/upload`) carry the same secret as `Authorization: Bearer`, or a MeetingToken. That check stays as it was; the secret comparison is now constant-time.
+  - **The runtime sends no secret.** It posts each workload event to the `callbackUrl` it was given, verbatim. So meeting-api gives it `<MEETING_API_URL>/runtime/callback?t=<hex HMAC-SHA256(INTERNAL_API_SECRET, "aw-runtime-callback.<workloadId>")>`, a token per bot. `/runtime/callback` recomputes the token from the event's `workloadId` and rejects a missing or wrong one with 401. This is the owner's decision: no runtime change and no runtime image. The token is never logged.
+  - **Rollout:** a bot started before this deploy carries a callback URL without a token. Once the new meeting-api runs, that bot's runtime events are refused, so if the bot dies without sending its own final status, the runtime can't close its meeting. That is why the rollout (Part 5) runs with no meeting in progress.
 - **Service-to-service calls** (meeting-api ↔ admin-api internal routes) keep the internal secret, as Vexa has them.
 - **One key per consumer, least privilege.** Keys are created, rotated and revoked by name and id. New scopes: `webhooks`, `erase`, `export` (`admin_api/token_scope.py`).
 
@@ -818,7 +828,7 @@ The portal decides what its users see and how its pages update. aw-bots only sen
 
 # Part 5 — Rollout order (the human runs these; no session does)
 
-Run it in a window with no meeting in progress. The step numbers continue the runbook (`deployment/base/aw-bots/README.md`, steps 1–8 done).
+Run it in a window with no meeting in progress: a bot started before step 14 has a runtime callback URL without a token, and its runtime events are refused afterwards (§1.10). The step numbers continue the runbook (`deployment/base/aw-bots/README.md`, steps 1–8 done).
 
 | Step | Action |
 |---|---|
