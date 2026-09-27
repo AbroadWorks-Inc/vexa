@@ -30,14 +30,18 @@ definition of these windows; the status writer's re-run rule uses it.
 (platform + room code) means. `resolve(rows, kind, *, now)` over the link's rows as `LinkRow`
 (status, `meeting_start`, `created_at`, whether entries manage it): `READ` (transcript,
 participants, `/ws/authorize-subscribe`, chat, annotate, docs, `continue_meeting`) is the live
-meeting, else the most recent that has started, never a future one; `PLANNED_EDIT` (`PATCH`/`DELETE
-/meetings/{p}/{n}`, intent, workspace, share) is the live meeting, else the single planned
-(`scheduled`/`idle`) one, several raising `AmbiguousRoom`, and with neither the `READ` answer; `STOP`
+meeting, else the most recent that has started (left planning, or its start is past), never a
+future one; `PLANNED_EDIT` (`PATCH`/`DELETE /meetings/{p}/{n}`, intent, workspace, share) is the
+live meeting, else the single planned (`scheduled`/`idle`) one that can still be sent (an
+entry-less plan past its start plus `AUTO_JOIN_GRACE_S` is ignored, Ruling R22), several raising
+`AmbiguousRoom`, and with neither the `READ` answer; `STOP`
 (`DELETE /bots/{p}/{n}`) is the live meeting only and never a plan. `adapters.link_rows(db, user_id,
 room)` reads the rows from Postgres and `fakes.link_rows_in` is its twin; the collector store, the
 bot-spawn repo and the stop route all resolve through them. `ManagedByEntries` is the refusal of an
 upstream edit (`PATCH`/`DELETE /meetings/…`, `PUT …/intent`) to a meeting with a `meeting_entries`
-row; the upstream routes answer both with 409 and the code as `detail`.
+row; the upstream routes answer both with 409 and the code as `detail`. The collector store's
+`update_planned_meeting` / `delete_planned_meeting` refuse such a row under the row lock (Ruling
+R21), so upstream calendar sync skips it.
 
 `IntakeService` (`service.py`) is the behaviour of `PUT /v2/entries` and `POST /v2/entries/remove`
 (§1.3, every §2.6 case): under the entry's link lock (both links, sorted, when the link changes;

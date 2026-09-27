@@ -7,11 +7,15 @@ Postgres and ``fakes.link_rows_in`` is its in-memory twin, so both stores choose
 
   * ``READ`` (``GET /transcripts/{p}/{n}``, participants, ``POST /ws/authorize-subscribe``, chat,
     ``annotate``, docs, ``continue_meeting``): the live meeting, else the most recent that has
-    started (start ≤ now); never a future one.
+    started; never a future one. A meeting has started when it has left planning (any status but
+    ``scheduled``/``idle``, whatever its ``scheduled_at``: a bot can run and finish ahead of its
+    slot) or when its start is at or before ``now``.
   * ``PLANNED_EDIT`` (``PATCH``/``DELETE /meetings/{p}/{n}``, ``PUT …/intent``, ``POST
     …/workspace``, ``POST …/share``): the live meeting, else the single planned one (``scheduled``
-    or ``idle``); two or more planned raise ``AmbiguousRoom``. A link with neither resolves as
-    ``READ`` does, so a finished meeting stays addressable.
+    or ``idle``) that can still be sent; two or more raise ``AmbiguousRoom``. An entry-less plan
+    past its start plus ``AUTO_JOIN_GRACE_S`` is a leftover the sweep never sends, so it doesn't
+    count (Ruling R22); an entry-managed plan never goes stale (the not-sent sweep ends it). A link
+    with neither resolves as ``READ`` does, so a finished meeting stays addressable.
   * ``STOP`` (``DELETE /bots/{p}/{n}``): the live meeting only; a stop never cancels a plan.
 
 "Live" is ``rules.is_live`` (``LIVE_STATUSES``) and a meeting's start is ``rules.meeting_start``.
@@ -26,7 +30,7 @@ Started rows go by start, then id.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional, Sequence
 
@@ -116,17 +120,35 @@ def _live(rows: Sequence[LinkRow]) -> list[LinkRow]:
 
 
 def _most_recent_started(rows: Sequence[LinkRow], now: datetime) -> list[LinkRow]:
-    started = [r for r in rows if r.start is not None and r.start <= now]
+    started = [
+        r
+        for r in rows
+        if r.status not in PLANNED_STATUSES or (r.start is not None and r.start <= now)
+    ]
     if not started:
         return []
     return [max(started, key=lambda r: (r.start or _OLDEST, r.id))]
 
 
+def _sendable(row: LinkRow, now: datetime, grace_s: float) -> bool:
+    """A plan that can still be sent: entry-managed, or not yet past its start plus the grace."""
+    return (
+        row.managed
+        or row.start is None
+        or now <= row.start + timedelta(seconds=grace_s)
+    )
+
+
 def resolve_all(
-    rows: Sequence[LinkRow], kind: LinkKind, *, now: datetime
+    rows: Sequence[LinkRow],
+    kind: LinkKind,
+    *,
+    now: datetime,
+    grace_s: Optional[float] = None,
 ) -> list[LinkRow]:
     """Every row ``kind`` addresses, the one it resolves to first: at most one for ``READ`` and
     ``PLANNED_EDIT``, every live row for ``STOP``. Raises ``AmbiguousRoom`` (``PLANNED_EDIT``).
+    ``grace_s`` defaults to ``AUTO_JOIN_GRACE_S`` (``settings.auto_join_grace_s``).
     """
     live = _live(rows)
     if kind is LinkKind.STOP:
@@ -134,7 +156,15 @@ def resolve_all(
     if live:
         return live[:1]
     if kind is LinkKind.PLANNED_EDIT:
-        planned = [r for r in rows if r.status in PLANNED_STATUSES]
+        if grace_s is None:
+            from .settings import auto_join_grace_s
+
+            grace_s = auto_join_grace_s()
+        planned = [
+            r
+            for r in rows
+            if r.status in PLANNED_STATUSES and _sendable(r, now, grace_s)
+        ]
         if len(planned) > 1:
             raise AmbiguousRoom([r.id for r in planned])
         if planned:
@@ -143,8 +173,12 @@ def resolve_all(
 
 
 def resolve(
-    rows: Sequence[LinkRow], kind: LinkKind, *, now: datetime
+    rows: Sequence[LinkRow],
+    kind: LinkKind,
+    *,
+    now: datetime,
+    grace_s: Optional[float] = None,
 ) -> Optional[LinkRow]:
     """The meeting ``kind`` resolves the link's ``rows`` to, or ``None``."""
-    found = resolve_all(rows, kind, now=now)
+    found = resolve_all(rows, kind, now=now, grace_s=grace_s)
     return found[0] if found else None

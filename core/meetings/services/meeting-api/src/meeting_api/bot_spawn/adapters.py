@@ -593,8 +593,8 @@ class SqlAlchemyMeetingRepo:
                 # A THIS-REQUEST dispatch supersedes an earlier stop ON THE PLAN. Legacy zombie rows
                 # exist (a scheduled row a rev-193 DELETE flagged but never terminalized), and
                 # claiming one with the flag still on it would make the spawn fence abort the very
-                # bot the user just asked for. Post-fix a stop terminalizes the planned row, so it is
-                # no longer claimable at all — this only ever meets rows an older build wrote.
+                # bot the user just asked for. A stop never touches a planned row (§1.6: it stops the
+                # live meeting only), so the flag on a plan only ever comes from an older build.
                 planned_data.pop("stop_requested", None)
                 claimable.status = "requested"
                 claimable.end_time = None

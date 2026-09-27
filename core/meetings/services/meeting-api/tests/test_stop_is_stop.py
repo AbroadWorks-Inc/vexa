@@ -115,8 +115,8 @@ async def test_f1_a_stop_never_cancels_a_scheduled_occurrence():
 async def test_f1_a_flagged_scheduled_row_is_never_due():
     """The standing guarantee, independent of who wrote the row.
 
-    Post-fix the stop terminalizes the plan, so this shape should not exist — but rev-193 rows do
-    exist, and a row carrying the user's stop must never be due whatever left it that way. Asserted
+    A stop never touches a plan (§1.6), so no current writer leaves this shape — but rev-193 rows
+    do exist, and a row carrying the user's stop must never be due whatever left it that way. Asserted
     on the PURE filter so it holds for every caller of ``due_rows``."""
     zombie = {
         "id": 26306, "user_id": USER, "platform": PLATFORM, "native_meeting_id": NATIVE,

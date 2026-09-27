@@ -571,8 +571,9 @@ def build_router(
         return row.id if row is not None else None
 
     # --- an entry-managed meeting is edited only through /v2/entries (§1.6): the upstream PATCH and
-    # DELETE, by row id or native pair, answer 409 `managed_by_entries`. An unknown or unowned id is
-    # not managed here, so it still reaches the store's 404. ---
+    # DELETE, by row id or native pair, answer 409 `managed_by_entries`. This is the fast path; the
+    # store refuses the same row under its row lock (Ruling R21). An unknown or unowned id is not
+    # managed here, so it still reaches the store's 404. ---
     async def _refuse_managed(user_id: int, meeting_id: int) -> None:
         from ..intake.resolver import ManagedByEntries
 
@@ -638,6 +639,8 @@ def build_router(
             )
         if row.get("error") == "duplicate":
             raise HTTPException(status_code=409, detail="Another active meeting uses that link")
+        if row.get("error") == "managed_by_entries":
+            raise HTTPException(status_code=409, detail="managed_by_entries")
         log_event(
             "meeting_plan_updated", audience="user", span="meetings.plan.update",
             user_id=user_id, meeting_id=str(meeting_id),
@@ -662,7 +665,7 @@ def build_router(
 
     async def _apply_meeting_delete(user_id: int, meeting_id: int) -> dict:
         await _refuse_managed(user_id, meeting_id)
-        result = await store.delete_planned_meeting(user_id, meeting_id)
+        result = await _on_link(store.delete_planned_meeting(user_id, meeting_id))
         if result is None:
             raise HTTPException(status_code=404, detail="Meeting not found")
         if result is False:

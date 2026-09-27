@@ -134,3 +134,30 @@ async def intake_pg_engine():
     async with eng.begin() as conn:
         await conn.run_sync(admin_models.Base.metadata.drop_all)
     await eng.dispose()
+
+
+@pytest.fixture()
+async def link_pg_engine():
+    """An async engine on ``MEETING_API_TEST_DATABASE_URL`` with the admin-api schema built and
+    every table dropped before and after — the link resolver's Postgres tests (§1.6). Skips
+    cleanly when the variable is unset."""
+    import os
+
+    url = os.getenv("MEETING_API_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("real-Postgres proofs for §1.6; set MEETING_API_TEST_DATABASE_URL to run")
+    pytest.importorskip("sqlalchemy", reason="see test_intake_pg_schema.py's docstring")
+    pytest.importorskip("asyncpg", reason="see test_intake_pg_schema.py's docstring")
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from admin_api.schema import models as admin_models
+    from admin_api.schema import sync as admin_sync
+
+    eng = create_async_engine(url)
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    await admin_sync.ensure_schema(eng, admin_models.Base)
+    yield eng
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    await eng.dispose()

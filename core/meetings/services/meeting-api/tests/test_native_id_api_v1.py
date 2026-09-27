@@ -55,17 +55,24 @@ def test_native_patch_renames_owned_meeting_200():
 def test_native_patch_resolves_by_the_link_resolver():
     """Several rows on the SAME native link → the planned edit addresses the single plan (§1.6); two
     plans name no single meeting → 409 ``ambiguous_room``, nothing written."""
+    from datetime import datetime, timedelta, timezone
+
+    def ahead(days):
+        return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
     client, store = _client()
     store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="completed",
                        created_at="2026-06-01T00:00:00Z")
-    plan = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="idle",
-                              created_at="2026-01-01T00:00:00Z")
+    plan = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE,
+                              status="scheduled", start_time=None,
+                              data={"scheduled_at": ahead(1)}, created_at="2026-01-01T00:00:00Z")
     r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "hit-plan"}, headers=H)
     assert r.status_code == 200, r.text
     assert r.json()["id"] == plan
 
-    second = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="idle",
-                                created_at="2026-06-02T00:00:00Z")
+    second = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE,
+                                status="scheduled", start_time=None,
+                                data={"scheduled_at": ahead(8)}, created_at="2026-06-02T00:00:00Z")
     r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "which?"}, headers=H)
     assert r.status_code == 409, r.text
     assert r.json() == {"detail": "ambiguous_room"}

@@ -749,7 +749,12 @@ async def sync_user(store, user_id: int, parsed: dict, *, auto_join_default: boo
                                            "status": updated.get("status"),
                                            "when": (updated.get("data") or {}).get("scheduled_at")})
                 continue
-        deleted = await store.delete_planned_meeting(user_id, row["id"])
+        from ..intake.resolver import ManagedByEntries
+
+        try:
+            deleted = await store.delete_planned_meeting(user_id, row["id"])
+        except ManagedByEntries:
+            continue  # entries manage it: edited only through /v2/entries (§1.6)
         if deleted:
             _forget(rows, row["id"])
             out["cancelled"].append({"id": row["id"], "native": row.get("native_meeting_id"),

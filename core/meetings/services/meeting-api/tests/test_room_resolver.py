@@ -1,8 +1,8 @@
 """§1.6 — the one link resolver: which meeting an upstream route that takes a link means.
 
 A link (platform + room code) holds many meetings: past ones, the live one and every scheduled
-occurrence. Upstream routes used to take the newest row, which with scheduled occurrences is
-usually a future one. Three groups:
+occurrence, and the newest row is usually a future one. The resolver picks the meeting each route
+kind means. Three groups:
 
   * the pure rule (``intake.resolver``) — READ, PLANNED_EDIT and STOP over the two §6.4 shapes:
     1 live + 2 future rows, and 0 live + 1 past + 2 future rows; ``ambiguous_room``;
@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import pytest
 from fastapi.testclient import TestClient
 
+from intake_builders import seed_link_row
 from meeting_api.collector import create_app as create_collector_app
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.intake.resolver import (
@@ -39,7 +39,6 @@ from meeting_api.intake.resolver import (
 USER = 7
 H = {"x-user-id": str(USER)}
 PLAT, NID = "google_meet", "kxo-misr-avz"
-PG_URL = os.getenv("MEETING_API_TEST_DATABASE_URL")
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
 
@@ -129,7 +128,7 @@ def test_planned_edit_takes_the_single_planned_meeting_even_in_the_future():
 
 def test_planned_edit_counts_an_idle_plan_as_planned():
     rows = [
-        _row(2, "idle", NOW - timedelta(days=40)),
+        _row(2, "idle", NOW - timedelta(minutes=5)),
         _row(3, "scheduled", NOW + timedelta(days=1)),
     ]
     with pytest.raises(AmbiguousRoom):
@@ -144,6 +143,55 @@ def test_planned_edit_of_a_link_holding_only_history_is_its_most_recent_started_
         _row(2, "failed", NOW - timedelta(days=1)),
     ]
     assert resolve(rows, LinkKind.PLANNED_EDIT, now=NOW).id == 2
+
+
+def test_read_counts_a_meeting_that_left_planning_as_started_whatever_its_scheduled_at():
+    """A bot ran on the 16:00 slot at 15:30 and it finished: its ``scheduled_at`` is still ahead,
+    but it has left planning, so it has started — and it is the most recent, not last week's.
+    """
+    rows = [
+        _row(1, "completed", NOW - timedelta(days=7)),
+        _row(2, "completed", NOW + timedelta(minutes=30)),
+        _row(3, "scheduled", NOW + timedelta(days=7)),
+    ]
+    assert resolve(rows, LinkKind.READ, now=NOW).id == 2
+    assert resolve(rows[:2], LinkKind.PLANNED_EDIT, now=NOW).id == 2
+
+
+def test_planned_edit_ignores_a_stale_entry_less_plan():
+    """Ruling R22: an entry-less plan past its start + ``AUTO_JOIN_GRACE_S`` can never be sent; it
+    is a leftover, so it neither counts as the plan nor makes the link ambiguous."""
+    rows = [
+        _row(1, "scheduled", NOW - timedelta(hours=2)),
+        _row(2, "scheduled", NOW + timedelta(days=1)),
+    ]
+    assert resolve(rows, LinkKind.PLANNED_EDIT, now=NOW).id == 2
+
+
+def test_an_entry_less_plan_inside_its_grace_still_counts():
+    rows = [
+        _row(1, "scheduled", NOW - timedelta(minutes=5)),
+        _row(2, "scheduled", NOW + timedelta(days=1)),
+    ]
+    with pytest.raises(AmbiguousRoom):
+        resolve(rows, LinkKind.PLANNED_EDIT, now=NOW)
+
+
+def test_an_entry_managed_plan_never_goes_stale():
+    """Entries keep a plan sendable until its end; the not-sent sweep ends it, not the resolver."""
+    stale = LinkRow(
+        id=1,
+        status="scheduled",
+        start=NOW - timedelta(hours=2),
+        created=NOW - timedelta(days=3),
+        managed=True,
+    )
+    with pytest.raises(AmbiguousRoom):
+        resolve(
+            [stale, _row(2, "scheduled", NOW + timedelta(days=1))],
+            LinkKind.PLANNED_EDIT,
+            now=NOW,
+        )
 
 
 def test_stop_never_resolves_to_a_plan():
@@ -373,9 +421,80 @@ def test_docs_attach_to_the_live_or_most_recent_started_meeting(shape):
 
 @pytest.mark.parametrize("shape", ["live", "past"])
 def test_chat_read_is_the_live_or_most_recent_started_meeting(shape):
-    client, _store, _ids = _collector(shape)
+    """The chat reply carries no id, so the resolution is observed at the store's port."""
+    client, store, ids = _collector(shape)
+    seen: list[tuple[str, Optional[int]]] = []
+    real = store.resolve_room
+
+    async def recording(user_id, platform, native_meeting_id, kind):
+        row = await real(user_id, platform, native_meeting_id, kind)
+        seen.append((kind.value, row.id if row else None))
+        return row
+
+    store.resolve_room = recording  # type: ignore[method-assign]
     r = client.get(f"/bots/{PLAT}/{NID}/chat", headers=H)
     assert r.status_code == 200, r.text
+    assert r.json() == {"messages": []}
+    assert seen == [("read", _started(ids))]
+
+
+def test_transcript_of_a_meeting_that_ran_ahead_of_its_slot_is_the_recent_one():
+    """A bot ran and finished before its ``scheduled_at`` (30 min ahead): GET /transcripts serves
+    that meeting, not last week's."""
+    now = _real_now()
+    store = InMemoryTranscriptStore()
+    store.seed_meeting(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        status="completed",
+        start_time=_iso(now - timedelta(days=7)),
+        created_at=_iso(now - timedelta(days=8)),
+        data={"scheduled_at": _iso(now - timedelta(days=7))},
+    )
+    recent = store.seed_meeting(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        status="completed",
+        start_time=_iso(now - timedelta(minutes=20)),
+        created_at=_iso(now - timedelta(days=1)),
+        data={"scheduled_at": _iso(now + timedelta(minutes=30))},
+    )
+    redis: Any = _CaptureRedis()
+    client = TestClient(create_collector_app(store, redis=redis))
+    r = client.get(f"/transcripts/{PLAT}/{NID}", headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == recent
+
+
+def test_planned_edit_skips_a_stale_entry_less_plan():
+    """Ruling R22 through the route: a missed entry-less occurrence (2 h ago) next to the next
+    plan does not make the link ambiguous; PATCH edits the next plan."""
+    now = _real_now()
+    store = InMemoryTranscriptStore()
+    stale = store.seed_meeting(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        status="scheduled",
+        start_time=None,
+        data={"scheduled_at": _iso(now - timedelta(hours=2))},
+    )
+    plan = store.seed_meeting(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        status="scheduled",
+        start_time=None,
+        data={"scheduled_at": _iso(now + timedelta(days=1))},
+    )
+    redis: Any = _CaptureRedis()
+    client = TestClient(create_collector_app(store, redis=redis))
+    r = client.patch(f"/meetings/{PLAT}/{NID}", headers=H, json={"title": "Next"})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == plan
+    assert store._meetings[stale]["data"].get("title") is None
 
 
 def test_reads_of_a_link_holding_only_future_meetings_404():
@@ -583,123 +702,33 @@ def test_continue_meeting_reuses_the_past_meeting_not_a_future_plan(monkeypatch)
 # ── real Postgres ────────────────────────────────────────────────────────────────────────────
 
 
-async def _pg_engine():
-    if not PG_URL:
-        pytest.skip(
-            "real-Postgres proofs for §1.6; set MEETING_API_TEST_DATABASE_URL to run"
-        )
-    pytest.importorskip("sqlalchemy", reason="see test_intake_pg_schema.py's docstring")
-    pytest.importorskip("asyncpg", reason="see test_intake_pg_schema.py's docstring")
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    from admin_api.schema import models as admin_models
-    from admin_api.schema import sync as admin_sync
-
-    engine = create_async_engine(PG_URL)
-    async with engine.begin() as conn:
-        await conn.run_sync(admin_models.Base.metadata.drop_all)
-    await admin_sync.ensure_schema(engine, admin_models.Base)
-    return engine
-
-
-@pytest.fixture
-async def pg_engine():
-    engine = await _pg_engine()
-    yield engine
-    from admin_api.schema import models as admin_models
-
-    async with engine.begin() as conn:
-        await conn.run_sync(admin_models.Base.metadata.drop_all)
-    await engine.dispose()
-
-
-async def pg_seed(
-    engine: Any,
-    status: str,
-    *,
-    start_time: Optional[datetime] = None,
-    scheduled_at: Optional[str] = None,
-    created_at: Optional[datetime] = None,
-    managed: bool = False,
-    user_id: int = USER,
-    native: str = NID,
-    data: Optional[dict] = None,
-) -> int:
-    """One ``meetings`` row on the link (+ one ``meeting_entries`` row when ``managed``)."""
-    from sqlalchemy import text
-
-    payload = dict(data or {})
-    if scheduled_at is not None:
-        payload["scheduled_at"] = scheduled_at
-
-    def naive(dt: Optional[datetime]) -> Optional[datetime]:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt else None
-
-    async with engine.begin() as conn:
-        mid = (
-            await conn.execute(
-                text(
-                    "INSERT INTO meetings (user_id, platform, platform_specific_id, status, data, "
-                    "start_time, created_at) VALUES (:u, :p, :n, :s, CAST(:d AS jsonb), :st, "
-                    "COALESCE(:c, now() AT TIME ZONE 'utc')) RETURNING id"
-                ),
-                {
-                    "u": user_id,
-                    "p": PLAT,
-                    "n": native,
-                    "s": status,
-                    "d": json.dumps(payload),
-                    "st": naive(start_time),
-                    "c": naive(created_at),
-                },
-            )
-        ).scalar_one()
-        if managed:
-            await conn.execute(
-                text(
-                    "INSERT INTO meeting_entries (user_id, source_user, external_id, meeting_id, "
-                    "meeting_url, platform, native_meeting_id, start_at, content_hash, state) "
-                    "VALUES (:u, 'a@x', :x, :m, :url, :p, :n, now(), 'h', 'active')"
-                ),
-                {
-                    "u": user_id,
-                    "x": f"e{mid}",
-                    "m": mid,
-                    "p": PLAT,
-                    "n": native,
-                    "url": f"https://meet.google.com/{native}",
-                },
-            )
-    return int(mid)
-
-
 async def _pg_shape(engine: Any, shape: str) -> dict[str, int]:
     now = _real_now()
     ids: dict[str, int] = {}
     if shape == "live":
-        ids["now"] = await pg_seed(
+        ids["now"] = await seed_link_row(
             engine,
             "active",
             start_time=now - timedelta(minutes=20),
             created_at=now - timedelta(minutes=21),
         )
     else:
-        ids["past"] = await pg_seed(
+        ids["past"] = await seed_link_row(
             engine,
             "completed",
             start_time=now - timedelta(days=6),
             created_at=now - timedelta(days=7),
         )
-    ids["soon"] = await pg_seed(
+    ids["soon"] = await seed_link_row(
         engine, "scheduled", scheduled_at=_iso(now + timedelta(days=1)), managed=True
     )
-    ids["later"] = await pg_seed(
+    ids["later"] = await seed_link_row(
         engine, "scheduled", scheduled_at=_iso(now + timedelta(days=8))
     )
     return ids
 
 
-async def test_pg_link_rows_reads_each_row_as_the_fake_does(pg_engine):
+async def test_pg_link_rows_reads_each_row_as_the_fake_does(link_pg_engine):
     """The adapter query: every row on the user's link — none of another user's or another
     link's — with the intake meeting start and whether entries manage it."""
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -708,17 +737,17 @@ async def test_pg_link_rows_reads_each_row_as_the_fake_does(pg_engine):
     from meeting_api.intake.ports import Room
 
     now = _real_now()
-    ids = await _pg_shape(pg_engine, "past")
-    garbled = await pg_seed(
-        pg_engine,
+    ids = await _pg_shape(link_pg_engine, "past")
+    garbled = await seed_link_row(
+        link_pg_engine,
         "failed",
         scheduled_at="soon-ish",
         start_time=now - timedelta(hours=3),
     )
-    await pg_seed(pg_engine, "active", user_id=USER + 1)
-    await pg_seed(pg_engine, "active", native="abc-defg-hij")
+    await seed_link_row(link_pg_engine, "active", user_id=USER + 1)
+    await seed_link_row(link_pg_engine, "active", native="abc-defg-hij")
 
-    session_factory = async_sessionmaker(pg_engine, expire_on_commit=False)
+    session_factory = async_sessionmaker(link_pg_engine, expire_on_commit=False)
     async with session_factory() as db:
         rows = {r.id: r for r in await link_rows(db, USER, Room(PLAT, NID))}
     assert set(rows) == {ids["past"], ids["soon"], ids["later"], garbled}
@@ -736,14 +765,14 @@ async def test_pg_link_rows_reads_each_row_as_the_fake_does(pg_engine):
 
 
 @pytest.mark.parametrize("shape", ["live", "past"])
-async def test_pg_store_resolves_each_kind_as_the_fake_does(pg_engine, shape):
+async def test_pg_store_resolves_each_kind_as_the_fake_does(link_pg_engine, shape):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from meeting_api.collector.adapters import SqlAlchemyTranscriptStore
 
-    ids = await _pg_shape(pg_engine, shape)
+    ids = await _pg_shape(link_pg_engine, shape)
     store = SqlAlchemyTranscriptStore(
-        async_sessionmaker(pg_engine, expire_on_commit=False)
+        async_sessionmaker(link_pg_engine, expire_on_commit=False)
     )
     started = ids.get("now", ids.get("past"))
 
@@ -777,13 +806,15 @@ async def test_pg_store_resolves_each_kind_as_the_fake_does(pg_engine, shape):
 
 
 @pytest.mark.parametrize("shape", ["live", "past"])
-async def test_pg_find_latest_is_the_read_rule(pg_engine, shape):
+async def test_pg_find_latest_is_the_read_rule(link_pg_engine, shape):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
 
-    ids = await _pg_shape(pg_engine, shape)
-    repo = SqlAlchemyMeetingRepo(async_sessionmaker(pg_engine, expire_on_commit=False))
+    ids = await _pg_shape(link_pg_engine, shape)
+    repo = SqlAlchemyMeetingRepo(
+        async_sessionmaker(link_pg_engine, expire_on_commit=False)
+    )
     assert (await repo.find_latest(USER, PLAT, NID))["id"] == ids.get(
         "now", ids.get("past")
     )

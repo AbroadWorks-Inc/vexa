@@ -196,8 +196,8 @@ class InMemoryMeetingRepo:
             # exist (a scheduled row flagged by a rev-193 DELETE that never terminalized it), and
             # claiming one while the flag rides along would make the spawn fence abort the very bot
             # the user just asked for. The flag records intent about the run that WAS planned; this
-            # is a new one. (Post-fix, a stop terminalizes the planned row, so it is not claimable
-            # at all — this only ever meets rows written by an older build.)
+            # is a new one. (A stop never touches a planned row — §1.6, it stops the live meeting
+            # only — so the flag on a plan only ever comes from an older build.)
             planned.pop("stop_requested", None)
             row["data"] = {**planned, **dict(data or {})}
             return dict(row)

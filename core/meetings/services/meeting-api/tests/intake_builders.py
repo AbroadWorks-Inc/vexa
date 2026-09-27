@@ -5,6 +5,10 @@ in-memory fakes. ``test_intake_adapter_pg.py`` builds its Postgres harness from 
 For the ``/v2`` routes: ``intake_app`` mounts ``build_intake_router`` on a bare FastAPI app,
 ``http`` is an in-process client for it (same event loop as the test, so a real Postgres engine
 works too), and ``conforms`` validates a body against an ``intake.v1`` shape.
+
+For the link resolver (§1.6): ``seed_link_row`` inserts one ``meetings`` row on a link into real
+Postgres (plus a ``meeting_entries`` row when the meeting is entry-managed); ``conftest``'s
+``link_pg_engine`` is the engine it writes to.
 """
 
 from __future__ import annotations
@@ -286,3 +290,64 @@ def http(app: FastAPI) -> httpx.AsyncClient:
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://meeting-api",
     )
+
+
+async def seed_link_row(
+    engine: Any,
+    status: str,
+    *,
+    start_time: Optional[datetime] = None,
+    scheduled_at: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+    managed: bool = False,
+    user_id: int = 7,
+    platform: str = "google_meet",
+    native: str = "kxo-misr-avz",
+    data: Optional[dict] = None,
+) -> int:
+    """One ``meetings`` row on the link (+ one ``meeting_entries`` row when ``managed``)."""
+    from sqlalchemy import text
+
+    payload = dict(data or {})
+    if scheduled_at is not None:
+        payload["scheduled_at"] = scheduled_at
+
+    def naive(dt: Optional[datetime]) -> Optional[datetime]:
+        return dt.astimezone(UTC).replace(tzinfo=None) if dt else None
+
+    async with engine.begin() as conn:
+        mid = (
+            await conn.execute(
+                text(
+                    "INSERT INTO meetings (user_id, platform, platform_specific_id, status, data, "
+                    "start_time, created_at) VALUES (:u, :p, :n, :s, CAST(:d AS jsonb), :st, "
+                    "COALESCE(:c, now() AT TIME ZONE 'utc')) RETURNING id"
+                ),
+                {
+                    "u": user_id,
+                    "p": platform,
+                    "n": native,
+                    "s": status,
+                    "d": json.dumps(payload),
+                    "st": naive(start_time),
+                    "c": naive(created_at),
+                },
+            )
+        ).scalar_one()
+        if managed:
+            await conn.execute(
+                text(
+                    "INSERT INTO meeting_entries (user_id, source_user, external_id, meeting_id, "
+                    "meeting_url, platform, native_meeting_id, start_at, content_hash, state) "
+                    "VALUES (:u, 'a@x', :x, :m, :url, :p, :n, now(), 'h', 'active')"
+                ),
+                {
+                    "u": user_id,
+                    "x": f"e{mid}",
+                    "m": mid,
+                    "p": platform,
+                    "n": native,
+                    "url": f"https://meet.google.com/{native}",
+                },
+            )
+    return int(mid)

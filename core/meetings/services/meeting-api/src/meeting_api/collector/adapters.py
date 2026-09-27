@@ -1498,6 +1498,9 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
+            # Entries manage it: edited only through /v2/entries (§1.6, Ruling R21).
+            if await self._has_entries(db, meeting.id):
+                return {"error": "managed_by_entries"}
             if meeting.status not in ("idle", "scheduled"):
                 return {"error": "conflict"}
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
@@ -1594,6 +1597,7 @@ class SqlAlchemyTranscriptStore:
     async def delete_planned_meeting(self, user_id, meeting_id) -> "Optional[bool]":
         from sqlalchemy import select
 
+        from ..intake.resolver import ManagedByEntries
         from .models import Meeting
 
         async with self._session_factory() as db:
@@ -1603,6 +1607,9 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
+            # Entries manage it: edited only through /v2/entries (§1.6, Ruling R21).
+            if await self._has_entries(db, meeting.id):
+                raise ManagedByEntries(meeting.id)
             if meeting.status not in ("idle", "scheduled"):
                 return False
             await db.delete(meeting)
