@@ -73,6 +73,17 @@ CASES = [
      "/v2/meetings/{meeting_id}/stop"),
     ("DELETE", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", "/v2/meetings/{meeting_id}"),
 
+    ("POST", "/v2/webhooks", "/v2/webhooks"),
+    ("GET", "/v2/webhooks", "/v2/webhooks"),
+    ("PATCH", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30", "/v2/webhooks/{subscription_id}"),
+    ("DELETE", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30", "/v2/webhooks/{subscription_id}"),
+    ("POST", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30/rotate-secret",
+     "/v2/webhooks/{subscription_id}/rotate-secret"),
+    ("POST", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30/test",
+     "/v2/webhooks/{subscription_id}/test"),
+    ("GET", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30/deliveries",
+     "/v2/webhooks/{subscription_id}/deliveries"),
+
     ("GET", "/transcripts/by-id/42", "/transcripts/by-id/{meeting_id}"),
     ("GET", "/transcripts/google_meet/abc-defg-hij", "/transcripts/{platform}/{native_meeting_id}"),
     ("POST", "/transcripts/google_meet/abc-defg-hij/share",
@@ -233,7 +244,18 @@ def test_bot_scope_still_runs_the_bot_lifecycle():
 #: The routes a bot+tx key must NOT reach: each needs a least-privilege scope of its own (§1.10).
 #: Written down here, not read from ROUTE_SCOPES, so a manifest edit that moves any other route out
 #: of bot/tx turns the test below red instead of redefining what it expects.
-LEAST_PRIVILEGE = frozenset({("DELETE", "/v2/meetings/{meeting_id}")})
+LEAST_PRIVILEGE = frozenset({
+    ("DELETE", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/webhooks"),
+    ("GET", "/v2/webhooks"),
+    ("PATCH", "/v2/webhooks/{subscription_id}"),
+    ("DELETE", "/v2/webhooks/{subscription_id}"),
+    ("POST", "/v2/webhooks/{subscription_id}/rotate-secret"),
+    ("POST", "/v2/webhooks/{subscription_id}/test"),
+    ("GET", "/v2/webhooks/{subscription_id}/deliveries"),
+})
+#: The routes a ``webhooks`` key reaches (§2.7), and the only ones.
+WEBHOOK_ROUTES = frozenset(k for k in LEAST_PRIVILEGE if k[1].startswith("/v2/webhooks"))
 
 
 def test_a_bot_and_tx_key_reaches_every_route():
@@ -258,6 +280,17 @@ def test_an_erase_key_reaches_only_the_erase_route():
             assert status != 403, f"{method} {url} refused an erase key"
         else:
             assert status == 403, f"{method} {url} let an erase key in"
+
+
+def test_a_webhooks_key_reaches_only_the_webhook_routes():
+    """``webhooks`` (§1.10) is least privilege: it opens the /v2/webhooks routes and nothing else."""
+    client = _client(["webhooks"])
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) in WEBHOOK_ROUTES:
+            assert status != 403, f"{method} {url} refused a webhooks key"
+        else:
+            assert status == 403, f"{method} {url} let a webhooks key in"
 
 
 # --- deny by default -----------------------------------------------------------------------------

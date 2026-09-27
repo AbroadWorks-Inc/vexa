@@ -838,6 +838,51 @@ def create_app(
     async def get_user_transcription(request: Request):
         return await _forward("GET", _admin("/user/transcription"), request)
 
+    # ---- webhook subscriptions (§2.7): identity owns them. Each forwards verbatim to the same
+    # admin-api path; the subscription id is re-encoded as one opaque segment. Scope `webhooks`.
+    @app.post("/v2/webhooks")
+    async def create_webhook(request: Request):
+        return await _forward("POST", _admin("/v2/webhooks"), request)
+
+    @app.get("/v2/webhooks")
+    async def list_webhooks(request: Request):
+        return await _forward("GET", _admin("/v2/webhooks"), request)
+
+    @app.patch("/v2/webhooks/{subscription_id}")
+    async def patch_webhook(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id)
+        if error is not None:
+            return error
+        return await _forward("PATCH", _admin(f"/v2/webhooks/{segment}"), request)
+
+    @app.delete("/v2/webhooks/{subscription_id}")
+    async def delete_webhook(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id)
+        if error is not None:
+            return error
+        return await _forward("DELETE", _admin(f"/v2/webhooks/{segment}"), request)
+
+    @app.post("/v2/webhooks/{subscription_id}/rotate-secret")
+    async def rotate_webhook_secret(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id)
+        if error is not None:
+            return error
+        return await _forward("POST", _admin(f"/v2/webhooks/{segment}/rotate-secret"), request)
+
+    @app.post("/v2/webhooks/{subscription_id}/test")
+    async def test_webhook(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id)
+        if error is not None:
+            return error
+        return await _forward("POST", _admin(f"/v2/webhooks/{segment}/test"), request)
+
+    @app.get("/v2/webhooks/{subscription_id}/deliveries")
+    async def list_webhook_deliveries(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id)
+        if error is not None:
+            return error
+        return await _forward("GET", _admin(f"/v2/webhooks/{segment}/deliveries"), request)
+
     # ---- the AGENT domain (P20·Stage 2): the gateway fronts agent-api under the canonical /agent/*
     # prefix so the SAME edge resolves key → user and injects X-User-Id; agent-api derives `subject`
     # from it (never the client). The terminal therefore talks ONLY to the gateway (one authenticated
