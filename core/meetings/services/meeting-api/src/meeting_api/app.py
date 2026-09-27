@@ -37,6 +37,14 @@ from fastapi.responses import JSONResponse
 from . import bot_spawn as _bot_spawn
 from . import events as _flows_events
 from . import recordings as _recordings
+from .callback_auth import (
+    INTERNAL_SECRET_HEADER,
+    TOKEN_PARAM,
+    install_access_log_redaction,
+    internal_secret,
+    runtime_callback_token_ok,
+    secret_matches,
+)
 from .collector.app import build_router as _build_collector_router
 from .collector.ports import RedisBus, TranscriptStore
 from .lifecycle.machine import LifecycleSink, MeetingStore
@@ -985,12 +993,20 @@ def _mount_lifecycle(
             },
         )
 
+    install_access_log_redaction()
+
     # Expose the in-process entry so the runtime-callback synthetic-terminal path can advance the FSM
     # DIRECTLY (no HTTP self-POST to 127.0.0.1:PORT). Same instance, same store, same side effects.
     app.state.apply_lifecycle_event = _apply_lifecycle_event
 
     @app.post("/bots/internal/callback/lifecycle")
     async def lifecycle_callback(request: Request) -> JSONResponse:
+        # §1.10: the bot reaches meeting-api directly and proves itself with the internal secret
+        # meeting-api put in its invocation.
+        if not secret_matches(request.headers.get(INTERNAL_SECRET_HEADER), internal_secret()):
+            log_event("lifecycle_callback_rejected", audience="system", level="warning",
+                      span="lifecycle.callback", fields={"reason": "internal_secret"})
+            return JSONResponse(status_code=401, content={"detail": "invalid internal secret"})
         body = await request.json()
         status_code, content = await _apply_lifecycle_event(
             body, transition_source=TransitionSource.BOT_CALLBACK
@@ -1027,6 +1043,16 @@ def _mount_lifecycle(
             body = {}
         workload_id = body.get("workloadId") or body.get("workload_id")
         state = body.get("state")
+        # §1.10: the runtime posts to the callbackUrl meeting-api gave it, which carries this
+        # workload's token. Neither the token nor the URL is ever logged.
+        if not runtime_callback_token_ok(
+            request.query_params.get(TOKEN_PARAM), workload_id, internal_secret()
+        ):
+            log_event(
+                "runtime_callback_rejected", audience="system", level="warning",
+                span="runtime.callback", fields={"workload_id": workload_id, "state": state},
+            )
+            return JSONResponse(status_code=401, content={"detail": "invalid callback token"})
         log_event(
             "runtime_callback", audience="system", span="runtime.callback",
             fields={"workload_id": workload_id, "state": state},

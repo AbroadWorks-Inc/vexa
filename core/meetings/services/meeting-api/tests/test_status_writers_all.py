@@ -51,6 +51,7 @@ import pytest
 import meeting_api
 from meeting_api.intake.projection import project_meeting
 from meeting_api.intake.status import check_completion_reason
+from internal_callers import BOT
 
 USER = 7
 PLAT, NID = "google_meet", "kxo-misr-avz"
@@ -768,7 +769,7 @@ async def _callback(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         for event in events:
-            r = await client.post("/bots/internal/callback/lifecycle", json=event)
+            r = await client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
             assert r.status_code == 200, r.text
 
 

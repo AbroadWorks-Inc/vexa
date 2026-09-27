@@ -33,6 +33,16 @@ def _gateway_identity(monkeypatch):
     monkeypatch.setenv("GATEWAY_IDENTITY_SECRET", SECRET)
 
 
+@pytest.fixture(autouse=True)
+def _internal_secret(monkeypatch):
+    """§1.10: the bot's lifecycle callback carries ``x-internal-secret`` and the runtime posts to a
+    tokened URL, both keyed by ``INTERNAL_API_SECRET``. The suite runs with
+    ``internal_callers.INTERNAL_SECRET``; a test of the unconfigured case clears it."""
+    from internal_callers import INTERNAL_SECRET
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", INTERNAL_SECRET)
+
+
 # --- lifecycle.v1 goldens (the seam) ---------------------------------------------------
 
 def _repo_root() -> Path:

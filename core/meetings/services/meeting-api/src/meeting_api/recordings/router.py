@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from typing import Optional
@@ -214,7 +215,7 @@ def build_router(
             bearer = _bearer_token(authorization)
             internal_secret = os.getenv("INTERNAL_API_SECRET")
             token_meeting_id = None
-            if not (internal_secret and bearer == internal_secret):
+            if not (internal_secret and hmac.compare_digest(bearer.encode(), internal_secret.encode())):
                 try:
                     claims = _verify_meeting_token(bearer, secret=token_secret)
                 except ValueError as e:
@@ -243,7 +244,7 @@ def build_router(
         bearer = _bearer_token(authorization)
         internal_secret = os.getenv("INTERNAL_API_SECRET")
         token_meeting_id: Optional[int] = None
-        if internal_secret and bearer == internal_secret:
+        if internal_secret and hmac.compare_digest(bearer.encode(), internal_secret.encode()):
             token_meeting_id = None  # internal auth → scope by session; skip the MeetingToken cross-check
         else:
             try:

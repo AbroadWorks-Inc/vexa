@@ -29,6 +29,7 @@ import uuid
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from ..callback_auth import tokened_callback_url
 from ..config_preflight import CONFIG_FAULT_KINDS, cached_probe_verdict
 from ..obs import log_event
 from ..service_authority import (
@@ -819,10 +820,14 @@ async def request_bot(
         raise stopped
 
     # 5. Spawn over runtime.v1.
+    workload_id = f"mtg-{meeting_id}-{connection_id[:8]}"
     spec = build_workload_spec(
-        workload_id=f"mtg-{meeting_id}-{connection_id[:8]}",
+        workload_id=workload_id,
         invocation=invocation,
-        callback_url=f"{meeting_api_url}/runtime/callback",
+        # §1.10: the runtime posts back to this URL verbatim; its token names this workload.
+        callback_url=tokened_callback_url(
+            f"{meeting_api_url}/runtime/callback", workload_id, internal_secret or ""
+        ),
     )
     try:
         result = await runtime.create_workload(spec)

@@ -22,6 +22,7 @@ from meeting_api.webhooks import (
     build_system_webhook_from_env,
     verify_signature,
 )
+from internal_callers import BOT
 
 
 SECRET = "system-callback-secret"
@@ -55,7 +56,7 @@ def _seed(repo, *, session_uid="sess-system", data=None):
 
 
 def _post(client, body):
-    response = client.post("/bots/internal/callback/lifecycle", json=body)
+    response = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=body)
     assert response.status_code == 200, response.text
 
 

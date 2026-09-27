@@ -11,6 +11,7 @@ an isolated brick behind a port-seam.
 | `app.py` | `create_app(...)` — composes the modules onto ONE app; the shared `/health`. | `GET /health` |
 | `identity_guard.py` | §1.10 — a client route believes `x-user-id` only with the gateway's fresh `x-gateway-signature` (`GATEWAY_IDENTITY_SECRET`), else 401; `/internal/*`, the bot and runtime callbacks, `/health*` and `/metrics` are exempt. Vectors: `core/gateway/contracts/gateway-identity/`. | — |
 | `lifecycle/` | **O-MTG-1** — the lifecycle.v1 receiver + meeting-state FSM. | `POST /bots/internal/callback/lifecycle` |
+| `callback_auth.py` | §1.10 — who may call the callbacks: the bot's lifecycle callback needs `x-internal-secret`; the runtime posts to a `callbackUrl` carrying a per-bot token (HMAC of `aw-runtime-callback.<workloadId>` under `INTERNAL_API_SECRET`), never logged. Vectors: `core/meetings/contracts/runtime-callback/`. | — |
 | `bot_spawn/` | `POST /bots` — build the invocation.v1 invocation + mint the MeetingToken + spawn the meeting-bot over runtime.v1, eager-creating the MeetingSession. | `POST /bots` |
 | `collector/` | the **folded-in** transcript backend (was the standalone transcription-collector): api.v1 reads + the `/ws` authorizer + the segments consumer. | `GET /transcripts/…`, `GET /meetings`, `POST /ws/authorize-subscribe` |
 | `recordings/` | chunk upload + finalize → master in `meeting.data` JSONB (recording.v1). | `POST /internal/recordings/upload`, `GET /recordings`, `GET /recordings/{id}/master` |

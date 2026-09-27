@@ -27,6 +27,8 @@ from meeting_api import create_app
 from meeting_api import events as events_mod
 from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
 
+from internal_callers import BOT
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 
 
@@ -38,7 +40,7 @@ def _seed(repo, *, session_uid="sess-flows", user_id=17, native="flows-meeting",
 
 
 def _post(client, body):
-    r = client.post("/bots/internal/callback/lifecycle", json=body)
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=body)
     assert r.status_code == 200, r.text
     return r
 

@@ -38,6 +38,7 @@ from meeting_api.collector.db_writer import (
 )
 from meeting_api.collector.fakes import FakeRedisBus, InMemoryTranscriptStore
 from gateway_identity import via_gateway
+from internal_callers import BOT
 
 USER = 7
 NATIVE = "abc-defg-hij"
@@ -343,7 +344,7 @@ async def test_completed_meeting_transcript_is_flushed_immediately(redis_c, gold
                                    "updated_at": datetime.now(timezone.utc).isoformat()})
 
     for case in ("joining", "active", "completed-stopped"):
-        assert client.post("/bots/internal/callback/lifecycle", json=goldens[case]).status_code == 200
+        assert client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens[case]).status_code == 200
 
     assert _durable_texts(store) == ["last words"]          # durable NOW
     assert await redis_c.hlen(segments_hash_key(1)) == 0    # hash drained
@@ -354,7 +355,7 @@ async def test_nonterminal_advance_does_not_finalize(redis_c, goldens):
     await store.append_segment(1, {**_seg("s1", 1.0, "mid-meeting"),
                                    "updated_at": datetime.now(timezone.utc).isoformat()})
     for case in ("joining", "active"):
-        client.post("/bots/internal/callback/lifecycle", json=goldens[case])
+        client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens[case])
     assert _durable_texts(store) == []                      # not finalized — the meeting is live
     assert await redis_c.hlen(segments_hash_key(1)) == 1
 
@@ -542,7 +543,7 @@ async def test_rest_after_completion_with_redis_wiped_serves_transcript_and_proc
                                             "params": json.dumps({"model": "claude-x"})})
 
     for case in ("joining", "active", "completed-stopped"):
-        assert client.post("/bots/internal/callback/lifecycle", json=goldens[case]).status_code == 200
+        assert client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens[case]).status_code == 200
 
     await redis_c.flushall()  # the eviction that used to be unrecoverable
 

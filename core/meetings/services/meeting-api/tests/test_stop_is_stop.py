@@ -39,6 +39,7 @@ from meeting_api.lifecycle.machine import dominant_completion_reason
 from meeting_api.lifecycle.occurrence import Disposition, disposition, may_dispatch_again
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
 from gateway_identity import via_gateway
+from internal_callers import BOT
 
 USER = 7
 PLATFORM = "google_meet"
@@ -305,8 +306,8 @@ async def test_f3_a_lost_race_records_stopped_not_the_fault_it_hit():
 
     async with _client(_app(repo)) as client:
         # The FSM's first event must be `joining`; then the bot's own terminal, blaming the network.
-        await client.post(LIFECYCLE, json={"connection_id": "sess-1", "status": "joining"})
-        r = await client.post(LIFECYCLE, json={
+        await client.post(LIFECYCLE, headers=BOT, json={"connection_id": "sess-1", "status": "joining"})
+        r = await client.post(LIFECYCLE, headers=BOT, json={
             "connection_id": "sess-1", "status": "failed",
             "completion_reason": "join_failure", "exit_code": 1,
         })

@@ -14,6 +14,7 @@ from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.bot_spawn.service import request_bot
 from meeting_api.webhooks import DeliveryResult
+from internal_callers import BOT
 
 
 class _CaptureSink:
@@ -73,7 +74,7 @@ def test_status_change_webhook_delivered(goldens):
         "webhook_events": {"meeting.status_change": True},
     })
     client = TestClient(create_app(meeting_repo=repo, webhook_sink=sink))
-    r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
     assert sink.calls, "no webhook delivered on FSM advance"
     c = sink.calls[0]
@@ -87,7 +88,7 @@ def test_no_webhook_when_url_unconfigured(goldens):
     repo, sink = InMemoryMeetingRepo(), _CaptureSink()
     _seed(repo, session_uid="sess-uid", data={})  # no webhook_url on the meeting
     client = TestClient(create_app(meeting_repo=repo, webhook_sink=sink))
-    r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
     assert not sink.calls
 
@@ -113,7 +114,7 @@ def _wired_client():
 
 
 def _post(client, event):
-    r = client.post("/bots/internal/callback/lifecycle", json=event)
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
     assert r.status_code == 200, r.text
 
 
@@ -308,7 +309,7 @@ def _delivery_logs(capsys):
 
 def _run_advance(repo, sink, goldens):
     client = TestClient(create_app(meeting_repo=repo, webhook_sink=sink))
-    return client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    return client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
 
 
 def test_delivered_outcome_is_logged(goldens, capsys):

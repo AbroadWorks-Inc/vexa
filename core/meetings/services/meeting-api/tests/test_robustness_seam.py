@@ -33,6 +33,7 @@ from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.ingest import consume_segments, ingest
 from gateway_identity import via_gateway
+from internal_callers import BOT
 
 SECRET = "test-admin-token"
 USER = 7
@@ -142,8 +143,8 @@ def test_lifecycle_publish_failure_is_surfaced_but_not_fatal():
     meeting_id = spawn.json()["id"]
 
     # joining → active: the active advance publishes a ws BotStatus frame → publish raises.
-    assert client.post(LIFECYCLE_ENDPOINT, json={"connection_id": session_uid, "status": "joining"}).status_code == 200
-    r = client.post(LIFECYCLE_ENDPOINT, json={"connection_id": session_uid, "status": "active"})
+    assert client.post(LIFECYCLE_ENDPOINT, headers=BOT, json={"connection_id": session_uid, "status": "joining"}).status_code == 200
+    r = client.post(LIFECYCLE_ENDPOINT, headers=BOT, json={"connection_id": session_uid, "status": "active"})
 
     # The publish RAISED but the callback still returned 200 and the DB row still transitioned.
     assert r.status_code == 200, r.text

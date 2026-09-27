@@ -25,6 +25,7 @@ from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.webhooks import WebhookSink
 from gateway_identity import via_gateway
+from internal_callers import BOT
 
 USER = 7
 SECRET = "test-admin-token"
@@ -103,7 +104,7 @@ def test_full_meeting_lifecycle_cascade():
         if st == "completed":
             ev["exit_code"] = 0
             ev["completion_reason"] = "stopped"
-        rr = client.post("/bots/internal/callback/lifecycle", json=ev)
+        rr = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=ev)
         assert rr.status_code == 200, f"{st}: {rr.text}"
 
     # ── 3. durable persist (sessions/repo) — the FSM advance reached the DB row ──

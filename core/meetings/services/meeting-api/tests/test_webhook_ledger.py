@@ -21,6 +21,7 @@ from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
 from meeting_api.webhooks import InMemoryDeliveryLedger, WebhookSink, build_delivery_record
 from gateway_identity import via_gateway
+from internal_callers import BOT
 
 # A resolver stub so the SSRF guard never touches DNS — hook.example resolves to a public IP.
 _PUBLIC = lambda host: ["93.184.216.34"]  # noqa: E731
@@ -50,7 +51,7 @@ def test_real_delivery_appears_in_delivery_history(goldens, receiver):
     client = TestClient(via_gateway(_app(repo, receiver, ledger)))
 
     # Drive the FSM advance → the callback delivers meeting.status_change to the receiver (200)...
-    r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
     assert len(receiver.received) == 1, "receiver should have gotten the real delivery"
 
@@ -85,7 +86,7 @@ def test_suppressed_delivery_recorded_with_its_named_outcome(goldens, receiver):
     })
     client = TestClient(via_gateway(_app(repo, receiver, ledger)))
 
-    r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
     assert receiver.received == [], "a suppressed event must never reach the wire"
 
@@ -104,7 +105,7 @@ def test_delivery_history_is_owner_scoped(goldens, receiver):
         "webhook_events": {"meeting.status_change": True},
     })
     client = TestClient(via_gateway(_app(repo, receiver, ledger)))
-    client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
 
     assert client.get("/webhooks/deliveries", headers={"X-User-Id": "1"}).json()["deliveries"]
     assert client.get("/webhooks/deliveries", headers={"X-User-Id": "2"}).json()["deliveries"] == []

@@ -94,9 +94,9 @@
   {
    "key": "INTERNAL_API_SECRET",
    "class": "defaulted",
-   "default": "(unset — the internal lifecycle-callback header is then not attached)",
+   "default": "(unset — the bot's lifecycle callbacks and the runtime's callbacks are refused with 401, bots get no internalSecret, and a recording upload needs a MeetingToken)",
    "secret": true,
-   "description": "shared secret for internal service-to-service calls (x-internal-secret on the self-driven lifecycle callback). Unset is a documented degrade; a PUBLISHED PLACEHOLDER is not — it is the whole internal tier handed to anyone who read the repository (F95), so the boot refuses it.",
+   "description": "shared secret for internal service-to-service calls. §1.10: meeting-api hands it to each bot (invocation internalSecret), POST /bots/internal/callback/lifecycle requires it as x-internal-secret, it keys the per-bot token in the runtime callbackUrl (POST /runtime/callback?t=<hex HMAC-SHA256 of \"aw-runtime-callback.<workloadId>\">; callback_auth.py), and a recording upload may present it as its bearer; every comparison is constant-time. Unset is a documented degrade; a PUBLISHED PLACEHOLDER is not — it is the whole internal tier handed to anyone who read the repository (F95), so the boot refuses it.",
    "forbidden_values": [
      "vexa-internal-secret",
      "lite-internal-secret",

@@ -45,6 +45,7 @@ from meeting_api.intake.service import IntakeService
 from meeting_api.intake.stop import IntakeStop
 from meeting_api.intake.validation import IntakeError
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+from internal_callers import BOT
 
 ACCOUNT = {"x-user-id": "1"}
 NO_LIVE_BOT = "no bot in this meeting; to cancel it, remove the entry"
@@ -643,7 +644,7 @@ async def test_pg_r5_outcome_survives_the_bots_completion(pg_engine):
         "bot_logs": ["[ACT] leave received"],
     }
     async with http(app) as client:
-        r = await client.post("/bots/internal/callback/lifecycle", json=event)
+        r = await client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
     assert r.status_code == 200, r.text
 
     row = await s.repo.get_meeting(mid)

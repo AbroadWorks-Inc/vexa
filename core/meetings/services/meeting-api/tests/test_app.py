@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from meeting_api import create_app
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from gateway_identity import via_gateway
+from internal_callers import BOT
 
 USER = 7
 HEADERS = {"x-user-id": str(USER)}
@@ -78,7 +79,7 @@ def test_lifecycle_callback_on_unified_app():
     event = json.loads(events[0].read_text())
 
     client = TestClient(via_gateway(create_app()))
-    r = client.post("/bots/internal/callback/lifecycle", json=event)
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
     assert r.status_code in (200, 409), r.text  # accepted, or a legal-transition rejection
 
 
