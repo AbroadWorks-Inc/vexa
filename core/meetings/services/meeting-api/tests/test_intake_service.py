@@ -556,7 +556,9 @@ async def test_join_now_adopting_a_shared_meeting_keeps_it_when_the_spawn_fails(
     assert h.spawn.calls == [(1, h.meeting_id(uuid))]
 
 
-async def test_join_now_adopting_an_entry_less_meeting_ends_it_not_sent():
+async def test_join_now_never_adopts_an_entry_less_upstream_meeting():
+    """Ruling R15: an entry-less upstream-planned row on the link is left to upstream; the paste
+    gets its own meeting, which ends ``not_sent`` when the spawn fails."""
     h = make_harness("2026-09-29T09:45:00Z", spawn_failure=ACCOUNT_LIMIT)
     planned = h.store.seed_meeting(
         1,
@@ -564,14 +566,11 @@ async def test_join_now_adopting_an_entry_less_meeting_ends_it_not_sent():
         status="scheduled",
         plan=Plan(ts("2026-09-29T10:00:00Z"), None, "Planned upstream", None, GMEET),
     )
-    uuid = h.store.meetings[planned]["uuid"]
+    upstream = h.store.meetings[planned]["uuid"]
     reply = await h.instant("manual:1", GMEET)
     m = reply["meeting"]
-    assert (reply["result"], m["id"], m["status"]) == (
-        "joined_existing",
-        uuid,
-        "failed",
-    )
+    assert (reply["result"], m["status"]) == ("created", "failed")
+    assert m["id"] != upstream
     assert m["outcome"] == {
         "kind": "not_sent",
         "detail": "account_limit",
@@ -579,7 +578,10 @@ async def test_join_now_adopting_an_entry_less_meeting_ends_it_not_sent():
         "at": "2026-09-29T09:45:00Z",
     }
     assert reply["entry"]["state"] == "closed"
-    assert h.events() == [(uuid, "meeting.updated"), (uuid, "meeting.not_sent")]
+    assert h.events() == [(m["id"], "meeting.scheduled"), (m["id"], "meeting.not_sent")]
+    assert h.meeting(upstream).status == "scheduled"
+    assert h.meeting(upstream).entries == ()
+    assert h.store.aw[planned]["event_seq"] == 0
 
 
 # ── the meeting's link is locked too ─────────────────────────────────────────────────────────

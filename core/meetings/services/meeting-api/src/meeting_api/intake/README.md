@@ -38,6 +38,14 @@ unless it was adopted with other entries on it: then only the pasted entry goes,
 and `rerun_entries` (R7) are for the scheduler and the status writer's callers. The service reaches
 storage, spawn, stop and publishing only through `ports.py` (`IntakeStore`/`IntakeTx`,
 `SpawnPort`, `StopPort`, `EventPublisher`); `fakes.py` holds the in-memory implementations.
+`PostgresIntakeStore(session_factory)` (`adapters.py`) is the `IntakeStore` over Postgres: each
+`room_lock` is one transaction holding the links' advisory locks, taken in sorted order
+(`pg_advisory_xact_lock(hashtextextended('aw-intake:'||user_id||':'||platform||':'||native, 0))`,
+§1.4) and released at commit or rollback; inside it the lock order is the link, then the meeting
+row, then `meeting_aw_state`, and status changes and events go through `write_status` /
+`write_event` in the same transaction. `room_meetings` returns the link's live meetings and the
+non-finished meetings entries manage, never an entry-less upstream-planned row (Ruling R15);
+`count_active_entries` is an index-only count on `ix_meeting_entries_active_user`.
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.
@@ -50,4 +58,5 @@ storage, spawn, stop and publishing only through `ports.py` (`IntakeStore`/`Inta
 - `IntakeService` — `service.py`; `IntakeSettings` — `settings.py`.
 - `IntakeStore`, `IntakeTx`, `EntryView`, `MeetingView`, `Room`, `SpawnOutcome`, `SpawnPort`,
   `StopPort`, `EventPublisher` — `ports.py`; the in-memory fakes — `fakes.py`.
+- `PostgresIntakeStore` — `adapters.py`.
 - The matching rules — `rules.py` (used inside the package).

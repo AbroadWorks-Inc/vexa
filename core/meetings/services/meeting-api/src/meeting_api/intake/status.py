@@ -62,6 +62,8 @@ __all__ = [
     "WrittenEvent",
     "check_event_data",
     "derive_event_id_v2",
+    "lock_aw_state",
+    "lock_meeting",
     "row_mapping",
     "write_event",
     "write_status",
@@ -142,7 +144,8 @@ def _stamp(instant: datetime) -> datetime:
     return instant.replace(microsecond=0)
 
 
-async def _lock_meeting(db: AsyncSession, meeting_id: int) -> Any:
+async def lock_meeting(db: AsyncSession, meeting_id: int) -> Any:
+    """The ``meetings`` row, locked ``FOR UPDATE`` and freshly read (``None`` when missing)."""
     from ..sessions.models import Meeting
 
     return await db.get(
@@ -150,7 +153,9 @@ async def _lock_meeting(db: AsyncSession, meeting_id: int) -> Any:
     )
 
 
-async def _lock_aw_state(db: AsyncSession, meeting_id: int) -> Any:
+async def lock_aw_state(db: AsyncSession, meeting_id: int) -> Any:
+    """The ``meeting_aw_state`` row, locked ``FOR UPDATE`` and freshly read, created when missing.
+    Call it only while holding the meeting row's lock (the §1.4 lock order)."""
     from ..sessions.models import MeetingAwState
 
     aw = await db.get(
@@ -243,7 +248,7 @@ async def write_status(
     """
     check_event_data(event_data)
     now = _now()
-    meeting = await _lock_meeting(db, meeting_id)
+    meeting = await lock_meeting(db, meeting_id)
     if meeting is None or meeting.status not in expected_from:
         raise StatusConflict(
             meeting_id, None if meeting is None else meeting.status, expected_from
@@ -255,7 +260,7 @@ async def write_status(
         current = meeting.data if isinstance(meeting.data, dict) else {}
         meeting.data = {**current, **data_patch}
 
-    aw = await _lock_aw_state(db, meeting_id)
+    aw = await lock_aw_state(db, meeting_id)
     if outcome is not None:
         aw.outcome_kind = outcome.kind
         aw.outcome_detail = outcome.detail
@@ -309,10 +314,10 @@ async def write_event(
     row as ``write_status``. ``change`` is carried as ``data.change`` when given. Raises
     ``LookupError`` when the meeting doesn't exist."""
     now = _now()
-    meeting = await _lock_meeting(db, meeting_id)
+    meeting = await lock_meeting(db, meeting_id)
     if meeting is None:
         raise LookupError(f"meeting {meeting_id} not found")
-    aw = await _lock_aw_state(db, meeting_id)
+    aw = await lock_aw_state(db, meeting_id)
     aw.event_seq = int(aw.event_seq or 0) + 1
     entries = await _entries(db, meeting_id)
     event_id = await _insert_outbox(

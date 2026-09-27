@@ -24,10 +24,14 @@ Public surface:
     storage, spawning, stopping and publishing only through the ports in ``ports.py``
     (``IntakeStore``/``IntakeTx``, ``SpawnPort``, ``StopPort``, ``EventPublisher``); the
     in-memory fakes are in ``fakes.py``. ``IntakeSettings.from_env()`` — ``settings.py``.
+  * ``PostgresIntakeStore(session_factory)`` — ``adapters.py``. The ``IntakeStore`` over Postgres:
+    one transaction per ``room_lock`` holding the links' advisory locks (§1.4), status changes and
+    events through ``write_status`` / ``write_event`` in that transaction.
 """
 
 from __future__ import annotations
 
+from .adapters import PostgresIntakeStore
 from .ports import (
     EntryView,
     EventPublisher,
@@ -58,6 +62,7 @@ __all__ = [
     "IntakeSettings",
     "IntakeStore",
     "IntakeTx",
+    "PostgresIntakeStore",
     "EntryView",
     "MeetingView",
     "Room",

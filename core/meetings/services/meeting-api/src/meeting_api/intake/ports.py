@@ -109,6 +109,32 @@ class EntryView:
             "removed_reason": self.removed_reason,
         }
 
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> EntryView:
+        """The entry from its row under its column names (``row()``'s shape, as
+        ``status.row_mapping`` reads a stored row)."""
+        return cls(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            source_user=row["source_user"],
+            external_id=row["external_id"],
+            meeting_id=int(row["meeting_id"]),
+            meeting_url=row["meeting_url"],
+            platform=row["platform"],
+            native_meeting_id=row["native_meeting_id"],
+            title=row["title"],
+            start=row["start_at"],
+            end=row["end_at"],
+            time_zone=row["time_zone"],
+            series_id=row["series_id"],
+            attendees=tuple(row["attendees"] or ()),
+            join_now=bool(row["join_now"]),
+            metadata=row["metadata"],
+            content_hash=row["content_hash"],
+            state=row["state"],
+            removed_reason=row["removed_reason"],
+        )
+
     def as_entry_in(self) -> EntryIn:
         """The stored entry as the request that would store it (for a re-run, R7)."""
         return EntryIn(
@@ -199,7 +225,9 @@ class IntakeTx(Protocol):
     async def entry(self, entry_id: int) -> Optional[EntryView]: ...
 
     async def room_meetings(self, user_id: int, room: Room) -> list[MeetingView]:
-        """The account's non-finished meetings on this link."""
+        """The account's meetings on this link that entries can join, by id: every live one, and
+        every other non-finished one that entries manage (it has at least one entry row). An
+        entry-less upstream-planned row is never returned (Ruling R15)."""
         ...
 
     async def meeting(self, meeting_id: int) -> MeetingView:

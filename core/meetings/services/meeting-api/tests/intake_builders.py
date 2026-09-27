@@ -1,5 +1,7 @@
 """Shared builders for the entry-service tests (§1.3, §2.6): a controllable clock, request bodies,
-and a harness wiring ``IntakeService`` to the in-memory fakes."""
+the settings, the request helpers (``Requests``) and a harness wiring ``IntakeService`` to the
+in-memory fakes. ``test_intake_adapter_pg.py`` builds its Postgres harness from the same pieces.
+"""
 
 from __future__ import annotations
 
@@ -73,14 +75,9 @@ def instant_body(external_id: str, meeting_url: str = ZOOM, *, user: str = A) ->
     }
 
 
-@dataclass
-class Harness:
-    clock: FakeClock
-    settings: IntakeSettings
-    store: InMemoryIntakeStore
-    spawn: FakeSpawn
-    stop: FakeStop
-    publisher: FakePublisher
+class Requests:
+    """``PUT`` / instant join / remove through ``self.service``, whatever store it runs on."""
+
     service: IntakeService
 
     async def put(
@@ -117,6 +114,17 @@ class Harness:
             body["reason"] = reason
         return await self.service.remove_entry(user_id, body)
 
+
+@dataclass
+class Harness(Requests):
+    clock: FakeClock
+    settings: IntakeSettings
+    store: InMemoryIntakeStore
+    spawn: FakeSpawn
+    stop: FakeStop
+    publisher: FakePublisher
+    service: IntakeService
+
     def meeting_id(self, uuid: str) -> int:
         return next(
             mid for mid, row in self.store.meetings.items() if row["uuid"] == uuid
@@ -148,6 +156,21 @@ class Harness:
         )
 
 
+def make_settings(
+    *,
+    lead_s: int = 300,
+    max_active_entries: int = 100_000,
+    blocked_hosts: frozenset[str] = frozenset({"meet.abroadworks.com"}),
+) -> IntakeSettings:
+    return IntakeSettings(
+        max_days_ahead=30,
+        join_now_adopt_ahead_s=3600,
+        lead_s=lead_s,
+        blocked_hosts=blocked_hosts,
+        max_active_entries=max_active_entries,
+    )
+
+
 def make_harness(
     now: str = "2026-09-26T12:00:00Z",
     *,
@@ -157,12 +180,10 @@ def make_harness(
     spawn_failure: Optional[SpawnOutcome] = None,
 ) -> Harness:
     clock = FakeClock(ts(now))
-    settings = IntakeSettings(
-        max_days_ahead=30,
-        join_now_adopt_ahead_s=3600,
+    settings = make_settings(
         lead_s=lead_s,
-        blocked_hosts=blocked_hosts,
         max_active_entries=max_active_entries,
+        blocked_hosts=blocked_hosts,
     )
     store = InMemoryIntakeStore(clock=clock, lead_s=lead_s)
     spawn = FakeSpawn(store, failure=spawn_failure)

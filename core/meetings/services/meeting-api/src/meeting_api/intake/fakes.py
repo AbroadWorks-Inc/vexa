@@ -2,12 +2,13 @@
 
   * ``InMemoryIntakeStore`` — ``IntakeStore`` over dicts. ``room_lock`` checks the lock order
     (distinct rooms, sorted), records every acquisition in ``lock_log``, and gives a transaction
-    that commits on a normal exit and rolls back when the block raises. Its status and event
-    writes behave as ``write_status`` / ``write_event`` (§1.4): the status change is conditional
-    (``StatusConflict``, nothing written), each event adds 1 to the meeting's sequence, a finished
-    status closes the active entries except the ones that re-run (``rules.is_rerun``, returned in
-    ``rerun_entry_ids``), and every event is recorded in order in ``events`` with the meeting as
-    projected at that moment.
+    that commits on a normal exit and rolls back when the block raises. ``room_meetings`` returns
+    the link's live meetings and the non-finished ones that have an entry (Ruling R15). Its status
+    and event writes behave as ``write_status`` / ``write_event`` (§1.4): the status change is
+    conditional (``StatusConflict``, nothing written), each event adds 1 to the meeting's
+    sequence, a finished status closes the active entries except the ones that re-run
+    (``rules.is_rerun``, returned in ``rerun_entry_ids``), and every event is recorded in order in
+    ``events`` with the meeting as projected at that moment.
   * ``FakeSpawn`` — ``SpawnPort``: claims a ``scheduled`` row (status ``requested``), answers
     ``already_live`` for any other row, or returns the failure it was given.
   * ``FakeStop`` — ``StopPort``: moves a live meeting to ``stopping`` with the outcome given.
@@ -324,13 +325,17 @@ class _FakeTx:
         return self._s.entries.get(entry_id)
 
     async def room_meetings(self, user_id: int, room: Room) -> list[MeetingView]:
+        managed = {e.meeting_id for e in self._s.entries.values()}
         return [
             self._s.view(mid)
             for mid, row in sorted(self._s.meetings.items())
             if row["user_id"] == user_id
             and row["platform"] == room.platform
             and row["platform_specific_id"] == room.native_meeting_id
-            and row["status"] not in FINISHED_STATUSES
+            and (
+                is_live(row["status"])
+                or (row["status"] not in FINISHED_STATUSES and mid in managed)
+            )
         ]
 
     async def meeting(self, meeting_id: int) -> MeetingView:
