@@ -11,5 +11,9 @@ Webhook subscriptions (§2.7): `webhook_subscriptions.py` serves `/v2/webhooks` 
 shared vectors in `core/identity/contracts/webhook-subscriptions/`.
 `retention.py` is the daily single-flight sweep (§1.13) that deletes final deliveries older than
 `WEBHOOK_DELIVERY_RETENTION_DAYS`, then published outbox rows with no deliveries left.
+`identity_guard.py` (§1.10) answers 401 to any client request whose `x-user-id` doesn't carry the
+gateway's fresh `x-gateway-signature` (`GATEWAY_IDENTITY_SECRET`); `/admin/*`, `/internal/*`,
+`/health*` and `/metrics` are exempt. The signing rule is pinned as shared vectors in
+`core/gateway/contracts/gateway-identity/`.
 
 _Governed by `docs/docs/governance/architecture.mdx` (P1–P12). This folder owns one concern; its public surface is its `index`/contract; it may depend only on what the dependency-rules allow._

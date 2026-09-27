@@ -24,6 +24,9 @@ from gateway import CARRIED_DOMAINS
 os.environ.setdefault("GUARD_ENABLED", "true")
 os.environ.setdefault("GUARD_ENABLE_REDIS", "false")
 os.environ.setdefault("GUARD_RATE_LIMIT_RPM", "0")
+# §1.10: the gateway forwards nothing without the key it signs x-user-id with. A test-only value;
+# tests that assert the unconfigured case clear it.
+os.environ.setdefault("GATEWAY_IDENTITY_SECRET", "test-gateway-identity-secret-unit")
 
 # ── WHICH PROFILE IS THIS BUILD? ────────────────────────────────────────────────────────────────
 #

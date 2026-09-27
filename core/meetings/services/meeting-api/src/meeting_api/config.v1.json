@@ -108,6 +108,24 @@
    ]
   },
   {
+   "key": "GATEWAY_IDENTITY_SECRET",
+   "class": "defaulted",
+   "default": "(unset — every client route answers 401; the bot callbacks, /internal/*, /health and /metrics are unaffected)",
+   "secret": true,
+   "description": "§1.10: the key the gateway signs x-user-id with (x-gateway-signature: t=<unix>,v1=<hex HMAC-SHA256 of \"<t>.<user_id>.<METHOD>.<path>\">). identity_guard.py refuses with 401 any client request whose signature is missing, malformed, wrong, for another user, or more than 60 s from this clock. The same value as the gateway's.",
+   "forbidden_values": [
+    "vexa-internal-secret",
+    "lite-internal-secret",
+    "changeme",
+    "change-me",
+    "CHANGE-ME",
+    "default",
+    "secret",
+    "<REPLACE_ME>"
+   ],
+   "targets": []
+  },
+  {
    "key": "DEFAULT_BOT_NAME",
    "class": "defaulted",
    "default": "(unset — request_bot falls back to VexaBot-{random})",

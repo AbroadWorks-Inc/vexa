@@ -8,6 +8,7 @@ the same machinery as every other `<domain>/contracts/<name>.v<N>` (gate:schema 
 | Contract | Between | Status |
 |---|---|---|
 | [`api.v1`](api.v1/) | api-gateway / mcp / meeting-api → the world | **frozen ≡ vexa `main` api-gateway 1.5.0** (OpenAPI 3.1) |
+| [`gateway-identity`](gateway-identity/) | gateway → meeting-api / admin-api (`x-gateway-signature`, §1.10) | shared test vectors, not a sealed contract |
 | [`ws.v1`](ws.v1/) | api-gateway `/ws` → the world (live transcripts/status/chat) | **frozen ≡ vexa `main` `/ws`** (pinned by main's G5 WS gate test) |
 
 The rule (MANIFEST §2): a back-compatible change re-seals (`pnpm seal:contracts`); a

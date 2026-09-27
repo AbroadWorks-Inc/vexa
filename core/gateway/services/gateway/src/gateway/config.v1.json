@@ -24,6 +24,23 @@
    ]
   },
   {
+   "key": "GATEWAY_IDENTITY_SECRET",
+   "class": "required-explicit",
+   "secret": true,
+   "description": "§1.10: the key of the x-gateway-signature the gateway puts on every request it forwards with x-user-id (identity_signature.py). meeting-api and admin-api hold the same value and believe x-user-id only with a fresh signature, so without it every client route downstream answers 401: the boot refuses, and a gateway built without preflight refuses to forward (503).",
+   "forbidden_values": [
+    "vexa-internal-secret",
+    "lite-internal-secret",
+    "changeme",
+    "change-me",
+    "CHANGE-ME",
+    "default",
+    "secret",
+    "<REPLACE_ME>"
+   ],
+   "targets": []
+  },
+  {
    "key": "ADMIN_API_URL",
    "class": "defaulted",
    "default": "http://admin-api:8001",

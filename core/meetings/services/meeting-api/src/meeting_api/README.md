@@ -9,6 +9,7 @@ an isolated brick behind a port-seam.
 | Module | Concern | HTTP surface (on the unified app) |
 |---|---|---|
 | `app.py` | `create_app(...)` — composes the modules onto ONE app; the shared `/health`. | `GET /health` |
+| `identity_guard.py` | §1.10 — a client route believes `x-user-id` only with the gateway's fresh `x-gateway-signature` (`GATEWAY_IDENTITY_SECRET`), else 401; `/internal/*`, the bot and runtime callbacks, `/health*` and `/metrics` are exempt. Vectors: `core/gateway/contracts/gateway-identity/`. | — |
 | `lifecycle/` | **O-MTG-1** — the lifecycle.v1 receiver + meeting-state FSM. | `POST /bots/internal/callback/lifecycle` |
 | `bot_spawn/` | `POST /bots` — build the invocation.v1 invocation + mint the MeetingToken + spawn the meeting-bot over runtime.v1, eager-creating the MeetingSession. | `POST /bots` |
 | `collector/` | the **folded-in** transcript backend (was the standalone transcription-collector): api.v1 reads + the `/ws` authorizer + the segments consumer. | `GET /transcripts/…`, `GET /meetings`, `POST /ws/authorize-subscribe` |

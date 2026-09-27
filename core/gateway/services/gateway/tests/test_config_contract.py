@@ -26,7 +26,7 @@ def test_preflight_refuses_boot_without_internal_api_secret():
 
 
 def test_preflight_passes_when_required_set():
-    cp.preflight({"INTERNAL_API_SECRET": "a-real-secret"})
+    cp.preflight({"INTERNAL_API_SECRET": "a-real-secret", "GATEWAY_IDENTITY_SECRET": "a-real-key"})
 
 
 def test_preflight_refuses_the_published_placeholder():
@@ -40,6 +40,6 @@ def test_preflight_refuses_the_published_placeholder():
     KEY, never the value."""
     for placeholder in ("vexa-internal-secret", "lite-internal-secret", "changeme"):
         with pytest.raises(cp.ConfigError) as ei:
-            cp.preflight({**{}, "INTERNAL_API_SECRET": placeholder})
+            cp.preflight({**{"GATEWAY_IDENTITY_SECRET": "a-real-key"}, "INTERNAL_API_SECRET": placeholder})
         assert "INTERNAL_API_SECRET" in str(ei.value)
         assert placeholder not in str(ei.value), "a refusal must never echo the value"

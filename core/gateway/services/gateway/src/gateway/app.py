@@ -42,6 +42,7 @@ from . import routes_manifest
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 
+from .identity_signature import SIGNATURE_HEADER, identity_secret, sign_now
 from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event, set_user_id
 from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
 
@@ -217,7 +218,8 @@ def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
 # the gateway resolved from the api-key, ``x-internal-secret`` is the internal service tier (agent-api
 # ``_internal_caller``, admin-api ``_check_internal`` — the gate the meeting room calls its own trust
 # boundary), ``x-gateway-verified`` is the marker ``VEXA_REQUIRE_GATEWAY_IDENTITY`` looks for, and
-# ``x-admin-api-key`` is admin-api's privileged surface.
+# ``x-admin-api-key`` is admin-api's privileged surface, and ``x-gateway-signature`` is the signature
+# meeting-api and admin-api check ``x-user-id`` against (``identity_signature.py``, §1.10).
 #
 # NONE of them may arrive from a client. The strip used to be an eight-name list of ``x-user-*``
 # spellings, so ``x-internal-secret`` from the public edge reached agent-api and was believed — and
@@ -225,7 +227,7 @@ def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
 # any api-key holder. A LIST rots the moment a new authority header is added; a PREFIX rule does not,
 # which is why this matches by family and why every new internal header must be spelled into one.
 _AUTHORITY_HEADER_PREFIXES = ("x-user-", "x-internal-", "x-vexa-internal-")
-_AUTHORITY_HEADER_EXACT = frozenset({"x-admin-api-key", "x-gateway-verified"})
+_AUTHORITY_HEADER_EXACT = frozenset({"x-admin-api-key", "x-gateway-verified", SIGNATURE_HEADER})
 
 
 def _is_authority_header(name: str) -> bool:
@@ -325,7 +327,7 @@ def create_app(
     # (agent chat SSE). Returns (downstream_headers, None) on success, or (None, error_Response) when
     # the caller is rejected (fail-closed). This is the ONE place the key → user resolution and the
     # anti-spoof identity injection live, so REST and SSE scope a request identically.
-    async def _authorize(method: str, request: Request, *, api_key: Optional[str] = None):
+    async def _authorize(method: str, url: str, request: Request, *, api_key: Optional[str] = None):
         # ``api_key`` overrides the header lookup for a route whose CLIENT protocol carries the key
         # somewhere else (the MCP transport uses ``Authorization: Bearer``). The resolution, the
         # scope check and the identity injection below are the same for every route.
@@ -437,11 +439,29 @@ def create_app(
             if user_data.get("webhook_events"):
                 headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
         headers[TRACE_HEADER] = get_trace_id() or ""
+        # §1.10: meeting-api and admin-api believe x-user-id only with a fresh signature over the
+        # forwarded method and path. Without the secret there is no identity to vouch for.
+        secret = identity_secret()
+        if not secret:
+            log_event(
+                "identity_signing_unconfigured",
+                audience="system",
+                level="error",
+                span="auth",
+                user_id=user_id,
+                fields={"method": method, "path": request.url.path},
+            )
+            return None, Response(
+                content=json.dumps({"detail": "GATEWAY_IDENTITY_SECRET is not configured"}),
+                status_code=503,
+                media_type="application/json",
+            )
+        headers[SIGNATURE_HEADER] = sign_now(secret, headers["x-user-id"], method, url)
         return headers, None
 
     # --- the REST proxy: faithful carve of main.forward_request for client (non-admin) routes.
     async def _forward(method: str, url: str, request: Request, *, api_key: Optional[str] = None) -> Response:
-        headers, error = await _authorize(method, request, api_key=api_key)
+        headers, error = await _authorize(method, url, request, api_key=api_key)
         if error is not None:
             return error
 
@@ -896,7 +916,7 @@ def create_app(
     SSE_HEADERS = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
     async def _forward_stream(method: str, url: str, request: Request) -> Response:
-        headers, error = await _authorize(method, request)
+        headers, error = await _authorize(method, url, request)
         if error is not None:
             return error
         content = await request.body()
@@ -922,7 +942,7 @@ def create_app(
     async def _forward_stream_verbatim(
         method: str, url: str, request: Request, *, api_key: Optional[str] = None
     ) -> Response:
-        headers, error = await _authorize(method, request, api_key=api_key)
+        headers, error = await _authorize(method, url, request, api_key=api_key)
         if error is not None:
             return error
         content = await request.body()

@@ -13,6 +13,10 @@ The production edge logic, injectable. Modules:
 - **`adapters.py`** — the real `httpx` + `redis` implementations of the ports, and
   `build_production_app(...)` (the prod entrypoint that wires them from env). Lazy-imports
   `httpx`/`redis` so the package imports cleanly in the test venv.
+- **`identity_signature.py`** — §1.10: the `x-gateway-signature` put on every forwarded request
+  carrying `x-user-id` (HMAC-SHA256 with `GATEWAY_IDENTITY_SECRET` over `<t>.<user_id>.<METHOD>.<path>`,
+  `path` = the forwarded URL's decoded path, no query). meeting-api and admin-api verify it; the rule
+  is pinned by `core/gateway/contracts/gateway-identity/signature.vectors.json`.
 - **`obs.py`** — the lane's `logevent.v1` trace emitter: `TraceMiddleware` (mint/read/forward
   `X-Trace-Id`), `log_event` bound to `service="gateway"`, and the `make_*` factories the
   downstream conformance hop reuses for `service="meeting-api"`.

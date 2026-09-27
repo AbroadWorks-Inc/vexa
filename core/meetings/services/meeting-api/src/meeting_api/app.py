@@ -40,6 +40,7 @@ from . import recordings as _recordings
 from .collector.app import build_router as _build_collector_router
 from .collector.ports import RedisBus, TranscriptStore
 from .lifecycle.machine import LifecycleSink, MeetingStore
+from .identity_guard import IdentityGuard
 from .obs import TraceMiddleware
 
 if TYPE_CHECKING:
@@ -204,6 +205,9 @@ def create_app(
     ``adapters.build_production_*`` (composition is P3; the seams are here).
     """
     app = FastAPI(title="Vexa Meeting API (v0.12)", version="0.12.0")
+    # §1.10: a client route believes x-user-id only with the gateway's signature. Added before the
+    # trace middleware, so it runs inside it and a refusal carries the trace id.
+    app.add_middleware(IdentityGuard)
     # The edge: read/mint X-Trace-Id and bind it for the request (logevent.v1 trace_id).
     app.add_middleware(TraceMiddleware)
 

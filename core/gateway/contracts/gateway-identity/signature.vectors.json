@@ -1,0 +1,261 @@
+{
+  "description": "Test vectors for the gateway identity signature (design §1.10). The gateway signs every request it forwards with x-user-id; meeting-api and admin-api verify. The secret here is a test-only literal, never deployed.",
+  "header": "x-gateway-signature",
+  "format": "t=<unix seconds, digits only>,v1=<64 lower-case hex digits>",
+  "message": "<t>.<user_id>.<METHOD>.<path>",
+  "algorithm": "HMAC-SHA256, key = GATEWAY_IDENTITY_SECRET (UTF-8), message UTF-8",
+  "path_rule": "the request path as the receiving service routes it: percent-decoded, no query string, no scheme or host (ASGI scope['path']). The gateway takes httpx.URL(<downstream url>).path of the URL it forwards to.",
+  "user_id_rule": "the exact x-user-id header value; a request must carry exactly one x-user-id and exactly one x-gateway-signature",
+  "max_skew_s": 60,
+  "secret": "test-gateway-identity-secret-0001",
+  "vectors": [
+    {
+      "t": 1790000000,
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "message": "1790000000.7.GET./meetings",
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b"
+    },
+    {
+      "t": 1790000000,
+      "user_id": "7",
+      "method": "POST",
+      "path": "/bots",
+      "message": "1790000000.7.POST./bots",
+      "header": "t=1790000000,v1=c1dcd091b5da5539425e265634a6f9c0e02b9d5489b521dd4a0acc3418a16533"
+    },
+    {
+      "t": 1790000000,
+      "user_id": "42",
+      "method": "PUT",
+      "path": "/v2/entries",
+      "message": "1790000000.42.PUT./v2/entries",
+      "header": "t=1790000000,v1=e1873eab6b484ff98c3de4f48f477e151734be69952c2d35a5099ab48002a54e"
+    },
+    {
+      "t": 1790000000,
+      "user_id": "42",
+      "method": "DELETE",
+      "path": "/meetings/google_meet/abc-defg-hij",
+      "message": "1790000000.42.DELETE./meetings/google_meet/abc-defg-hij",
+      "header": "t=1790000000,v1=4a9d5f4be3d3d89083f372cc5eeffd8c948eee102ee581554d3dd41ce920bb3f"
+    },
+    {
+      "t": 1790000000,
+      "user_id": "1",
+      "method": "GET",
+      "path": "/transcripts/zoom/85012345678",
+      "message": "1790000000.1.GET./transcripts/zoom/85012345678",
+      "header": "t=1790000000,v1=7ff5e4e18bca006069ba2d8846ee7eecf46e8df6df8f2a525b20f34d4793e52d"
+    },
+    {
+      "t": 1790000000,
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings/teams/room one",
+      "message": "1790000000.7.GET./meetings/teams/room one",
+      "header": "t=1790000000,v1=7714833ad5edbf22b92c8fec5eb18ed29bf4da8f06ee8e79e500de0cdd98f3b3"
+    }
+  ],
+  "verify_cases": [
+    {
+      "case": "signed now",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": true
+    },
+    {
+      "case": "signed 60 s ago",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000060,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": true
+    },
+    {
+      "case": "signed 61 s ago",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000061,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "signed 60 s ahead",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1789999940,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": true
+    },
+    {
+      "case": "signed 61 s ahead",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1789999939,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "for another user",
+      "user_id": "8",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "for another method",
+      "user_id": "7",
+      "method": "POST",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "for another path",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings/1",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "under another secret",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=8a924d5d67f8f3ec944b968a783ae72ea127c174de6562b752cf73d064af84a7",
+      "valid": false
+    },
+    {
+      "case": "missing header",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": null,
+      "valid": false
+    },
+    {
+      "case": "missing user id",
+      "user_id": null,
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "empty header",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "",
+      "valid": false
+    },
+    {
+      "case": "no v1",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000",
+      "valid": false
+    },
+    {
+      "case": "no t",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "fields reversed",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b,t=1790000000",
+      "valid": false
+    },
+    {
+      "case": "extra field",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b,v0=00",
+      "valid": false
+    },
+    {
+      "case": "t not digits",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=+1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "t with spaces",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t= 1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "v1 upper-case hex",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90F0C6CD23D647551926C794FEBFAA3E5F663429B060B7BF5C825BF61414F30B",
+      "valid": false
+    },
+    {
+      "case": "v1 too short",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f3",
+      "valid": false
+    },
+    {
+      "case": "v1 not hex",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "valid": false
+    },
+    {
+      "case": "tampered t",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "now": 1790000001,
+      "header": "t=1790000001,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    }
+  ]
+}

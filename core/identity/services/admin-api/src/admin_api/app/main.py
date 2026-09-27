@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..schema.models import APIToken, PlatformSetting, User
 from ..token_scope import USER_TIER_SCOPES, VALID_SCOPES, generate_prefixed_token
 from .db import get_db
+from .identity_guard import IdentityGuard
 from . import events as events_mod
 from . import person_settings as person_settings_mod
 from .webhook_subscriptions import WebhookDeps, build_webhook_router
@@ -417,6 +418,8 @@ def _resolve_capture_signal(user_data: dict, platform_diagnostics: dict) -> bool
 
 def create_app(*, webhooks: Optional[WebhookDeps] = None) -> FastAPI:
     app = FastAPI(title="Vexa Admin API (v0.12)")
+    # §1.10: a client route believes x-user-id only with the gateway's signature.
+    app.add_middleware(IdentityGuard)
 
     # --- liveness probe (gate:health): process-up, no DB dependency. Readiness (DB reachable)
     # is a separate concern — keeping /health a pure liveness check makes it green without a

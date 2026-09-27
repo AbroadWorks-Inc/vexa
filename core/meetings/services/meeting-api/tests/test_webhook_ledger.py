@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
 from meeting_api.webhooks import InMemoryDeliveryLedger, WebhookSink, build_delivery_record
+from gateway_identity import via_gateway
 
 # A resolver stub so the SSRF guard never touches DNS — hook.example resolves to a public IP.
 _PUBLIC = lambda host: ["93.184.216.34"]  # noqa: E731
@@ -46,7 +47,7 @@ def test_real_delivery_appears_in_delivery_history(goldens, receiver):
         "webhook_url": "https://hook.example/x", "webhook_secret": "s3cr3t",
         "webhook_events": {"meeting.status_change": True},
     })
-    client = TestClient(_app(repo, receiver, ledger))
+    client = TestClient(via_gateway(_app(repo, receiver, ledger)))
 
     # Drive the FSM advance → the callback delivers meeting.status_change to the receiver (200)...
     r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
@@ -82,7 +83,7 @@ def test_suppressed_delivery_recorded_with_its_named_outcome(goldens, receiver):
         # subscribes to completed only → meeting.status_change is SUPPRESSED
         "webhook_events": {"meeting.completed": True, "meeting.status_change": False},
     })
-    client = TestClient(_app(repo, receiver, ledger))
+    client = TestClient(via_gateway(_app(repo, receiver, ledger)))
 
     r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
     assert r.status_code == 200, r.text
@@ -102,13 +103,15 @@ def test_delivery_history_is_owner_scoped(goldens, receiver):
         "webhook_url": "https://hook.example/x", "webhook_secret": "s3cr3t",
         "webhook_events": {"meeting.status_change": True},
     })
-    client = TestClient(_app(repo, receiver, ledger))
+    client = TestClient(via_gateway(_app(repo, receiver, ledger)))
     client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
 
     assert client.get("/webhooks/deliveries", headers={"X-User-Id": "1"}).json()["deliveries"]
     assert client.get("/webhooks/deliveries", headers={"X-User-Id": "2"}).json()["deliveries"] == []
-    # No X-User-Id at all → empty (never leak another user's history to an unidentified caller).
-    assert client.get("/webhooks/deliveries").json()["deliveries"] == []
+    # No X-User-Id at all → refused before the route (never leak another user's history to an
+    # unidentified caller).
+    r = client.get("/webhooks/deliveries")
+    assert r.status_code == 401 and "deliveries" not in r.json()
 
 
 # ── the ledger port itself (P14 guard is belt-and-braces, not only the caller's discipline) ──────
