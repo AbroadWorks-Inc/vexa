@@ -12,7 +12,8 @@ Cursors are opaque to clients: URL-safe base64 of a small JSON value.
 
 ``PostgresIntakeReads`` opens one session per call. ``erase`` is one transaction holding the
 meeting's link lock and then its row lock (the §1.4 order), so it can't interleave with an entry
-write on that link or with an event written for that meeting.
+write on that link or with an event written for that meeting. ``record_export`` (§1.9) is
+``export.store_export``.
 
 SQLAlchemy and the ORM models are imported inside the functions that use them, so the package
 imports without SQLAlchemy installed.
@@ -28,7 +29,15 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 from .adapters import take_link_lock
-from .ports import EntryView, ErasedRows, MeetingQuery, MeetingView, Room
+from .export import store_export
+from .ports import (
+    EntryView,
+    ErasedRows,
+    ExportReport,
+    MeetingQuery,
+    MeetingView,
+    Room,
+)
 from .rules import FINISHED_STATUSES, meeting_start
 from .status import lock_meeting, row_mapping
 from .validation import IntakeError
@@ -324,3 +333,9 @@ class PostgresIntakeReads:
                 outbox=int(outbox.rowcount),  # type: ignore[attr-defined]
                 deliveries=int(deliveries.rowcount),  # type: ignore[attr-defined]
             )
+
+    async def record_export(
+        self, user_id: int, meeting_id: int, report: ExportReport
+    ) -> Optional[str]:
+        async with self._session_factory() as db, db.begin():
+            return await store_export(db, user_id, meeting_id, report)

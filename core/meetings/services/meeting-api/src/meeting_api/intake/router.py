@@ -7,6 +7,7 @@
     GET    /v2/meetings/{id}[?user=]   one meeting by UUID
     POST   /v2/meetings/{id}/stop      the bot in the call leaves now (``StopPort``)
     DELETE /v2/meetings/{id}           erase a finished meeting's aw-bots data (§1.13)
+    POST   /v2/meetings/{id}/export    the export result (§1.9)
 
 The gateway checks the scope and sets ``x-user-id`` (the account). Every success body is an
 ``intake.v1`` shape (``Reply``, ``EntryPage``, ``MeetingPage``, ``Meeting``, ``Erased``); every
@@ -26,6 +27,12 @@ with the injected deleter: recording objects, then transcript rows). A storage f
 aborts before any row is removed (503 ``unavailable``). Then one transaction removes the meeting's
 delivery rows, outbox rows and entries (``IntakeReads.erase``). The meeting row and
 ``meeting_aw_state`` stay, and no event is written.
+
+The export result (§1.9) has its body and write in ``export.py`` (``parse_export``,
+``IntakeReads.record_export``): it is taken only for a finished meeting of the account
+(``meeting_not_found`` otherwise, ``meeting_not_finished`` for a scheduled or live one), stored on
+``meeting_aw_state`` and emitted as ``export.handed_off`` / ``export.failed``; the same result again
+changes nothing. The reply is the meeting (``intake.v1`` ``Meeting``), whose ``export`` shows it.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ from ..bot_spawn.auto_join import LIVE_STATUSES
 from ..collector.app import delete_completed_artifacts
 from ..collector.ports import TranscriptStore
 from ..obs import log_event
+from .export import EXPORT_NOT_FINISHED, parse_export
 from .ports import IntakeReads, MeetingQuery, MeetingView, StopPort
 from .reads import (
     decode_entry_cursor,
@@ -400,5 +408,27 @@ def build_intake_router(
                 },
             }
         )
+
+    @router.post("/v2/meetings/{meeting_id}/export")
+    async def record_export(
+        meeting_id: str,
+        request: Request,
+        x_user_id: Optional[str] = Header(default=None),
+    ) -> JSONResponse:
+        user_id = _account(x_user_id)
+        report = parse_export(await _body(request))
+        meeting = await _meeting(user_id, meeting_id, None)
+        if meeting.status not in FINISHED_STATUSES:
+            raise IntakeError("meeting_not_finished", EXPORT_NOT_FINISHED)
+        event_id = await reads.record_export(user_id, meeting.id, report)
+        log_event(
+            "intake_export_recorded" if event_id else "intake_export_unchanged",
+            audience="user",
+            span="meetings.intake.export",
+            user_id=user_id,
+            meeting_id=str(meeting.id),
+            fields={"state": report.state},
+        )
+        return JSONResponse((await _fresh(user_id, meeting)).project(lead_s=lead_s))
 
     return router

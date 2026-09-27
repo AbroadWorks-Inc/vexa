@@ -29,6 +29,7 @@ V2_ROUTES = {
     ("GET", "/v2/meetings/{meeting_id}"),
     ("POST", "/v2/meetings/{meeting_id}/stop"),
     ("DELETE", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/{meeting_id}/export"),
 }
 ACCOUNT = {"x-user-id": "1"}
 
@@ -83,6 +84,8 @@ def test_the_bare_app_factory_mounts_no_v2_route():
         ("PUT", "/v2/entries", {}, {}, 401, "unauthorized"),
         ("POST", "/v2/meetings/any/stop", None, {}, 401, "unauthorized"),
         ("DELETE", "/v2/meetings/any", None, {}, 401, "unauthorized"),
+        ("POST", "/v2/meetings/any/export", {}, {}, 401, "unauthorized"),
+        ("POST", "/v2/meetings/any/export", {}, ACCOUNT, 400, "invalid_request"),
     ],
 )
 async def test_the_mounted_routes_answer(

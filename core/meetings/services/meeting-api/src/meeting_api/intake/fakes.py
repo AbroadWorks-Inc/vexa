@@ -21,7 +21,8 @@
   * ``InMemoryIntakeReads`` — ``IntakeReads`` over an ``InMemoryIntakeStore``: the same visibility,
     order and cursors as ``reads.PostgresIntakeReads``. The store has no delivery rows, so
     ``deliveries`` maps an event id to the number of delivery rows a test says it has; ``erase``
-    removes those with the meeting's events.
+    removes those with the meeting's events. ``record_export`` stores the exporter's result on the
+    meeting's aw-state row and writes its ``export.*`` event, as the Postgres one does.
   * ``link_rows_in(rows, user_id, room)`` — the twin of ``adapters.link_rows`` (§1.6): the link
     resolver's rows out of plain meeting dicts (``id``, ``user_id``, ``platform``,
     ``native_meeting_id``, ``status``, ``data``, ``start_time``, ``created_at`` and
@@ -51,12 +52,14 @@ from typing import (
 from .ports import (
     EntryView,
     ErasedRows,
+    ExportReport,
     MeetingQuery,
     MeetingView,
     RecordedStop,
     Room,
     SpawnOutcome,
 )
+from .export import EXPORT_NOT_FINISHED
 from .projection import iso_utc
 from .resolver import LinkRow
 from .rules import (
@@ -676,3 +679,26 @@ class InMemoryIntakeReads:
                 (entry.user_id, entry.source_user, entry.external_id)
             ]
         return ErasedRows(entries=len(gone), outbox=len(events), deliveries=deliveries)
+
+    async def record_export(
+        self, user_id: int, meeting_id: int, report: ExportReport
+    ) -> Optional[str]:
+        row = self._s.meetings.get(meeting_id)
+        if row is None or row["user_id"] != user_id:
+            raise IntakeError("meeting_not_found", "no such meeting")
+        if row["status"] not in FINISHED_STATUSES:
+            raise IntakeError("meeting_not_finished", EXPORT_NOT_FINISHED)
+        aw = self._s.aw[meeting_id]
+        if (aw.get("export_state"), aw.get("export_s3_path")) == (
+            report.state,
+            report.s3_path,
+        ):
+            return None
+        self._s.aw[meeting_id] = {
+            **aw,
+            "export_state": report.state,
+            "export_s3_path": report.s3_path,
+            "export_error": report.error,
+            "export_at": self._s._clock().replace(microsecond=0),
+        }
+        return self._s.write_event(meeting_id, f"export.{report.state}").event_id

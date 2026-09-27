@@ -5,9 +5,10 @@ in-memory implementation and the Postgres adapter implements the same protocol. 
 stopping go through ``SpawnPort`` / ``StopPort`` (the existing spawn and stop paths), and events
 are handed to ``EventPublisher`` after the transaction that wrote them commits.
 
-The ``/v2`` reads and erasure (§2.1, §1.13) go through ``IntakeReads``: the entries a sender holds
-for one user, the meetings a user may see, one meeting by UUID, and the removal of a finished
-meeting's entries, outbox and delivery rows. ``reads.py`` holds the Postgres implementation.
+The ``/v2`` reads, erasure and the export result (§2.1, §1.13, §1.9) go through ``IntakeReads``: the
+entries a sender holds for one user, the meetings a user may see, one meeting by UUID, the removal
+of a finished meeting's entries, outbox and delivery rows, and the exporter's result on a finished
+meeting. ``reads.py`` holds the Postgres implementation.
 
 ``IntakeStore.room_lock(user_id, rooms)`` opens one transaction holding the link lock of every
 room given, taken in the order given (the caller passes them sorted); an empty ``rooms`` is a plain
@@ -44,6 +45,7 @@ __all__ = [
     "EntryView",
     "ErasedRows",
     "EventPublisher",
+    "ExportReport",
     "IntakeReads",
     "IntakeStore",
     "IntakeTx",
@@ -412,6 +414,16 @@ class ErasedRows:
     deliveries: int
 
 
+@dataclass(frozen=True)
+class ExportReport:
+    """The exporter's result for one meeting (§1.9): ``state`` is ``handed_off`` or ``failed``,
+    ``s3_path`` the export folder, ``error`` why it failed."""
+
+    state: Literal["handed_off", "failed"]
+    s3_path: str
+    error: Optional[str] = None
+
+
 class IntakeReads(Protocol):
     async def entries(
         self, user_id: int, source_user: str, *, after: Optional[str], limit: int
@@ -439,4 +451,16 @@ class IntakeReads(Protocol):
         of the meeting's outbox events (their attempts cascade), the outbox rows, then the
         meeting's entries. The meeting row and ``meeting_aw_state`` stay. Raises
         ``IntakeError("meeting_not_finished")`` if the meeting isn't finished."""
+        ...
+
+    async def record_export(
+        self, user_id: int, meeting_id: int, report: ExportReport
+    ) -> Optional[str]:
+        """In one transaction, under the meeting's link lock, its row lock and then its
+        ``meeting_aw_state`` lock: store ``report`` on ``export_state`` / ``export_s3_path`` /
+        ``export_error`` / ``export_at`` and write ``export.<state>`` through ``write_event``;
+        returns that event's id. A report with the stored state and path writes nothing and
+        returns ``None``. Raises ``IntakeError("meeting_not_found")`` for another account's
+        meeting and ``IntakeError("meeting_not_finished")`` if the meeting isn't finished.
+        """
         ...

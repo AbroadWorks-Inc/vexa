@@ -83,7 +83,7 @@ non-finished meetings entries manage, never an entry-less upstream-planned row (
 `count_active_entries` is an index-only count on `ix_meeting_entries_active_user`.
 `build_intake_router(...)` (`router.py`) is the `/v2` meeting routes of §2.1: `PUT /v2/entries`,
 `POST /v2/entries/remove`, `GET /v2/entries`, `GET /v2/meetings`, `GET /v2/meetings/{id}`,
-`POST /v2/meetings/{id}/stop` and `DELETE /v2/meetings/{id}`. Every success body is an `intake.v1`
+`POST /v2/meetings/{id}/stop`, `DELETE /v2/meetings/{id}` and `POST /v2/meetings/{id}/export`. Every success body is an `intake.v1`
 shape and every failure the §2.5 body; the route class scopes that error handling to these routes,
 so a validation failure is 400 `invalid_request` here while upstream routes keep 422, and a
 database that can't be reached (or a write that lost a unique-key race) is 503 `unavailable`. A
@@ -91,7 +91,13 @@ database that can't be reached (or a write that lost a unique-key race) is 503 `
 an attendee. Stop calls the `StopPort` for a live meeting and answers 409 `no_live_bot` otherwise.
 Erasure runs upstream's `delete_completed_artifacts` (objects first, then transcripts), then
 `IntakeReads.erase` removes the meeting's delivery, outbox and entry rows in one transaction; the
-meeting row and `meeting_aw_state` stay and no event is written. The reads and erasure go through
+meeting row and `meeting_aw_state` stay and no event is written. The export result (§1.9,
+`{state: "handed_off"|"failed", s3_path, error?}`, validated by `export.parse_export`) is taken only for
+a finished meeting of the account (`meeting_not_found` otherwise, `meeting_not_finished` for a
+scheduled or live one): `IntakeReads.record_export` stores it on `meeting_aw_state.export_*` and
+writes `export.handed_off` / `export.failed` through `write_event`, under the link lock, the meeting
+row and then `meeting_aw_state`; the stored state and path again write nothing. The reply is the
+meeting. The reads, erasure and export result go through
 `IntakeReads` (`ports.py`): `PostgresIntakeReads` (`reads.py`) over Postgres, `InMemoryIntakeReads`
 in `fakes.py`. `GET /v2/entries` pages by `external_id` (served by
 `uq_meeting_entries_user_source_external`); `GET /v2/meetings` pages by `(meeting_event_time, id)`,
@@ -167,7 +173,9 @@ one delivery for that subscription, in one transaction; the reply is `{event_id}
 - `IntakeStore`, `IntakeTx`, `EntryView`, `MeetingView`, `Room`, `SpawnOutcome`, `SpawnPort`,
   `StopPort`, `EventPublisher` — `ports.py`; the in-memory fakes — `fakes.py`.
 - `PostgresIntakeStore` — `adapters.py`.
-- `build_intake_router` — `router.py`; `IntakeReads`, `MeetingQuery`, `ErasedRows` — `ports.py`;
+- `build_intake_router` — `router.py`; `IntakeReads`, `MeetingQuery`, `ErasedRows`, `ExportReport` —
+  `ports.py`; `parse_export`, `ExportIn`, `store_export` (the export result's body and Postgres
+  write) — `export.py`;
   `PostgresIntakeReads` — `reads.py`.
 - `OutboxPublisher`, `fan_out`, `PostgresWebhookTests`, `SubscriptionNotFound`, `WebhookTests` —
   `outbox.py`.
