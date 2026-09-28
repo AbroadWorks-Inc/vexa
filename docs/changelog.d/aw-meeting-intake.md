@@ -17,7 +17,7 @@
   their legacy shape.
 - **aw-bots: keys and signed identity.** New scopes `webhooks`, `erase` and `export` (sealed in
   `identity.v1`), for one least-privilege key per consumer. The gateway signs the user it forwards
-  (`GATEWAY_IDENTITY_SECRET`); meeting-api and admin-api refuse a client request without a valid
+  (a key ring, `GATEWAY_IDENTITY_KEYS`, with the active key named by `kid`; the signature covers the query, the body and the forwarded scope and limit headers); meeting-api and admin-api refuse a client request without a valid
   signature, so every client goes through the gateway. Bot status callbacks must carry the internal
   secret, and runtime callbacks a per-bot token in their URL. The gateway limits entry writes per
   account (600 a minute, `rate_limited`).
