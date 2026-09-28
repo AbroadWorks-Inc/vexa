@@ -103,6 +103,8 @@
           "api/calendar",
           "api/settings",
           "webhooks",
+          "api/v2-meetings",
+          "api/v2-webhooks",
           "api/agent",
           "api/errors"
         ]

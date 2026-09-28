@@ -1,0 +1,359 @@
+---
+title: "Webhooks API (/v2)"
+description: "Subscribe to aw-bots meeting events, verify each signed delivery, dedupe and order them, rotate the secret, and read the delivery log."
+---
+
+aw-bots reports every change to a meeting by signed webhook to every subscriber of the account
+that made it. Subscriptions are managed through the gateway with a key holding the `webhooks`
+scope; the events carry the same [meeting object](/api/v2-meetings#the-meeting-object) every
+`/v2` read returns. Base URL, keys and the error shape are as in the
+[Meeting intake API (/v2)](/api/v2-meetings#base-url--keys).
+
+```bash
+export AW_BOTS_WEBHOOKS_KEY=vxa_webhooks_…   # placeholder; a key with the webhooks scope
+```
+
+These subscriptions are separate from the per-account webhook in [Settings](/webhooks)
+(`PUT /user/webhook`), which keeps its own older envelope.
+
+## Subscriptions
+
+A subscription object:
+
+```json
+{
+  "id": "2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f",
+  "url": "https://portal.example.com/api/webhooks/aw-bots",
+  "events": [],
+  "active": true,
+  "description": "portal live updates",
+  "secret_last4": "x9Qa",
+  "previous_secret_expires_at": null,
+  "created_at": "2026-09-28T10:00:00Z",
+  "updated_at": "2026-09-28T10:00:00Z"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The subscription's UUID. |
+| `url` | Where deliveries are posted. |
+| `events` | The event types it receives; `[]` means all. |
+| `active` | `false` = paused: nothing is delivered. |
+| `description` | Free text. |
+| `secret_last4` | The last four characters of the current secret, to recognise it. A secret is never returned in full after the call that set it. |
+| `previous_secret_expires_at` | After a rotation, when the old secret stops signing; otherwise `null`. |
+
+**URL rules.** `http` or `https` with a host. The URL is checked when saved and again before
+every send: a host that is, or resolves to, a private, loopback, link-local or otherwise reserved
+address is refused (`400 invalid_request`), unless the deployment allow-lists it
+(`WEBHOOK_PRIVATE_HOST_ALLOWLIST`, which holds the portal's in-cluster host).
+
+### Add a subscription
+
+```bash POST /v2/webhooks
+curl -X POST "$AW_BOTS_BASE_URL/v2/webhooks" \
+  -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://portal.example.com/api/webhooks/aw-bots",
+    "secret": "<RECEIVER_SECRET>",
+    "events": [],
+    "description": "portal live updates"
+  }'
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `url` | string | yes | 1–2048 characters; see the URL rules. |
+| `secret` | string | no | 16–512 characters. The receiver normally supplies its own. If omitted, aw-bots generates one and returns it **once**, as `secret` in this response. A supplied secret is never echoed. |
+| `events` | array of strings | yes | `[]` = all events; otherwise each must be an event type below. |
+| `description` | string or null | no | At most 500 characters. |
+
+**201 Created** with the subscription object (plus `secret` when generated). At most 20 per
+account: the 21st is `429 quota_exceeded`. A new subscription, or a change to its events, reaches
+the sender within about 30 s.
+
+### List subscriptions
+
+```bash GET /v2/webhooks
+curl "$AW_BOTS_BASE_URL/v2/webhooks" -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY"
+```
+
+**200** `{"subscriptions": [ …subscription objects, oldest first… ]}`. Secrets are never shown.
+
+### Change a subscription
+
+```bash PATCH /v2/webhooks/{id}
+curl -X PATCH "$AW_BOTS_BASE_URL/v2/webhooks/2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f" \
+  -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY" -H "Content-Type: application/json" \
+  -d '{"active": false}'
+```
+
+Send any of `url`, `events`, `active` (none of them `null`) and `description`; an empty body is
+`invalid_request`. **200** with the subscription. Pausing (`active: false`) cancels its pending
+deliveries; events that happen while paused are not delivered later.
+
+### Remove a subscription
+
+```bash DELETE /v2/webhooks/{id}
+curl -X DELETE "$AW_BOTS_BASE_URL/v2/webhooks/2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f" \
+  -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY"
+```
+
+**204 No Content**. Its pending deliveries are cancelled.
+
+### Rotate the secret
+
+```bash POST /v2/webhooks/{id}/rotate-secret
+curl -X POST "$AW_BOTS_BASE_URL/v2/webhooks/2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f/rotate-secret" \
+  -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY" -H "Content-Type: application/json" \
+  -d '{"secret": "<NEW_RECEIVER_SECRET>"}'
+```
+
+Body `{"secret"?}` (16–512 characters; omit it to have one generated and returned once as
+`secret`). **200** with the subscription, `previous_secret_expires_at` set to now + 24 h. For the
+next 24 h every delivery carries two signatures, one under each secret (see
+[Signing](#signing)), so the receiver can switch to the new secret whenever it likes.
+
+### Send a test
+
+```bash POST /v2/webhooks/{id}/test
+curl -X POST "$AW_BOTS_BASE_URL/v2/webhooks/2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f/test" \
+  -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY"
+```
+
+**202 Accepted** `{"subscription_id": "…", "event_id": "evt_test_…"}`. A signed `webhook.test` is
+queued to that one subscriber now, whatever its `events` list, and shows in its delivery log like
+any other delivery. A paused subscription's test is cancelled, not sent.
+
+### Read the delivery log
+
+```bash GET /v2/webhooks/{id}/deliveries
+curl "$AW_BOTS_BASE_URL/v2/webhooks/2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f/deliveries?limit=50" \
+  -H "X-API-Key: $AW_BOTS_WEBHOOKS_KEY"
+```
+
+`limit` 1–200 (default 50); `before` = the `next_before` of the previous page. Newest first.
+
+```json Response — 200
+{
+  "deliveries": [
+    {
+      "id": 1042,
+      "event_id": "evt_ef69c30038906cb161306e9e12261b439e1f66a7c5426a943b43f6ed880cf5a9",
+      "event_type": "meeting.completed",
+      "state": "delivered",
+      "attempts": 2,
+      "next_attempt_at": null,
+      "last_status_code": 200,
+      "last_error": null,
+      "created_at": "2026-09-29T05:12:42Z",
+      "updated_at": "2026-09-29T05:13:45Z",
+      "attempt_log": [
+        { "attempt": 1, "outcome": "retry", "status_code": 503, "error": null, "duration_ms": 41, "at": "2026-09-29T05:12:43Z" },
+        { "attempt": 2, "outcome": "delivered", "status_code": 200, "error": null, "duration_ms": 38, "at": "2026-09-29T05:13:45Z" }
+      ]
+    }
+  ],
+  "next_before": null
+}
+```
+
+`state` is `pending`, `sending`, `delivered`, `failed`, `dead` or `cancelled`. Delivery rows in a
+final state are kept for 30 days (`WEBHOOK_DELIVERY_RETENTION_DAYS`).
+
+### Errors
+
+The `/v2` error shape. `400 invalid_request` (a bad field, an unknown event type, a refused URL),
+`401 unauthorized`, `403 forbidden`, `404 webhook_not_found` (not one of the account's
+subscriptions), `404 account_not_found`, `429 quota_exceeded`, `503 unavailable` (storage down, the
+deployment's secret key ring not configured, or the test couldn't be queued; retry).
+
+---
+
+## Events
+
+| `event_type` | When |
+|---|---|
+| `meeting.scheduled` | A meeting was created by an entry. |
+| `meeting.updated` | Its time, link, title or entries changed. |
+| `meeting.removed` | Removed before its bot was sent (its last entry was removed), or merged into a live meeting (`data.merged_into`). |
+| `meeting.waiting_for_room` | Due, but another bot is still on the link. Sent once; the bot goes when the link is free. |
+| `meeting.not_sent` | Ended with no bot; `outcome` carries the typed code and exact message. |
+| `meeting.status_change` | Every bot step without a typed event: to `requested`, `joining`, `awaiting_admission`, `needs_help`, `stopping`. |
+| `meeting.started` | The bot reached `active`. |
+| `meeting.completed` | The meeting reached `completed`. |
+| `bot.failed` | The meeting reached `failed` (except `not_sent`, which is `meeting.not_sent`). |
+| `export.handed_off` / `export.failed` | The exporter's result (`meeting.export`). |
+| `webhook.test` | A test send. |
+
+A status change is **exactly one event**, never two: the typed one when there is one, else
+`meeting.status_change`. A receiver that follows every step listens to the typed events as well as
+`meeting.status_change`. `bot.retry`, `recording.ready` and `transcription.ready` are accepted in
+`events` but not sent to subscribers. Erasing a meeting sends nothing. aw-bots' part ends at
+`export.handed_off`: transcription is not an aw-bots event.
+
+### The envelope
+
+Every delivery is one JSON object:
+
+```json
+{
+  "api_version": "2026-09-25",
+  "created_at": "2026-09-29T05:12:41Z",
+  "data": {
+    "change": { "at": "2026-09-29T05:12:41Z", "from": "stopping", "reason": "stopped", "to": "completed" },
+    "meeting": {
+      "bot_joins_at": "2026-09-29T04:25:00Z",
+      "completion_reason": "stopped",
+      "end": "2026-09-29T05:00:00Z",
+      "entries": [
+        { "attendees": ["a@abroadworks.com", "b@example.com"], "external_id": "google:3n5kq8example",
+          "metadata": { "crm_id": "42" }, "series_id": "google:series-weekly", "user": "a@abroadworks.com" }
+      ],
+      "export": null,
+      "failure_stage": null,
+      "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+      "meeting_url": "https://meet.google.com/abc-defg-hij",
+      "outcome": null,
+      "platform": "google_meet",
+      "room": "abc-defg-hij",
+      "sequence": 9,
+      "start": "2026-09-29T04:30:00Z",
+      "status": "completed",
+      "time_zone": "Asia/Kolkata",
+      "title": "Weekly sync"
+    }
+  },
+  "event_id": "evt_ef69c30038906cb161306e9e12261b439e1f66a7c5426a943b43f6ed880cf5a9",
+  "event_type": "meeting.completed"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `event_id` | `evt_` + the sha256 hex of the text `<meeting id>`, `<event_type>` and `<sequence>` joined by `\|` (for the example: `5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90\|meeting.completed\|9`). The same on every redelivery of the event, different for every event. |
+| `event_type` | One of the events above. |
+| `api_version` | `2026-09-25`. |
+| `created_at` | When the event was recorded (UTC, whole seconds). |
+| `data.meeting` | The full [meeting object](/api/v2-meetings#the-meeting-object) as it was at this event, with `id` and `sequence`. |
+| `data.change` | `{from, to, reason, at}` on every status change, whatever the event type, and on `meeting.scheduled` (`from: null`). Absent on events that change no status (`meeting.updated`, `meeting.waiting_for_room`, `export.*`). `reason` is the step's reason when it has one. |
+| `data.merged_into` | Only on a `meeting.removed` that merged the meeting into a live one: the live meeting's UUID. |
+
+`webhook.test` carries no meeting, only the subscription:
+
+```json
+{ "api_version": "2026-09-25", "created_at": "2026-09-29T05:12:41Z",
+  "data": { "subscription_id": "2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f" },
+  "event_id": "evt_test_0c4d8e2f6a1b4c3d9e8f7a6b5c4d3e2f", "event_type": "webhook.test" }
+```
+
+Answer a verified test with a 2xx and do nothing else.
+
+### Ordering and duplicates
+
+Delivery is **at least once and not in order**:
+
+- **Dedupe on `event_id`.** Keep the ids you have processed for at least **48 hours**, and mark an
+  id seen only after you have processed it. Never key on the body or the signature: the
+  signature's timestamp differs between redeliveries.
+- **Order by `data.meeting.sequence`.** It rises by 1 with every event of a meeting. Keep the
+  highest `sequence` applied per meeting `id` and ignore an event with a lower one; it is older
+  than what you have. A gap means an event is still on its way; the meeting in the newest event is
+  complete on its own, so applying it is safe.
+
+## Signing
+
+Every delivery carries:
+
+| Header | Value |
+|---|---|
+| `Content-Type` | `application/json` |
+| `X-Webhook-Timestamp` | Unix seconds when it was signed. |
+| `X-Webhook-Signature` | `sha256=` + hex HMAC-SHA256 with the secret over `"<X-Webhook-Timestamp>." + <raw body>`. Always exactly one value. |
+| `X-Webhook-Signature-Previous` | The same under the previous secret, only during the 24 h after a rotation. |
+
+There is **no `Authorization` header**: the secret never crosses the wire. To verify:
+
+1. Take the **raw body bytes** as received. Don't parse and re-serialise first.
+2. Reject a timestamp more than **300 s** from your clock.
+3. Compute `sha256=` + hex HMAC-SHA256(secret, `timestamp + "." + raw body`) and compare it in
+   constant time with `X-Webhook-Signature` and, if present, `X-Webhook-Signature-Previous`.
+   Accept a match on either.
+4. On failure answer 401 (it is not retried); on success process, then answer 2xx.
+
+```python verify.py
+import hashlib
+import hmac
+import time
+
+
+def verify(raw_body: bytes, headers: dict, secret: str, tolerance_s: int = 300) -> bool:
+    ts = headers.get("X-Webhook-Timestamp", "")
+    if not ts.isdigit() or abs(time.time() - int(ts)) > tolerance_s:
+        return False
+    expected = "sha256=" + hmac.new(
+        secret.encode(), ts.encode() + b"." + raw_body, hashlib.sha256
+    ).hexdigest()
+    return any(
+        hmac.compare_digest(expected, headers.get(name, ""))
+        for name in ("X-Webhook-Signature", "X-Webhook-Signature-Previous")
+    )
+```
+
+```javascript verify.mjs
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+// rawBody: the request body as a Buffer; headers: lower-cased names (as Node gives them)
+export function verify(rawBody, headers, secret, toleranceS = 300) {
+  const ts = headers["x-webhook-timestamp"] ?? "";
+  if (!/^[0-9]+$/.test(ts) || Math.abs(Date.now() / 1000 - Number(ts)) > toleranceS) return false;
+  const expected = Buffer.from(
+    "sha256=" + createHmac("sha256", secret).update(ts + ".").update(rawBody).digest("hex"));
+  return ["x-webhook-signature", "x-webhook-signature-previous"].some((name) => {
+    const got = Buffer.from(headers[name] ?? "");
+    return got.length === expected.length && timingSafeEqual(got, expected);
+  });
+}
+```
+
+Both snippets check out against the sealed `webhook.v1` goldens: the body is
+`MeetingEvent.meeting-completed.json` written compactly with sorted keys (exactly how aw-bots posts
+it), the secret `whsec_demo_secret`, the timestamp `1790658761`, giving
+`sha256=d4b79a595be48b0769c0e9a685672032fc9bb64275ae2ee05ec9ce237aeb98a4`
+(`SignatureHeaders.subscription.json`). With `whsec_demo_previous_secret`, the match is on
+`X-Webhook-Signature-Previous` (`SignatureHeaders.rotated.json`). Test with the golden's own
+timestamp as "now", or the 300 s check refuses it.
+
+**Rotation, step by step:** call `rotate-secret`; give the receiver the new secret alongside the
+old one (it accepts a match on either header); after 24 h the previous header stops and the old
+secret can go.
+
+## Delivery and retries
+
+| Your answer | Result |
+|---|---|
+| 2xx | `delivered` |
+| 5xx, 429, a timeout (10 s per attempt) or a connection error | retried after 1 min, 5 min, 30 min and 2 h, then `dead` |
+| anything else: 4xx, a redirect (redirects are never followed) | `failed`, not retried |
+
+- The retry waits are the operator's setting `WEBHOOK_RETRY_SCHEDULE_S` (default
+  `60,300,1800,7200`, in seconds); the number of entries is the number of retries.
+- **Answer 2xx fast.** Verify, store or queue the event, answer, and do slow work afterwards. An
+  answer later than 10 s counts as a timeout and is sent again.
+- Answer 5xx (or 503) when you can't take the event right now, so it comes back; answer 4xx only for
+  a request you will never accept.
+- A URL the guard refuses at send time is `failed`. A delivery aw-bots can't sign or resolve yet
+  (DNS failure, a subscription it can't read) is retried like any other.
+- Every attempt is in the [delivery log](#read-the-delivery-log).
+
+## Receiver checklist
+
+1. Subscribe once with a `webhooks` key and your own secret; keep the secret out of logs.
+2. Read the raw body; verify either signature header; reject more than 300 s of skew.
+3. Skip an `event_id` already seen (kept 48 h); skip an event whose `sequence` is lower than the
+   one you applied for that meeting.
+4. Apply the event (or queue it), then mark the `event_id` seen, then answer 2xx within 10 s.
+   Answer 503 if your store is down, so aw-bots retries.
+5. Answer a verified `webhook.test` with 200 and do nothing else. Use `POST …/test` after setup
+   and check the delivery log.
