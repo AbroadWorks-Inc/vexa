@@ -1,5 +1,5 @@
 {
-  "description": "Test vectors for the webhook URL guard (design §2.7): admin-api checks a subscription URL on save, meeting-api again on every send (webhooks/ssrf.py). Rules: only http and https; a host is required; the internal hostnames and the private, loopback, link-local and multicast ranges are refused, an IPv4-mapped IPv6 address (::ffff:a.b.c.d) being judged as the IPv4 address it maps; a DNS name is resolved and refused if it resolves to nothing or if ANY address it resolves to is refused. A host in the allow-list (WEBHOOK_PRIVATE_HOST_ALLOWLIST, compared case-insensitively) is accepted without those checks and without resolving it. 'resolves_to' is what the test resolver returns for the URL's host.",
+  "description": "Test vectors for the webhook URL guard (design §2.7): admin-api checks a subscription URL on save, meeting-api again on every send (webhooks/ssrf.py). Rules: only http and https; a host is required; a URL that does not parse is refused, and so is a port that is given but is not a number from 1 to 65535, allow-listed host or not; the internal hostnames and the private, loopback, link-local and multicast ranges are refused, an IPv4-mapped IPv6 address (::ffff:a.b.c.d) being judged as the IPv4 address it maps; a DNS name is resolved and refused if it resolves to nothing or if ANY address it resolves to is refused. A host in the allow-list (WEBHOOK_PRIVATE_HOST_ALLOWLIST, compared case-insensitively) is accepted without those checks and without resolving it. 'resolves_to' is what the test resolver returns for the URL's host.",
   "vectors": [
     {"url": "https://hooks.example.com/aw", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "allow"},
     {"url": "https://93.184.216.34/hook", "resolves_to": null, "allowlist": [], "expect": "allow"},
@@ -29,12 +29,25 @@
     {"url": "https://internal.example.com/aw", "resolves_to": ["10.1.2.3"], "allowlist": [], "expect": "refuse"},
     {"url": "https://mixed.example.com/aw", "resolves_to": ["93.184.216.34", "192.168.1.5"], "allowlist": [], "expect": "refuse"},
     {"url": "https://nowhere.example.com/aw", "resolves_to": [], "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:99999/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:65536/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:0/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:-1/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:abc/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:+443/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "refuse"},
+    {"url": "https://93.184.216.34:99999/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
+    {"url": "https://hooks.example.com:1/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "allow"},
+    {"url": "https://hooks.example.com:65535/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "allow"},
+    {"url": "https://hooks.example.com:/x", "resolves_to": ["93.184.216.34"], "allowlist": [], "expect": "allow"},
+    {"url": "http://[::1/x", "resolves_to": null, "allowlist": [], "expect": "refuse"},
     {"url": "http://portal.notetaker.svc.cluster.local/api/hooks", "resolves_to": ["10.100.0.7"], "allowlist": [], "expect": "refuse"},
     {"url": "http://portal.notetaker.svc.cluster.local/api/hooks", "resolves_to": ["10.100.0.7"], "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "allow"},
     {"url": "http://PORTAL.Notetaker.svc.cluster.local/api/hooks", "resolves_to": ["10.100.0.7"], "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "allow"},
     {"url": "http://portal.notetaker.svc.cluster.local/api/hooks", "resolves_to": [], "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "allow"},
     {"url": "http://10.0.0.1/x", "resolves_to": null, "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "refuse"},
     {"url": "http://evil-portal.notetaker.svc.cluster.local/x", "resolves_to": ["10.100.0.8"], "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "refuse"},
-    {"url": "ftp://portal.notetaker.svc.cluster.local/x", "resolves_to": null, "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "refuse"}
+    {"url": "ftp://portal.notetaker.svc.cluster.local/x", "resolves_to": null, "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "refuse"},
+    {"url": "http://portal.notetaker.svc.cluster.local:99999/api/hooks", "resolves_to": null, "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "refuse"},
+    {"url": "http://portal.notetaker.svc.cluster.local:8080/api/hooks", "resolves_to": null, "allowlist": ["portal.notetaker.svc.cluster.local"], "expect": "allow"}
   ]
 }

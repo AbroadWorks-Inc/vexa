@@ -99,6 +99,15 @@ def test_a_refusal_never_echoes_the_url():
     assert "abcd1234" not in str(ei.value) and "10.0.0.1" not in str(ei.value)
 
 
+@pytest.mark.parametrize(
+    "url", ["https://hooks.example.com:tok3n/x", "http://[tok3n::1/x"]
+)
+def test_a_url_that_does_not_parse_is_refused_without_echoing_it(url):
+    with pytest.raises(UrlRefused) as ei:
+        check_subscription_url(url, allowlist=(), resolver=lambda h: ["93.184.216.34"])
+    assert "tok3n" not in str(ei.value)
+
+
 def test_the_allow_list_setting_is_comma_separated_and_case_folded():
     assert parse_allowlist(" Portal.Notetaker.svc.cluster.local , other.svc ,") == {
         PORTAL,
@@ -519,6 +528,32 @@ def test_private_urls_are_refused(env, url):
     assert r.json()["error"]["code"] == "invalid_request"
     assert r.json()["error"]["message"].startswith("url:")
     assert _sql(env["engine"], "SELECT count(*) FROM webhook_subscriptions")[0][0] == 0
+
+
+@needs_pg
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://hooks.example.com:99999/aw",
+        "https://hooks.example.com:0/aw",
+        "https://hooks.example.com:abc/aw",
+        f"http://{PORTAL}:99999/api/hooks",
+        "http://[::1/aw",
+    ],
+)
+def test_a_url_with_an_invalid_port_is_refused_on_create_and_patch(env, url):
+    r = _create(env, url=url)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+    assert r.json()["error"]["message"].startswith("url:")
+    assert "abc" not in r.json()["error"]["message"]
+    assert _sql(env["engine"], "SELECT count(*) FROM webhook_subscriptions")[0][0] == 0
+
+    sid = _create(env).json()["id"]
+    r = env["client"].patch(f"/v2/webhooks/{sid}", json={"url": url}, headers=_as(1))
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+    assert _row(env, sid)["url"] == "https://hooks.example.com/aw"
 
 
 @needs_pg

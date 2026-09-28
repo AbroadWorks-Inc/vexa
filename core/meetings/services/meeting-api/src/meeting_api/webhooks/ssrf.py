@@ -190,9 +190,15 @@ def validate_webhook_url(
       time — the TOCTOU window). The string value is the original URL (Host/SNI preserved).
     - A host in ``allowlist`` is accepted as is, unresolved (``pinned_ips`` empty).
 
+    - A URL that does not parse, or a port that is given but is not a number from 1 to 65535, is
+      refused, allow-listed host or not.
+
     Raises `SSRFError` (a ValueError) with a user-friendly message when blocked.
     """
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        raise SSRFError("Webhook URL could not be parsed") from None
 
     if parsed.scheme not in ("http", "https"):
         raise SSRFError("Webhook URL must use http or https scheme")
@@ -201,13 +207,19 @@ def validate_webhook_url(
     if not hostname:
         raise SSRFError("Webhook URL must have a valid hostname")
 
+    try:
+        port = parsed.port
+    except ValueError:
+        port = 0
+    if port == 0:
+        raise SSRFError("Webhook URL port must be a number from 1 to 65535")
+
     if _is_allowlisted(hostname, allowlist):
-        return PinnedURL(url, host=hostname, port=parsed.port, scheme=parsed.scheme, pinned_ips=[])
+        return PinnedURL(url, host=hostname, port=port, scheme=parsed.scheme, pinned_ips=[])
 
     if _is_blocked_hostname(hostname):
         raise SSRFError("Webhook URL cannot target internal or private networks")
 
-    port = parsed.port
     # Literal IP — check directly, no DNS. The "resolved" set is the literal itself.
     try:
         ipaddress.ip_address(hostname)

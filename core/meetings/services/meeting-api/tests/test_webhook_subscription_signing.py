@@ -248,6 +248,16 @@ def test_every_shared_url_vector(vector):
             )
 
 
+@pytest.mark.parametrize(
+    "url", ["https://hooks.example.com:tok3n/x", "http://[tok3n::1/x"]
+)
+def test_a_url_that_does_not_parse_is_refused_without_echoing_it(url):
+    with pytest.raises(SSRFError) as ei:
+        validate_webhook_url(url, resolver=lambda h: ["93.184.216.34"])
+    assert not isinstance(ei.value, UnresolvableHost)
+    assert "tok3n" not in str(ei.value)
+
+
 def test_the_default_allowlist_lets_the_portal_through_and_blocks_10_0_0_1():
     allowlist = parse_allowlist(DEFAULT_PRIVATE_HOST_ALLOWLIST)
     assert allowlist == frozenset({"portal.notetaker.svc.cluster.local"})

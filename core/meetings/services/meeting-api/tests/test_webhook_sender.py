@@ -860,6 +860,23 @@ async def test_the_allowlist_lets_the_portal_through_and_blocks_10_0_0_1(world):
     assert "10.0.0.1" not in attempt["error"]
 
 
+@pytest.mark.parametrize("port", ["99999", "0", "abc"])
+async def test_a_url_with_an_invalid_port_is_refused_not_a_fault(world, port, capsys):
+    sub = await world.subscribe(url=f"https://hooks.example.com:{port}/aw")
+    did, _ = await world.event(sub)
+
+    await world.sender.run_once()
+
+    row = await world.h.delivery(did)
+    assert (row["state"], row["attempts"]) == ("failed", 1)
+    (attempt,) = await world.h.attempt_rows(did)
+    assert (attempt["outcome"], attempt["status_code"]) == ("failed", None)
+    assert attempt["error"].startswith("url refused")
+    assert port not in attempt["error"]
+    assert world.receiver.posted == []
+    assert '"webhook_delivery_crashed"' not in capsys.readouterr().out
+
+
 async def test_a_host_that_does_not_resolve_is_retried(h):
     clock = h.clock
     subs = StaticSubscriptions()

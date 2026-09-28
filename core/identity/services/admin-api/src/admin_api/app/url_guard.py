@@ -5,6 +5,8 @@ private-host allow-list; the two services share no code, so both test suites rea
 (``core/identity/contracts/webhook-subscriptions/url-guard.vectors.json``):
 
 - only ``http`` and ``https``, and a host is required;
+- a URL that does not parse is refused, and so is a port that is given but is not a number from 1
+  to 65535, allow-listed host or not;
 - a host in ``WEBHOOK_PRIVATE_HOST_ALLOWLIST`` (comma-separated, compared case-insensitively) is
   accepted as is, without resolving it;
 - the internal hostnames below are refused;
@@ -120,12 +122,21 @@ def check_subscription_url(
     resolver: Optional[Resolver] = None,
 ) -> None:
     """Raise ``UrlRefused`` unless ``url`` may receive webhooks."""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        raise UrlRefused("the URL could not be parsed") from None
     if parsed.scheme not in ("http", "https"):
         raise UrlRefused("the URL must use http or https")
     hostname = (parsed.hostname or "").lower()
     if not hostname:
         raise UrlRefused("the URL must have a host")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = 0
+    if port == 0:
+        raise UrlRefused("the URL's port must be a number from 1 to 65535")
     if hostname in {host.strip().lower() for host in allowlist}:
         return
     if hostname in _BLOCKED_HOSTNAMES:
