@@ -24,13 +24,18 @@ webhooks.py}`, reimplemented clean. The wire shape is sealed in `meetings/contra
   An IPv4-mapped IPv6 address is judged as the IPv4 address it maps. The secret box and URL rules are
   pinned by the shared vectors in `core/identity/contracts/webhook-subscriptions/`.
 - **Subscription sender** (`sender.py`, `subscriptions.py`, §1.8) — one loop per replica claims due
-  `webhook_deliveries` rows (`FOR UPDATE SKIP LOCKED`, `sending` with a 60 s lease), re-checks the
-  subscription is active in `webhook_subscriptions` (else `cancelled`) and its URL passes the guard,
-  signs the stored `payload_text` and posts it (10 s) if at least 15 s of the lease is left (else it
-  leaves the row for the next claim). Claims, leases and retry times use the database's `now()`. One attempt row per attempt; 2xx `delivered`,
-  5xx/429/timeout/connection error, or a fault the sender does not map (`sender error`), retried at
-  +60 s, +300 s, +1800 s, +7200 s then `dead`, any other answer `failed`. Every move out of `sending` is guarded by the claim's lease, so a pause or delete
-  mid-flight stays `cancelled`. Subscriptions come from admin-api's internal read, cached 30 s.
+  `webhook_deliveries` rows (`FOR UPDATE SKIP LOCKED`, `sending` with a 60 s lease) together with
+  each subscription's sealed secrets from `webhook_subscriptions`, re-checks the subscription is
+  active (else `cancelled`) and its URL passes the guard (DNS on the sender's own
+  `WEBHOOK_DNS_THREADS` pool, `WEBHOOK_DNS_TIMEOUT_S` per lookup), signs the stored `payload_text`
+  with the claim's secrets and posts it (10 s) if at least 15 s of the lease is left (else a failed
+  attempt, `lease short`). Claims, leases and retry times use the database's `now()`. One attempt
+  row per attempt; 2xx `delivered`, 5xx/429/timeout/connection error, `dns timeout`, `lease short`,
+  or a fault the sender does not map (`sender error`), retried after each wait in
+  `WEBHOOK_RETRY_SCHEDULE_S` (default 60, 300, 1800, 7200 s) then `dead`, any other answer
+  `failed`. Every move out of `sending` is guarded by the claim's lease, so a pause or delete
+  mid-flight stays `cancelled`. The URL and the publisher's event matching come from admin-api's
+  internal read, cached 30 s; secrets never come from that cache.
   Redis is not used. `fakes.py` holds `InMemoryDeliveryStore`, the offline `DeliveryStore`.
 - **`POST /internal/webhooks/test`** (`internal_router.py`) — admin-api's `webhook.test` hand-off
   (internal secret); the write itself is `intake/outbox.py`'s `PostgresWebhookTests`.
