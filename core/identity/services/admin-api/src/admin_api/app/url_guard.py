@@ -10,9 +10,10 @@ private-host allow-list; the two services share no code, so both test suites rea
 - a host in ``WEBHOOK_PRIVATE_HOST_ALLOWLIST`` (comma-separated, compared case-insensitively) is
   accepted as is, without resolving it;
 - the internal hostnames below are refused;
-- a literal address is refused when it is private, loopback, link-local, multicast or "this
-  network"; an IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) is judged as the IPv4 address it
-  maps;
+- a literal address is refused when it is private, loopback, link-local, multicast, "this
+  network", unspecified, shared address space (CGNAT), benchmarking, NAT64 or IPv4-compatible
+  (``_BLOCKED_NETWORKS``); an IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) is judged as the IPv4
+  address it maps;
 - a DNS name is resolved, and refused when it resolves to nothing or when ANY of its addresses
   is refused.
 
@@ -44,20 +45,25 @@ DEFAULT_PRIVATE_HOST_ALLOWLIST = "portal.notetaker.svc.cluster.local"
 
 Resolver = Callable[[str], List[str]]
 
+# meeting-api's ssrf.py holds the same list.
 _BLOCKED_NETWORKS = [
     ipaddress.ip_network(net)
     for net in (
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "224.0.0.0/4",
-        "::1/128",
-        "fc00::/7",
-        "fe80::/10",
-        "ff00::/8",
+        "0.0.0.0/8",  # this network
+        "10.0.0.0/8",  # private
+        "100.64.0.0/10",  # shared address space (CGNAT)
+        "127.0.0.0/8",  # loopback
+        "169.254.0.0/16",  # link-local, cloud metadata
+        "172.16.0.0/12",  # private
+        "192.168.0.0/16",  # private
+        "198.18.0.0/15",  # benchmarking
+        "224.0.0.0/4",  # multicast
+        "::/96",  # unspecified (::) and IPv4-compatible (::a.b.c.d)
+        "::1/128",  # loopback
+        "64:ff9b::/96",  # NAT64 (64:ff9b::a.b.c.d)
+        "fc00::/7",  # unique local
+        "fe80::/10",  # link-local
+        "ff00::/8",  # multicast
     )
 ]
 

@@ -43,19 +43,24 @@ import socket
 from typing import Any, Callable, Collection, List, Optional
 from urllib.parse import urlparse
 
-# Blocked IP ranges per OWASP (localhost, private, link-local, multicast).
+# Blocked IP ranges per OWASP (localhost, private, link-local, multicast), plus the ranges that
+# reach this network another way. admin-api's url_guard.py holds the same list.
 _BLOCKED_IPV4_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),       # current network
     ipaddress.ip_network("10.0.0.0/8"),      # private
+    ipaddress.ip_network("100.64.0.0/10"),   # shared address space (CGNAT)
     ipaddress.ip_network("127.0.0.0/8"),     # loopback
     ipaddress.ip_network("169.254.0.0/16"),  # link-local (incl. cloud metadata 169.254.169.254)
     ipaddress.ip_network("172.16.0.0/12"),   # private
     ipaddress.ip_network("192.168.0.0/16"),  # private
+    ipaddress.ip_network("198.18.0.0/15"),   # benchmarking
     ipaddress.ip_network("224.0.0.0/4"),     # multicast
 ]
 
 _BLOCKED_IPV6_NETWORKS = [
+    ipaddress.ip_network("::/96"),           # unspecified (::) and IPv4-compatible (::a.b.c.d)
     ipaddress.ip_network("::1/128"),         # loopback
+    ipaddress.ip_network("64:ff9b::/96"),    # NAT64 (64:ff9b::a.b.c.d)
     ipaddress.ip_network("fc00::/7"),        # unique local
     ipaddress.ip_network("fe80::/10"),       # link-local
     ipaddress.ip_network("ff00::/8"),        # multicast
