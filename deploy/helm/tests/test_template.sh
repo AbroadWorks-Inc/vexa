@@ -552,12 +552,20 @@ for kv in \
   'JOIN_NOW_ADOPT_AHEAD_S|value: "3600"' \
   'ENTRY_BLOCKED_HOSTS|value: ""' \
   'INTAKE_MAX_ACTIVE_ENTRIES|value: "100000"' \
+  'INTAKE_CONFLICT_RETRIES|value: "3"' \
   'AUTO_JOIN_LEAD_S|value: "120"' \
   'NOT_SENT_SWEEP_INTERVAL_S|value: "30"' \
+  'BOT_SEND_MAX_ATTEMPTS|value: "3"' \
+  'BOT_SEND_RETRY_BACKOFF_S|value: "60"' \
+  'SWEEP_BATCH_SIZE|value: "200"' \
+  'SWEEP_MAX_ITEM_FAILURES|value: "5"' \
   'VEXA_JITSI_HOSTS|value: ""' \
   'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' \
   'WEBHOOK_PUBLISH_INTERVAL_S|value: "1"' \
-  'WEBHOOK_SEND_INTERVAL_S|value: "1"' ; do
+  'WEBHOOK_SEND_INTERVAL_S|value: "1"' \
+  'WEBHOOK_RETRY_SCHEDULE_S|value: "60,300,1800,7200"' \
+  'WEBHOOK_DNS_THREADS|value: "4"' \
+  'WEBHOOK_DNS_TIMEOUT_S|value: "5"' ; do
   env_is "$RENDER" meeting-api "${kv%%|*}" "${kv##*|}"
 done
 for kv in \
@@ -572,11 +580,24 @@ env_is "$RENDER" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "600"'
 RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
   --set meetingApi.entryBlockedHosts=meet.example.org --set meetingApi.autoJoinLeadSeconds=300 \
   --set meetingApi.jitsiHosts=meet.example.org \
+  --set meetingApi.intakeConflictRetries=5 --set meetingApi.botSendMaxAttempts=7 \
+  --set meetingApi.botSendRetryBackoffSeconds=45 \
+  --set meetingApi.sweepBatchSize=50 --set meetingApi.sweepMaxItemFailures=2 \
+  --set meetingApi.webhookRetryScheduleSeconds=30\\,120 --set meetingApi.webhookDnsThreads=8 \
+  --set meetingApi.webhookDnsTimeoutSeconds=2 \
   --set adminApi.webhookPrivateHostAllowlist=portal.example.svc.cluster.local \
   --set gateway.intakeRateLimitPerMin=900)"
 env_is "$RENDER_INTAKE" meeting-api ENTRY_BLOCKED_HOSTS 'value: "meet.example.org"'
 env_is "$RENDER_INTAKE" meeting-api AUTO_JOIN_LEAD_S 'value: "300"'
 env_is "$RENDER_INTAKE" meeting-api VEXA_JITSI_HOSTS 'value: "meet.example.org"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_RETRIES 'value: "5"'
+env_is "$RENDER_INTAKE" meeting-api BOT_SEND_MAX_ATTEMPTS 'value: "7"'
+env_is "$RENDER_INTAKE" meeting-api BOT_SEND_RETRY_BACKOFF_S 'value: "45"'
+env_is "$RENDER_INTAKE" meeting-api SWEEP_BATCH_SIZE 'value: "50"'
+env_is "$RENDER_INTAKE" meeting-api SWEEP_MAX_ITEM_FAILURES 'value: "2"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_RETRY_SCHEDULE_S 'value: "30,120"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_THREADS 'value: "8"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_TIMEOUT_S 'value: "2"'
 env_is "$RENDER_INTAKE" admin-api WEBHOOK_PRIVATE_HOST_ALLOWLIST 'value: "portal.example.svc.cluster.local"'
 env_is "$RENDER_INTAKE" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "900"'
 

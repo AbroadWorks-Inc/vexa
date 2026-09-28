@@ -419,21 +419,21 @@
    "class": "defaulted",
    "default": "60,300,1800,7200",
    "description": "webhooks (§1.8, §6.9 F-A): the subscription sender's retry waits (s), comma-separated, 1 to 20 positive whole numbers. Its length is the number of retries: after a 5xx, 429, timeout, connection error, DNS timeout, too little lease left to post (lease short) or nothing to sign or resolve with, attempt n waits entry n; one failure after the last entry the delivery is dead (the default: 4 retries, 5 attempts). Set but malformed, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_DNS_THREADS",
    "class": "defaulted",
    "default": "4",
    "description": "webhooks (§1.8, §6.9 F-H): threads in the subscription sender's own DNS pool (the send-time SSRF guard's lookups), per replica; a whole number of at least 1. The pool is separate from the default executor recording storage uses, so slow DNS never delays recordings, and it is shut down on app shutdown. Set but malformed, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_DNS_TIMEOUT_S",
    "class": "defaulted",
    "default": "5",
    "description": "webhooks (§1.8, §6.9 F-H): the most (s, above 0, decimals allowed) one send-time DNS lookup may take, waiting for a pool thread included. A lookup that takes longer is a failed attempt (error 'dns timeout') on WEBHOOK_RETRY_SCHEDULE_S. Set but malformed, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SCHEDULER_TICK_INTERVAL",
@@ -662,14 +662,14 @@
    "class": "defaulted",
    "default": "3",
    "description": "intake and auto-join (§6.9 F-K): an entry-managed meeting's bot send is tried at most this many times in total; the last failure ends the meeting not_sent with its typed code",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "BOT_SEND_RETRY_BACKOFF_S",
    "class": "defaulted",
    "default": "60",
    "description": "intake and auto-join (§6.9 F-K): seconds between two sends of an entry-managed meeting's bot after a failure (entry-less rows keep AUTO_JOIN_RETRY_BACKOFF_S)",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "INTAKE_MAX_ACTIVE_ENTRIES",
@@ -683,21 +683,21 @@
    "class": "defaulted",
    "default": "3",
    "description": "intake (§6.9 F-D): how many more times an entry write that lost a race on a database constraint is run again, after a short random pause; one that still loses answers 500 internal_error",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SWEEP_BATCH_SIZE",
    "class": "defaulted",
    "default": "200",
    "description": "intake sweeps (§6.9 F-I): the auto-join tick, the not-sent sweep and the outbox publisher read their work in pages of at most this many items, in a stable order, every page each tick",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SWEEP_MAX_ITEM_FAILURES",
    "class": "defaulted",
    "default": "5",
    "description": "intake sweeps (§6.9 F-I): an item that fails this many times (counted per sweep in sweep_item_failures, across replicas) is logged, counted in aw_sweep_items_total{result=given_up} and never tried again by that sweep",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "CALENDAR_SYNC_INTERVAL_S",

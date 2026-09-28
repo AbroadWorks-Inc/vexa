@@ -175,10 +175,20 @@ spec:
               value: {{ .Values.meetingApi.entryBlockedHosts | default "" | quote }}
             - name: INTAKE_MAX_ACTIVE_ENTRIES
               value: {{ .Values.meetingApi.intakeMaxActiveEntries | default "100000" | quote }}
+            - name: INTAKE_CONFLICT_RETRIES
+              value: {{ .Values.meetingApi.intakeConflictRetries | default "3" | quote }}
             - name: AUTO_JOIN_LEAD_S
               value: {{ .Values.meetingApi.autoJoinLeadSeconds | default "120" | quote }}
             - name: NOT_SENT_SWEEP_INTERVAL_S
               value: {{ .Values.meetingApi.notSentSweepIntervalSeconds | default "30" | quote }}
+            - name: BOT_SEND_MAX_ATTEMPTS
+              value: {{ .Values.meetingApi.botSendMaxAttempts | default "3" | quote }}
+            - name: BOT_SEND_RETRY_BACKOFF_S
+              value: {{ .Values.meetingApi.botSendRetryBackoffSeconds | default "60" | quote }}
+            - name: SWEEP_BATCH_SIZE
+              value: {{ .Values.meetingApi.sweepBatchSize | default "200" | quote }}
+            - name: SWEEP_MAX_ITEM_FAILURES
+              value: {{ .Values.meetingApi.sweepMaxItemFailures | default "5" | quote }}
             - name: VEXA_JITSI_HOSTS
               value: {{ .Values.meetingApi.jitsiHosts | default "" | quote }}
             # Webhook subscriptions: the outbox publisher and the sender.
@@ -188,6 +198,12 @@ spec:
               value: {{ .Values.meetingApi.webhookPublishIntervalSeconds | default "1" | quote }}
             - name: WEBHOOK_SEND_INTERVAL_S
               value: {{ .Values.meetingApi.webhookSendIntervalSeconds | default "1" | quote }}
+            - name: WEBHOOK_RETRY_SCHEDULE_S
+              value: {{ .Values.meetingApi.webhookRetryScheduleSeconds | default "60,300,1800,7200" | quote }}
+            - name: WEBHOOK_DNS_THREADS
+              value: {{ .Values.meetingApi.webhookDnsThreads | default "4" | quote }}
+            - name: WEBHOOK_DNS_TIMEOUT_S
+              value: {{ .Values.meetingApi.webhookDnsTimeoutSeconds | default "5" | quote }}
             {{- with .Values.meetingApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
