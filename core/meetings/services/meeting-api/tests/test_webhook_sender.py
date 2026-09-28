@@ -37,13 +37,15 @@ import pytest
 from meeting_api.webhooks.fakes import InMemoryDeliveryStore
 from meeting_api.webhooks.secret_box import SecretBox
 from meeting_api.webhooks.sender import (
+    DEFAULT_RETRY_SCHEDULE_S,
     LEASE_MARGIN_S,
     LEASE_S,
-    RETRY_SCHEDULE_S,
     SEND_TIMEOUT_S,
     DeliveryResult,
     HttpxPoster,
     PostgresDeliveryStore,
+    SenderSettings,
+    SenderSettingsError,
     TransportError,
     WebhookSender,
 )
@@ -480,7 +482,7 @@ async def test_the_retry_schedule_then_dead_with_byte_identical_payloads(world):
     did, body = await world.event(sub)
     world.receiver.answers = [500, 503, 429, TransportError("ConnectError"), 502]
 
-    expected_waits = list(RETRY_SCHEDULE_S)
+    expected_waits = list(DEFAULT_RETRY_SCHEDULE_S)
     assert expected_waits == [60, 300, 1800, 7200]
     for n, wait in enumerate(expected_waits, start=1):
         assert await world.sender.run_once() == 1
@@ -539,6 +541,87 @@ async def test_a_timeout_is_retried(h):
         None,
         "timeout",
     )
+
+
+# ── the retry schedule is a setting (WEBHOOK_RETRY_SCHEDULE_S) ────────────────────────────────
+
+
+def test_the_default_retry_schedule_is_unchanged():
+    assert DEFAULT_RETRY_SCHEDULE_S == (60, 300, 1800, 7200)
+    assert SenderSettings.from_env({}).retry_schedule_s == (60, 300, 1800, 7200)
+    assert SenderSettings.from_env(
+        {"WEBHOOK_RETRY_SCHEDULE_S": ""}
+    ).retry_schedule_s == (60, 300, 1800, 7200)
+    assert SenderSettings().retry_schedule_s == DEFAULT_RETRY_SCHEDULE_S
+
+
+@pytest.mark.parametrize(
+    "raw, parsed",
+    [
+        ("5,10", (5, 10)),
+        (" 5 , 10 ,15 ", (5, 10, 15)),
+        ("1", (1,)),
+        (",".join(["30"] * 20), (30,) * 20),
+    ],
+)
+def test_a_retry_schedule_setting_is_read(raw, parsed):
+    settings = SenderSettings.from_env({"WEBHOOK_RETRY_SCHEDULE_S": raw})
+    assert settings.retry_schedule_s == parsed
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "abc",
+        "60,,300",
+        "60,",
+        "0",
+        "60,0",
+        "-5",
+        "60,1.5",
+        "60;300",
+        ",".join(["30"] * 21),
+    ],
+)
+def test_a_malformed_retry_schedule_is_refused(raw):
+    with pytest.raises(SenderSettingsError) as err:
+        SenderSettings.from_env({"WEBHOOK_RETRY_SCHEDULE_S": raw})
+    assert "WEBHOOK_RETRY_SCHEDULE_S" in str(err.value)
+
+
+async def test_a_custom_schedule_sets_the_retry_times_and_when_it_goes_dead(h):
+    subs = StaticSubscriptions()
+    receiver = Receiver(default=503)
+    sender = WebhookSender(
+        h.store,
+        subs,
+        box(),
+        receiver,
+        allowlist=frozenset(),
+        resolver=resolve_public,
+        clock=h.clock,
+        settings=SenderSettings(retry_schedule_s=(5, 10)),
+    )
+    w = World(h, h.clock, subs, receiver, sender)
+    did, _ = await w.event(await w.subscribe())
+
+    for n, wait in enumerate((5, 10), start=1):
+        assert await sender.run_once() == 1
+        row = await h.delivery(did)
+        assert (row["state"], row["attempts"]) == ("pending", n)
+        assert row["next_attempt_at"] == w.clock.now + timedelta(seconds=wait)
+        w.clock.advance(wait - 1)
+        assert await sender.run_once() == 0
+        w.clock.advance(1)
+
+    assert await sender.run_once() == 1
+    row = await h.delivery(did)
+    assert (row["state"], row["attempts"]) == ("dead", 3)
+    attempts = await h.attempt_rows(did)
+    assert [a["outcome"] for a in attempts] == ["retry", "retry", "dead"]
+    w.clock.advance(86_400)
+    assert await sender.run_once() == 0
+    assert len(receiver.posted) == 3
 
 
 @pytest.mark.parametrize("code", [400, 401, 404, 410, 422, 301])
@@ -740,7 +823,7 @@ async def test_claims_leases_and_retries_run_on_the_database_clock(pg_engine):
         status_code=503,
         error="HTTP 503",
         duration_ms=3,
-        retry_in_s=RETRY_SCHEDULE_S[0],
+        retry_in_s=DEFAULT_RETRY_SCHEDULE_S[0],
     )
     assert await store.record(claim, retry) is True
     row = await h.delivery(claim.id)
@@ -982,7 +1065,7 @@ async def test_a_sender_fault_is_an_attempt_on_the_retry_schedule_then_dead(
         sub = await w.subscribe(url=f"https://{CRASH_HOST}/aw?token=q-9f8e7d")
     did, body = await w.event(sub)
 
-    for n, wait in enumerate(RETRY_SCHEDULE_S, start=1):
+    for n, wait in enumerate(DEFAULT_RETRY_SCHEDULE_S, start=1):
         assert await w.sender.run_once() == 1
         row = await h.delivery(did)
         assert (row["state"], row["attempts"], row["lease_until"]) == (
@@ -1032,7 +1115,9 @@ async def test_the_reviews_reproduction_no_longer_holds_the_row_in_sending(h):
     row = await h.delivery(did)
     assert claimed == [1, 1, 0, 0, 0]
     assert (row["state"], row["attempts"]) == ("pending", 2)
-    assert row["next_attempt_at"] == due + timedelta(seconds=61 + RETRY_SCHEDULE_S[1])
+    assert row["next_attempt_at"] == due + timedelta(
+        seconds=61 + DEFAULT_RETRY_SCHEDULE_S[1]
+    )
     assert len(await h.attempt_rows(did)) == 2
 
 
@@ -1401,6 +1486,15 @@ def test_a_key_ring_set_but_wrong_refuses_to_boot(monkeypatch):
         main_mod.build_production_app()
 
 
+def test_a_malformed_retry_schedule_refuses_to_boot(monkeypatch):
+    import meeting_api.__main__ as main_mod
+
+    _production_env(monkeypatch)
+    monkeypatch.setenv("WEBHOOK_RETRY_SCHEDULE_S", "60,soon")
+    with pytest.raises(SenderSettingsError, match="WEBHOOK_RETRY_SCHEDULE_S"):
+        main_mod.build_production_app()
+
+
 def test_a_valid_key_ring_reaches_the_background_loops(monkeypatch):
     import meeting_api.__main__ as main_mod
 
@@ -1490,3 +1584,20 @@ async def test_one_sender_runs_per_replica_unguarded(monkeypatch):
 async def test_no_sender_without_a_key_ring(monkeypatch):
     guarded, ticks = await _run_lifespan_once(monkeypatch, secret_box=None)
     assert ticks == []
+
+
+async def test_the_sender_settings_reach_the_sender(monkeypatch):
+    import meeting_api.webhooks.sender as sender_mod
+
+    seen: dict[str, Any] = {}
+
+    class Capturing(sender_mod.WebhookSender):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            seen.update(kw)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(sender_mod, "WebhookSender", Capturing)
+    monkeypatch.setenv("WEBHOOK_RETRY_SCHEDULE_S", "5,10")
+    _, ticks = await _run_lifespan_once(monkeypatch, secret_box=box())
+    assert ticks == ["send"]
+    assert seen["settings"].retry_schedule_s == (5, 10)

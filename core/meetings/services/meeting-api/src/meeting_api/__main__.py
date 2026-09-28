@@ -687,6 +687,10 @@ def _attach_background_loops(
         os.getenv("WEBHOOK_PRIVATE_HOST_ALLOWLIST", DEFAULT_PRIVATE_HOST_ALLOWLIST)
     )
     webhook_subscriptions = AdminSubscriptions(admin_api_url, internal_secret)
+    # Read at boot: a malformed sender setting refuses to start (SenderSettingsError).
+    from .webhooks.sender import SenderSettings
+
+    webhook_sender_settings = SenderSettings.from_env()
 
     # The publisher is single-flight, every WEBHOOK_PUBLISH_INTERVAL_S: one replica fans the outbox
     # out per tick (a second one would only find the rows already published). It needs Postgres and
@@ -736,6 +740,7 @@ def _attach_background_loops(
             webhook_secret_box,
             HttpxPoster(allowlist=webhook_allowlist),
             allowlist=webhook_allowlist,
+            settings=webhook_sender_settings,
         )
         while True:
             try:

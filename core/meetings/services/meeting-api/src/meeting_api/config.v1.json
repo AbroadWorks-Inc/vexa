@@ -415,6 +415,13 @@
    "targets": ["helm"]
   },
   {
+   "key": "WEBHOOK_RETRY_SCHEDULE_S",
+   "class": "defaulted",
+   "default": "60,300,1800,7200",
+   "description": "webhooks (§1.8, §6.9 F-A): the subscription sender's retry waits (s), comma-separated, 1 to 20 positive whole numbers. Its length is the number of retries: after a 5xx, 429, timeout, connection error or nothing to sign or resolve with, attempt n waits entry n; one failure after the last entry the delivery is dead (the default: 4 retries, 5 attempts). Set but malformed, meeting-api refuses to start.",
+   "targets": []
+  },
+  {
    "key": "SCHEDULER_TICK_INTERVAL",
    "class": "defaulted",
    "default": "1",

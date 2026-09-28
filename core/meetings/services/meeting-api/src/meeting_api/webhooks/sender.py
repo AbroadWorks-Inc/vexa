@@ -24,11 +24,11 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    what happened                                 state                  attempt ``outcome``
    ============================================  =====================  ==================
    2xx                                           ``delivered``          ``delivered``
-   5xx, 429, timeout, connection error, or       ``pending`` at +60 s,  ``retry``
-   nothing to sign or resolve with (the          +300 s, +1800 s,
-   subscription read, the secret, DNS), or a     +7200 s; then ``dead`` ``dead``
-   fault the sender does not map (stored as
-   ``sender error``)
+   5xx, 429, timeout, connection error, or       ``pending`` after the  ``retry``
+   nothing to sign or resolve with (the          next wait in
+   subscription read, the secret, DNS), or a     ``WEBHOOK_RETRY_       ``dead``
+   fault the sender does not map (stored as      SCHEDULE_S``; then
+   ``sender error``)                             ``dead``
    any other answer, or a URL the guard refuses  ``failed``             ``failed``
    ============================================  =====================  ==================
 
@@ -41,6 +41,10 @@ Every move out of ``sending`` is guarded ``WHERE id = :id AND state = 'sending' 
 :the claim's lease``: a delivery that admin-api cancelled while it was in flight (a pause or a
 delete) stays ``cancelled``, and a claim whose lease another replica has since taken writes
 nothing. The attempt row is written either way, since the send happened.
+
+The retry schedule is ``SenderSettings.retry_schedule_s`` (``WEBHOOK_RETRY_SCHEDULE_S``, default
+``60,300,1800,7200``): one wait per retry, so its length is the number of retries and a delivery is
+tried at most one time more than that before it is ``dead``.
 
 Errors stored and logged name a type or a cause, never a URL, a host, a secret or a key. Redis is
 not used anywhere here.
@@ -59,6 +63,7 @@ the guard validated with the Host header and TLS SNI of the real host).
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -79,8 +84,8 @@ from .subscriptions import SubscriptionSource, SubscriptionsUnavailable
 
 __all__ = [
     "CLAIM_LIMIT",
+    "DEFAULT_RETRY_SCHEDULE_S",
     "LEASE_S",
-    "RETRY_SCHEDULE_S",
     "SEND_TIMEOUT_S",
     "URL_CHECK_TIMEOUT_S",
     "Claim",
@@ -89,6 +94,8 @@ __all__ = [
     "HttpxPoster",
     "Poster",
     "PostgresDeliveryStore",
+    "SenderSettings",
+    "SenderSettingsError",
     "TransportError",
     "WebhookSender",
 ]
@@ -97,11 +104,47 @@ LEASE_S = 60
 LEASE_MARGIN_S = 5.0
 SEND_TIMEOUT_S = 10.0
 URL_CHECK_TIMEOUT_S = 5.0
-RETRY_SCHEDULE_S = (60, 300, 1800, 7200)
+DEFAULT_RETRY_SCHEDULE_S = (60, 300, 1800, 7200)
+MAX_RETRIES = 20
 CLAIM_LIMIT = 50
 SENDER_ERROR = "sender error"
 
 _SPAN = "webhooks.delivery"
+
+
+class SenderSettingsError(ValueError):
+    """A sender setting is set but malformed; meeting-api refuses to start. The message names the
+    setting and what it must be."""
+
+
+def _retry_schedule(raw: str) -> tuple[int, ...]:
+    parts = [part.strip() for part in raw.split(",")]
+    if 1 <= len(parts) <= MAX_RETRIES and all(
+        p.isascii() and p.isdigit() and int(p) >= 1 for p in parts
+    ):
+        return tuple(int(p) for p in parts)
+    raise SenderSettingsError(
+        "WEBHOOK_RETRY_SCHEDULE_S must be a comma-separated list of 1 to "
+        f"{MAX_RETRIES} positive whole seconds"
+    )
+
+
+@dataclass(frozen=True)
+class SenderSettings:
+    """The sender's settings (``config.v1.json``). ``retry_schedule_s`` holds one wait per
+    retry."""
+
+    retry_schedule_s: tuple[int, ...] = DEFAULT_RETRY_SCHEDULE_S
+
+    @classmethod
+    def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> SenderSettings:
+        """The settings from the environment; an unset or empty key takes its default, and a
+        malformed one raises ``SenderSettingsError``."""
+        env = os.environ if environ is None else environ
+        raw = (env.get("WEBHOOK_RETRY_SCHEDULE_S") or "").strip()
+        return cls(
+            retry_schedule_s=_retry_schedule(raw) if raw else DEFAULT_RETRY_SCHEDULE_S
+        )
 
 
 @dataclass(frozen=True)
@@ -158,18 +201,20 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _retry(claim: Claim, **fields: Any) -> DeliveryResult:
-    if claim.attempt <= len(RETRY_SCHEDULE_S):
+def _retry(claim: Claim, schedule: tuple[int, ...], **fields: Any) -> DeliveryResult:
+    if claim.attempt <= len(schedule):
         return DeliveryResult(
             state="pending",
             outcome="retry",
-            retry_in_s=RETRY_SCHEDULE_S[claim.attempt - 1],
+            retry_in_s=schedule[claim.attempt - 1],
             **fields,
         )
     return DeliveryResult(state="dead", outcome="dead", retry_in_s=None, **fields)
 
 
-def _answered(claim: Claim, code: int, duration_ms: int) -> DeliveryResult:
+def _answered(
+    claim: Claim, schedule: tuple[int, ...], code: int, duration_ms: int
+) -> DeliveryResult:
     fields: dict[str, Any] = {
         "status_code": code,
         "duration_ms": duration_ms,
@@ -180,7 +225,7 @@ def _answered(claim: Claim, code: int, duration_ms: int) -> DeliveryResult:
             state="delivered", outcome="delivered", retry_in_s=None, **fields
         )
     if code >= 500 or code == 429:
-        return _retry(claim, **{**fields, "error": f"HTTP {code}"})
+        return _retry(claim, schedule, **{**fields, "error": f"HTTP {code}"})
     return DeliveryResult(
         state="failed",
         outcome="failed",
@@ -189,8 +234,8 @@ def _answered(claim: Claim, code: int, duration_ms: int) -> DeliveryResult:
     )
 
 
-def _unsent(claim: Claim, error: str) -> DeliveryResult:
-    return _retry(claim, status_code=None, error=error, duration_ms=None)
+def _unsent(claim: Claim, schedule: tuple[int, ...], error: str) -> DeliveryResult:
+    return _retry(claim, schedule, status_code=None, error=error, duration_ms=None)
 
 
 class WebhookSender:
@@ -210,6 +255,7 @@ class WebhookSender:
         claim_limit: int = CLAIM_LIMIT,
         send_timeout_s: float = SEND_TIMEOUT_S,
         url_check_timeout_s: float = URL_CHECK_TIMEOUT_S,
+        settings: SenderSettings = SenderSettings(),
     ) -> None:
         self._store = store
         self._subscriptions = subscriptions
@@ -222,6 +268,7 @@ class WebhookSender:
         self._claim_limit = claim_limit
         self._send_timeout_s = send_timeout_s
         self._url_check_timeout_s = url_check_timeout_s
+        self._schedule = settings.retry_schedule_s
 
     async def run_once(self) -> int:
         """One tick: claim what is due and deliver it. Returns how many rows were claimed."""
@@ -240,7 +287,7 @@ class WebhookSender:
             raise
         except Exception as exc:  # noqa: BLE001
             self._log_fault(claim, exc)
-            result = _unsent(claim, SENDER_ERROR)
+            result = _unsent(claim, self._schedule, SENDER_ERROR)
         if result is None:
             return
         try:
@@ -269,7 +316,7 @@ class WebhookSender:
         else:
             error = "subscription not in the account's read"
         if sub is None:
-            return _unsent(claim, error)
+            return _unsent(claim, self._schedule, error)
 
         try:
             target = await asyncio.wait_for(
@@ -282,9 +329,9 @@ class WebhookSender:
                 timeout=self._url_check_timeout_s,
             )
         except UnresolvableHost:
-            return _unsent(claim, "host could not be resolved")
+            return _unsent(claim, self._schedule, "host could not be resolved")
         except asyncio.TimeoutError:
-            return _unsent(claim, "host resolution timed out")
+            return _unsent(claim, self._schedule, "host resolution timed out")
         except SSRFError as exc:
             return DeliveryResult(
                 state="failed",
@@ -298,7 +345,7 @@ class WebhookSender:
         try:
             secret = self._box.decrypt(sub.secret_enc, sub.enc_key_id)
         except SecretBoxError:
-            return _unsent(claim, "secret could not be opened")
+            return _unsent(claim, self._schedule, "secret could not be opened")
         previous = None
         previous_enc, previous_key = sub.previous_secret_enc, sub.previous_enc_key_id
         if sub.previous_live(now) and previous_enc and previous_key:
@@ -335,14 +382,14 @@ class WebhookSender:
                 self._poster.post(target, body, headers), timeout=self._send_timeout_s
             )
         except asyncio.TimeoutError:
-            result = _unsent(claim, "timeout")
+            result = _unsent(claim, self._schedule, "timeout")
         except TransportError as exc:
-            result = _unsent(claim, f"connection error ({exc})")
+            result = _unsent(claim, self._schedule, f"connection error ({exc})")
         except SSRFError:
-            result = _unsent(claim, "address refused at connect")
+            result = _unsent(claim, self._schedule, "address refused at connect")
         else:
             elapsed = int((time.monotonic() - started) * 1000)
-            result = _answered(claim, code, elapsed)
+            result = _answered(claim, self._schedule, code, elapsed)
         if result.duration_ms is None:
             result = DeliveryResult(
                 state=result.state,
