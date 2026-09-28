@@ -28,8 +28,8 @@ webhooks.py}`, reimplemented clean. The wire shape is sealed in `meetings/contra
   subscription is active in `webhook_subscriptions` (else `cancelled`) and its URL passes the guard,
   signs the stored `payload_text` and posts it (10 s) if at least 15 s of the lease is left (else it
   leaves the row for the next claim). Claims, leases and retry times use the database's `now()`. One attempt row per attempt; 2xx `delivered`,
-  5xx/429/timeout/connection error retried at +60 s, +300 s, +1800 s, +7200 s then `dead`, any other
-  answer `failed`. Every move out of `sending` is guarded by the claim's lease, so a pause or delete
+  5xx/429/timeout/connection error, or a fault the sender does not map (`sender error`), retried at
+  +60 s, +300 s, +1800 s, +7200 s then `dead`, any other answer `failed`. Every move out of `sending` is guarded by the claim's lease, so a pause or delete
   mid-flight stays `cancelled`. Subscriptions come from admin-api's internal read, cached 30 s.
   Redis is not used. `fakes.py` holds `InMemoryDeliveryStore`, the offline `DeliveryStore`.
 - **`POST /internal/webhooks/test`** (`internal_router.py`) — admin-api's `webhook.test` hand-off

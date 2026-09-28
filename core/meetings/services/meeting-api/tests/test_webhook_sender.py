@@ -918,6 +918,216 @@ async def test_a_secret_the_ring_cannot_open_is_retried_without_a_send(world):
     assert world.receiver.posted == []
 
 
+# ── a sender fault is an attempt ─────────────────────────────────────────────────────────────
+
+CRASH_HOST = "crash.example.com"
+
+
+class SenderFault(Exception):
+    """A fault the sender does not map; its text carries what must never be stored or logged."""
+
+
+def _fault() -> SenderFault:
+    return SenderFault(f"boom {SECRET} https://{CRASH_HOST}/aw?token=q-9f8e7d")
+
+
+def resolve_or_fault(host: str) -> list[str]:
+    if host == CRASH_HOST:
+        raise _fault()
+    return resolve_public(host)
+
+
+def _faulting_world(h: Any, *, claim_limit: int = 50) -> World:
+    subs = StaticSubscriptions()
+    receiver = Receiver()
+    sender = WebhookSender(
+        h.store,
+        subs,
+        box(),
+        receiver,
+        allowlist=frozenset(),
+        resolver=resolve_or_fault,
+        clock=h.clock,
+        claim_limit=claim_limit,
+    )
+    return World(h, h.clock, subs, receiver, sender)
+
+
+@pytest.mark.parametrize("where", ["transport", "validation"])
+async def test_a_sender_fault_is_an_attempt_on_the_retry_schedule_then_dead(
+    h, where, capsys
+):
+    w = _faulting_world(h)
+    if where == "transport":
+        sub = await w.subscribe()
+        w.receiver.default = _fault()
+    else:
+        sub = await w.subscribe(url=f"https://{CRASH_HOST}/aw?token=q-9f8e7d")
+    did, body = await w.event(sub)
+
+    for n, wait in enumerate(RETRY_SCHEDULE_S, start=1):
+        assert await w.sender.run_once() == 1
+        row = await h.delivery(did)
+        assert (row["state"], row["attempts"], row["lease_until"]) == (
+            "pending",
+            n,
+            None,
+        )
+        assert row["next_attempt_at"] == w.clock.now + timedelta(seconds=wait)
+        assert row["last_error"] == "sender error"
+        w.clock.advance(wait - 1)
+        assert await w.sender.run_once() == 0
+        w.clock.advance(1)
+
+    assert await w.sender.run_once() == 1
+    row = await h.delivery(did)
+    assert (row["state"], row["attempts"], row["lease_until"]) == ("dead", 5, None)
+    w.clock.advance(86_400)
+    assert await w.sender.run_once() == 0
+
+    attempts = await h.attempt_rows(did)
+    assert [a["attempt"] for a in attempts] == [1, 2, 3, 4, 5]
+    assert [a["outcome"] for a in attempts] == ["retry"] * 4 + ["dead"]
+    assert {(a["status_code"], a["error"]) for a in attempts} == {
+        (None, "sender error")
+    }
+    logged = capsys.readouterr().out
+    assert logged.count('"webhook_delivery_crashed"') == 5
+    assert "SenderFault" in logged  # the operator log names the fault's type, only
+    stored = json.dumps([row, attempts], default=str)
+    for value in (SECRET, "q-9f8e7d", CRASH_HOST, body.decode()):
+        assert value not in logged, value
+        assert value not in stored, value
+
+
+async def test_the_reviews_reproduction_no_longer_holds_the_row_in_sending(h):
+    """D2 I2: a faulting delivery, ticked 5 times 61 s apart, used to stay ``sending`` with 0
+    attempts, its ``next_attempt_at`` unchanged and no attempt row."""
+    w = _faulting_world(h)
+    did, _ = await w.event(await w.subscribe(url=f"https://{CRASH_HOST}/aw"))
+    due = (await h.delivery(did))["next_attempt_at"]
+
+    claimed = []
+    for _ in range(5):
+        claimed.append(await w.sender.run_once())
+        w.clock.advance(61)
+
+    row = await h.delivery(did)
+    assert claimed == [1, 1, 0, 0, 0]
+    assert (row["state"], row["attempts"]) == ("pending", 2)
+    assert row["next_attempt_at"] == due + timedelta(seconds=61 + RETRY_SCHEDULE_S[1])
+    assert len(await h.attempt_rows(did)) == 2
+
+
+async def test_faulting_deliveries_never_hold_back_the_others(h):
+    """Claims are taken oldest-due first; a faulting row moves to its next retry time, so rows due
+    before it are claimed ahead of it on the next tick."""
+    w = _faulting_world(h, claim_limit=3)
+    bad = await w.subscribe(url=f"https://{CRASH_HOST}/aw")
+    good = await w.subscribe()
+    w.clock.advance(-10)
+    poisoned = [(await w.event(bad))[0] for _ in range(3)]
+    w.clock.advance(10)
+
+    assert await w.sender.run_once() == 3  # the three poisoned rows, the oldest due
+    w.clock.advance(30)
+    healthy = [(await w.event(good))[0] for _ in range(2)]
+    # every poisoned lease has run out, and their first retry is due
+    w.clock.advance(31)
+
+    assert await w.sender.run_once() == 3
+    for did in healthy:
+        assert (await h.delivery(did))["state"] == "delivered"
+    assert len(w.receiver.posted) == 2
+
+    for _ in range(40):
+        w.clock.advance(3600)
+        await w.sender.run_once()
+    for did in poisoned:
+        row = await h.delivery(did)
+        assert (row["state"], row["attempts"]) == ("dead", 5)
+    for did in healthy:
+        assert len(await h.attempt_rows(did)) == 1
+
+
+async def test_claims_are_taken_oldest_due_first_across_pending_and_expired_leases(h):
+    w = _faulting_world(h, claim_limit=2)
+    sub = await w.subscribe()
+    w.clock.advance(-30)
+    leased, _ = await w.event(sub)  # due first, then held by a replica that died
+    (stale,) = await h.store.claim(lease_s=LEASE_S, limit=1)
+    assert stale.id == leased
+    w.clock.advance(10)
+    older, _ = await w.event(sub)
+    w.clock.advance(10)
+    newer, _ = await w.event(sub)
+    w.clock.advance(10)
+    await h.add_event("evt_future", "meeting.updated", "{}")
+    future = await h.add_delivery(
+        "evt_future", sub.id, USER, w.clock.now + timedelta(seconds=5)
+    )
+
+    # the dead replica's lease still holds: the two pending rows, oldest first
+    assert [c.id for c in await h.store.claim(lease_s=LEASE_S, limit=2)] == [
+        older,
+        newer,
+    ]
+    w.clock.advance(LEASE_S)
+    # its lease has run out and it is due first; the two just claimed are still leased
+    assert [c.id for c in await h.store.claim(lease_s=LEASE_S, limit=2)] == [
+        leased,
+        future,
+    ]
+
+
+class _FaultyRecord:
+    """The store, but ``record`` raises for one delivery."""
+
+    def __init__(self, inner: Any, broken: int) -> None:
+        self._inner = inner
+        self._broken = broken
+
+    async def claim(self, *, lease_s: int, limit: int) -> list[Any]:
+        return await self._inner.claim(lease_s=lease_s, limit=limit)
+
+    async def is_active(self, subscription_id: str) -> bool:
+        return await self._inner.is_active(subscription_id)
+
+    async def cancel(self, claim: Any) -> bool:
+        return await self._inner.cancel(claim)
+
+    async def record(self, claim: Any, result: DeliveryResult) -> bool:
+        if claim.id == self._broken:
+            raise _fault()
+        return await self._inner.record(claim, result)
+
+
+async def test_a_store_that_cannot_record_one_row_still_delivers_the_rest(h, capsys):
+    w = _faulting_world(h)
+    sub = await w.subscribe()
+    broken, _ = await w.event(sub)
+    others = [(await w.event(sub))[0] for _ in range(3)]
+    sender = WebhookSender(
+        _FaultyRecord(h.store, broken),
+        w.subs,
+        box(),
+        w.receiver,
+        allowlist=frozenset(),
+        resolver=resolve_public,
+        clock=h.clock,
+    )
+
+    assert await sender.run_once() == 4
+
+    for did in others:
+        assert (await h.delivery(did))["state"] == "delivered"
+    row = await h.delivery(broken)
+    assert (row["state"], row["attempts"]) == ("sending", 0)  # its lease runs out
+    logged = capsys.readouterr().out
+    assert '"webhook_delivery_crashed"' in logged
+    assert SECRET not in logged
+
+
 # ── logs ─────────────────────────────────────────────────────────────────────────────────────
 
 

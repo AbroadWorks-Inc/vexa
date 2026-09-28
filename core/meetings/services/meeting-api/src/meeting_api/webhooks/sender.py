@@ -26,9 +26,16 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    2xx                                           ``delivered``          ``delivered``
    5xx, 429, timeout, connection error, or       ``pending`` at +60 s,  ``retry``
    nothing to sign or resolve with (the          +300 s, +1800 s,
-   subscription read, the secret, DNS)           +7200 s; then ``dead`` ``dead``
+   subscription read, the secret, DNS), or a     +7200 s; then ``dead`` ``dead``
+   fault the sender does not map (stored as
+   ``sender error``)
    any other answer, or a URL the guard refuses  ``failed``             ``failed``
    ============================================  =====================  ==================
+
+   A fault the sender does not map is logged (``webhook_delivery_crashed``, naming only the fault's
+   type) and recorded as an attempt like any other retry, so it moves the row to its next retry
+   time and ends ``dead``. Only a fault while recording leaves the row as it was: its lease runs
+   out and it is claimed again.
 
 Every move out of ``sending`` is guarded ``WHERE id = :id AND state = 'sending' AND lease_until =
 :the claim's lease``: a delivery that admin-api cancelled while it was in flight (a pause or a
@@ -40,7 +47,8 @@ not used anywhere here.
 
 Metrics (§1.13): each claim moves ``aw_webhook_deliveries_total{event_type,outcome,user_id}`` once,
 with the attempt's ``outcome`` (``delivered``, ``retry``, ``failed``, ``dead``) or what happened
-instead (``cancelled``, ``superseded``, ``lease_short``, ``crashed``); each post made moves
+instead (``cancelled``, ``superseded``, ``lease_short``, or ``crashed`` when the attempt could not
+be recorded); each post made moves
 ``aw_webhook_delivery_seconds``.
 
 ``DeliveryStore`` is the storage port (``PostgresDeliveryStore`` in production) and ``Poster`` the
@@ -91,6 +99,7 @@ SEND_TIMEOUT_S = 10.0
 URL_CHECK_TIMEOUT_S = 5.0
 RETRY_SCHEDULE_S = (60, 300, 1800, 7200)
 CLAIM_LIMIT = 50
+SENDER_ERROR = "sender error"
 
 _SPAN = "webhooks.delivery"
 
@@ -226,27 +235,32 @@ class WebhookSender:
 
     async def _deliver(self, claim: Claim, claimed_at: float) -> None:
         try:
-            await self._deliver_claim(claim, claimed_at)
+            result = await self._attempt(claim, claimed_at)
         except asyncio.CancelledError:
             raise
-        # the lease expires and the row is claimed again
+        except Exception as exc:  # noqa: BLE001
+            self._log_fault(claim, exc)
+            result = _unsent(claim, SENDER_ERROR)
+        if result is None:
+            return
+        try:
+            await self._finish(claim, result)
+        except asyncio.CancelledError:
+            raise
+        # nothing could be written: the lease runs out and the row is claimed again
         except Exception as exc:  # noqa: BLE001
             webhook_delivery(claim.event_type, "crashed", claim.user_id, None)
-            log_event(
-                "webhook_delivery_crashed",
-                audience="operator",
-                level="error",
-                span=_SPAN,
-                user_id=claim.user_id,
-                fields={**self._ids(claim), "error": type(exc).__name__},
-            )
+            self._log_fault(claim, exc)
 
-    async def _deliver_claim(self, claim: Claim, claimed_at: float) -> None:
+    async def _attempt(
+        self, claim: Claim, claimed_at: float
+    ) -> Optional[DeliveryResult]:
+        """The result to record for this claim, or ``None`` when there is nothing to record."""
         now = self._clock()
         if not await self._store.is_active(claim.subscription_id):
             cancelled = await self._store.cancel(claim)
             self._log(claim, "cancelled" if cancelled else "superseded", None)
-            return
+            return None
         try:
             sub = await self._subscriptions.find(claim.user_id, claim.subscription_id)
         except SubscriptionsUnavailable:
@@ -255,8 +269,7 @@ class WebhookSender:
         else:
             error = "subscription not in the account's read"
         if sub is None:
-            await self._finish(claim, _unsent(claim, error))
-            return
+            return _unsent(claim, error)
 
         try:
             target = await asyncio.wait_for(
@@ -269,13 +282,11 @@ class WebhookSender:
                 timeout=self._url_check_timeout_s,
             )
         except UnresolvableHost:
-            await self._finish(claim, _unsent(claim, "host could not be resolved"))
-            return
+            return _unsent(claim, "host could not be resolved")
         except asyncio.TimeoutError:
-            await self._finish(claim, _unsent(claim, "host resolution timed out"))
-            return
+            return _unsent(claim, "host resolution timed out")
         except SSRFError as exc:
-            refused = DeliveryResult(
+            return DeliveryResult(
                 state="failed",
                 outcome="failed",
                 status_code=None,
@@ -283,14 +294,11 @@ class WebhookSender:
                 duration_ms=None,
                 retry_in_s=None,
             )
-            await self._finish(claim, refused)
-            return
 
         try:
             secret = self._box.decrypt(sub.secret_enc, sub.enc_key_id)
         except SecretBoxError:
-            await self._finish(claim, _unsent(claim, "secret could not be opened"))
-            return
+            return _unsent(claim, "secret could not be opened")
         previous = None
         previous_enc, previous_key = sub.previous_secret_enc, sub.previous_enc_key_id
         if sub.previous_live(now) and previous_enc and previous_key:
@@ -313,7 +321,7 @@ class WebhookSender:
             # Too little lease left to post and record inside it: send nothing, write nothing,
             # and let the lease run out so the row is claimed again.
             self._log(claim, "lease_short", None)
-            return
+            return None
         body = claim.payload_text.encode("utf-8")
         headers = signed_headers(
             body,
@@ -344,7 +352,7 @@ class WebhookSender:
                 duration_ms=int((time.monotonic() - started) * 1000),
                 retry_in_s=result.retry_in_s,
             )
-        await self._finish(claim, result)
+        return result
 
     async def _finish(self, claim: Claim, result: DeliveryResult) -> None:
         moved = await self._store.record(claim, result)
@@ -359,6 +367,16 @@ class WebhookSender:
             "subscription_id": claim.subscription_id,
             "attempt": claim.attempt,
         }
+
+    def _log_fault(self, claim: Claim, exc: Exception) -> None:
+        log_event(
+            "webhook_delivery_crashed",
+            audience="operator",
+            level="error",
+            span=_SPAN,
+            user_id=claim.user_id,
+            fields={**self._ids(claim), "error": type(exc).__name__},
+        )
 
     def _log(self, claim: Claim, state: str, result: Optional[DeliveryResult]) -> None:
         webhook_delivery(
