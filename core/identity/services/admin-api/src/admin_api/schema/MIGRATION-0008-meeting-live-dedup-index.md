@@ -22,8 +22,8 @@ must exist before `webhook_deliveries`, and `webhook_deliveries` before
 `webhook_delivery_attempts` (their FKs).
 
 **`meetings.uuid`** is the stable external identity every intake/webhook payload keys off (never
-the internal `id`). Added nullable, backfilled in batches, then locked down via a validated CHECK
-constraint — never a blocking `SET NOT NULL` — so the live `meetings` table is never held under an
+the internal `id`). Added nullable, given its default, backfilled in batches, then locked down via
+a validated CHECK constraint — never a blocking `SET NOT NULL` — so the live `meetings` table is never held under an
 exclusive lock for the backfill's duration.
 
 **The index swap** (`uq_meeting_active_user_platform_native` → `uq_meeting_live_user_platform_native`).
@@ -66,9 +66,26 @@ If it does not, resolve the duplicates (as MIGRATION-0002's step 2) before conti
 ## Production rollout (run in this ORDER, before deploying the SSOT change)
 
 Run against prod via `kubectl -n aw-bots exec -it <postgres pod> -- psql -U postgres -d vexa`, as
-**standalone statements** (no `BEGIN` — `CONCURRENTLY` refuses transaction blocks).
+**standalone statements** (no `BEGIN` — `CONCURRENTLY` refuses transaction blocks). Start the
+session with `\set ON_ERROR_STOP on`, so a failed statement stops the pass instead of running the
+next one.
+
+**Lock timeout.** A statement that needs a lock `meetings` writers also need (`ACCESS EXCLUSIVE`,
+or `SHARE ROW EXCLUSIVE` for a new foreign key) waits behind any open transaction on `meetings`,
+and while it waits every later read and write on `meetings` queues behind it. So each such step
+below starts with `SET lock_timeout = '5s';`. If it fails with `canceling statement due to lock
+timeout`, nothing changed: find the long transaction (`SELECT pid, xact_start, state, query FROM
+pg_stat_activity WHERE xact_start < now() - interval '1 minute';`), let it finish, and re-run the
+same step. The `CONCURRENTLY` steps and `VALIDATE` take only `SHARE UPDATE EXCLUSIVE`, which
+queues no reader or writer; they run with `RESET lock_timeout;`, because a timeout part-way
+through a `CONCURRENTLY` build leaves an INVALID index to clean up.
 
 ### Step 1.1 — the six new tables
+
+Three of them reference `meetings` by foreign key, so each `CREATE TABLE` briefly takes
+`SHARE ROW EXCLUSIVE` on `meetings` (it blocks writes, not reads). Run
+`SET lock_timeout = '5s';` first. On a timeout, re-run from the table that failed; the ones before
+it already exist.
 
 SQL generated verbatim from the models (`CreateTable(...).compile(dialect=postgresql.dialect())`),
 pasted unedited — see `tests/test_intake_pg_schema.py::test_migration_new_table_sql_matches_models`
@@ -197,11 +214,30 @@ these are brand-new, empty tables, so an in-band `CREATE INDEX` takes no meaning
 
 ### Step 1.2 — `meetings.uuid`, nullable
 
+`ACCESS EXCLUSIVE`, metadata-only (a nullable column with no default rewrites nothing).
+
 ```sql
+SET lock_timeout = '5s';
 ALTER TABLE meetings ADD COLUMN uuid uuid;
 ```
 
-### Step 1.3 — backfill in batches of 1000
+### Step 1.3 — default new rows going forward
+
+Set **before** the backfill, so every row the running code inserts from here on gets its `uuid`
+at insert time and the backfill has a fixed set of rows to fill. `ACCESS EXCLUSIVE`,
+metadata-only (existing rows are not touched).
+
+```sql
+SET lock_timeout = '5s';
+ALTER TABLE meetings ALTER COLUMN uuid SET DEFAULT gen_random_uuid();
+```
+
+### Step 1.4 — backfill in batches of 1000
+
+Fills the rows that existed before step 1.3, plus any the running code inserted between steps 1.2
+and 1.3. Each batch takes row locks only. With `lock_timeout` still set, a batch that waits on a
+row a long transaction holds is cancelled; the batches already committed stay, and re-running the
+block continues from the rows still NULL.
 
 ```sql
 DO $$
@@ -223,10 +259,11 @@ END $$;
 (Run via `psql`'s own top-level `\i` or as a single non-interactive statement — the `COMMIT` inside
 the `DO` block requires a plain session, not an explicit surrounding transaction.)
 
-### Step 1.4 — default new rows going forward
+Then confirm nothing is left, before step 1.6:
 
 ```sql
-ALTER TABLE meetings ALTER COLUMN uuid SET DEFAULT gen_random_uuid();
+SELECT count(*) FROM meetings WHERE uuid IS NULL;
+-- expect 0; if not, re-run the DO block above.
 ```
 
 ### Step 1.5 — the unique index, without locking writes
@@ -234,18 +271,25 @@ ALTER TABLE meetings ALTER COLUMN uuid SET DEFAULT gen_random_uuid();
 The exact name SQLAlchemy generates for `Column(unique=True, index=True)` on `meetings.uuid`:
 
 ```sql
+RESET lock_timeout;
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ix_meetings_uuid ON meetings (uuid);
 ```
 
 ### Step 1.6 — `NOT NULL`, without a blocking full-table scan
 
 ```sql
+SET lock_timeout = '5s';
 ALTER TABLE meetings ADD CONSTRAINT ck_meetings_uuid_not_null CHECK (uuid IS NOT NULL) NOT VALID;
+RESET lock_timeout;
 ALTER TABLE meetings VALIDATE CONSTRAINT ck_meetings_uuid_not_null;
+SET lock_timeout = '5s';
 ALTER TABLE meetings ALTER COLUMN uuid SET NOT NULL;
 ALTER TABLE meetings DROP CONSTRAINT ck_meetings_uuid_not_null;
 ```
 
+`ADD CONSTRAINT … NOT VALID`, `SET NOT NULL` and `DROP CONSTRAINT` each take `ACCESS EXCLUSIVE`
+for a moment (hence the timeout); none scans the table. If `VALIDATE` fails, a row still has a
+NULL `uuid`: re-run step 1.4's block, then `VALIDATE` again.
 `VALIDATE CONSTRAINT` takes only a `SHARE UPDATE EXCLUSIVE` lock (reads/writes proceed); with a
 valid `CHECK (col IS NOT NULL)` already proven, `SET NOT NULL` (PG 12+) is a metadata-only change
 and does not re-scan the table. The helper CHECK is then redundant with the column's own `NOT NULL`
@@ -254,6 +298,7 @@ and is dropped.
 ### Step 1.7 — the live-link dedup index, without locking writes
 
 ```sql
+RESET lock_timeout;
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_meeting_live_user_platform_native
 ON meetings (user_id, platform, platform_specific_id)
 WHERE status IN ('requested', 'joining', 'awaiting_admission', 'needs_help', 'active', 'stopping');
@@ -322,8 +367,12 @@ multi-occurrence write path is only truly unblocked once it runs.
 Run only **after** step 2 (the new code + new index have been live and healthy for a while):
 
 ```sql
+RESET lock_timeout;
 DROP INDEX CONCURRENTLY IF EXISTS uq_meeting_active_user_platform_native;
 ```
+
+This step is one-way in practice: once intake has run, the old index can only be rebuilt after a
+data decision the operator makes (see "Rollback").
 
 ## Verify
 
@@ -338,17 +387,74 @@ WHERE indexrelid::regclass::text IN (
 
 ## Rollback
 
-**Before step 3:** free — the old index is still in place and enforcing the old (superset)
-invariant, so reverting the code deploy alone is sufficient. The new column/indexes/tables can be
-left in place (harmless, unused by the old code) or dropped:
+What can be undone depends on how far the rollout got. "Old code" is the admin-api and meeting-api
+from before this change; the old admin-api's model still declares
+`uq_meeting_active_user_platform_native`, so its boot `ensure_schema` builds that index if it is
+missing — as a plain, write-blocking `CREATE UNIQUE INDEX` — and refuses to boot
+(`SchemaInvariantError`) if the build fails.
+
+**After step 1, before step 2 (the new code has never run).** Free: nothing reads the new schema
+yet. Leave it in place (the old code ignores it), or drop the `meetings` additions:
 
 ```sql
+RESET lock_timeout;
 DROP INDEX CONCURRENTLY IF EXISTS ix_meeting_scheduled_due;
 DROP INDEX CONCURRENTLY IF EXISTS uq_meeting_live_user_platform_native;
 DROP INDEX CONCURRENTLY IF EXISTS ix_meetings_uuid;
+SET lock_timeout = '5s';
 ALTER TABLE meetings DROP COLUMN IF EXISTS uuid;
 ```
 
-**After step 3:** the old index is gone; recreate it (out-of-band, `CONCURRENTLY`, same predicate as
-MIGRATION-0002) before or as part of reverting the code deploy, so the ROB1/ROB2 backstop is never
-absent while the old code (which relies on it) is live.
+(`DROP COLUMN` takes `ACCESS EXCLUSIVE` for a moment and rewrites nothing.) The six new tables are
+still empty at this point and can stay.
+
+**After step 2, before step 3.** Revert the code deploy alone. The old index is still in place, so
+the new code could never have created a second non-finished row per link, and the old code boots
+against it unchanged. Leave the new schema in place: the old code inserts without `uuid` and gets
+the default. Do **not** drop `meetings.uuid` here — the new code has already sent those UUIDs out
+in intake responses and webhook payloads, and a later roll-forward would mint different ones for
+the same meetings.
+
+**After step 3.** The old index cannot simply be recreated. Once intake has run, one link
+legitimately holds many `scheduled` rows (14 days of a daily standup is 14 rows on one link), so
+`CREATE UNIQUE INDEX CONCURRENTLY` fails and leaves an INVALID index, and the old admin-api's own
+boot build fails the same way and refuses to start. The real options:
+
+1. **Roll forward (the default).** Keep the new schema and the live-only index, fix the defect in
+   the new code, and deploy the fixed services. This needs no data change.
+2. **Revert to the old code, only after an explicit data clean-up the operator decides.** First
+   measure whether the old index can be built at all (read-only; the old index's predicate, from
+   MIGRATION-0002):
+
+   ```sql
+   SELECT count(*) AS links_with_dups,
+          coalesce(sum(n - 1), 0) AS rows_over_one
+   FROM (
+     SELECT count(*) AS n
+     FROM meetings
+     WHERE status NOT IN ('completed', 'failed')
+       AND platform_specific_id IS NOT NULL
+     GROUP BY user_id, platform, platform_specific_id
+     HAVING count(*) > 1
+   ) AS dups;
+   ```
+
+   - **Both zero:** recreate the old index before reverting the code, so the ROB1/ROB2 backstop
+     is never absent while the old code runs, then check it is valid:
+
+     ```sql
+     RESET lock_timeout;
+     CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_meeting_active_user_platform_native
+     ON meetings (user_id, platform, platform_specific_id)
+     WHERE status NOT IN ('completed', 'failed');
+     SELECT indisvalid FROM pg_index
+     WHERE indexrelid::regclass::text = 'uq_meeting_active_user_platform_native';
+     -- expect true; if false: DROP INDEX CONCURRENTLY uq_meeting_active_user_platform_native;
+     ```
+
+   - **Not zero:** the old code cannot be restored as it is. Which of those rows to change, and
+     how, is the operator's decision and is not scripted here. Whatever is chosen changes what
+     intake's `meeting_entries` rows point at (`meeting_entries.meeting_id` is `ON DELETE
+     RESTRICT`, so those `meetings` rows cannot simply be deleted), and the old code does not read
+     `meeting_entries` at all. After the clean-up, re-run the count above; only when it returns
+     zero, build the index as in the previous bullet, then revert the code.
