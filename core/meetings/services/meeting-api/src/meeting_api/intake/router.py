@@ -13,9 +13,10 @@ The gateway checks the scope and sets ``x-user-id`` (the account). Every success
 ``intake.v1`` shape (``Reply``, ``EntryPage``, ``MeetingPage``, ``Meeting``, ``Erased``); every
 failure is the §2.5 body ``{"error": {"code", "message"}}``. The error handling is scoped to these
 routes by their route class, so a request that fails validation here is a 400 ``invalid_request``
-while the upstream routes keep FastAPI's 422. A database that can't be reached, or a write that
-lost a race on a unique key (the same entry arriving at once on two links), is a 503
-``unavailable``: the client retries.
+while the upstream routes keep FastAPI's 422. A database that can't be reached or timed out is a
+503 ``unavailable``: the client retries. A write that lost a race on a unique key (the same entry
+arriving at once on two links) is run again by the service (§6.9 F-D); one that keeps losing is a
+500 ``internal_error``.
 
 Visibility for ``user=``: a meeting is visible to a user when one of its entries, in any state,
 has that user as its ``user`` or among its ``attendees``. ``GET /v2/meetings/{id}`` without
@@ -115,7 +116,7 @@ def _validation_message(exc: RequestValidationError) -> str:
 
 
 def _retryable(exc: BaseException) -> bool:
-    """The database couldn't be reached, or a write lost a race on a unique key."""
+    """The database couldn't be reached or timed out."""
     if isinstance(exc, (OSError, TimeoutError)):
         return True
     try:
@@ -131,7 +132,6 @@ def _retryable(exc: BaseException) -> bool:
             sa_exc.InterfaceError,
             sa_exc.DisconnectionError,
             sa_exc.TimeoutError,
-            sa_exc.IntegrityError,
         ),
     )
 

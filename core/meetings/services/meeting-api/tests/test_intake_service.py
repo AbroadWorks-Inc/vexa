@@ -421,6 +421,7 @@ def test_settings_defaults(monkeypatch):
         "INTAKE_MAX_ACTIVE_ENTRIES",
         "BOT_SEND_MAX_ATTEMPTS",
         "BOT_SEND_RETRY_BACKOFF_S",
+        "INTAKE_CONFLICT_RETRIES",
     ):
         monkeypatch.delenv(key, raising=False)
     from meeting_api.bot_spawn.auto_join import DEFAULT_LEAD_S
@@ -433,6 +434,7 @@ def test_settings_defaults(monkeypatch):
         max_active_entries=100_000,
         send_max_attempts=3,
         send_retry_backoff_s=60,
+        conflict_retries=3,
     )
 
 
@@ -446,6 +448,7 @@ def test_settings_from_env(monkeypatch):
     monkeypatch.setenv("INTAKE_MAX_ACTIVE_ENTRIES", "5")
     monkeypatch.setenv("BOT_SEND_MAX_ATTEMPTS", "5")
     monkeypatch.setenv("BOT_SEND_RETRY_BACKOFF_S", "90")
+    monkeypatch.setenv("INTAKE_CONFLICT_RETRIES", "1")
     assert IntakeSettings.from_env() == IntakeSettings(
         max_days_ahead=14,
         join_now_adopt_ahead_s=900,
@@ -454,6 +457,7 @@ def test_settings_from_env(monkeypatch):
         max_active_entries=5,
         send_max_attempts=5,
         send_retry_backoff_s=90,
+        conflict_retries=1,
     )
 
 
@@ -770,3 +774,80 @@ async def test_a_blocked_host_with_a_trailing_dot_is_blocked():
             await h.put(meeting_url=url)
         assert err.value.code == "platform_not_enabled"
     assert h.store.meetings == {}
+
+
+# ── a constraint race is retried, then internal_error (§6.9 F-D) ────────────────────────────
+
+
+class _Racing:
+    """The in-memory store whose first ``lose`` link-locked transactions lose a constraint race at
+    their commit (``ConstraintRace``, rolled back); ``tries`` counts those transactions.
+    """
+
+    def __init__(self, store, lose: int) -> None:
+        self._store = store
+        self.lose = lose
+        self.tries = 0
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def room_lock(self, user_id, rooms):
+        from contextlib import asynccontextmanager
+
+        from meeting_api.intake.ports import ConstraintRace
+
+        store = self._store
+
+        @asynccontextmanager
+        async def lock():
+            async with store.room_lock(user_id, rooms) as tx:
+                yield tx
+                if rooms:
+                    self.tries += 1
+                    if self.tries <= self.lose:
+                        raise ConstraintRace("uq_meeting_entries_user_source_external")
+
+        return lock()
+
+
+def _racing_harness(lose: int, *, retries: int = 3):
+    from intake_builders import make_settings
+    from meeting_api.intake.service import IntakeService
+
+    h = make_harness()
+    racing = _Racing(h.store, lose)
+    naps: list[float] = []
+
+    async def nap(seconds: float) -> None:
+        naps.append(seconds)
+
+    h.service = IntakeService(
+        racing,
+        h.spawn,
+        h.stop,
+        h.publisher,
+        make_settings(conflict_retries=retries),
+        clock=h.clock,
+        sleep=nap,
+    )
+    return h, racing, naps
+
+
+async def test_a_constraint_race_resolves_on_a_retry():
+    h, racing, naps = _racing_harness(lose=2)
+    reply = await h.put()
+    assert reply["result"] == "created"
+    assert racing.tries == 3 and len(naps) == 2
+    assert all(0 < nap < 1 for nap in naps)
+    assert len(h.store.meetings) == 1  # the lost tries rolled back
+    assert h.events() == [(reply["meeting"]["id"], "meeting.scheduled")]
+
+
+async def test_a_constraint_that_always_fails_is_internal_error_after_the_retries():
+    h, racing, naps = _racing_harness(lose=100, retries=2)
+    with pytest.raises(IntakeError) as err:
+        await h.put()
+    assert (err.value.code, err.value.http_status) == ("internal_error", 500)
+    assert racing.tries == 3 and len(naps) == 2
+    assert h.store.meetings == {} and h.events() == []

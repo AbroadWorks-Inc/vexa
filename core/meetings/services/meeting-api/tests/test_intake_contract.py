@@ -99,6 +99,7 @@ def test_intake_golden_count_covers_every_reply_result_and_error_code():
         "rate_limited",
         "quota_exceeded",
         "unavailable",
+        "internal_error",
     ]
     for code in codes:
         assert f"Error.{code}.json" in names

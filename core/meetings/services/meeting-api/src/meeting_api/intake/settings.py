@@ -8,7 +8,8 @@ sweep's ``AUTO_JOIN_GRACE_S`` with the sweep's default: the link resolver ignore
 entry-less ``scheduled`` plan past its ``scheduled_at`` plus this grace, which the sweep will never
 send (§1.6, Ruling R22). ``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of
 an entry-managed meeting's bot (§6.9 F-K): that many failed sends in total, this many seconds
-apart, then the meeting ends ``not_sent``.
+apart, then the meeting ends ``not_sent``. ``INTAKE_CONFLICT_RETRIES`` is how many more times an
+entry write that lost a constraint race is run again (§6.9 F-D).
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ class IntakeSettings:
     max_active_entries: int
     send_max_attempts: int
     send_retry_backoff_s: int
+    conflict_retries: int
 
     @classmethod
     def from_env(cls) -> IntakeSettings:
@@ -69,4 +71,5 @@ class IntakeSettings:
             max_active_entries=int(os.getenv("INTAKE_MAX_ACTIVE_ENTRIES", "100000")),
             send_max_attempts=int(os.getenv("BOT_SEND_MAX_ATTEMPTS", "3")),
             send_retry_backoff_s=int(os.getenv("BOT_SEND_RETRY_BACKOFF_S", "60")),
+            conflict_retries=int(os.getenv("INTAKE_CONFLICT_RETRIES", "3")),
         )

@@ -9,7 +9,9 @@ requests needing the same links queue instead of deadlocking):
 
 the single-bigint form (``sweeps/single_flight.py`` explains why the two-int form is a trap). The
 lock is released when the transaction ends: it commits when the block exits normally and rolls back
-when the block raises, taking every row and outbox event written in it along.
+when the block raises, taking every row and outbox event written in it along. A unique or foreign
+key violation (``IntegrityError``, at a flush or the commit) comes out as ``ports.ConstraintRace``,
+naming the constraint only.
 
 Inside the transaction the lock order is the link lock, then the ``meetings`` row, then its
 ``meeting_aw_state`` row: every write to a meeting or its aw-state row locks them through
@@ -59,7 +61,7 @@ from typing import (
     Sequence,
 )
 
-from .ports import EntryView, MeetingView, Room
+from .ports import ConstraintRace, EntryView, MeetingView, Room
 from .projection import iso_utc
 from .resolver import LinkRow
 from .rules import FINISHED_STATUSES, Plan
@@ -175,6 +177,12 @@ async def link_rows(db: AsyncSession, user_id: int, room: Room) -> list[LinkRow]
     ]
 
 
+def _constraint(exc: Any) -> str:
+    """The name of the constraint a write violated, never the values it carried."""
+    cause = getattr(getattr(exc, "orig", None), "__cause__", None)
+    return str(getattr(cause, "constraint_name", None) or "a unique or foreign key")
+
+
 def _plan_data(plan: Plan) -> dict[str, Any]:
     """The plan's keys in ``meetings.data``: the join time auto-join reads, the title and link."""
     return {
@@ -196,13 +204,18 @@ class PostgresIntakeStore:
     async def room_lock(
         self, user_id: int, rooms: Sequence[Room]
     ) -> AsyncIterator[PostgresIntakeTx]:
+        from sqlalchemy.exc import IntegrityError
+
         ordered = tuple(rooms)
         if list(ordered) != sorted(set(ordered)):
             raise ValueError("link locks must be distinct and taken in sorted order")
-        async with self._session_factory() as db, db.begin():
-            for room in ordered:
-                await take_link_lock(db, user_id, room)
-            yield PostgresIntakeTx(db)
+        try:
+            async with self._session_factory() as db, db.begin():
+                for room in ordered:
+                    await take_link_lock(db, user_id, room)
+                yield PostgresIntakeTx(db)
+        except IntegrityError as exc:
+            raise ConstraintRace(_constraint(exc)) from exc
 
     async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
         async with self._reading() as tx:

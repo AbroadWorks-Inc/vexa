@@ -667,10 +667,11 @@ async def test_two_scheduled_and_one_live_row_share_a_link(make_pg):
         (await h.meeting_id(eleven), "scheduled"),
         (await h.meeting_id(one_pm["meeting"]["id"]), "scheduled"),
     ]
-    from sqlalchemy.exc import IntegrityError
+    from meeting_api.intake.ports import ConstraintRace
 
-    # only the live row is unique per link: a second bot on the link is refused by the index
-    with pytest.raises(IntegrityError, match="uq_meeting_live_user_platform_native"):
+    # only the live row is unique per link: a second bot on the link is refused by the index,
+    # which the store names (and only names)
+    with pytest.raises(ConstraintRace, match="^uq_meeting_live_user_platform_native$"):
         await h.set_status(eleven, "requested")
     assert (await link_rows(h.engine, GROOM))[1] == (
         await h.meeting_id(eleven),

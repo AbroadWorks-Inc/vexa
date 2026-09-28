@@ -6,7 +6,10 @@ after a link change while live), plus the new link on an update, all sorted, thr
 transaction ends without writing and the service starts again once with those links added. A
 remove doesn't know the links before reading, so it first reads without a link lock.
 Events are published after the transaction commits (a failed publish is logged: the outbox holds
-them). A stop (R5) is recorded inside the transaction (``stop.record_stop``); the leave command
+them). A transaction that loses a race on a database constraint (``ConstraintRace``: another write
+stored the same key first) is rolled back and run again, up to ``INTAKE_CONFLICT_RETRIES`` more
+times after a short random pause; if it still loses, the request fails with ``internal_error``
+(500), logged with its stack (§6.9 F-D). A stop (R5) is recorded inside the transaction (``stop.record_stop``); the leave command
 and spawns run after the commit, each through its own port.
 
 ``PUT`` (§1.3 steps 1–9):
@@ -57,6 +60,9 @@ meeting's time, link, title or entries change, ``meeting.removed`` (R8, R2), and
 
 from __future__ import annotations
 
+import asyncio
+import random
+import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
@@ -65,6 +71,7 @@ from urllib.parse import urlparse
 from ..collector.meeting_link import parse_meeting_url
 from ..obs import log_event
 from .ports import (
+    ConstraintRace,
     EntryView,
     EventPublisher,
     IntakeStore,
@@ -107,6 +114,10 @@ _REMOVE_RESULT = {
     "finished": "entry_removed",
 }
 
+
+#: The pause before running a write that lost a constraint race again, in seconds: a random point
+#: in this range, times the try's number, so two racers don't meet again (§6.9 F-D).
+_CONFLICT_DELAY_S = (0.01, 0.05)
 
 #: Errors that mean a bug, not an outage: a failed leave command is logged, these are raised.
 _PROGRAMMING_ERRORS = (TypeError, AttributeError, KeyError, AssertionError, NameError)
@@ -183,6 +194,7 @@ class IntakeService:
         settings: IntakeSettings,
         *,
         clock: Callable[[], datetime] = _utcnow,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._store = store
         self._spawn = spawn
@@ -190,6 +202,7 @@ class IntakeService:
         self._publisher = publisher
         self._settings = settings
         self._clock = clock
+        self._sleep = sleep
 
     # ── routes ──────────────────────────────────────────────────────────────────────────────
 
@@ -279,6 +292,54 @@ class IntakeService:
         *,
         restarts: int,
     ) -> Optional[_Done]:
+        retries = self._settings.conflict_retries
+        for attempt in range(retries + 1):
+            try:
+                work, done = await self._transact(
+                    user_id, base, read, body, restarts=restarts
+                )
+                break
+            except ConstraintRace as exc:
+                if attempt == retries:
+                    log_event(
+                        "intake_conflict_unresolved",
+                        audience="operator",
+                        level="error",
+                        span="meetings.intake",
+                        user_id=user_id,
+                        fields={
+                            "constraint": str(exc),
+                            "tries": attempt + 1,
+                            "traceback": "".join(
+                                traceback.format_exception(
+                                    type(exc), exc, exc.__traceback__
+                                )
+                            ),
+                        },
+                    )
+                    raise IntakeError(
+                        "internal_error",
+                        "the write kept conflicting with another; it was not stored",
+                    ) from exc
+                await self._sleep(random.uniform(*_CONFLICT_DELAY_S) * (attempt + 1))
+        await self._publish(work.events)
+        for stop in work.stops:
+            await self._leave(user_id, stop)
+        if work.stops and done is not None:
+            done = replace(done, meeting=await self._read(user_id, done.meeting.id))
+        return done
+
+    async def _transact(
+        self,
+        user_id: int,
+        base: frozenset[Room],
+        read: Callable[[IntakeTx], Awaitable[Optional[EntryView]]],
+        body: Callable[[_Work, Optional[EntryView]], Awaitable[Optional[_Done]]],
+        *,
+        restarts: int,
+    ) -> tuple[_Work, Optional[_Done]]:
+        """One run of the write: its transaction under the links it needs (restarted with the
+        entry's links added when they weren't covered), committed."""
         rooms = base
         for _ in range(restarts + 1):
             async with self._store.room_lock(user_id, sorted(rooms)) as tx:
@@ -291,18 +352,11 @@ class IntakeService:
                         continue
                 work = _Work(tx)
                 done = await body(work, existing)
-                break
-        else:
-            raise IntakeError(
-                "unavailable",
-                "the entry's meeting link changed during the request; retry",
-            )
-        await self._publish(work.events)
-        for stop in work.stops:
-            await self._leave(user_id, stop)
-        if work.stops and done is not None:
-            done = replace(done, meeting=await self._read(user_id, done.meeting.id))
-        return done
+            return work, done
+        raise IntakeError(
+            "unavailable",
+            "the entry's meeting link changed during the request; retry",
+        )
 
     async def _leave(self, user_id: int, stop: RecordedStop) -> None:
         """§1.7 steps 5–6 for a stop this request recorded and committed. A failure is logged and

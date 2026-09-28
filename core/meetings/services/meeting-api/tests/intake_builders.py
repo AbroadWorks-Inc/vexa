@@ -181,6 +181,7 @@ def make_settings(
     blocked_hosts: frozenset[str] = frozenset({"meet.abroadworks.com"}),
     send_max_attempts: int = 3,
     send_retry_backoff_s: int = 60,
+    conflict_retries: int = 3,
 ) -> IntakeSettings:
     return IntakeSettings(
         max_days_ahead=30,
@@ -190,6 +191,7 @@ def make_settings(
         max_active_entries=max_active_entries,
         send_max_attempts=send_max_attempts,
         send_retry_backoff_s=send_retry_backoff_s,
+        conflict_retries=conflict_retries,
     )
 
 

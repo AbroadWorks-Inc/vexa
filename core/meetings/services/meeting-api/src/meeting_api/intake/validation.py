@@ -140,6 +140,7 @@ class IntakeError(Exception):
         "rate_limited": 429,
         "quota_exceeded": 429,
         "unavailable": 503,
+        "internal_error": 500,
     }
 
     def __init__(

@@ -545,6 +545,28 @@ async def test_storage_down_is_503_unavailable():
         _error(response, 503, "unavailable")
 
 
+async def test_a_constraint_that_keeps_failing_is_500_internal_error_never_503():
+    """§6.9 F-D: the service retried the race; what is left is a bug to look at, counted as
+    ``internal_error``."""
+    from meeting_api.intake.ports import ConstraintRace
+    from meeting_api.metrics import registry
+
+    h = make_harness()
+
+    def lose(store: Any, rooms: Any) -> None:
+        if rooms:
+            raise ConstraintRace("uq_meeting_entries_user_source_external")
+
+    label = {"route": "PUT /v2/entries", "result": "internal_error", "user_id": "1"}
+    before = registry().get_sample_value("aw_intake_requests_total", label) or 0.0
+    client, _ = _client(h)
+    async with client:
+        h.store.on_lock = lose
+        put = await client.put("/v2/entries", json=entry_body(), headers=ACCOUNT)
+    _error(put, 500, "internal_error")
+    assert registry().get_sample_value("aw_intake_requests_total", label) == before + 1
+
+
 async def test_a_programming_error_is_not_dressed_up_as_unavailable():
     class _Broken(InMemoryIntakeReads):
         async def meeting_by_uuid(self, user_id: int, uuid: str):
@@ -624,20 +646,24 @@ async def pg_routes(intake_pg_engine, monkeypatch):
 
 
 @needs_pg
-async def test_pg_the_same_entry_on_two_links_at_once_is_503_then_retry_works(
+async def test_pg_the_same_entry_on_two_links_at_once_resolves_on_a_retry(
     pg_routes, monkeypatch
 ):
-    """A7's carry: two PUTs of one entry with different links take different link locks, both find
-    no entry and both insert it; the loser's unique violation is a retryable 503, never a 500, and
-    it rolls back everything it wrote."""
+    """Two PUTs of one entry with different links take different link locks, both find no entry
+    and both insert it; the loser's unique violation rolls its transaction back and the service
+    runs it again (§6.9 F-D), which finds the winner's entry: both answer 200, one meeting.
+    """
     from meeting_api.intake.adapters import PostgresIntakeTx
 
     service, reads, stop, engine = pg_routes
     barrier = asyncio.Barrier(2)
     original = PostgresIntakeTx.save_entry
+    calls = {"n": 0}
 
     async def save_entry(self, *args: Any, **kwargs: Any):
-        await barrier.wait()
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            await barrier.wait()
         return await original(self, *args, **kwargs)
 
     monkeypatch.setattr(PostgresIntakeTx, "save_entry", save_entry)
@@ -650,32 +676,40 @@ async def test_pg_the_same_entry_on_two_links_at_once_is_503_then_retry_works(
                 headers=ACCOUNT,
             ),
         )
-        monkeypatch.setattr(PostgresIntakeTx, "save_entry", original)
-        codes = sorted(r.status_code for r in results)
-        assert codes == [200, 503], [r.text for r in results]
-        loser = next(r for r in results if r.status_code == 503)
-        _error(loser, 503, "unavailable")
-        winner = next(r for r in results if r.status_code == 200).json()
+    assert [r.status_code for r in results] == [200, 200], [r.text for r in results]
+    assert sorted(r.json()["result"] for r in results) == ["created", "updated"]
+    assert calls["n"] == 3  # two first tries, one retry
 
-        from sqlalchemy import text
+    from sqlalchemy import text
 
-        async with engine.connect() as conn:
-            meetings = (
-                await conn.execute(text("SELECT count(*) FROM meetings"))
-            ).scalar()
-            outbox = (
-                await conn.execute(text("SELECT count(*) FROM webhook_outbox"))
-            ).scalar()
-        assert (meetings, outbox) == (1, 1)
+    async with engine.connect() as conn:
+        meetings = (await conn.execute(text("SELECT count(*) FROM meetings"))).scalar()
+        entries = (
+            await conn.execute(text("SELECT count(*) FROM meeting_entries"))
+        ).scalar()
+    assert (meetings, entries) == (1, 1)
 
-        retry_body = (
-            entry_body("race")
-            if winner["meeting"]["room"] != "kxo-misr-avz"
-            else entry_body("race", meeting_url=GMEET_OTHER)
-        )
-        retry = await client.put("/v2/entries", json=retry_body, headers=ACCOUNT)
-    assert retry.status_code == 200
-    assert retry.json()["result"] == "updated"
+
+@needs_pg
+async def test_pg_a_constraint_that_always_fails_is_500_after_the_retries(
+    pg_routes, monkeypatch
+):
+    from sqlalchemy.exc import IntegrityError
+
+    from meeting_api.intake.adapters import PostgresIntakeTx
+
+    service, reads, stop, engine = pg_routes
+    calls = {"n": 0}
+
+    async def save_entry(self, *args: Any, **kwargs: Any):
+        calls["n"] += 1
+        raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+
+    monkeypatch.setattr(PostgresIntakeTx, "save_entry", save_entry)
+    async with http(intake_app(service, reads, stop)) as client:
+        put = await client.put("/v2/entries", json=entry_body("race"), headers=ACCOUNT)
+    _error(put, 500, "internal_error")
+    assert calls["n"] == 4  # the try and INTAKE_CONFLICT_RETRIES (3) more
 
 
 @needs_pg

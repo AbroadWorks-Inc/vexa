@@ -679,6 +679,13 @@
    "targets": ["helm"]
   },
   {
+   "key": "INTAKE_CONFLICT_RETRIES",
+   "class": "defaulted",
+   "default": "3",
+   "description": "intake (§6.9 F-D): how many more times an entry write that lost a race on a database constraint is run again, after a short random pause; one that still loses answers 500 internal_error",
+   "targets": []
+  },
+  {
    "key": "CALENDAR_SYNC_INTERVAL_S",
    "class": "defaulted",
    "default": "300",

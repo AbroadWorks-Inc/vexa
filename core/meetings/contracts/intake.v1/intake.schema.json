@@ -252,7 +252,7 @@
                 "invalid_request", "unrecognized_link", "platform_not_enabled", "too_far_ahead",
                 "already_ended", "unauthorized", "forbidden", "entry_not_found",
                 "meeting_not_found", "meeting_not_finished", "no_live_bot", "rate_limited",
-                "quota_exceeded", "unavailable"
+                "quota_exceeded", "unavailable", "internal_error"
               ]
             },
             "message": { "type": "string" }
