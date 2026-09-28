@@ -52,15 +52,21 @@ _BLOCKED_IPV4_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),     # loopback
     ipaddress.ip_network("169.254.0.0/16"),  # link-local (incl. cloud metadata 169.254.169.254)
     ipaddress.ip_network("172.16.0.0/12"),   # private
+    ipaddress.ip_network("192.0.0.0/24"),    # IETF protocol assignments
     ipaddress.ip_network("192.168.0.0/16"),  # private
     ipaddress.ip_network("198.18.0.0/15"),   # benchmarking
     ipaddress.ip_network("224.0.0.0/4"),     # multicast
+    ipaddress.ip_network("240.0.0.0/4"),     # reserved (incl. broadcast 255.255.255.255)
 ]
 
 _BLOCKED_IPV6_NETWORKS = [
     ipaddress.ip_network("::/96"),           # unspecified (::) and IPv4-compatible (::a.b.c.d)
     ipaddress.ip_network("::1/128"),         # loopback
+    ipaddress.ip_network("::ffff:0:0:0/96"), # SIIT IPv4-translated (::ffff:0:a.b.c.d)
     ipaddress.ip_network("64:ff9b::/96"),    # NAT64 (64:ff9b::a.b.c.d)
+    ipaddress.ip_network("64:ff9b:1::/48"),  # local-use NAT64
+    ipaddress.ip_network("2001::/32"),       # Teredo
+    ipaddress.ip_network("2002::/16"),       # 6to4
     ipaddress.ip_network("fc00::/7"),        # unique local
     ipaddress.ip_network("fe80::/10"),       # link-local
     ipaddress.ip_network("ff00::/8"),        # multicast

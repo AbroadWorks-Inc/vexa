@@ -11,8 +11,8 @@ private-host allow-list; the two services share no code, so both test suites rea
   accepted as is, without resolving it;
 - the internal hostnames below are refused;
 - a literal address is refused when it is private, loopback, link-local, multicast, "this
-  network", unspecified, shared address space (CGNAT), benchmarking, NAT64 or IPv4-compatible
-  (``_BLOCKED_NETWORKS``); an IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) is judged as the IPv4
+  network", unspecified, shared address space (CGNAT), benchmarking, IETF protocol assignments,
+  reserved, NAT64, SIIT, Teredo, 6to4 or IPv4-compatible (``_BLOCKED_NETWORKS``); an IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) is judged as the IPv4
   address it maps;
 - a DNS name is resolved, and refused when it resolves to nothing or when ANY of its addresses
   is refused.
@@ -55,12 +55,18 @@ _BLOCKED_NETWORKS = [
         "127.0.0.0/8",  # loopback
         "169.254.0.0/16",  # link-local, cloud metadata
         "172.16.0.0/12",  # private
+        "192.0.0.0/24",  # IETF protocol assignments
         "192.168.0.0/16",  # private
         "198.18.0.0/15",  # benchmarking
         "224.0.0.0/4",  # multicast
+        "240.0.0.0/4",  # reserved (incl. broadcast 255.255.255.255)
         "::/96",  # unspecified (::) and IPv4-compatible (::a.b.c.d)
         "::1/128",  # loopback
+        "::ffff:0:0:0/96",  # SIIT IPv4-translated (::ffff:0:a.b.c.d)
         "64:ff9b::/96",  # NAT64 (64:ff9b::a.b.c.d)
+        "64:ff9b:1::/48",  # local-use NAT64
+        "2001::/32",  # Teredo
+        "2002::/16",  # 6to4
         "fc00::/7",  # unique local
         "fe80::/10",  # link-local
         "ff00::/8",  # multicast
