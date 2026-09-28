@@ -65,12 +65,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
-            # The identity secret is in either Secret; the webhook key ring only in an existing one.
-            - name: GATEWAY_IDENTITY_SECRET
+            # The gateway identity key ring is in either Secret; the webhook key ring only in an
+            # existing one.
+            - name: GATEWAY_IDENTITY_KEYS
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: GATEWAY_IDENTITY_SECRET
+                  key: GATEWAY_IDENTITY_KEYS
                   optional: true
             - name: WEBHOOK_SECRET_ENC_KEYS
               valueFrom:

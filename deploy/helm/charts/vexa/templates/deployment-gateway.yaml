@@ -61,13 +61,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
-            # Signs x-user-id for meeting-api and admin-api. Not optional: the gateway refuses to start
-            # without it.
-            - name: GATEWAY_IDENTITY_SECRET
+            # The key ring the gateway signs x-user-id with for meeting-api and admin-api, and the
+            # kid it signs with (§1.10). Not optional: the gateway refuses to start without them.
+            - name: GATEWAY_IDENTITY_KEYS
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: GATEWAY_IDENTITY_SECRET
+                  key: GATEWAY_IDENTITY_KEYS
+            - name: GATEWAY_IDENTITY_ACTIVE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_ACTIVE_KEY
             - name: INTAKE_RATE_LIMIT_PER_MIN
               value: {{ .Values.gateway.intakeRateLimitPerMin | default 600 | quote }}
             - name: LOG_LEVEL

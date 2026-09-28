@@ -445,10 +445,10 @@ class RaisingDownstream(CountingDownstream):
         raise self._exc
 
 
-def test_identity_secret_unset_is_503_unavailable_on_v2_and_detail_elsewhere(
+def test_identity_ring_unset_is_503_unavailable_on_v2_and_detail_elsewhere(
     monkeypatch,
 ):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET", raising=False)
+    monkeypatch.delenv("GATEWAY_IDENTITY_KEYS", raising=False)
     client, downstream = _gateway(None)
 
     r = client.get("/v2/meetings", headers=AUTH)
@@ -456,13 +456,13 @@ def test_identity_secret_unset_is_503_unavailable_on_v2_and_detail_elsewhere(
     assert r.json() == {
         "error": {
             "code": "unavailable",
-            "message": "GATEWAY_IDENTITY_SECRET is not configured",
+            "message": "GATEWAY_IDENTITY_KEYS is not configured",
         }
     }
 
     r = client.get("/meetings", headers=AUTH)
     assert r.status_code == 503
-    assert r.json() == {"detail": "GATEWAY_IDENTITY_SECRET is not configured"}
+    assert r.json() == {"detail": "GATEWAY_IDENTITY_KEYS is not configured"}
     assert downstream.calls == 0
 
 

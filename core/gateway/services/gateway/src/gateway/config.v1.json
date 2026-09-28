@@ -24,10 +24,10 @@
    ]
   },
   {
-   "key": "GATEWAY_IDENTITY_SECRET",
+   "key": "GATEWAY_IDENTITY_KEYS",
    "class": "required-explicit",
    "secret": true,
-   "description": "§1.10, §6.9 F-E: the key of the x-gateway-signature (v2: over the method, path, raw query and the SHA-256 of the exact body forwarded; core/gateway/contracts/gateway-identity) the gateway puts on every request it forwards with x-user-id (identity_signature.py). The gateway signs with this key only; during a rotation meeting-api and admin-api also accept their GATEWAY_IDENTITY_SECRET_PREVIOUS. meeting-api and admin-api hold the same value and believe x-user-id only with a fresh signature, so without it every client route downstream answers 401: the boot refuses, and a gateway built without preflight refuses to forward (503).",
+   "description": "§1.10, §6.9 F-E: the key ring the gateway signs x-user-id with, in the webhook secret encryption ring's format: JSON {\"<kid>\": \"<exactly 32 bytes, base64>\"}, a kid being 1-64 of A-Z a-z 0-9 . _ - (identity_signature.py). Every request forwarded with x-user-id carries x-gateway-signature: kid=<kid>,t=<unix>,v2=<hex HMAC-SHA256> over the kid, t, user, scopes and limits headers, method, body SHA-256, raw query and path (core/gateway/contracts/gateway-identity). meeting-api and admin-api hold the same ring. Unset, the boot refuses; set but malformed (bad JSON, a key that isn't 32 bytes, a bad kid), the boot refuses too, naming the fault and never a key; a gateway built without preflight refuses to forward (503).",
    "forbidden_values": [
     "vexa-internal-secret",
     "lite-internal-secret",
@@ -38,6 +38,12 @@
     "secret",
     "<REPLACE_ME>"
    ],
+   "targets": ["compose", "helm", "lite"]
+  },
+  {
+   "key": "GATEWAY_IDENTITY_ACTIVE_KEY",
+   "class": "required-explicit",
+   "description": "§1.10, §6.9 F-E: the kid in GATEWAY_IDENTITY_KEYS the gateway signs with, named in every signature. It must be in the ring, or the boot refuses. Rotation: add the new key to the ring on all three services and roll; switch this to its kid and roll the gateway; later drop the old key from every ring and roll.",
    "targets": ["compose", "helm", "lite"]
   },
   {

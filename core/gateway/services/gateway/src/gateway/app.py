@@ -42,7 +42,7 @@ from . import routes_manifest
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 
-from .identity_signature import SIGNATURE_HEADER, identity_secret, sign_now
+from .identity_signature import SIGNATURE_HEADER, KeyRingError, sign_now, signing_key
 from .intake_limit import IntakeLimiter, IntakeUnavailable
 from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event, set_user_id
 from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
@@ -483,26 +483,28 @@ def create_app(
                 headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
         headers[TRACE_HEADER] = get_trace_id() or ""
         # §1.10: meeting-api and admin-api believe x-user-id only with a fresh signature, which
-        # _sign adds once the exact query and body to forward are known. Without the secret there
-        # is no identity to vouch for.
-        secret = identity_secret()
-        if not secret:
+        # _sign adds once the exact query and body to forward are known. Without a usable key ring
+        # there is no identity to vouch for; the fault names a setting, never a key.
+        try:
+            signing_key()
+        except KeyRingError as e:
             log_event(
                 "identity_signing_unconfigured",
                 audience="system",
                 level="error",
                 span="auth",
                 user_id=user_id,
-                fields={"method": method, "path": request.url.path},
+                fields={"method": method, "path": request.url.path, "fault": str(e)},
             )
-            return None, _refusal(request.url.path, 503, "GATEWAY_IDENTITY_SECRET is not configured")
+            return None, _refusal(request.url.path, 503, str(e))
         return headers, None
 
-    # §1.10, §6.9 F-E: the signature covers the forwarded x-user-id, x-user-scopes and
+    # §1.10, §6.9 F-E: signed with the ring's active key, named by kid, over the forwarded
+    # x-user-id, x-user-scopes and
     # x-user-limits, the method, the path and query of the URL httpx sends, and the SHA-256 of the
     # exact body bytes forwarded.
     def _sign(headers: dict, method: str, url: str, params: Optional[dict], content: bytes) -> None:
-        headers[SIGNATURE_HEADER] = sign_now(identity_secret(), headers, method, url, params, content)
+        headers[SIGNATURE_HEADER] = sign_now(signing_key(), headers, method, url, params, content)
 
     # --- the REST proxy: faithful carve of main.forward_request for client (non-admin) routes.
     async def _forward(method: str, url: str, request: Request, *, api_key: Optional[str] = None) -> Response:

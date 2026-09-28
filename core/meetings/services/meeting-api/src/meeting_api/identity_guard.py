@@ -1,26 +1,29 @@
 """Only the gateway can say who is calling (design §1.10).
 
 Client routes take the caller from ``x-user-id``. The gateway sets that header after it has
-checked the caller's key, and signs it with ``GATEWAY_IDENTITY_SECRET`` (§6.9 F-E)::
+checked the caller's key, and signs it with the active key of the ``GATEWAY_IDENTITY_KEYS`` ring,
+naming that key's id (§6.9 F-E)::
 
-    x-gateway-signature: t=<unix seconds>,v2=<hex HMAC-SHA256(secret, message)>
-    message = "v2\n<t>\n<user_id>\n<scopes>\n<limits>\n<METHOD>\n<body_sha256>\n<query>\n<path>"
+    x-gateway-signature: kid=<key id>,t=<unix seconds>,v2=<hex HMAC-SHA256(key, message)>
+    message = "v2\n<kid>\n<t>\n<user_id>\n<scopes>\n<limits>\n<METHOD>\n<body_sha256>\n<query>\n<path>"
 
 ``IdentityGuard`` answers 401 before any client route runs unless the request carries exactly one
 ``x-user-id``, at most one ``x-user-scopes`` and one ``x-user-limits``, and exactly one signature
 that
 
-- parses as ``t=<digits>,v2=<64 lower-case hex digits>``,
+- parses as ``kid=<1-64 of A-Z a-z 0-9 . _ ->,t=<digits>,v2=<64 lower-case hex digits>``,
+- names a ``kid`` in this service's ring,
 - was made at most ``MAX_SKEW_S`` seconds before or after this service's clock, and
-- matches, in constant time, the HMAC over that ``t``, that ``x-user-id``, the ``x-user-scopes``
-  and ``x-user-limits`` values (empty when absent), the request's method,
-  the SHA-256 of its body, its raw query (``scope["query_string"]``) and its path
-  (``scope["path"]``: percent-decoded), under ``GATEWAY_IDENTITY_SECRET`` or, while it is set,
-  ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` (the key being rotated out).
+- matches, in constant time, the HMAC under that kid's key over the kid, that ``t``, that
+  ``x-user-id``, the ``x-user-scopes`` and ``x-user-limits`` values (empty when absent), the
+  request's method, the SHA-256 of its body, its raw query (``scope["query_string"]``) and its
+  path (``scope["path"]``: percent-decoded).
 
-The guard reads the whole body to hash it, only once the header has parsed and is fresh, and hands
-the route the same bytes. Without ``GATEWAY_IDENTITY_SECRET`` every client request is refused,
-whatever the previous key.
+The ring is ``GATEWAY_IDENTITY_KEYS``, in the webhook secret encryption ring's format: a JSON object
+``{"<kid>": "<exactly 32 bytes, standard base64>"}``. The HMAC key is a kid's 32 raw bytes. Unset or
+malformed, every client request is refused, and the rejection log says why (naming the setting,
+never a key). The guard reads the whole body to hash it, only once the header has parsed, names a
+known kid and is fresh, and hands the route the same bytes.
 
 Routes that don't take a caller from the gateway are exempt, and they are listed here, not inferred:
 
@@ -35,13 +38,16 @@ gateway's tests and admin-api's tests read too.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import functools
 import hashlib
 import hmac
 import json
 import os
 import re
 import time
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from .obs import log_event
 
@@ -50,13 +56,16 @@ USER_HEADER = "x-user-id"
 SCOPES_HEADER = "x-user-scopes"
 LIMITS_HEADER = "x-user-limits"
 MAX_SKEW_S = 60
+KEYS_ENV = "GATEWAY_IDENTITY_KEYS"
+KEY_BYTES = 32
+KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 EXEMPT_PATHS = frozenset(
     {"/bots/internal/callback/lifecycle", "/runtime/callback", "/metrics"}
 )
 EXEMPT_PREFIXES = ("/internal/", "/health")
 
-_SIGNATURE = re.compile(r"t=([0-9]{1,12}),v2=([0-9a-f]{64})")
+_SIGNATURE = re.compile(r"kid=([A-Za-z0-9._-]{1,64}),t=([0-9]{1,12}),v2=([0-9a-f]{64})")
 
 
 def is_exempt(path: str) -> bool:
@@ -64,38 +73,72 @@ def is_exempt(path: str) -> bool:
     return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
 
 
-def identity_secrets() -> tuple[str, ...]:
-    """The keys a signature may be made with: ``GATEWAY_IDENTITY_SECRET``, then
-    ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` when it is set. Empty when the current key isn't set.
-    """
-    current = (os.getenv("GATEWAY_IDENTITY_SECRET") or "").strip()
-    previous = (os.getenv("GATEWAY_IDENTITY_SECRET_PREVIOUS") or "").strip()
-    if not current:
-        return ()
-    return (current, previous) if previous else (current,)
+class KeyRingError(ValueError):
+    """The identity key ring is unusable. The message names the fault, never a key."""
+
+
+def parse_ring(keys_json: str) -> dict[str, bytes]:
+    """The ring in ``keys_json``: kid → 32 raw key bytes."""
+    try:
+        raw = json.loads(keys_json)
+    except ValueError as exc:
+        raise KeyRingError(f"{KEYS_ENV} is not valid JSON") from exc
+    if not isinstance(raw, dict) or not raw:
+        raise KeyRingError(f"{KEYS_ENV} must be a non-empty JSON object of id -> key")
+    ring: dict[str, bytes] = {}
+    for kid, encoded in raw.items():
+        if not KID.fullmatch(kid):
+            raise KeyRingError(
+                f"{KEYS_ENV}: a key id must be 1-64 characters of A-Z a-z 0-9 . _ -"
+            )
+        if not isinstance(encoded, str):
+            raise KeyRingError(f"{KEYS_ENV}: key {kid!r} is not a base64 string")
+        try:
+            key = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise KeyRingError(f"{KEYS_ENV}: key {kid!r} is not valid base64") from exc
+        if len(key) != KEY_BYTES:
+            raise KeyRingError(
+                f"{KEYS_ENV}: key {kid!r} must be exactly {KEY_BYTES} bytes"
+            )
+        ring[kid] = key
+    return ring
+
+
+@functools.lru_cache(maxsize=4)
+def _ring(keys_json: str) -> Mapping[str, bytes]:
+    return parse_ring(keys_json)
+
+
+def identity_ring() -> Mapping[str, bytes]:
+    """The ring from ``GATEWAY_IDENTITY_KEYS``: empty when unset, ``KeyRingError`` when wrong."""
+    keys_json = (os.getenv(KEYS_ENV) or "").strip()
+    return _ring(keys_json) if keys_json else {}
 
 
 def precheck(
-    secrets: Sequence[str],
+    ring: Mapping[str, bytes],
     user_id: Optional[str],
     header: Optional[str],
     now: float,
 ) -> Optional[str]:
     """Why ``header`` can't vouch for anything, found without the body; ``None`` if it may."""
-    if not secrets or not secrets[0]:
+    if not ring:
         return "unconfigured"
     if not header or user_id is None:
         return "missing"
     match = _SIGNATURE.fullmatch(header)
     if match is None:
         return "malformed"
-    if abs(now - int(match.group(1))) > MAX_SKEW_S:
+    if match.group(1) not in ring:
+        return "unknown_key"
+    if abs(now - int(match.group(2))) > MAX_SKEW_S:
         return "expired"
     return None
 
 
 def verify_signature(
-    secrets: Sequence[str],
+    ring: Mapping[str, bytes],
     user_id: Optional[str],
     scopes: str,
     limits: str,
@@ -107,15 +150,17 @@ def verify_signature(
     now: float,
 ) -> Optional[str]:
     """``None`` when ``header`` vouches for ``user_id`` on this request, else why it doesn't."""
-    reason = precheck(secrets, user_id, header, now)
+    reason = precheck(ring, user_id, header, now)
     if reason is not None:
         return reason
     match = _SIGNATURE.fullmatch(header or "")
     if match is None or user_id is None:
         return "malformed"
+    kid = match.group(1)
     fields = [
         "v2",
-        match.group(1),
+        kid,
+        match.group(2),
         user_id,
         scopes,
         limits,
@@ -125,15 +170,8 @@ def verify_signature(
         path,
     ]
     message = "\n".join(fields).encode("utf-8")
-    matched = [
-        hmac.compare_digest(
-            match.group(2),
-            hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest(),
-        )
-        for secret in secrets
-        if secret
-    ]
-    return None if any(matched) else "mismatch"
+    expected = hmac.new(ring[kid], message, hashlib.sha256).hexdigest()
+    return None if hmac.compare_digest(match.group(3), expected) else "mismatch"
 
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
@@ -203,13 +241,17 @@ class IdentityGuard:
             return
         headers = scope.get("headers") or []
         path = scope["path"]
-        secrets = identity_secrets()
+        fault = None
+        try:
+            ring = identity_ring()
+        except KeyRingError as e:
+            ring, fault = {}, str(e)
         user_id = _single(headers, USER_HEADER.encode())
         scopes = _at_most_one(headers, SCOPES_HEADER.encode())
         limits = _at_most_one(headers, LIMITS_HEADER.encode())
         header = _single(headers, SIGNATURE_HEADER.encode())
         now = self.clock()
-        reason = precheck(secrets, user_id, header, now)
+        reason = "ring_invalid" if fault else precheck(ring, user_id, header, now)
         if reason is None and (scopes is None or limits is None):
             reason = "duplicated"
         if reason is None and scopes is not None and limits is not None:
@@ -217,7 +259,7 @@ class IdentityGuard:
             if body is None:
                 return
             reason = verify_signature(
-                secrets,
+                ring,
                 user_id,
                 scopes,
                 limits,
@@ -236,7 +278,12 @@ class IdentityGuard:
             audience="system",
             level="warning",
             span="identity",
-            fields={"reason": reason, "method": scope["method"], "path": path},
+            fields={
+                "reason": reason,
+                "method": scope["method"],
+                "path": path,
+                **({"fault": fault} if fault else {}),
+            },
         )
         body = _unauthorized(path)
         await send(

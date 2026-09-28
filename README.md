@@ -102,8 +102,10 @@ they are sealed as `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
 ### Keys and signed identity
 
 - **Every client goes through the gateway.** The gateway checks the key's scope, sets `x-user-id`
-  and signs it with `GATEWAY_IDENTITY_SECRET`. meeting-api and admin-api refuse a client request
-  whose signature is missing, wrong or older than 60 s, so a direct call with `x-user-id` gets 401.
+  and signs it with the active key of the `GATEWAY_IDENTITY_KEYS` ring, naming it (`kid`), over the
+  user, the scope and limit headers, the method, path, query and body. meeting-api and admin-api
+  refuse a client request whose signature is missing, wrong, under a kid not in their ring or older
+  than 60 s, so a direct call with `x-user-id` gets 401.
   Only the bots, the runtime and service-to-service calls reach meeting-api directly: bot status
   callbacks carry the internal secret, each bot's runtime callback URL carries its own token, and
   the `/internal/*` routes between admin-api and meeting-api check the internal secret.
@@ -280,7 +282,7 @@ Every setting lives in configuration, not code:
 | Exporter buckets | `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX` | `aw-bots`, `aw-chatworks-transcribe`, `recordings/` |
 | How long exported files are kept | the exporter tags each object `retention-class`; the bucket's lifecycle rules act on the tag | `master.webm` = `recording-mp4` (30 days), `audio.wav` = `audio` (7 days), JSON = `metadata` (365 days) |
 | Exporter ↔ AW Bots | `GATEWAY_URL` + `EXPORTER_API_KEY` (the `exporter` key, scopes `tx` + `export`); `VEXA_WEBHOOK_SECRET` (same value as `VEXA_SYSTEM_WEBHOOK_SECRET`) | the gateway's in-cluster URL; key from Secret `aw-bots-key-exporter` |
-| Signed identity | `GATEWAY_IDENTITY_SECRET` on the gateway, meeting-api and admin-api (one value) | **required**: without it the gateway refuses to start and meeting-api and admin-api refuse every client request |
+| Signed identity | `GATEWAY_IDENTITY_KEYS` (a key ring in the webhook ring's format) on the gateway, meeting-api and admin-api (one value); `GATEWAY_IDENTITY_ACTIVE_KEY` (the kid it signs with) on the gateway | **required**: without them the gateway refuses to start and meeting-api and admin-api refuse every client request. Rotation: add the new key to the ring on all three and roll; switch the active kid on the gateway and roll; later drop the old key and roll |
 | Webhook secret encryption | `WEBHOOK_SECRET_ENC_KEYS` (a key ring) and `WEBHOOK_SECRET_ENC_ACTIVE_KEY`, on meeting-api and admin-api, read only from an existing Secret | required for webhook subscriptions; unset, subscriptions are off and the services log why |
 | Intake | `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES` (meeting-api); `INTAKE_RATE_LIMIT_PER_MIN` (gateway) | 30 days, 3600 s, `meet.abroadworks.com` until the Jitsi cutover, 100 000, 600 |
 | Webhooks | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (meeting-api, admin-api); `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS` (admin-api) | `portal.notetaker.svc.cluster.local`, 20, 30 days |
@@ -289,8 +291,8 @@ The full list of exporter settings is in
 [`integrations/out/aw-notetaker/README.md`](integrations/out/aw-notetaker/README.md). Secret values
 live only in Kubernetes Secrets, never in this repo. On EKS the three new secret names go into
 `aw-bots-secrets` **before** the `helm upgrade` that brings the new services. Docker Compose, Lite and
-a chart-managed Secret (`secrets.gatewayIdentitySecret`) supply `GATEWAY_IDENTITY_SECRET` too; they
-don't need the webhook key ring.
+a chart-managed Secret (`secrets.gatewayIdentityKeys`, `secrets.gatewayIdentityActiveKey`) supply
+`GATEWAY_IDENTITY_KEYS` and `GATEWAY_IDENTITY_ACTIVE_KEY` too; they don't need the webhook key ring.
 
 ---
 

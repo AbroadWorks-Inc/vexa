@@ -1,15 +1,17 @@
 """The gateway signs the identity it forwards (design §1.10, §6.9 F-E).
 
 Every forwarded request that carries ``x-user-id`` also carries ``x-gateway-signature`` (version
-``v2``), made with ``GATEWAY_IDENTITY_SECRET`` over the forwarded user, ``x-user-scopes`` and
-``x-user-limits`` values, method, path, raw query string and the SHA-256 of the exact body bytes
-forwarded. A signature a client sends is never forwarded.
-Without the secret the gateway refuses to start (preflight) and refuses to forward. The signing
-rule is pinned by the shared vectors meeting-api and admin-api verify with.
+``v2``), made with the active key of the ``GATEWAY_IDENTITY_KEYS`` ring and naming it (``kid``),
+over the forwarded user, ``x-user-scopes`` and ``x-user-limits`` values, method, path, raw query
+string and the SHA-256 of the exact body bytes forwarded. A signature a client sends is never
+forwarded. Without a usable ring the gateway refuses to start (preflight and the ring check) and
+refuses to forward. The signing rule is pinned by the shared vectors meeting-api and admin-api
+verify with.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -24,12 +26,23 @@ from fastapi.testclient import TestClient
 from gateway import config_preflight as cp
 from gateway import create_app
 from gateway.adapters import AdminApiAuthorizer
-from gateway.identity_signature import SIGNATURE_HEADER, sign, signed_target
+from gateway.identity_signature import (
+    SIGNATURE_HEADER,
+    KeyRingError,
+    SigningKey,
+    parse_ring,
+    sign,
+    signed_target,
+    signing_key,
+)
 
 from conftest import VALID_KEY, VALID_USER, FakeAuthorizer, FakeDownstream, FakeRedis
 
 AUTH = {"x-api-key": VALID_KEY}
-SECRET = "test-gateway-identity-secret-unit"
+#: The suite's ring (``conftest.py``): one test-only key.
+KID = "gw-unit"
+KEY = b"test-gateway-identity-unit-key-1"
+RING = json.dumps({KID: base64.b64encode(KEY).decode()})
 #: The x-user-scopes and x-user-limits the gateway forwards for ``VALID_USER``.
 SCOPES = ",".join(VALID_USER["scopes"])
 LIMITS = str(VALID_USER["max_concurrent"])
@@ -48,7 +61,7 @@ VECTORS = _vectors()
 
 def _verify(
     header: str,
-    secret: str,
+    key: bytes,
     user_id: str,
     method: str,
     path: str,
@@ -57,13 +70,16 @@ def _verify(
     *,
     scopes: str = SCOPES,
     limits: str = LIMITS,
+    kid: str = KID,
 ) -> int:
     """Check ``header`` the way the receiving services do; returns its ``t``."""
-    t_part, mac_part = header.split(",")
+    kid_part, t_part, mac_part = header.split(",")
+    assert kid_part == f"kid={kid}"
     assert t_part.startswith("t=") and mac_part.startswith("v2=")
     t = int(t_part[2:])
     fields = [
         "v2",
+        kid,
         str(t),
         user_id,
         scopes,
@@ -74,7 +90,7 @@ def _verify(
         path,
     ]
     message = "\n".join(fields).encode()
-    expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    expected = hmac.new(key, message, hashlib.sha256).hexdigest()
     assert hmac.compare_digest(mac_part[3:], expected)
     return t
 
@@ -94,7 +110,7 @@ def _verify_as_sent(last: dict[str, Any], user_id: str = "7") -> int:
     sent = _as_sent(last)
     return _verify(
         last["headers"][SIGNATURE_HEADER],
-        SECRET,
+        KEY,
         user_id,
         sent.method,
         sent.url.path,
@@ -107,7 +123,8 @@ def _verify_as_sent(last: dict[str, Any], user_id: str = "7") -> int:
 
 @pytest.fixture()
 def signing(monkeypatch):
-    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET", SECRET)
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", RING)
+    monkeypatch.setenv("GATEWAY_IDENTITY_ACTIVE_KEY", KID)
 
 
 def _client(downstream: Optional[FakeDownstream] = None, **kwargs: Any):
@@ -132,6 +149,7 @@ def test_signer_reproduces_the_shared_vectors(vector):
     assert vector["message"] == "\n".join(
         [
             "v2",
+            vector["kid"],
             str(vector["t"]),
             vector["user_id"],
             vector["scopes"],
@@ -142,8 +160,9 @@ def test_signer_reproduces_the_shared_vectors(vector):
             vector["path"],
         ]
     )
+    key = SigningKey(vector["kid"], base64.b64decode(VECTORS["keys"][vector["kid"]]))
     got = sign(
-        VECTORS["secret"],
+        key,
         vector["user_id"],
         vector["scopes"],
         vector["limits"],
@@ -162,12 +181,69 @@ def test_the_vectors_cover_query_body_and_rotation():
     assert any(v["body"] for v in vectors) and any(not v["body"] for v in vectors)
     for field in ("scopes", "limits"):
         assert any(v[field] for v in vectors) and any(not v[field] for v in vectors)
+    assert {v["kid"] for v in vectors} == set(VECTORS["keys"])
+    assert VECTORS["active_key"] in VECTORS["keys"]
     cases = VECTORS["verify_cases"]
-    assert any(c["previous_secret"] and c["valid"] for c in cases)
-    assert any(
-        c["previous_secret"] is None and "previous" in c["case"] and not c["valid"]
-        for c in cases
+    older = [k for k in VECTORS["keys"] if k != VECTORS["active_key"]]
+    assert any(c["valid"] and f"kid={older[0]}," in c["header"] for c in cases)
+    assert any("not in the ring" in c["case"] and not c["valid"] for c in cases)
+    assert any("dropped from the ring" in c["case"] and not c["valid"] for c in cases)
+
+
+@pytest.mark.parametrize("case", VECTORS["ring_cases"], ids=lambda c: c["case"])
+def test_the_ring_parser_agrees_with_the_shared_cases(case):
+    if case["valid"]:
+        ring = parse_ring(case["keys"])
+        assert ring and all(len(key) == 32 for key in ring.values())
+        return
+    with pytest.raises(KeyRingError) as ei:
+        parse_ring(case["keys"])
+    assert "GATEWAY_IDENTITY_KEYS" in str(ei.value)
+    assert _key_texts(case["keys"]).isdisjoint(str(ei.value).split())
+
+
+def _key_texts(keys: str) -> set[str]:
+    """The key strings in a ring's text, to check an error never shows one."""
+    try:
+        raw = json.loads(keys)
+    except ValueError:
+        return {keys}
+    if not isinstance(raw, dict):
+        return set()
+    return {v for v in raw.values() if isinstance(v, str) and v}
+
+
+@pytest.mark.parametrize(
+    "env,named",
+    [
+        ({}, "GATEWAY_IDENTITY_KEYS"),
+        ({"GATEWAY_IDENTITY_KEYS": RING}, "GATEWAY_IDENTITY_ACTIVE_KEY"),
+        ({"GATEWAY_IDENTITY_ACTIVE_KEY": KID}, "GATEWAY_IDENTITY_KEYS"),
+        (
+            {"GATEWAY_IDENTITY_KEYS": RING, "GATEWAY_IDENTITY_ACTIVE_KEY": "gw-other"},
+            "GATEWAY_IDENTITY_ACTIVE_KEY",
+        ),
+        (
+            {"GATEWAY_IDENTITY_KEYS": "not json", "GATEWAY_IDENTITY_ACTIVE_KEY": KID},
+            "GATEWAY_IDENTITY_KEYS",
+        ),
+    ],
+    ids=["unset", "no-active", "no-ring", "active-not-in-ring", "malformed"],
+)
+def test_an_unusable_ring_gives_no_signing_key(env, named):
+    with pytest.raises(KeyRingError) as ei:
+        signing_key(env)
+    assert named in str(ei.value)
+    assert base64.b64encode(KEY).decode() not in str(ei.value)
+
+
+def test_the_signing_key_is_the_active_one_and_never_shown():
+    key = signing_key(
+        {"GATEWAY_IDENTITY_KEYS": RING, "GATEWAY_IDENTITY_ACTIVE_KEY": KID}
     )
+    assert (key.kid, key.key) == (KID, KEY)
+    assert KEY.decode() not in repr(key)
+    assert base64.b64encode(KEY).decode() not in repr(key)
 
 
 @pytest.mark.parametrize(
@@ -204,9 +280,7 @@ def test_a_forwarded_request_is_signed_over_its_path_and_empty_body(signing):
     assert downstream.last["headers"]["x-user-id"] == str(VALID_USER["user_id"])
     t = _verify_as_sent(downstream.last)
     assert before <= t <= int(time.time())
-    _verify(
-        downstream.last["headers"][SIGNATURE_HEADER], SECRET, "7", "GET", "/meetings"
-    )
+    _verify(downstream.last["headers"][SIGNATURE_HEADER], KEY, "7", "GET", "/meetings")
 
 
 def test_the_query_signed_is_the_query_forwarded(signing):
@@ -216,7 +290,7 @@ def test_the_query_signed_is_the_query_forwarded(signing):
     _verify_as_sent(downstream.last)
     _verify(
         downstream.last["headers"][SIGNATURE_HEADER],
-        SECRET,
+        KEY,
         "7",
         "GET",
         "/meetings",
@@ -235,7 +309,7 @@ def test_the_body_signed_is_the_body_forwarded(signing):
     _verify_as_sent(downstream.last)
     _verify(
         downstream.last["headers"][SIGNATURE_HEADER],
-        SECRET,
+        KEY,
         "7",
         "POST",
         "/bots",
@@ -253,18 +327,18 @@ def test_the_scopes_and_limits_signed_are_those_forwarded(signing):
     headers = downstream.last["headers"]
     assert headers["x-user-scopes"] == SCOPES
     assert headers["x-user-limits"] == LIMITS
-    _verify(headers[SIGNATURE_HEADER], SECRET, "7", "GET", "/meetings")
+    _verify(headers[SIGNATURE_HEADER], KEY, "7", "GET", "/meetings")
     with pytest.raises(AssertionError):
         _verify(
             headers[SIGNATURE_HEADER],
-            SECRET,
+            KEY,
             "7",
             "GET",
             "/meetings",
             scopes="bot,tx,export",
         )
     with pytest.raises(AssertionError):
-        _verify(headers[SIGNATURE_HEADER], SECRET, "7", "GET", "/meetings", limits="45")
+        _verify(headers[SIGNATURE_HEADER], KEY, "7", "GET", "/meetings", limits="45")
 
 
 def test_a_forward_to_admin_api_is_signed_over_the_admin_api_path(signing):
@@ -273,7 +347,7 @@ def test_a_forward_to_admin_api_is_signed_over_the_admin_api_path(signing):
     assert downstream.last["url"].endswith("/user/webhook")
     _verify(
         downstream.last["headers"][SIGNATURE_HEADER],
-        SECRET,
+        KEY,
         "7",
         "GET",
         "/user/webhook",
@@ -312,7 +386,9 @@ def test_the_streamed_leg_is_signed_over_its_query(signing):
 
 def test_a_client_supplied_signature_is_never_forwarded(signing):
     client, downstream = _client()
-    forged = sign(SECRET, "1", "", "", "GET", "/meetings", "", b"", int(time.time()))
+    forged = sign(
+        SigningKey(KID, KEY), "1", "", "", "GET", "/meetings", "", b"", int(time.time())
+    )
     r = client.get(
         "/meetings", headers={**AUTH, SIGNATURE_HEADER: forged, "x-user-id": "1"}
     )
@@ -323,39 +399,95 @@ def test_a_client_supplied_signature_is_never_forwarded(signing):
     _verify_as_sent(downstream.last)
 
 
-def test_the_gateway_signs_with_the_current_key_only(signing, monkeypatch):
-    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", "test-previous-key")
+def test_the_gateway_signs_with_the_active_key_of_the_ring(signing, monkeypatch):
+    new_key = b"test-gateway-identity-unit-key-2"
+    ring = {
+        KID: base64.b64encode(KEY).decode(),
+        "gw-unit-2": base64.b64encode(new_key).decode(),
+    }
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", json.dumps(ring))
+    monkeypatch.setenv("GATEWAY_IDENTITY_ACTIVE_KEY", "gw-unit-2")
     client, downstream = _client()
     assert client.get("/meetings", headers=AUTH).status_code == 200
-    _verify_as_sent(downstream.last)
+    _verify(
+        downstream.last["headers"][SIGNATURE_HEADER],
+        new_key,
+        "7",
+        "GET",
+        "/meetings",
+        kid="gw-unit-2",
+    )
 
 
-def test_without_the_secret_the_gateway_refuses_to_forward(monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET", raising=False)
+@pytest.mark.parametrize(
+    "keys,active",
+    [(None, KID), (RING, None), ("not json", KID), (RING, "gw-other")],
+    ids=["no-ring", "no-active", "malformed", "active-not-in-ring"],
+)
+def test_without_a_usable_ring_the_gateway_refuses_to_forward(
+    monkeypatch, keys, active
+):
+    for name, value in (
+        ("GATEWAY_IDENTITY_KEYS", keys),
+        ("GATEWAY_IDENTITY_ACTIVE_KEY", active),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
     client, downstream = _client()
     r = client.get("/meetings", headers=AUTH)
     assert r.status_code == 503
-    assert "GATEWAY_IDENTITY_SECRET" in r.json()["detail"]
+    assert "GATEWAY_IDENTITY_" in r.json()["detail"]
+    assert base64.b64encode(KEY).decode() not in r.text
     assert downstream.last is None
 
 
-def test_preflight_refuses_boot_without_the_identity_secret():
+@pytest.mark.parametrize(
+    "missing", ["GATEWAY_IDENTITY_KEYS", "GATEWAY_IDENTITY_ACTIVE_KEY"]
+)
+def test_preflight_refuses_boot_without_the_ring(missing):
+    env = {
+        "INTERNAL_API_SECRET": "a-real-secret",
+        "GATEWAY_IDENTITY_KEYS": RING,
+        "GATEWAY_IDENTITY_ACTIVE_KEY": KID,
+    }
+    del env[missing]
     with pytest.raises(cp.ConfigError) as ei:
-        cp.preflight({"INTERNAL_API_SECRET": "a-real-secret"})
-    assert "GATEWAY_IDENTITY_SECRET" in str(ei.value)
+        cp.preflight(env)
+    assert missing in str(ei.value)
 
 
 @pytest.mark.parametrize("placeholder", ["<REPLACE_ME>", "changeme"])
-def test_preflight_refuses_a_placeholder_identity_secret(placeholder):
+def test_preflight_refuses_a_placeholder_ring(placeholder):
     with pytest.raises(cp.ConfigError) as ei:
         cp.preflight(
             {
                 "INTERNAL_API_SECRET": "a-real-secret",
-                "GATEWAY_IDENTITY_SECRET": placeholder,
+                "GATEWAY_IDENTITY_KEYS": placeholder,
+                "GATEWAY_IDENTITY_ACTIVE_KEY": KID,
             }
         )
-    assert "GATEWAY_IDENTITY_SECRET" in str(ei.value)
+    assert "GATEWAY_IDENTITY_KEYS" in str(ei.value)
     assert placeholder not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "keys,active",
+    [("not json", KID), (RING, "gw-other")],
+    ids=["malformed", "active-not-in-ring"],
+)
+def test_the_production_app_refuses_to_start_with_an_unusable_ring(
+    monkeypatch, keys, active
+):
+    from gateway import adapters
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", "a-real-secret")
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", keys)
+    monkeypatch.setenv("GATEWAY_IDENTITY_ACTIVE_KEY", active)
+    with pytest.raises(KeyRingError) as ei:
+        adapters.build_production_app()
+    assert "GATEWAY_IDENTITY_" in str(ei.value)
 
 
 class _RecordingClient:
@@ -398,7 +530,7 @@ async def test_the_ws_subscribe_hop_is_signed_over_the_body_it_posts(signing):
     assert hop["headers"]["content-type"] == "application/json"
     _verify(
         hop["headers"][SIGNATURE_HEADER],
-        SECRET,
+        KEY,
         "7",
         "POST",
         "/ws/authorize-subscribe",
@@ -410,8 +542,8 @@ async def test_the_ws_subscribe_hop_is_signed_over_the_body_it_posts(signing):
     assert hop["headers"]["x-user-limits"] == "3"
 
 
-async def test_the_ws_subscribe_hop_is_not_made_without_the_secret(monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET", raising=False)
+async def test_the_ws_subscribe_hop_is_not_made_without_the_ring(monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_KEYS", raising=False)
     client = _RecordingClient()
     authorizer = AdminApiAuthorizer(
         client, "http://admin-api:8001", "http://meeting-api:8080"
@@ -420,5 +552,5 @@ async def test_the_ws_subscribe_hop_is_not_made_without_the_secret(monkeypatch):
         VALID_KEY, [{"platform": "zoom", "native_meeting_id": "1"}]
     )
     assert result["authorized"] == []
-    assert "GATEWAY_IDENTITY_SECRET" in result["errors"][0]
+    assert "GATEWAY_IDENTITY_KEYS" in result["errors"][0]
     assert all(not p["url"].endswith("/ws/authorize-subscribe") for p in client.posts)

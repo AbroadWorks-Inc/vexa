@@ -2,20 +2,26 @@
   "description": "Test vectors for the gateway identity signature, version v2 (design §1.10, §6.9 F-E). The gateway signs every request it forwards with x-user-id; meeting-api and admin-api verify. The secrets here are test-only literals, never deployed.",
   "header": "x-gateway-signature",
   "version": "v2",
-  "format": "t=<unix seconds, digits only>,v2=<64 lower-case hex digits>",
-  "message": "v2\\n<t>\\n<user_id>\\n<scopes>\\n<limits>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>",
-  "message_rule": "the nine fields joined by a line feed (\\n), in this order. Only the last field, path, can contain a line feed, so the join is unambiguous.",
-  "algorithm": "HMAC-SHA256 over the UTF-8 message, key = GATEWAY_IDENTITY_SECRET (UTF-8)",
+  "format": "kid=<key id>,t=<unix seconds, digits only>,v2=<64 lower-case hex digits>",
+  "message": "v2\\n<kid>\\n<t>\\n<user_id>\\n<scopes>\\n<limits>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>",
+  "message_rule": "the ten fields joined by a line feed (\\n), in this order. Only the last field, path, can contain a line feed, so the join is unambiguous.",
+  "algorithm": "HMAC-SHA256 over the UTF-8 message; the key is the 32 raw bytes the kid names in the ring (the base64 decoded, not its text)",
+  "ring_rule": "GATEWAY_IDENTITY_KEYS is the same format as the webhook secret encryption ring: a non-empty JSON object {\"<kid>\": \"<exactly 32 bytes, standard base64>\"}. A kid is 1-64 characters of A-Z a-z 0-9 . _ - (it travels in the header). GATEWAY_IDENTITY_ACTIVE_KEY (gateway only) names the kid the gateway signs with; it must be in the ring.",
   "path_rule": "the request path as the receiving service routes it: percent-decoded, no query string, no scheme or host (ASGI scope['path']). The gateway takes httpx.URL(<forwarded url>).path.",
   "query_rule": "the raw query string exactly as forwarded, without the leading '?', or empty when there is none (ASGI scope['query_string'], ASCII). The gateway takes the query of the URL httpx sends: httpx.URL(<downstream url>).copy_merge_params(<forwarded params>).query. Not parsed, not re-ordered, not re-encoded.",
   "body_rule": "body_sha256 is the lower-case hex SHA-256 of the exact request body bytes: the bytes the gateway forwards, and the bytes the verifier receives before any handler reads them. An empty body hashes the empty string (e3b0c442...b855). In these vectors body is given as a UTF-8 string.",
   "user_id_rule": "the exact x-user-id header value; a request must carry exactly one x-user-id and exactly one x-gateway-signature",
   "scopes_limits_rule": "scopes and limits are the exact x-user-scopes and x-user-limits header values as forwarded; an absent header is an empty field. A request that carries either header more than once is refused.",
-  "rotation_rule": "the gateway signs with GATEWAY_IDENTITY_SECRET only. A verifier accepts a signature that matches under GATEWAY_IDENTITY_SECRET or, when it is set, GATEWAY_IDENTITY_SECRET_PREVIOUS. Without GATEWAY_IDENTITY_SECRET a verifier accepts nothing, whatever the previous key.",
+  "rotation_rule": "the gateway signs with the active key and names it in kid. A verifier looks the kid up in its own ring and checks the signature with that key only; a kid not in its ring is refused. Without a usable ring a verifier accepts nothing.",
   "max_skew_s": 60,
-  "secret": "test-gateway-identity-secret-0001",
+  "keys": {
+    "gw-2026-09": "dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUE=",
+    "gw-2026-03": "dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUI="
+  },
+  "active_key": "gw-2026-09",
   "vectors": [
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "7",
       "scopes": "",
@@ -25,10 +31,11 @@
       "query": "",
       "body": "",
       "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "v2\n1790000000\n7\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
-      "header": "t=1790000000,v2=0fdde8dfbda3847a0f250795defe3d352a6dd25e5737d59186d81ed00689e565"
+      "message": "v2\ngw-2026-09\n1790000000\n7\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "kid=gw-2026-09,t=1790000000,v2=255ace0fb5bd33a1a9e866f0e758bc38403c985be6d2b7ba5f914b2ec6b2cc3c"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "7",
       "scopes": "bot,tx",
@@ -38,10 +45,11 @@
       "query": "",
       "body": "",
       "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "v2\n1790000000\n7\nbot,tx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284"
+      "message": "v2\ngw-2026-09\n1790000000\n7\nbot,tx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "7",
       "scopes": "bot,tx",
@@ -51,10 +59,11 @@
       "query": "limit=5&offset=10",
       "body": "",
       "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "v2\n1790000000\n7\nbot,tx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nlimit=5&offset=10\n/meetings",
-      "header": "t=1790000000,v2=981ba255355f49bb53d49edf2c774d1b7f3f1d5bcc5a71ac6d1123937330cffe"
+      "message": "v2\ngw-2026-09\n1790000000\n7\nbot,tx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nlimit=5&offset=10\n/meetings",
+      "header": "kid=gw-2026-09,t=1790000000,v2=75953e9370d79b140d96ff4ffe2f90473bca974f4ee2824fa736595b8cf8cabd"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "7",
       "scopes": "bot",
@@ -64,10 +73,11 @@
       "query": "",
       "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
       "body_sha256": "42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4",
-      "message": "v2\n1790000000\n7\nbot\n3\nPOST\n42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4\n\n/bots",
-      "header": "t=1790000000,v2=df598f4a744e2429099e527f28b0558c57a47a9d38882ae75b77e97631b82e82"
+      "message": "v2\ngw-2026-09\n1790000000\n7\nbot\n3\nPOST\n42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4\n\n/bots",
+      "header": "kid=gw-2026-09,t=1790000000,v2=10db72c64033d21c92969ccbcd2e0e4a04b4a46941f9f5ed4b8ebbdccd22a9c7"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "42",
       "scopes": "bot",
@@ -77,10 +87,11 @@
       "query": "",
       "body": "{\"entries\":[{\"source\":\"calendar\",\"meeting_url\":\"https://meet.google.com/abc-defg-hij\"}]}",
       "body_sha256": "2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6",
-      "message": "v2\n1790000000\n42\nbot\n\nPUT\n2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6\n\n/v2/entries",
-      "header": "t=1790000000,v2=8d8968969e339b37a265de675c87c7aef8b0e0c114263557bd750024b4da969f"
+      "message": "v2\ngw-2026-09\n1790000000\n42\nbot\n\nPUT\n2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6\n\n/v2/entries",
+      "header": "kid=gw-2026-09,t=1790000000,v2=6a60faaa6372512916584fe1580fa9d03056246b2a0578d5b758a4f3f8aeaf07"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "42",
       "scopes": "",
@@ -90,10 +101,11 @@
       "query": "",
       "body": "",
       "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "v2\n1790000000\n42\n\n5\nDELETE\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings/google_meet/abc-defg-hij",
-      "header": "t=1790000000,v2=e154a4bb60b5576f41b508d2a2d0c075aa4695f76b58357cd92a1483af0018ed"
+      "message": "v2\ngw-2026-09\n1790000000\n42\n\n5\nDELETE\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings/google_meet/abc-defg-hij",
+      "header": "kid=gw-2026-09,t=1790000000,v2=87e738984e511f46e0e47963be52a501773e82a2d5a5a88beaf7ff042c8c65cb"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "1",
       "scopes": "tx,export",
@@ -103,10 +115,11 @@
       "query": "",
       "body": "",
       "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "v2\n1790000000\n1\ntx,export\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/transcripts/zoom/85012345678",
-      "header": "t=1790000000,v2=b6815c2519dafbef3a59cb63c8825b200afbf5eac983ee5e82dee67130df541e"
+      "message": "v2\ngw-2026-09\n1790000000\n1\ntx,export\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/transcripts/zoom/85012345678",
+      "header": "kid=gw-2026-09,t=1790000000,v2=54f225e40bd030bf5efbeaccd77746894d545498fdf905e4f498cc1f7bc5efa1"
     },
     {
+      "kid": "gw-2026-09",
       "t": 1790000000,
       "user_id": "7",
       "scopes": "tx",
@@ -116,8 +129,22 @@
       "query": "type=audio&x=%2F",
       "body": "",
       "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "v2\n1790000000\n7\ntx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ntype=audio&x=%2F\n/meetings/teams/room one",
-      "header": "t=1790000000,v2=31b9ccdb552123733bb6bffb7154e8cdfb657e4ed48eb59e3729ad380f683b8e"
+      "message": "v2\ngw-2026-09\n1790000000\n7\ntx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ntype=audio&x=%2F\n/meetings/teams/room one",
+      "header": "kid=gw-2026-09,t=1790000000,v2=80330e8af4b5a846d1df0c729ab7a43f8b1781b656c52a71e9c6196855c05155"
+    },
+    {
+      "kid": "gw-2026-03",
+      "t": 1790000000,
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-03\n1790000000\n7\nbot,tx\n3\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "kid=gw-2026-03,t=1790000000,v2=2927eccb03a635b1fb3b6d9cc87d7e64f1068aa5b4596a2e8959255ad7c31544"
     }
   ],
   "verify_cases": [
@@ -131,8 +158,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": true
     },
     {
@@ -145,8 +175,11 @@
       "query": "",
       "body": "",
       "now": 1790000060,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": true
     },
     {
@@ -159,8 +192,11 @@
       "query": "",
       "body": "",
       "now": 1790000061,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -173,8 +209,11 @@
       "query": "",
       "body": "",
       "now": 1789999940,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": true
     },
     {
@@ -187,8 +226,11 @@
       "query": "",
       "body": "",
       "now": 1789999939,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -201,8 +243,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -215,8 +260,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -229,8 +277,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -243,8 +294,11 @@
       "query": "limit=5&offset=10",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=981ba255355f49bb53d49edf2c774d1b7f3f1d5bcc5a71ac6d1123937330cffe",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=75953e9370d79b140d96ff4ffe2f90473bca974f4ee2824fa736595b8cf8cabd",
       "valid": true
     },
     {
@@ -257,8 +311,11 @@
       "query": "limit=6&offset=10",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=981ba255355f49bb53d49edf2c774d1b7f3f1d5bcc5a71ac6d1123937330cffe",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=75953e9370d79b140d96ff4ffe2f90473bca974f4ee2824fa736595b8cf8cabd",
       "valid": false
     },
     {
@@ -271,8 +328,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=981ba255355f49bb53d49edf2c774d1b7f3f1d5bcc5a71ac6d1123937330cffe",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=75953e9370d79b140d96ff4ffe2f90473bca974f4ee2824fa736595b8cf8cabd",
       "valid": false
     },
     {
@@ -285,8 +345,11 @@
       "query": "limit=5",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -299,8 +362,11 @@
       "query": "offset=10&limit=5",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=981ba255355f49bb53d49edf2c774d1b7f3f1d5bcc5a71ac6d1123937330cffe",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=75953e9370d79b140d96ff4ffe2f90473bca974f4ee2824fa736595b8cf8cabd",
       "valid": false
     },
     {
@@ -313,8 +379,11 @@
       "query": "",
       "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=61a0dc2db650f6b5a76757a761c071fe74d9c22af66c43a7bb83593672d8069d",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=96d708da5decb8183ba36c6427abc03c2ef7627269e67ff63cd1efcf2cc2899d",
       "valid": true
     },
     {
@@ -327,8 +396,11 @@
       "query": "",
       "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hik\"}",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=61a0dc2db650f6b5a76757a761c071fe74d9c22af66c43a7bb83593672d8069d",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=96d708da5decb8183ba36c6427abc03c2ef7627269e67ff63cd1efcf2cc2899d",
       "valid": false
     },
     {
@@ -341,8 +413,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=61a0dc2db650f6b5a76757a761c071fe74d9c22af66c43a7bb83593672d8069d",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=96d708da5decb8183ba36c6427abc03c2ef7627269e67ff63cd1efcf2cc2899d",
       "valid": false
     },
     {
@@ -355,8 +430,11 @@
       "query": "",
       "body": "{}",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -369,8 +447,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -383,8 +464,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -397,8 +481,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -411,8 +498,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -425,8 +515,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -439,8 +532,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=0fdde8dfbda3847a0f250795defe3d352a6dd25e5737d59186d81ed00689e565",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=255ace0fb5bd33a1a9e866f0e758bc38403c985be6d2b7ba5f914b2ec6b2cc3c",
       "valid": true
     },
     {
@@ -453,12 +549,15 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=0fdde8dfbda3847a0f250795defe3d352a6dd25e5737d59186d81ed00689e565",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=255ace0fb5bd33a1a9e866f0e758bc38403c985be6d2b7ba5f914b2ec6b2cc3c",
       "valid": false
     },
     {
-      "case": "under another secret",
+      "case": "under the active key, older key also in the ring",
       "user_id": "7",
       "scopes": "bot,tx",
       "limits": "3",
@@ -467,26 +566,15 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=52bd1d31c53b50aee86b5759b6e0f0c03107717bae0202086b761a2f4d6f91c9",
-      "valid": false
-    },
-    {
-      "case": "under the previous secret, previous configured",
-      "user_id": "7",
-      "scopes": "bot,tx",
-      "limits": "3",
-      "method": "GET",
-      "path": "/meetings",
-      "query": "",
-      "body": "",
-      "now": 1790000000,
-      "previous_secret": "test-gateway-identity-secret-0000",
-      "header": "t=1790000000,v2=b2e71f54235cdc40c7df6ba53447372de60a077543f81ae35f7d120dfce75f8c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": true
     },
     {
-      "case": "under the previous secret, previous not configured",
+      "case": "under the active key, only key in the ring",
       "user_id": "7",
       "scopes": "bot,tx",
       "limits": "3",
@@ -495,26 +583,14 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=b2e71f54235cdc40c7df6ba53447372de60a077543f81ae35f7d120dfce75f8c",
-      "valid": false
-    },
-    {
-      "case": "under the current secret, previous configured",
-      "user_id": "7",
-      "scopes": "bot,tx",
-      "limits": "3",
-      "method": "GET",
-      "path": "/meetings",
-      "query": "",
-      "body": "",
-      "now": 1790000000,
-      "previous_secret": "test-gateway-identity-secret-0000",
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": true
     },
     {
-      "case": "under another secret, previous configured",
+      "case": "under an older key still in the ring",
       "user_id": "7",
       "scopes": "bot,tx",
       "limits": "3",
@@ -523,8 +599,160 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": "test-gateway-identity-secret-0000",
-      "header": "t=1790000000,v2=52bd1d31c53b50aee86b5759b6e0f0c03107717bae0202086b761a2f4d6f91c9",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-03,t=1790000000,v2=2927eccb03a635b1fb3b6d9cc87d7e64f1068aa5b4596a2e8959255ad7c31544",
+      "valid": true
+    },
+    {
+      "case": "under an older key dropped from the ring",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09"
+      ],
+      "header": "kid=gw-2026-03,t=1790000000,v2=2927eccb03a635b1fb3b6d9cc87d7e64f1068aa5b4596a2e8959255ad7c31544",
+      "valid": false
+    },
+    {
+      "case": "a kid not in the ring",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2025-01,t=1790000000,v2=19cb00db71091e11fdde6dabe1b05a507edc570668416ed9a947c9b30ed3d75a",
+      "valid": false
+    },
+    {
+      "case": "kid relabelled: signed under the active key, header names the older one",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-03,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
+      "valid": false
+    },
+    {
+      "case": "kid relabelled: signed for the older kid with the active key's bytes",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-03,t=1790000000,v2=4b6a0cd57f284ec0607e3e1c5f9a076ddd5b2b0de57cab1edfc12ae003a64fce",
+      "valid": false
+    },
+    {
+      "case": "an empty ring",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
+      "valid": false
+    },
+    {
+      "case": "no kid",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
+      "valid": false
+    },
+    {
+      "case": "empty kid",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
+      "valid": false
+    },
+    {
+      "case": "kid with a comma",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw,2026,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
+      "valid": false
+    },
+    {
+      "case": "kid after t",
+      "user_id": "7",
+      "scopes": "bot,tx",
+      "limits": "3",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "t=1790000000,kid=gw-2026-09,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -537,7 +765,10 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
       "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
       "valid": false
     },
@@ -551,8 +782,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v1=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v1=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -565,7 +799,10 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
       "header": null,
       "valid": false
     },
@@ -579,8 +816,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -593,7 +833,10 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
       "header": "",
       "valid": false
     },
@@ -607,8 +850,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000",
       "valid": false
     },
     {
@@ -621,8 +867,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -635,8 +884,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284,t=1790000000",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735,t=1790000000,kid=gw-2026-09",
       "valid": false
     },
     {
@@ -649,8 +901,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284,v0=00",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735,v0=00",
       "valid": false
     },
     {
@@ -663,8 +918,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=+1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=+1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -677,8 +935,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t= 1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t= 1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
       "valid": false
     },
     {
@@ -691,8 +952,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6E911056CC544021B183BC2DD6715287B5F02603C786F12EC41436D2E327F284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473E13EE31FEED6C0DD95784EDE903A20BF2840DF0B7E0EED45523E698352735",
       "valid": false
     },
     {
@@ -705,8 +969,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f2",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e6983527",
       "valid": false
     },
     {
@@ -719,8 +986,11 @@
       "query": "",
       "body": "",
       "now": 1790000000,
-      "previous_secret": null,
-      "header": "t=1790000000,v2=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000000,v2=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
       "valid": false
     },
     {
@@ -733,8 +1003,93 @@
       "query": "",
       "body": "",
       "now": 1790000001,
-      "previous_secret": null,
-      "header": "t=1790000001,v2=6e911056cc544021b183bc2dd6715287b5f02603c786f12ec41436d2e327f284",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "header": "kid=gw-2026-09,t=1790000001,v2=473e13ee31feed6c0dd95784ede903a20bf2840df0b7e0eed45523e698352735",
+      "valid": false
+    }
+  ],
+  "ring_cases": [
+    {
+      "case": "one key",
+      "keys": "{\"k1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": true
+    },
+    {
+      "case": "two keys",
+      "keys": "{\"gw-2026-09\": \"dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUE=\", \"gw-2026-03\": \"dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUI=\"}",
+      "valid": true
+    },
+    {
+      "case": "kid of 64 characters",
+      "keys": "{\"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": true
+    },
+    {
+      "case": "kid with . _ -",
+      "keys": "{\"gw.2026_09-a\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": true
+    },
+    {
+      "case": "not JSON",
+      "keys": "k1:cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=",
+      "valid": false
+    },
+    {
+      "case": "a JSON array",
+      "keys": "[\"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"]",
+      "valid": false
+    },
+    {
+      "case": "an empty object",
+      "keys": "{}",
+      "valid": false
+    },
+    {
+      "case": "a key that is not a string",
+      "keys": "{\"k1\": 7}",
+      "valid": false
+    },
+    {
+      "case": "a key that is not base64",
+      "keys": "{\"k1\": \"not base64!\"}",
+      "valid": false
+    },
+    {
+      "case": "a key of 31 bytes",
+      "keys": "{\"k1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg==\"}",
+      "valid": false
+    },
+    {
+      "case": "a key of 33 bytes",
+      "keys": "{\"k1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJy\"}",
+      "valid": false
+    },
+    {
+      "case": "an empty kid",
+      "keys": "{\"\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid of 65 characters",
+      "keys": "{\"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid with a comma",
+      "keys": "{\"k,1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid with an equals sign",
+      "keys": "{\"k=1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid with a space",
+      "keys": "{\"k 1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
       "valid": false
     }
   ]

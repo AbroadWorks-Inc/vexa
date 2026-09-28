@@ -23,7 +23,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from .identity_signature import SIGNATURE_HEADER, identity_secret, sign_now
+from .identity_signature import SIGNATURE_HEADER, KeyRingError, sign_now, signing_key
 from .obs import TRACE_HEADER, get_trace_id
 from .ports import AuthUnavailable
 
@@ -130,14 +130,14 @@ class AdminApiAuthorizer:
         auth_headers["content-type"] = "application/json"
         if user_data:
             # §1.10: meeting-api believes x-user-id only with the gateway's signature.
-            secret = identity_secret()
-            if not secret:
-                return {"authorized": [],
-                        "errors": ["authorization_unavailable:GATEWAY_IDENTITY_SECRET is not configured"]}
+            try:
+                key = signing_key()
+            except KeyRingError as e:
+                return {"authorized": [], "errors": [f"authorization_unavailable:{e}"]}
             auth_headers["x-user-id"] = str(user_data["user_id"])
             auth_headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
             auth_headers["x-user-limits"] = str(user_data.get("max_concurrent", 3))
-            auth_headers[SIGNATURE_HEADER] = sign_now(secret, auth_headers, "POST", url, None, body)
+            auth_headers[SIGNATURE_HEADER] = sign_now(key, auth_headers, "POST", url, None, body)
         try:
             resp = await self._client.post(url, headers=auth_headers, content=body)
             if resp.status_code != 200:
@@ -206,6 +206,9 @@ def build_production_app(
     # reject every /internal/validate hop (503 on every API-key check), the 2026-04-23 shape. Fail
     # loud at boot with one message naming the missing key, instead of coming up green and 503ing.
     preflight()
+    # §1.10: a ring that is set but wrong (bad JSON, a key that isn't 32 bytes, the active id not
+    # in it) refuses the boot too, naming the fault and never a key.
+    signing_key()
 
     admin_api_url = admin_api_url or os.getenv("ADMIN_API_URL", "http://admin-api:8001")
     meeting_api_url = meeting_api_url or os.getenv("MEETING_API_URL", "http://meeting-api:8080")

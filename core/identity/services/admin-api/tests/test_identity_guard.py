@@ -1,17 +1,20 @@
 """Only the gateway can say who is calling (design §1.10).
 
 A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` (version ``v2``)
-over the request's user, ``x-user-scopes``, ``x-user-limits``, method, path, raw query and body
-(§6.9 F-E). Unsigned, forged, stale, future, wrong-user, wrong-scopes, wrong-limits, wrong-query,
-wrong-body, v1 and duplicated identities answer 401 before any route runs;
-so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't configured. A signature under
-``GATEWAY_IDENTITY_SECRET_PREVIOUS`` is accepted only while that key is set. The operator's ``/admin/*`` surface, ``/internal/*`` and ``/health`` are exempt, and
-every route of the app is checked against that list.
+made with a key of the ``GATEWAY_IDENTITY_KEYS`` ring, named by its ``kid``, over the request's
+user, ``x-user-scopes``, ``x-user-limits``, method, path, raw query and body (§6.9 F-E).
+Unsigned, forged, stale, future, wrong-user, wrong-scopes, wrong-limits, wrong-query, wrong-body,
+unknown-kid, v1 and duplicated identities answer 401 before any route runs; so does every client
+request when the ring is unset or malformed, and the rejection says why. The operator's
+``/admin/*`` surface, ``/internal/*`` and ``/health`` are exempt, and every route of the app is
+checked against that list.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import re
 import time
@@ -26,11 +29,20 @@ from starlette.routing import Route
 from admin_api.app.identity_guard import (
     MAX_SKEW_S,
     IdentityGuard,
+    KeyRingError,
     is_exempt,
+    parse_ring,
     verify_signature,
 )
 from admin_api.app.main import create_app
-from gateway_identity import load_vectors, signature, signed_headers, via_gateway
+from gateway_identity import (
+    KEY,
+    KID,
+    load_vectors,
+    signature,
+    signed_headers,
+    via_gateway,
+)
 
 VECTORS = load_vectors()
 GUARD_BODY = {"detail": "the caller's identity must come from the gateway"}
@@ -62,11 +74,11 @@ EXEMPT = {
 
 @pytest.mark.parametrize("case", VECTORS["verify_cases"], ids=lambda c: c["case"])
 def test_the_verifier_agrees_with_the_shared_vectors(case):
-    secrets = [VECTORS["secret"]]
-    if case["previous_secret"] is not None:
-        secrets.append(case["previous_secret"])
+    ring = {
+        kid: base64.b64decode(VECTORS["keys"][kid]) for kid in case["verifier_kids"]
+    }
     reason = verify_signature(
-        secrets,
+        ring,
         case["user_id"],
         case["scopes"],
         case["limits"],
@@ -108,7 +120,7 @@ def test_a_key_alone_is_401(client):
 
 
 def test_a_forged_signature_is_401(client):
-    forged = f"t={int(time.time())},v2={'0' * 64}"
+    forged = f"kid={KID},t={int(time.time())},v2={'0' * 64}"
     r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": forged})
     assert r.status_code == 401
 
@@ -118,6 +130,12 @@ def test_a_forged_signature_is_401(client):
 )
 def test_a_signature_outside_the_window_is_401(client, offset):
     sig = signature("7", "GET", "/", t=int(time.time()) + offset)
+    r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 401
+
+
+def test_a_signature_made_with_another_key_is_401(client):
+    sig = signature("7", "GET", "/", key=b"not-the-gateways-key-32-bytes-ok")
     r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
     assert r.status_code == 401
 
@@ -211,30 +229,79 @@ def test_a_v1_signature_is_401(client):
     assert r.status_code == 401
 
 
-PREVIOUS = "test-gateway-identity-previous-admin-api"
+@pytest.mark.parametrize("case", VECTORS["ring_cases"], ids=lambda c: c["case"])
+def test_the_ring_parser_agrees_with_the_shared_cases(case):
+    if case["valid"]:
+        assert all(len(key) == 32 for key in parse_ring(case["keys"]).values())
+        return
+    with pytest.raises(KeyRingError) as ei:
+        parse_ring(case["keys"])
+    assert "GATEWAY_IDENTITY_KEYS" in str(ei.value)
+    assert case["keys"] not in str(ei.value)
 
 
-def test_the_previous_key_is_accepted_while_it_is_configured(client, monkeypatch):
-    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
-    sig = signature("7", "GET", "/", secret=PREVIOUS)
-    r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
-    assert r.status_code == 200, r.text
-    assert client.get("/", headers=signed_headers(7, "GET", "/")).status_code == 200
+NEW_KID = "gw-admin-api-next"
+NEW_KEY = b"test-gateway-identity-next-key-2"
 
 
-def test_the_previous_key_is_refused_once_it_is_dropped(client, monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", raising=False)
-    sig = signature("7", "GET", "/", secret=PREVIOUS)
+def _two_key_ring() -> str:
+    return json.dumps(
+        {
+            KID: base64.b64encode(KEY).decode(),
+            NEW_KID: base64.b64encode(NEW_KEY).decode(),
+        }
+    )
+
+
+def test_every_key_in_the_ring_is_accepted_by_its_kid(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", _two_key_ring())
+    for kid, key in ((KID, KEY), (NEW_KID, NEW_KEY)):
+        sig = signature("7", "GET", "/", kid=kid, key=key)
+        r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
+        assert r.status_code == 200, (kid, r.text)
+
+
+def test_a_key_dropped_from_the_ring_is_refused(client):
+    sig = signature("7", "GET", "/", kid=NEW_KID, key=NEW_KEY)
     r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
     assert r.status_code == 401
 
 
-def test_the_previous_key_alone_accepts_nothing(client, monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET")
-    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
-    sig = signature("7", "GET", "/", secret=PREVIOUS)
+def test_a_kid_that_names_another_key_of_the_ring_is_401(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", _two_key_ring())
+    sig = signature("7", "GET", "/", kid=NEW_KID, key=KEY)
     r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
     assert r.status_code == 401
+
+
+def test_the_unknown_kid_is_logged_without_the_signature(client, caplog):
+    sig = signature("7", "GET", "/", kid="gw-unknown", key=NEW_KEY)
+    with caplog.at_level(logging.WARNING, logger="admin_api.identity_guard"):
+        client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert "reason=unknown_key method=GET path=/" in caplog.text
+    assert sig.split("v2=")[1] not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        "not json",
+        "{}",
+        json.dumps({KID: "c2hvcnQ="}),
+        json.dumps({"k,1": base64.b64encode(KEY).decode()}),
+    ],
+    ids=["not-json", "empty", "short-key", "bad-kid"],
+)
+def test_a_malformed_ring_refuses_every_request_and_says_why(
+    client, monkeypatch, caplog, keys
+):
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", keys)
+    with caplog.at_level(logging.WARNING, logger="admin_api.identity_guard"):
+        r = client.get("/", headers=signed_headers(7, "GET", "/"))
+    assert r.status_code == 401
+    assert "reason=ring_invalid" in caplog.text
+    assert "fault=GATEWAY_IDENTITY_KEYS" in caplog.text
+    assert base64.b64encode(KEY).decode() not in caplog.text
 
 
 async def _echo(scope, receive, send):
@@ -314,8 +381,8 @@ def test_a_duplicated_user_id_is_401(client):
     assert client.get("/", headers=httpx.Headers(headers)).status_code == 401
 
 
-def test_without_the_secret_every_client_request_is_401(client, monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET")
+def test_without_the_ring_every_client_request_is_401(client, monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_KEYS")
     assert client.get("/", headers=signed_headers(7, "GET", "/")).status_code == 401
 
 
@@ -326,7 +393,7 @@ def test_a_v2_route_answers_the_v2_error_shape(client):
 
 
 def test_the_rejection_is_logged_without_the_signature(client, caplog):
-    forged = f"t={int(time.time())},v2={'a' * 64}"
+    forged = f"kid={KID},t={int(time.time())},v2={'a' * 64}"
     with caplog.at_level(logging.WARNING, logger="admin_api.identity_guard"):
         client.get("/?x=1", headers={"x-user-id": "7", "x-gateway-signature": forged})
     assert "reason=mismatch method=GET path=/" in caplog.text

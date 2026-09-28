@@ -67,7 +67,9 @@ RUNTIME_URL = f"http://127.0.0.1:{RUNTIME_HOST_PORT}"
 # Env the stack boots with — pinned so the test knows the secrets it must present.
 ADMIN_TOKEN = "gate-admin-token"
 INTERNAL_API_SECRET = "gate-internal-secret"
-GATEWAY_IDENTITY_SECRET = "gate-identity-secret"
+# A test-only one-key identity ring (§1.10) and its kid.
+GATEWAY_IDENTITY_KEYS = '{"gate": "Z2F0ZS1pZGVudGl0eS1yaW5nLWtleS10ZXN0LW9ubHk="}'
+GATEWAY_IDENTITY_ACTIVE_KEY = "gate"
 MINIO_BUCKET = "vexa"
 
 SERVICES = ["redis", "postgres", "minio", "admin-api", "runtime", "meeting-api", "gateway"]
@@ -133,7 +135,8 @@ def _stack_env() -> dict:
         "COMPOSE_PROJECT_NAME": PROJECT,
         "ADMIN_TOKEN": ADMIN_TOKEN,
         "INTERNAL_API_SECRET": INTERNAL_API_SECRET,
-        "GATEWAY_IDENTITY_SECRET": GATEWAY_IDENTITY_SECRET,
+        "GATEWAY_IDENTITY_KEYS": GATEWAY_IDENTITY_KEYS,
+        "GATEWAY_IDENTITY_ACTIVE_KEY": GATEWAY_IDENTITY_ACTIVE_KEY,
         "MINIO_BUCKET": MINIO_BUCKET,
         "BROWSER_IMAGE": os.getenv("BROWSER_IMAGE", "vexaai/vexa-bot:v012"),
         "API_GATEWAY_HOST_PORT": GATEWAY_PORT,

@@ -1,16 +1,18 @@
 """Only the gateway can say who is calling (design §1.10).
 
 A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` (version ``v2``)
-over the request's user, ``x-user-scopes``, ``x-user-limits``, method, path, raw query and body
-(§6.9 F-E). Unsigned, forged, stale, future, wrong-user, wrong-scopes, wrong-limits, wrong-route,
-wrong-query, wrong-body, v1 and duplicated identities answer 401 before any route runs; so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't configured. A
-signature under ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` is accepted only while that key is set. The exempt routes are listed, and every route of the production app is checked
-against that list.
+made with a key of the ``GATEWAY_IDENTITY_KEYS`` ring, named by its ``kid``, over the request's
+user, ``x-user-scopes``, ``x-user-limits``, method, path, raw query and body (§6.9 F-E).
+Unsigned, forged, stale, future, wrong-user, wrong-scopes, wrong-limits, wrong-route, wrong-query,
+wrong-body, unknown-kid, v1 and duplicated identities answer 401 before any route runs; so does
+every client request when the ring is unset or malformed, and the rejection says why. The exempt
+routes are listed, and every route of the production app is checked against that list.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
@@ -24,6 +26,8 @@ from starlette.routing import Route
 
 import meeting_api.__main__ as main_mod
 from gateway_identity import (
+    KEY,
+    KID,
     load_vectors,
     signature,
     signed_headers,
@@ -33,7 +37,9 @@ from meeting_api import create_app
 from meeting_api.identity_guard import (
     MAX_SKEW_S,
     IdentityGuard,
+    KeyRingError,
     is_exempt,
+    parse_ring,
     verify_signature,
 )
 
@@ -52,11 +58,11 @@ EXEMPT = {
 
 @pytest.mark.parametrize("case", VECTORS["verify_cases"], ids=lambda c: c["case"])
 def test_the_verifier_agrees_with_the_shared_vectors(case):
-    secrets = [VECTORS["secret"]]
-    if case["previous_secret"] is not None:
-        secrets.append(case["previous_secret"])
+    ring = {
+        kid: base64.b64decode(VECTORS["keys"][kid]) for kid in case["verifier_kids"]
+    }
     reason = verify_signature(
-        secrets,
+        ring,
         case["user_id"],
         case["scopes"],
         case["limits"],
@@ -95,15 +101,26 @@ def test_no_identity_at_all_is_401(client):
 
 
 def test_a_forged_signature_is_401(client):
-    forged = f"t={int(time.time())},v2={'0' * 64}"
+    forged = f"kid={KID},t={int(time.time())},v2={'0' * 64}"
     r = client.get(
         "/meetings", headers={"x-user-id": "7", "x-gateway-signature": forged}
     )
     assert r.status_code == 401
 
 
-def test_a_signature_made_with_another_secret_is_401(client):
-    sig = signature("7", "GET", "/meetings", secret="not-the-gateways-secret")
+@pytest.mark.parametrize("case", VECTORS["ring_cases"], ids=lambda c: c["case"])
+def test_the_ring_parser_agrees_with_the_shared_cases(case):
+    if case["valid"]:
+        assert all(len(key) == 32 for key in parse_ring(case["keys"]).values())
+        return
+    with pytest.raises(KeyRingError) as ei:
+        parse_ring(case["keys"])
+    assert "GATEWAY_IDENTITY_KEYS" in str(ei.value)
+    assert case["keys"] not in str(ei.value)
+
+
+def test_a_signature_made_with_another_key_is_401(client):
+    sig = signature("7", "GET", "/meetings", key=b"not-the-gateways-key-32-bytes-ok")
     r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
     assert r.status_code == 401
 
@@ -236,31 +253,79 @@ def test_a_v1_signature_is_401(client):
     assert r.status_code == 401
 
 
-PREVIOUS = "test-gateway-identity-previous-meeting-api"
+NEW_KID = "gw-meeting-api-next"
+NEW_KEY = b"test-gateway-identity-next-key-1"
 
 
-def test_the_previous_key_is_accepted_while_it_is_configured(client, monkeypatch):
-    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
-    sig = signature("7", "GET", "/meetings", secret=PREVIOUS)
+def _two_key_ring() -> str:
+    return json.dumps(
+        {
+            KID: base64.b64encode(KEY).decode(),
+            NEW_KID: base64.b64encode(NEW_KEY).decode(),
+        }
+    )
+
+
+def test_every_key_in_the_ring_is_accepted_by_its_kid(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", _two_key_ring())
+    for kid, key in ((KID, KEY), (NEW_KID, NEW_KEY)):
+        sig = signature("7", "GET", "/meetings", kid=kid, key=key)
+        r = client.get(
+            "/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig}
+        )
+        assert r.status_code == 200, (kid, r.text)
+
+
+def test_a_key_dropped_from_the_ring_is_refused(client):
+    sig = signature("7", "GET", "/meetings", kid=NEW_KID, key=NEW_KEY)
     r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 401
+
+
+def test_a_kid_that_names_another_key_of_the_ring_is_401(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", _two_key_ring())
+    sig = signature("7", "GET", "/meetings", kid=NEW_KID, key=KEY)
+    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 401
+
+
+def test_the_unknown_kid_is_logged_without_the_signature(client, capsys):
+    sig = signature("7", "GET", "/meetings", kid="gw-unknown", key=NEW_KEY)
+    client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    rejected = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{") and '"identity_rejected"' in line
+    ]
+    assert rejected[-1]["fields"]["reason"] == "unknown_key"
+    assert sig.split("v2=")[1] not in json.dumps(rejected)
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        "not json",
+        "{}",
+        json.dumps({KID: "c2hvcnQ="}),
+        json.dumps({"k,1": base64.b64encode(KEY).decode()}),
+    ],
+    ids=["not-json", "empty", "short-key", "bad-kid"],
+)
+def test_a_malformed_ring_refuses_every_request_and_says_why(
+    client, monkeypatch, capsys, keys
+):
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", keys)
     r = client.get("/meetings", headers=signed_headers(7, "GET", "/meetings"))
-    assert r.status_code == 200, r.text
-
-
-def test_the_previous_key_is_refused_once_it_is_dropped(client, monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", raising=False)
-    sig = signature("7", "GET", "/meetings", secret=PREVIOUS)
-    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
     assert r.status_code == 401
-
-
-def test_the_previous_key_alone_accepts_nothing(client, monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET")
-    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
-    sig = signature("7", "GET", "/meetings", secret=PREVIOUS)
-    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
-    assert r.status_code == 401
+    rejected = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{") and '"identity_rejected"' in line
+    ]
+    fields = rejected[-1]["fields"]
+    assert fields["reason"] == "ring_invalid"
+    assert "GATEWAY_IDENTITY_KEYS" in fields["fault"]
+    assert base64.b64encode(KEY).decode() not in json.dumps(rejected)
 
 
 # ── the guard reads the body it hashes, and the route still gets every byte ────────────────────
@@ -344,8 +409,8 @@ def test_a_duplicated_user_id_is_401(client):
     assert r.status_code == 401
 
 
-def test_without_the_secret_every_client_request_is_401(client, monkeypatch):
-    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET")
+def test_without_the_ring_every_client_request_is_401(client, monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_KEYS")
     r = client.get("/meetings", headers=signed_headers(7, "GET", "/meetings"))
     assert r.status_code == 401
 
@@ -357,7 +422,7 @@ def test_a_v2_route_answers_the_v2_error_shape(client):
 
 
 def test_the_rejection_is_logged_without_the_signature(client, capsys):
-    forged = f"t={int(time.time())},v2={'a' * 64}"
+    forged = f"kid={KID},t={int(time.time())},v2={'a' * 64}"
     client.get(
         "/meetings?x=1", headers={"x-user-id": "7", "x-gateway-signature": forged}
     )

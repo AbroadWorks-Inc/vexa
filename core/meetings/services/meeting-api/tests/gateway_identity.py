@@ -5,16 +5,17 @@ that sends ``x-user-id`` stands for a request the gateway forwarded, so it reach
 ``via_gateway(app)``, which signs such a request the way the gateway does: over the ``x-user-id``,
 ``x-user-scopes`` and ``x-user-limits`` it carries (an absent header is an empty field), its
 method, its path (``scope["path"]``), its raw query (``scope["query_string"]``) and the SHA-256 of
-its body, with ``SECRET``. A request that already carries a signature, or
+its body, with the suite's ring key ``KEY`` named ``KID``. A request that already carries a signature, or
 carries no ``x-user-id``, passes through untouched, which is how the guard's own tests send
 unsigned and forged requests.
 
 The signing rule is the shared one (``core/gateway/contracts/gateway-identity``); the suite's
-``GATEWAY_IDENTITY_SECRET`` is ``SECRET`` (``conftest.py``).
+``GATEWAY_IDENTITY_KEYS`` is ``RING`` (``conftest.py``).
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -22,7 +23,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-SECRET = "test-gateway-identity-secret-meeting-api"
+KID = "gw-meeting-api-test"
+KEY = b"test-gateway-identity-meeting-ap"
+RING = json.dumps({KID: base64.b64encode(KEY).decode()})
 SIGNATURE_HEADER = "x-gateway-signature"
 
 
@@ -44,12 +47,14 @@ def signature(
     query: str = "",
     body: bytes = b"",
     t: Optional[int] = None,
-    secret: str = SECRET,
+    kid: str = KID,
+    key: bytes = KEY,
 ) -> str:
     """The ``x-gateway-signature`` value the gateway would send."""
     t = int(time.time()) if t is None else t
     fields = [
         "v2",
+        kid,
         str(t),
         user_id,
         scopes,
@@ -60,7 +65,7 @@ def signature(
         path,
     ]
     message = "\n".join(fields).encode()
-    return f"t={t},v2={hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()}"
+    return f"kid={kid},t={t},v2={hmac.new(key, message, hashlib.sha256).hexdigest()}"
 
 
 def signed_headers(

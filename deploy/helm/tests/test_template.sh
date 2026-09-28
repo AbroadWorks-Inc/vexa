@@ -581,9 +581,10 @@ env_is "$RENDER_INTAKE" admin-api WEBHOOK_PRIVATE_HOST_ALLOWLIST 'value: "portal
 env_is "$RENDER_INTAKE" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "900"'
 
 # §1.10/§1.11 secrets reach the services by secretKeyRef to the shared Secret (existingSecretName
-# when set): GATEWAY_IDENTITY_SECRET on all three services, the webhook key ring on meeting-api and
-# admin-api. The gateway cannot run without the identity secret, so its reference is NOT optional
-# (a missing key stops the pod at creation); the other two degrade without it, so theirs are.
+# when set): the gateway identity ring GATEWAY_IDENTITY_KEYS on all three services and its active
+# kid GATEWAY_IDENTITY_ACTIVE_KEY on the gateway, the webhook key ring on meeting-api and admin-api.
+# The gateway cannot run without the identity ring, so its references are NOT optional (a missing
+# key stops the pod at creation); the other two degrade without it, so theirs are.
 RENDER_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
   --set secrets.existingSecretName=aw-test-secrets --set postgres.existingCredentialsSecret=true)"
 secret_ref() {  # secret_ref <component> <KEY> <optional:yes|no>
@@ -600,9 +601,10 @@ secret_ref() {  # secret_ref <component> <KEY> <optional:yes|no>
     echo "  FAIL: $1 $2 reference must not be optional (the service refuses to boot without it)"; fail=1
   fi
 }
-secret_ref gateway GATEWAY_IDENTITY_SECRET no
+secret_ref gateway GATEWAY_IDENTITY_KEYS no
+secret_ref gateway GATEWAY_IDENTITY_ACTIVE_KEY no
 for comp in meeting-api admin-api; do
-  for key in GATEWAY_IDENTITY_SECRET WEBHOOK_SECRET_ENC_KEYS WEBHOOK_SECRET_ENC_ACTIVE_KEY; do
+  for key in GATEWAY_IDENTITY_KEYS WEBHOOK_SECRET_ENC_KEYS WEBHOOK_SECRET_ENC_ACTIVE_KEY; do
     secret_ref "$comp" "$key" yes
   done
 done
@@ -612,32 +614,43 @@ if grep -qE '^kind: Secret' <<< "$RENDER_EXISTING"; then
 else
   echo "  OK: no Secret rendered with existingSecretName + existingCredentialsSecret set"
 fi
-# Without existingSecretName the chart-managed Secret supplies GATEWAY_IDENTITY_SECRET from
-# secrets.gatewayIdentitySecret (required, like internalApiSecret) and the gateway reads it from
-# there; the webhook key ring is never in it (the services switch webhooks off without it).
-if grep -qxF '  GATEWAY_IDENTITY_SECRET: "helm-render-test-identity-only"' <<< "$RENDER"; then
-  echo "  OK: the chart-managed Secret carries GATEWAY_IDENTITY_SECRET from secrets.gatewayIdentitySecret"
+# Without existingSecretName the chart-managed Secret supplies GATEWAY_IDENTITY_KEYS and
+# GATEWAY_IDENTITY_ACTIVE_KEY from secrets.gatewayIdentityKeys / secrets.gatewayIdentityActiveKey
+# (required, like internalApiSecret) and the gateway reads both from there; the webhook key ring
+# is never in it (the services switch webhooks off without it).
+if grep -qxF '  GATEWAY_IDENTITY_KEYS: "{\"render-test\": \"aGVsbS1yZW5kZXItdGVzdC1pZGVudGl0eS1vbmx5ISE=\"}"' <<< "$RENDER" \
+    && grep -qxF '  GATEWAY_IDENTITY_ACTIVE_KEY: "render-test"' <<< "$RENDER"; then
+  echo "  OK: the chart-managed Secret carries the identity ring and its active kid"
 else
-  echo "  FAIL: the chart-managed Secret does not carry GATEWAY_IDENTITY_SECRET"; fail=1
+  echo "  FAIL: the chart-managed Secret does not carry the identity ring and its active kid"; fail=1
 fi
-if grep -A5 'name: GATEWAY_IDENTITY_SECRET$' <<< "$(component_deploy "$RENDER" gateway)" | grep -q 'name: vexa-vexa-secrets'; then
-  echo "  OK: gateway reads GATEWAY_IDENTITY_SECRET from the chart-managed Secret"
+for key in GATEWAY_IDENTITY_KEYS GATEWAY_IDENTITY_ACTIVE_KEY; do
+  if grep -A5 "name: $key\$" <<< "$(component_deploy "$RENDER" gateway)" | grep -q 'name: vexa-vexa-secrets'; then
+    echo "  OK: gateway reads $key from the chart-managed Secret"
+  else
+    echo "  FAIL: gateway does not read $key from the chart-managed Secret"; fail=1
+  fi
+done
+if grep -qE '^  GATEWAY_IDENTITY_SECRET:' <<< "$RENDER"; then
+  echo "  FAIL: the chart-managed Secret still carries GATEWAY_IDENTITY_SECRET"; fail=1
 else
-  echo "  FAIL: gateway does not read GATEWAY_IDENTITY_SECRET from the chart-managed Secret"; fail=1
+  echo "  OK: the chart-managed Secret carries no GATEWAY_IDENTITY_SECRET"
 fi
 if grep -qE '^  (WEBHOOK_SECRET_ENC_KEYS|WEBHOOK_SECRET_ENC_ACTIVE_KEY):' <<< "$RENDER"; then
   echo "  FAIL: the chart-managed Secret carries a webhook key-ring key"; fail=1
 else
   echo "  OK: the chart-managed Secret carries no webhook key-ring key"
 fi
-if NO_IDENTITY="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
-    --set secrets.gatewayIdentitySecret= 2>&1)"; then
-  echo "  FAIL: the chart-managed Secret rendered without secrets.gatewayIdentitySecret"; fail=1
-elif grep -q 'secrets.gatewayIdentitySecret is required' <<< "$NO_IDENTITY"; then
-  echo "  OK: the chart-managed Secret refuses to render without secrets.gatewayIdentitySecret"
-else
-  echo "  FAIL: render without secrets.gatewayIdentitySecret failed for another reason"; fail=1
-fi
+for value in gatewayIdentityKeys gatewayIdentityActiveKey; do
+  if NO_IDENTITY="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+      --set "secrets.$value=" 2>&1)"; then
+    echo "  FAIL: the chart-managed Secret rendered without secrets.$value"; fail=1
+  elif grep -q "secrets.$value is required" <<< "$NO_IDENTITY"; then
+    echo "  OK: the chart-managed Secret refuses to render without secrets.$value"
+  else
+    echo "  FAIL: render without secrets.$value failed for another reason"; fail=1
+  fi
+done
 
 # Per-service pod annotations (meetingApi/adminApi.podAnnotations) merge over
 # global.podAnnotations; the per-service key wins, the global-only key stays, other services keep

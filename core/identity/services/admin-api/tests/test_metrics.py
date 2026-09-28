@@ -140,7 +140,7 @@ def test_a_slow_read_is_cut_off_at_the_timeout(monkeypatch):
 
 
 def test_the_identity_guard_does_not_block_metrics():
-    # The suite runs with GATEWAY_IDENTITY_SECRET set; an unsigned scrape still gets through.
+    # The suite runs with GATEWAY_IDENTITY_KEYS set; an unsigned scrape still gets through.
     r = TestClient(create_app()).get("/metrics")
     assert r.status_code == 200
     assert "aw_api_token_expires_seconds" in r.text

@@ -24,7 +24,8 @@ helm upgrade --install vexa deploy/helm/charts/vexa -n vexa --create-namespace \
   --set global.imageTag=YYMMDD-HHMM \
   --set secrets.adminApiToken=$ADMIN_TOKEN \
   --set secrets.internalApiSecret=$INTERNAL_API_SECRET \
-  --set secrets.gatewayIdentitySecret=$GATEWAY_IDENTITY_SECRET \
+  --set-file secrets.gatewayIdentityKeys=gateway-identity-ring.json \
+  --set secrets.gatewayIdentityActiveKey=$GATEWAY_IDENTITY_ACTIVE_KEY \
   --set secrets.transcriptionServiceToken=$STT_TOKEN \
   --wait --timeout 10m
 
@@ -51,7 +52,7 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 |---|---|---|
 | `global.imageTag` | `""` | Set to a pinned `YYMMDD-HHMM` tag — overrides every service tag (build-once). |
 | `runtime.backend` | `k8s` | `k8s` spawns Pods via RBAC (real cloud); `docker` mounts the host socket (single-node only); `process` runs child processes. |
-| `secrets.*` | placeholders | `adminApiToken`, `internalApiSecret`, `gatewayIdentitySecret`, `transcriptionServiceToken`, `dispatchSigningKey`, `nextauthSecret`, `anthropic*`. Or set `secrets.existingSecretName` (must carry `ADMIN_API_TOKEN`, `INTERNAL_API_SECRET`, `GATEWAY_IDENTITY_SECRET`, `TRANSCRIPTION_SERVICE_TOKEN`, `VEXA_DISPATCH_SIGNING_KEY`, `NEXTAUTH_SECRET`). |
+| `secrets.*` | placeholders | `adminApiToken`, `internalApiSecret`, `gatewayIdentityKeys`, `gatewayIdentityActiveKey`, `transcriptionServiceToken`, `dispatchSigningKey`, `nextauthSecret`, `anthropic*`. Or set `secrets.existingSecretName` (must carry `ADMIN_API_TOKEN`, `INTERNAL_API_SECRET`, `GATEWAY_IDENTITY_KEYS`, `GATEWAY_IDENTITY_ACTIVE_KEY`, `TRANSCRIPTION_SERVICE_TOKEN`, `VEXA_DISPATCH_SIGNING_KEY`, `NEXTAUTH_SECRET`). |
 | `postgres.enabled` / `redis.enabled` / `minio.enabled` | `true` | Flip to `false` to use managed backing; then set `database.*` / `redisConfig.*` and a pre-existing `postgres.credentialsSecretName`. |
 | `postgres.existingCredentialsSecret` | `false` | `true` keeps the in-cluster Postgres but reads its password from a pre-created `postgres.credentialsSecretName` Secret (`POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`); the chart renders none, so an upgrade never rewrites it. |
 | `statefulAntiAffinity` | `true` | postgres, redis and minio prefer different nodes. `false` drops that preference when they are meant to share one node (Karpenter otherwise starts an extra node for it). |
@@ -59,7 +60,7 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 | `terminal.enabled` | `true` | The web UI. Set `terminal.publicUrl` (NEXTAUTH_URL/TERMINAL_URL) when fronted by ingress; add OAuth via `terminal.extraEnv`. |
 | `ingress.enabled` | `false` | Fronts the **terminal** by default; set `host`/`className`/`tls`. Add a second path to `gateway` to also expose the raw API. |
 | `minio.service.type` | `ClusterIP` | `NodePort` to reach presigned download URLs browser-side on dev clusters. |
-| `GATEWAY_IDENTITY_SECRET`, `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | none | `GATEWAY_IDENTITY_SECRET` comes from the existing Secret or, in the chart-managed one, from the required `secrets.gatewayIdentitySecret`; the gateway refuses to start without it, and meeting-api and admin-api hold the same value. The webhook key ring is read only from an existing Secret (meeting-api and admin-api); without it the webhook feature is off. |
+| `GATEWAY_IDENTITY_KEYS`, `GATEWAY_IDENTITY_ACTIVE_KEY`, `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | none | The gateway identity ring (JSON `{"<kid>": "<32 bytes base64>"}`, the webhook ring's format) and its active kid come from the existing Secret or, in the chart-managed one, from the required `secrets.gatewayIdentityKeys` (pass it with `--set-file`) and `secrets.gatewayIdentityActiveKey`; the gateway reads both and refuses to start without them, and meeting-api and admin-api hold the same ring. The webhook key ring is read only from an existing Secret (meeting-api and admin-api); without it the webhook feature is off. |
 | `meetingApi.entryMaxDaysAhead` / `joinNowAdoptAheadSeconds` / `entryBlockedHosts` / `intakeMaxActiveEntries` | `30` / `3600` / `""` / `100000` | Meeting intake (`ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES`). |
 | `meetingApi.autoJoinLeadSeconds` / `notSentSweepIntervalSeconds` / `jitsiHosts` | `120` / `30` / `""` | `AUTO_JOIN_LEAD_S`, `NOT_SENT_SWEEP_INTERVAL_S`, `VEXA_JITSI_HOSTS`. |
 | `meetingApi.webhookPrivateHostAllowlist` / `adminApi.webhookPrivateHostAllowlist` | `""` | `WEBHOOK_PRIVATE_HOST_ALLOWLIST`: private hosts a webhook may target; empty refuses every private target. Set both the same. |

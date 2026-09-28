@@ -46,9 +46,13 @@ global:
 # VEXA_SERVICE_AUTHORITY_SECRET, VEXA_SYSTEM_WEBHOOK_SECRET, VEXA_DISPATCH_SIGNING_KEY,
 # VEXA_BOT_API_KEY, ANTHROPIC_API_KEY,
 # ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN.
-# GATEWAY_IDENTITY_SECRET — the key the gateway signs x-user-id with; gateway, meeting-api and
-#   admin-api hold the same value. The gateway refuses to start without it (its reference is not
-#   optional). In an existing Secret, or secrets.gatewayIdentitySecret for the chart-managed one.
+# GATEWAY_IDENTITY_KEYS + GATEWAY_IDENTITY_ACTIVE_KEY — the key ring the gateway signs x-user-id
+#   with (the webhook ring's format: JSON {"<kid>": "<32 bytes base64>"}) and the kid it signs
+#   with. The gateway reads both and refuses to start without them (not optional); meeting-api and
+#   admin-api read the ring. In an existing Secret, or secrets.gatewayIdentityKeys +
+#   secrets.gatewayIdentityActiveKey for the chart-managed one. Rotation: add the new key to the
+#   ring and roll all three; switch the active kid and roll the gateway; later drop the old key and
+#   roll all three.
 # WEBHOOK_SECRET_ENC_KEYS + WEBHOOK_SECRET_ENC_ACTIVE_KEY — the key ring webhook subscription
 #   secrets are encrypted under (JSON {"<id>": "<32 bytes base64>"} + the active id), on
 #   meeting-api and admin-api. Read ONLY from an existing Secret (no value here); unset, the
@@ -63,8 +67,9 @@ secrets:
   adminApiToken: "CHANGE_ME"        # admin-api auth + MeetingToken signing (== meeting-api ADMIN_TOKEN)
   internalApiSecret: ""             # REQUIRED, no default (F95): the internal tier every service
                                     # presents AND believes — `openssl rand -hex 32`
-  gatewayIdentitySecret: ""         # REQUIRED, no default: GATEWAY_IDENTITY_SECRET, the key the gateway
-                                    # signs x-user-id with — `openssl rand -hex 32`
+  gatewayIdentityKeys: ""           # REQUIRED, no default: GATEWAY_IDENTITY_KEYS, the JSON key ring the
+                                    # gateway signs x-user-id with — pass it with --set-file
+  gatewayIdentityActiveKey: ""      # REQUIRED, no default: GATEWAY_IDENTITY_ACTIVE_KEY, its kid to sign with
   transcriptionServiceToken: ""     # funded STT token threaded into spawned bots
   serviceAuthoritySecret: ""        # exact-byte HMAC secret; required only when meetingApi.serviceAuthorityConfig is set
   systemWebhookSecret: ""           # exact-byte HMAC secret; required only when meetingApi.systemWebhookUrl is set

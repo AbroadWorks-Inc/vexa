@@ -15,7 +15,7 @@ shared vectors in `core/identity/contracts/webhook-subscriptions/`.
 (`aw_api_token_expires_seconds{name,user_id}`, read from `api_tokens` at scrape time) and the
 retention sweep's last run (`aw_sweep_last_run_timestamp_seconds{sweep}`).
 `identity_guard.py` (§1.10) answers 401 to any client request whose `x-user-id` doesn't carry the
-gateway's fresh `x-gateway-signature` (v2, over the user, scopes and limits headers, method, path, query and body; `GATEWAY_IDENTITY_SECRET`, or `GATEWAY_IDENTITY_SECRET_PREVIOUS` while a rotation runs); `/admin/*`, `/internal/*`,
+gateway's fresh `x-gateway-signature` (v2, over the user, scopes and limits headers, method, path, query and body; checked under the key its `kid` names in the `GATEWAY_IDENTITY_KEYS` ring); `/admin/*`, `/internal/*`,
 `/health*` and `/metrics` are exempt. The signing rule is pinned as shared vectors in
 `core/gateway/contracts/gateway-identity/`.
 
