@@ -183,20 +183,14 @@ class InMemoryIntakeStore:
         found = current or rows
         return found[-1] if found else None
 
-    async def overdue_meetings(
-        self, now: datetime, *, open_ended_s: int
-    ) -> list[MeetingView]:
+    async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
         managed = {e.meeting_id for e in self.entries.values()}
         views = [
             self.view(mid)
             for mid, row in sorted(self.meetings.items())
             if row["status"] == "scheduled" and mid in managed
         ]
-        return [
-            v
-            for v in views
-            if is_overdue(v.start, v.end, now=now, open_ended_s=open_ended_s)
-        ]
+        return [v for v in views if is_overdue(v.end, now=now)]
 
     def entries_of(self, meeting_id: int, state: str = "active") -> list[EntryView]:
         return [
@@ -242,6 +236,7 @@ class InMemoryIntakeStore:
             "outcome_at": None,
             "last_error_code": None,
             "last_error_message": None,
+            "send_attempts": 0,
             "waiting_for_room_sent_at": None,
         }
         if plan is not None:
@@ -468,6 +463,27 @@ class _FakeTx:
             "last_error_code": code,
             "last_error_message": message,
         }
+
+    async def record_send_failure(
+        self, meeting_id: int, code: str, message: str, *, retry_at: datetime
+    ) -> int:
+        attempts = int(self._s.aw[meeting_id].get("send_attempts") or 0) + 1
+        self._s.aw[meeting_id] = {
+            **self._s.aw[meeting_id],
+            "last_error_code": code,
+            "last_error_message": message,
+            "send_attempts": attempts,
+        }
+        row = self._s.meetings[meeting_id]
+        self._s.meetings[meeting_id] = {
+            **row,
+            "data": {
+                **row["data"],
+                "auto_join_error": message,
+                "auto_join_next_retry": retry_at.isoformat(),
+            },
+        }
+        return attempts
 
     async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
         self._s.aw[meeting_id] = {

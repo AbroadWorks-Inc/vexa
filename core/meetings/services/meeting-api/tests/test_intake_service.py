@@ -419,6 +419,8 @@ def test_settings_defaults(monkeypatch):
         "AUTO_JOIN_LEAD_S",
         "ENTRY_BLOCKED_HOSTS",
         "INTAKE_MAX_ACTIVE_ENTRIES",
+        "BOT_SEND_MAX_ATTEMPTS",
+        "BOT_SEND_RETRY_BACKOFF_S",
     ):
         monkeypatch.delenv(key, raising=False)
     from meeting_api.bot_spawn.auto_join import DEFAULT_LEAD_S
@@ -429,6 +431,8 @@ def test_settings_defaults(monkeypatch):
         lead_s=DEFAULT_LEAD_S,
         blocked_hosts=frozenset({"meet.abroadworks.com"}),
         max_active_entries=100_000,
+        send_max_attempts=3,
+        send_retry_backoff_s=60,
     )
 
 
@@ -440,12 +444,16 @@ def test_settings_from_env(monkeypatch):
         "ENTRY_BLOCKED_HOSTS", " Meet.AbroadWorks.com , calls.example.org ,"
     )
     monkeypatch.setenv("INTAKE_MAX_ACTIVE_ENTRIES", "5")
+    monkeypatch.setenv("BOT_SEND_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("BOT_SEND_RETRY_BACKOFF_S", "90")
     assert IntakeSettings.from_env() == IntakeSettings(
         max_days_ahead=14,
         join_now_adopt_ahead_s=900,
         lead_s=300,
         blocked_hosts=frozenset({"meet.abroadworks.com", "calls.example.org"}),
         max_active_entries=5,
+        send_max_attempts=5,
+        send_retry_backoff_s=90,
     )
 
 
@@ -520,8 +528,10 @@ async def test_join_now_adopting_a_shared_meeting_keeps_it_when_the_spawn_fails(
 
 async def test_join_now_never_adopts_an_entry_less_upstream_meeting():
     """Ruling R15: an entry-less upstream-planned row on the link is left to upstream; the paste
-    gets its own meeting, which ends ``not_sent`` when the spawn fails."""
-    h = make_harness("2026-09-29T09:45:00Z", spawn_failure=ACCOUNT_LIMIT)
+    gets its own meeting, which ends ``not_sent`` when its last send fails."""
+    h = make_harness(
+        "2026-09-29T09:45:00Z", spawn_failure=ACCOUNT_LIMIT, send_max_attempts=1
+    )
     planned = h.store.seed_meeting(
         1,
         GROOM,

@@ -146,13 +146,18 @@ bot, a leaving one included) — `meeting.waiting_for_room` goes out
 once (`meeting_aw_state.waiting_for_room_sent_at`) and no retry pause is stamped, so the bot goes on
 the first tick after the link is free. `not_sent_tick` (every `NOT_SENT_SWEEP_INTERVAL_S`,
 single-flight) ends every `scheduled` entry-managed meeting past its end (`IntakeStore.overdue_meetings`,
-`rules.is_overdue`; an open-ended one's end is its start plus `JOIN_NOW_ADOPT_AHEAD_S`) `failed`,
+`rules.is_overdue`; an open-ended one has no end to pass) `failed`,
 outcome `not_sent`, under its link lock, with detail `last_error_code` (message `last_error_message`),
 else `room_busy` ("another bot was still on this meeting link when the meeting ended"), else
-`ended_before_sent` ("the meeting ended before a bot was sent").
+`ended_before_sent` ("the meeting ended before a bot was sent"). A bot send for an entry-managed
+meeting (the scheduler's, or a `join_now` entry's before the claim) is bounded (§6.9 F-K,
+`IntakeService.send_failed`): each failure adds 1 to `meeting_aw_state.send_attempts` with its typed
+code and exact message and holds the next send `BOT_SEND_RETRY_BACKOFF_S`, and the
+`BOT_SEND_MAX_ATTEMPTS`-th ends the meeting `not_sent` (`meeting.not_sent`); the meeting's end stays
+the outer bound. `JOIN_NOW_ADOPT_AHEAD_S` is only the look-ahead a pasted link adopts by.
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
-`AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
-`config.v1.json`.
+`AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES`, `BOT_SEND_MAX_ATTEMPTS` and
+`BOT_SEND_RETRY_BACKOFF_S`, all declared in `config.v1.json`.
 
 `OutboxPublisher` (`outbox.py`, §1.8) turns unpublished `webhook_outbox` rows into
 `webhook_deliveries` rows: single-flight, every `WEBHOOK_PUBLISH_INTERVAL_S`, up to 500 rows oldest

@@ -232,10 +232,12 @@ async def test_join_now_is_spawned_on_the_exact_row_through_the_spawn_port():
 
 
 async def test_a_failed_instant_join_carries_the_typed_outcome():
+    """The last of its bounded sends (§6.9 F-K) ends the meeting with the typed outcome."""
     h = make_harness(
         spawn_failure=SpawnOutcome(
             "failed", "account_limit", "bot limit reached (45 of 45)"
-        )
+        ),
+        send_max_attempts=1,
     )
     client, _ = _client(h)
     async with client:

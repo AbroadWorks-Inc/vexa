@@ -6,7 +6,9 @@ the sweep's entrypoint does, with the sweep's default, and is the one reader int
 entry and upstream ``POST /bots`` both adopt by (§1.1 R1, §1.5). ``auto_join_grace_s`` reads the
 sweep's ``AUTO_JOIN_GRACE_S`` with the sweep's default: the link resolver ignores a timed,
 entry-less ``scheduled`` plan past its ``scheduled_at`` plus this grace, which the sweep will never
-send (§1.6, Ruling R22).
+send (§1.6, Ruling R22). ``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of
+an entry-managed meeting's bot (§6.9 F-K): that many failed sends in total, this many seconds
+apart, then the meeting ends ``not_sent``.
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ class IntakeSettings:
     lead_s: int
     blocked_hosts: frozenset[str]
     max_active_entries: int
+    send_max_attempts: int
+    send_retry_backoff_s: int
 
     @classmethod
     def from_env(cls) -> IntakeSettings:
@@ -63,4 +67,6 @@ class IntakeSettings:
                 h.strip().lower() for h in blocked.split(",") if h.strip()
             ),
             max_active_entries=int(os.getenv("INTAKE_MAX_ACTIVE_ENTRIES", "100000")),
+            send_max_attempts=int(os.getenv("BOT_SEND_MAX_ATTEMPTS", "3")),
+            send_retry_backoff_s=int(os.getenv("BOT_SEND_RETRY_BACKOFF_S", "60")),
         )

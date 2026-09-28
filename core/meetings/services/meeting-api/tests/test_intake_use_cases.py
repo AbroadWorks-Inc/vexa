@@ -128,9 +128,31 @@ async def test_2_6_2_instant_join_unrecognized_link():
     assert h.spawn.calls == [] and h.published() == []
 
 
-async def test_2_6_2_instant_join_spawn_fails():
+async def test_2_6_2_instant_join_spawn_fails_and_is_tried_again():
+    """F-K: a failed instant send is attempt 1 of ``BOT_SEND_MAX_ATTEMPTS``: the meeting stays
+    ``scheduled`` with the code, and the scheduler sends again after the backoff."""
     failure = SpawnOutcome("failed", "account_limit", "bot limit reached (45 of 45)")
     h = make_harness(spawn_failure=failure)
+    reply = await h.instant("manual:1")
+    m = reply["meeting"]
+    assert reply["result"] == "created"
+    assert (m["status"], m["outcome"]) == ("scheduled", None)
+    assert reply["entry"]["state"] == "active"
+    aw = h.store.aw[h.meeting_id(m["id"])]
+    assert (aw["send_attempts"], aw["last_error_code"], aw["last_error_message"]) == (
+        1,
+        "account_limit",
+        "bot limit reached (45 of 45)",
+    )
+    assert (
+        h.meeting(m["id"]).data["auto_join_next_retry"] == "2026-09-26T12:01:00+00:00"
+    )
+    assert h.events() == [(m["id"], "meeting.scheduled")]
+
+
+async def test_2_6_2_instant_join_spawn_fails_on_its_last_attempt():
+    failure = SpawnOutcome("failed", "account_limit", "bot limit reached (45 of 45)")
+    h = make_harness(spawn_failure=failure, send_max_attempts=1)
     reply = await h.instant("manual:1")
     m = reply["meeting"]
     assert reply["result"] == "created"

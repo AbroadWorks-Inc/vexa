@@ -645,8 +645,8 @@ def _attach_background_loops(
             await asyncio.sleep(auto_join_interval)
 
     # Not-sent sweep (§1.5, R6): a meeting entries manage that reaches its end without a bot ends
-    # `failed`, outcome `not_sent`, with its cause. An open-ended meeting's end is its start plus
-    # JOIN_NOW_ADOPT_AHEAD_S.
+    # `failed`, outcome `not_sent`, with its cause. An open-ended meeting has no end to pass: its
+    # bounded bot sends end it (BOT_SEND_MAX_ATTEMPTS).
     not_sent_interval = float(os.getenv("NOT_SENT_SWEEP_INTERVAL_S", "30"))
 
     async def _not_sent_loop() -> None:
@@ -655,14 +655,12 @@ def _attach_background_loops(
         from datetime import datetime, timezone
 
         from .intake import sweeps
-        from .intake.settings import join_now_adopt_ahead_s
 
         async def _tick():
             await sweeps.not_sent_tick(
                 intake_store,
                 publisher=scheduler_publisher,
                 now=datetime.now(timezone.utc),
-                open_ended_s=join_now_adopt_ahead_s(),
             )
 
         while True:

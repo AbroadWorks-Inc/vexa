@@ -902,7 +902,7 @@ class _NoStop:
         raise AssertionError("no stop expected")
 
 
-def _pg_intake(pg: PgBackend, runtime=None, **port_kw):
+def _pg_intake(pg: PgBackend, runtime=None, *, send_max_attempts: int = 3, **port_kw):
     """``IntakeService`` over Postgres with the real ``ExactRowSpawn`` over the same database."""
     from intake_builders import make_settings
     from meeting_api.intake import PostgresIntakeStore
@@ -912,7 +912,13 @@ def _pg_intake(pg: PgBackend, runtime=None, **port_kw):
     store = PostgresIntakeStore(pg.session_factory)
     publisher = FakePublisher()
     port = _port(pg.repo, runtime, store=store, publisher=publisher, **port_kw)
-    service = IntakeService(store, port, _NoStop(), publisher, make_settings())
+    service = IntakeService(
+        store,
+        port,
+        _NoStop(),
+        publisher,
+        make_settings(send_max_attempts=send_max_attempts),
+    )
     return service, publisher
 
 
@@ -930,13 +936,28 @@ async def test_pg_instant_join_through_intake_with_the_real_port(pg_engine):
     assert abs((joins - sent_at).total_seconds()) < 30  # R7: the send time
 
 
-async def test_pg_instant_join_at_the_bot_limit_ends_not_sent(pg_engine):
+async def test_pg_instant_join_at_the_bot_limit_is_tried_again(pg_engine):
+    """§6.9 F-K: the first failed send is attempt 1; the meeting stays scheduled for the next."""
     from intake_builders import ZOOM, instant_body
 
     pg = PgBackend(pg_engine)
     for i in range(45):
         await pg.seed(status="active", native=f"n{i:02d}-aaaa-bbb")
     service, _ = _pg_intake(pg)
+    reply = await service.put_entry(USER, instant_body("paste:2", ZOOM))
+    assert (reply["result"], reply["meeting"]["status"]) == ("created", "scheduled")
+    assert reply["meeting"]["outcome"] is None
+
+
+async def test_pg_instant_join_at_the_bot_limit_ends_not_sent_on_its_last_send(
+    pg_engine,
+):
+    from intake_builders import ZOOM, instant_body
+
+    pg = PgBackend(pg_engine)
+    for i in range(45):
+        await pg.seed(status="active", native=f"n{i:02d}-aaaa-bbb")
+    service, _ = _pg_intake(pg, send_max_attempts=1)
     reply = await service.put_entry(USER, instant_body("paste:2", ZOOM))
     meeting = reply["meeting"]
     assert reply["result"] == "created"

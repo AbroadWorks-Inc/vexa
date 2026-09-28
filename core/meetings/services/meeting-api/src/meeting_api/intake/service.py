@@ -30,13 +30,14 @@ and spawns run after the commit, each through its own port.
      ``previous_meeting_id`` when it left a meeting). A meeting left with no entries is removed
      (R8, detail ``entry_moved``); one left with others is re-planned;
   6. a ``join_now`` entry whose meeting is still ``scheduled`` after the commit is spawned on
-     that exact row: ``sent`` keeps the result, ``already_live`` → ``joined_existing``, a failure
-     ends the meeting ``not_sent`` with the typed code and exact message. When other active
-     entries share the meeting (it was adopted) and the spawn failed before claiming it, only
-     the pasted entry is removed (reason ``not_sent``), the failure is recorded on the meeting,
-     which stays ``scheduled`` with its time back to the remaining entries (``joined_existing``,
-     Ruling R12). A failure after the claim has already ended the meeting ``not_sent`` (Ruling
-     R17): the reply keeps the result with that meeting.
+     that exact row: ``sent`` keeps the result, ``already_live`` → ``joined_existing``. A failure
+     before the claim is one of the meeting's bounded sends (``send_failed``, §6.9 F-K): the
+     meeting stays ``scheduled`` with the typed code and the scheduler tries again, and the last
+     attempt ends it ``not_sent``. When other active entries share the meeting (it was adopted),
+     only the pasted entry is removed instead (reason ``not_sent``), the failure is recorded on
+     the meeting, which stays ``scheduled`` with its time back to the remaining entries
+     (``joined_existing``, Ruling R12). A failure after the claim has already ended the meeting
+     ``not_sent`` (Ruling R17): the reply keeps the result with that meeting.
 Only a write that adds an active entry checks the quota (429 ``quota_exceeded``).
 
 ``remove``: the entry becomes ``removed``. Others remain → the meeting is re-planned
@@ -46,7 +47,8 @@ one is stopped with that outcome (``bot_stopping``, R5). The status change is co
 meeting that went live meanwhile takes the live branch. When the meeting has already finished,
 only the entry goes (``entry_removed``) and the finished meeting is left as history.
 
-``merge_into_live`` is R2's exception; the auto-join tick calls it, never a route.
+``merge_into_live`` is R2's exception and ``send_failed`` a failed bot send (§6.9 F-K); the auto-join
+tick calls both, never a route.
 
 Events: ``meeting.scheduled`` for a meeting an entry created, ``meeting.updated`` when a
 meeting's time, link, title or entries change, ``meeting.removed`` (R8, R2), and
@@ -56,7 +58,7 @@ meeting's time, link, title or entries change, ``meeting.removed`` (R8, R2), and
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -499,17 +501,21 @@ class IntakeService:
     ) -> str:
         """A real spawn failure for a ``join_now`` entry.
 
-        A failure BEFORE the claim leaves the meeting ``scheduled``: it ends ``not_sent`` with the
-        typed code and exact message, unless other active entries share it (an adopted meeting,
-        Ruling R12): then only the pasted entry goes (``removed``, reason ``not_sent``), the
-        failure is recorded on the meeting, its time returns to the remaining entries, and it
-        stays ``scheduled`` for them (``joined_existing``).
+        A failure BEFORE the claim leaves the meeting ``scheduled``. When other active entries
+        share it (an adopted meeting, Ruling R12) only the pasted entry goes (``removed``, reason
+        ``not_sent``), the failure is recorded on the meeting, its time returns to the remaining
+        entries, and it stays ``scheduled`` for them (``joined_existing``). Otherwise the failure
+        is one of the meeting's bounded sends (``_send_failed``): the scheduler tries again after
+        the backoff, and the last attempt ends the meeting ``not_sent``; the reply keeps
+        ``done.result``.
 
         A failure AFTER the claim finds the meeting finished: the spawn port already ended it
         ``not_sent`` (Ruling R17), and the reply is ``done.result`` with that meeting (``created``
         for a new one, ``joined_existing`` for an adopted one). A meeting that is live got its bot
         from the scheduler meanwhile (``joined_existing``)."""
         meeting = done.meeting
+        code = outcome.code or "internal_error"
+        message = outcome.message or "the bot was not sent"
         async with self._store.room_lock(user_id, [meeting.room]) as tx:
             w = _Work(tx)
             mine = await tx.find_entry(user_id, entry.user, entry.external_id)
@@ -527,25 +533,53 @@ class IntakeService:
                 return "joined_existing"
             if others and mine is not None:
                 await tx.mark_entry_removed(mine.id, "not_sent")
-                await tx.record_spawn_error(meeting.id, outcome.code, outcome.message)
+                await tx.record_spawn_error(meeting.id, code, message)
                 await self._replan(tx, meeting.id, current.room)
                 await w.event(meeting.id, "meeting.updated")
                 result = "joined_existing"
             else:
-                try:
-                    await w.status(
-                        meeting.id,
-                        "failed",
-                        expected_from={"scheduled"},
-                        outcome=Outcome("not_sent", outcome.code, outcome.message),
-                        change_reason=outcome.code,
-                        event_type="meeting.not_sent",
-                    )
-                except StatusConflict:
-                    return "joined_existing"
+                await self._send_failed(w, meeting.id, code, message, now=self._clock())
                 result = done.result
         await self._publish(w.events)
         return result
+
+    async def send_failed(
+        self, user_id: int, meeting_id: int, code: str, message: str, *, now: datetime
+    ) -> bool:
+        """§6.9 F-K: one failed send of an entry-managed meeting's bot, under its link lock. The
+        attempt is counted on the meeting (``send_attempts``, so every replica and tick shares the
+        count) with the typed code and exact message, and the next send waits
+        ``BOT_SEND_RETRY_BACKOFF_S``; the ``BOT_SEND_MAX_ATTEMPTS``-th failure ends the meeting
+        ``failed``, outcome ``not_sent``, with that code and message (``meeting.not_sent``).
+        Returns whether it ended. A meeting no longer ``scheduled`` is left alone."""
+        room = (await self._read(user_id, meeting_id)).room
+        async with self._store.room_lock(user_id, [room]) as tx:
+            w = _Work(tx)
+            current = await tx.meeting(meeting_id)
+            if current.status != "scheduled" or current.room != room:
+                return False
+            ended = await self._send_failed(w, meeting_id, code, message, now=now)
+        await self._publish(w.events)
+        return ended
+
+    async def _send_failed(
+        self, w: _Work, meeting_id: int, code: str, message: str, *, now: datetime
+    ) -> bool:
+        retry_at = now + timedelta(seconds=self._settings.send_retry_backoff_s)
+        attempts = await w.tx.record_send_failure(
+            meeting_id, code, message, retry_at=retry_at
+        )
+        if attempts < self._settings.send_max_attempts:
+            return False
+        await w.status(
+            meeting_id,
+            "failed",
+            expected_from={"scheduled"},
+            outcome=Outcome("not_sent", code, message),
+            change_reason=code,
+            event_type="meeting.not_sent",
+        )
+        return True
 
     async def _check_quota(self, tx: IntakeTx, user_id: int) -> None:
         limit = self._settings.max_active_entries

@@ -15,11 +15,11 @@ under the link lock and answers one of:
     out. Nothing else is written (no retry stamp), so the bot goes on the first tick after the link
     is free.
 
-``not_sent_tick(store, *, publisher, now, open_ended_s)`` is R6's backstop. Every
+``not_sent_tick(store, *, publisher, now)`` is R6's backstop. Every
 entry-managed meeting past its end without a bot (``IntakeStore.overdue_meetings``) is read again
 under its link lock and, still ``scheduled`` and overdue (``rules.is_overdue``), ends ``failed``
-with outcome ``not_sent`` through the status writer (``meeting.not_sent``). An open-ended meeting's
-end is its start plus ``open_ended_s`` (``JOIN_NOW_ADOPT_AHEAD_S``). ``not_sent_cause`` gives the
+with outcome ``not_sent`` through the status writer (``meeting.not_sent``). An open-ended meeting
+has no end to pass; its bounded sends end it (§6.9 F-K). ``not_sent_cause`` gives the
 detail and message:
 
   * ``meeting_aw_state.last_error_code`` when a spawn failed, with ``last_error_message`` (else
@@ -141,15 +141,12 @@ async def not_sent_tick(
     *,
     publisher: Optional[EventPublisher] = None,
     now: datetime,
-    open_ended_s: int,
 ) -> int:
     """End every overdue entry-managed meeting ``not_sent`` (R6); returns how many ended."""
     ended = 0
-    for view in await store.overdue_meetings(now, open_ended_s=open_ended_s):
+    for view in await store.overdue_meetings(now):
         try:
-            if await _end_not_sent(
-                store, publisher, view, now=now, open_ended_s=open_ended_s
-            ):
+            if await _end_not_sent(store, publisher, view, now=now):
                 ended += 1
         except Exception as exc:
             log_event(
@@ -175,7 +172,6 @@ async def _end_not_sent(
     view: MeetingView,
     *,
     now: datetime,
-    open_ended_s: int,
 ) -> bool:
     user_id, room = view.user_id, view.room
     async with store.room_lock(user_id, [room]) as tx:
@@ -184,9 +180,7 @@ async def _end_not_sent(
             current.status != "scheduled"
             or current.room != room
             or not current.entries
-            or not is_overdue(
-                current.start, current.end, now=now, open_ended_s=open_ended_s
-            )
+            or not is_overdue(current.end, now=now)
         ):
             return False
         detail, message = not_sent_cause(current.aw)

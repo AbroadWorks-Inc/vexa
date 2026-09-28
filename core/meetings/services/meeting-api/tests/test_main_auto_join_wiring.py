@@ -268,7 +268,7 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
     guarded, delays = await _run_loops(
         monkeypatch,
         session_factory=_fake_session_factory,
-        env={"NOT_SENT_SWEEP_INTERVAL_S": "7", "JOIN_NOW_ADOPT_AHEAD_S": "1800"},
+        env={"NOT_SENT_SWEEP_INTERVAL_S": "7"},
     )
 
     (not_sent,) = [c for c in calls if c[0] == "not-sent"]
@@ -276,7 +276,7 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
     _, store, kwargs = not_sent
     assert isinstance(store, PostgresIntakeStore) and store is auto_join[1]
     assert isinstance(kwargs["publisher"], OutboxOnly)
-    assert kwargs["open_ended_s"] == 1800
+    assert set(kwargs) == {"publisher", "now"}
     assert abs(kwargs["now"] - datetime.now(timezone.utc)) < timedelta(seconds=30)
     assert sweep_lock_key("not-sent") in guarded
     assert 7.0 in delays

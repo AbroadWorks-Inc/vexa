@@ -13,7 +13,7 @@ meeting. ``reads.py`` holds the Postgres implementation.
 ``IntakeStore.room_lock(user_id, rooms)`` opens one transaction holding the link lock of every
 room given, taken in the order given (the caller passes them sorted); an empty ``rooms`` is a plain
 transaction with no link lock. The transaction commits when the block exits normally and rolls
-back when it raises. ``IntakeStore.overdue_meetings(now, open_ended_s=...)`` is the not-sent
+back when it raises. ``IntakeStore.overdue_meetings(now)`` is the not-sent
 sweep's read across every account (§1.5).
 
 An entry is keyed by (``user_id``, ``source_user``, ``external_id``) and has at most one row that
@@ -276,7 +276,18 @@ class IntakeTx(Protocol):
         self, meeting_id: int, code: Optional[str], message: Optional[str]
     ) -> None:
         """Store a spawn failure on ``meeting_aw_state`` (``last_error_code``,
-        ``last_error_message``) without changing the meeting's status."""
+        ``last_error_message``) without changing the meeting's status or counting a send: the
+        failed send was a pasted entry's, not the meeting's own (Ruling R12)."""
+        ...
+
+    async def record_send_failure(
+        self, meeting_id: int, code: str, message: str, *, retry_at: datetime
+    ) -> int:
+        """One failed send of the meeting's bot (§6.9 F-K), without changing its status: under the
+        meeting row lock, then ``meeting_aw_state``, add 1 to ``send_attempts``, store the code and
+        message (``last_error_code``, ``last_error_message``), and hold the next send until
+        ``retry_at`` (``data.auto_join_next_retry``, with ``data.auto_join_error``). Returns the
+        attempts made so far."""
         ...
 
     async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
@@ -333,9 +344,7 @@ class IntakeStore(Protocol):
         self, user_id: int, rooms: Sequence[Room]
     ) -> AsyncContextManager[IntakeTx]: ...
 
-    async def overdue_meetings(
-        self, now: datetime, *, open_ended_s: int
-    ) -> list[MeetingView]:
+    async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
         """Every account's ``scheduled`` meetings that entries manage and that are past their end
         at ``now`` (``rules.is_overdue``), by id: the not-sent sweep's candidates (§1.5). Read
         without a link lock; the sweep reads each one again under its link lock."""

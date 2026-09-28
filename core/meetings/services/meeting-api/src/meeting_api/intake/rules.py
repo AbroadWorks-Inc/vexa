@@ -27,9 +27,8 @@ has started.
     before ``now``, so for an entry starting after ``now`` both give the same answer); a live
     one's at the later of ``now`` and its planned end; an open-ended live one's at ``now + lead``,
     the horizon R1 matches it by.
-  * ``is_overdue`` — R6: a meeting still without a bot is past its end: its ``end``, or for an
-    open-ended meeting ``start + open_ended_s`` (the not-sent sweep passes
-    ``JOIN_NOW_ADOPT_AHEAD_S``, the window a pasted link adopts by).
+  * ``is_overdue`` — R6: a meeting still without a bot is past its ``end``. An open-ended meeting
+    has no end to pass: its bounded send attempts end it (§6.9 F-K).
 
 Every tie between candidate meetings goes to the earliest start, then the lowest id.
 """
@@ -249,15 +248,6 @@ def is_future_move(
     )
 
 
-def is_overdue(
-    start: Optional[datetime],
-    end: Optional[datetime],
-    *,
-    now: datetime,
-    open_ended_s: float,
-) -> bool:
-    """R6: ``now`` is at or past the meeting's end; an open-ended meeting's end is ``start +
-    open_ended_s``. A meeting with neither a start nor an end is never overdue."""
-    if end is not None:
-        return now >= end
-    return start is not None and now >= start + timedelta(seconds=open_ended_s)
+def is_overdue(end: Optional[datetime], *, now: datetime) -> bool:
+    """R6: ``now`` is at or past the meeting's end; an open-ended meeting is never overdue."""
+    return end is not None and now >= end

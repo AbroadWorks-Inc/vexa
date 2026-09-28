@@ -306,14 +306,9 @@ def test_each_not_sent_cause_and_its_exact_message():
     }
 
 
-async def _sweep(h, at: str, *, open_ended_s: int = 3600) -> int:
+async def _sweep(h, at: str) -> int:
     h.clock.set(at)
-    return await not_sent_tick(
-        h.store,
-        publisher=h.publisher,
-        now=h.clock(),
-        open_ended_s=open_ended_s,
-    )
+    return await not_sent_tick(h.store, publisher=h.publisher, now=h.clock())
 
 
 def _outcome(h, mid):
@@ -378,10 +373,8 @@ async def test_not_sent_carries_the_last_spawn_error():
     )
 
 
-async def test_an_open_ended_meeting_ends_not_sent_after_the_adopt_window():
-    """Ruling (flagged): an open-ended meeting (no end) without a bot ends ``not_sent`` once
-    ``JOIN_NOW_ADOPT_AHEAD_S`` has passed since its start."""
-    h = make_harness()
+def _open_ended(h) -> int:
+    """A pasted meeting (no end) that has had no bot since 09:00."""
     start = ts("2026-09-29T09:00:00Z")
     paste = parse_entry(
         {
@@ -393,16 +386,83 @@ async def test_an_open_ended_meeting_ends_not_sent_after_the_adopt_window():
         now=start,
         max_days_ahead=30,
     )
-    mid = h.store.seed_meeting(
+    return h.store.seed_meeting(
         USER,
         ROOM,
         status="scheduled",
         plan=Plan(start, None, None, None, GMEET),
         entries=[(paste, "active")],
     )
-    assert await _sweep(h, "2026-09-29T09:59:59Z") == 0
-    assert await _sweep(h, "2026-09-29T10:00:00Z") == 1
-    assert _outcome(h, mid)[:3] == ("failed", "not_sent", "ended_before_sent")
+
+
+async def test_an_open_ended_meeting_is_never_ended_by_time():
+    """F-K: an open-ended meeting has no end to pass; its send attempts bound it, never
+    ``JOIN_NOW_ADOPT_AHEAD_S``."""
+    h = make_harness()
+    mid = _open_ended(h)
+    assert await _sweep(h, "2026-09-29T10:00:00Z") == 0
+    assert await _sweep(h, "2026-10-01T10:00:00Z") == 0
+    assert h.store.meetings[mid]["status"] == "scheduled"
+
+
+# ── bounded send attempts (F-K) ──────────────────────────────────────────────────────────────
+
+LIMIT = ("account_limit", "bot limit reached (45 of 45)")
+
+
+async def test_each_failed_send_is_counted_and_backs_off_by_the_setting():
+    h = make_harness()
+    mid = _open_ended(h)
+    h.clock.set("2026-09-29T09:00:00Z")
+    assert await h.service.send_failed(USER, mid, *LIMIT, now=h.clock()) is False
+    view = h.store.view(mid)
+    assert view.status == "scheduled"
+    assert (view.aw["send_attempts"], view.aw["last_error_code"]) == (
+        1,
+        "account_limit",
+    )
+    assert view.aw["last_error_message"] == "bot limit reached (45 of 45)"
+    assert view.data["auto_join_next_retry"] == "2026-09-29T09:01:00+00:00"
+    assert view.data["auto_join_error"] == "bot limit reached (45 of 45)"
+
+
+async def test_the_last_failed_send_ends_the_meeting_not_sent_with_its_code():
+    h = make_harness()
+    mid = _open_ended(h)
+    for minute in (0, 1):
+        h.clock.set(f"2026-09-29T09:0{minute}:00Z")
+        assert await h.service.send_failed(USER, mid, *LIMIT, now=h.clock()) is False
+    mark = h.mark()
+    h.clock.set("2026-09-29T09:02:00Z")
+    assert (
+        await h.service.send_failed(
+            USER, mid, "spawn_error", "kernel said no", now=h.clock()
+        )
+        is True
+    )
+    assert _outcome(h, mid) == ("failed", "not_sent", "spawn_error", "kernel said no")
+    uuid = h.store.meetings[mid]["uuid"]
+    assert h.events(mark) == [(uuid, "meeting.not_sent")]
+    assert h.store.events[-1].change["reason"] == "spawn_error"
+    assert h.published()[-1] == h.store.events[-1].event_id
+    assert h.store.aw[mid]["send_attempts"] == 3
+
+
+async def test_the_attempt_limit_is_the_setting():
+    h = make_harness(send_max_attempts=1)
+    mid = _open_ended(h)
+    h.clock.set("2026-09-29T09:00:00Z")
+    assert await h.service.send_failed(USER, mid, *LIMIT, now=h.clock()) is True
+    assert _outcome(h, mid) == ("failed", "not_sent", *LIMIT)
+
+
+async def test_a_failed_send_on_a_meeting_no_longer_scheduled_changes_nothing():
+    h = make_harness()
+    mid = _open_ended(h)
+    h.store.write_status(mid, "requested", expected_from={"scheduled"})
+    mark = h.mark()
+    assert await h.service.send_failed(USER, mid, *LIMIT, now=h.clock()) is False
+    assert h.store.aw[mid]["send_attempts"] == 0 and h.events(mark) == []
 
 
 async def test_the_not_sent_sweep_leaves_entry_less_and_live_meetings_alone():
@@ -447,7 +507,7 @@ async def _ctx(_user_id: int) -> dict:
 class Pg:
     """The real repo, intake store, exact-row spawn and entry service over one database."""
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, *, send_max_attempts: int = 3) -> None:
         from sqlalchemy.ext.asyncio import async_sessionmaker
 
         from intake_builders import make_settings
@@ -473,7 +533,11 @@ class Pg:
             redis_url="redis://r",
         )
         self.service = IntakeService(
-            self.store, spawn, NoStop(), self.publisher, make_settings(lead_s=300)
+            self.store,
+            spawn,
+            NoStop(),
+            self.publisher,
+            make_settings(lead_s=300, send_max_attempts=send_max_attempts),
         )
 
     async def tick(self, now: datetime, **kw: Any) -> dict:
@@ -497,12 +561,7 @@ class Pg:
         )
 
     async def not_sent(self, now: datetime) -> int:
-        return await not_sent_tick(
-            self.store,
-            publisher=self.publisher,
-            now=now,
-            open_ended_s=3600,
-        )
+        return await not_sent_tick(self.store, publisher=self.publisher, now=now)
 
     async def put(
         self, external_id: str, start: datetime, end: datetime, *, url: str = GMEET
@@ -531,7 +590,7 @@ class Pg:
                     text(
                         "SELECT m.status, m.data, a.outcome_kind, a.outcome_detail, "
                         "a.outcome_message, a.last_error_code, a.last_error_message, "
-                        "a.waiting_for_room_sent_at FROM meetings m "
+                        "a.waiting_for_room_sent_at, a.send_attempts FROM meetings m "
                         "LEFT JOIN meeting_aw_state a ON a.meeting_id = m.id WHERE m.id = :m"
                     ),
                     {"m": mid},
@@ -920,9 +979,9 @@ async def test_pg_a_spawn_failure_records_its_code_and_backs_off(pg):
     assert row["last_error_message"] == "bot limit reached (45 of 45)"
     assert row["data"]["auto_join_error"] == "bot limit reached (45 of 45)"
     assert (
-        row["data"]["auto_join_next_retry"]
-        == (now + timedelta(seconds=300)).isoformat()
+        row["data"]["auto_join_next_retry"] == (now + timedelta(seconds=60)).isoformat()
     )
+    assert row["send_attempts"] == 1
 
     assert (await pg.tick(now + timedelta(seconds=30)))["due"] == 0
 
@@ -1055,3 +1114,92 @@ async def test_pg_two_replicas_run_each_sweep_once(pg):
     assert results["not-sent"] == [1]
     assert (await pg.row(ended))["outcome_detail"] == "ended_before_sent"
     assert len(pg.runtime.specs) == 1
+
+
+# ── bounded send attempts on Postgres (F-K) ──────────────────────────────────────────────────
+
+
+async def _full_account(pg: Pg, now: datetime) -> list[int]:
+    return [
+        await pg.seed_upstream(
+            now - timedelta(hours=1), status="active", native=f"n{i:02d}-aaaa-bbb"
+        )
+        for i in range(45)
+    ]
+
+
+def _not_sent_count(detail: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_meetings_not_sent_total", {"detail": detail, "user_id": str(USER)}
+    )
+    return value or 0.0
+
+
+@pg_only
+async def test_pg_send_attempts_are_counted_across_ticks_and_replicas(pg):
+    """Each failed send is one attempt, stored on the meeting, so a second replica (its own repo,
+    store and service over the same database) continues the count; the third ends the meeting
+    ``not_sent`` with the last code and message (``meeting.not_sent``, the counter)."""
+    now = _now()
+    await _full_account(pg, now)
+    mid = await pg.put("e1", now, now + timedelta(minutes=30))
+    before = _not_sent_count("account_limit")
+
+    assert (await pg.tick(now))["errors"] == 1
+    row = await pg.row(mid)
+    assert (row["status"], row["send_attempts"]) == ("scheduled", 1)
+    assert (await pg.tick(now + timedelta(seconds=30)))["due"] == 0
+
+    replica = Pg(pg.engine)
+    assert (await replica.tick(now + timedelta(seconds=60)))["errors"] == 1
+    assert (await pg.row(mid))["send_attempts"] == 2
+
+    assert (await pg.tick(now + timedelta(seconds=120)))["errors"] == 1
+    row = await pg.row(mid)
+    assert (
+        row["status"],
+        row["outcome_kind"],
+        row["outcome_detail"],
+        row["outcome_message"],
+        row["send_attempts"],
+    ) == ("failed", "not_sent", "account_limit", "bot limit reached (45 of 45)", 3)
+    assert (await pg.events(mid))[-1] == "meeting.not_sent"
+    assert _not_sent_count("account_limit") == before + 1
+    assert pg.runtime.specs == [] and replica.runtime.specs == []
+
+
+@pg_only
+async def test_pg_a_send_that_succeeds_on_its_second_attempt_joins_normally(pg):
+    now = _now()
+    live = await _full_account(pg, now)
+    mid = await pg.put("e1", now, now + timedelta(minutes=30))
+    assert (await pg.tick(now))["errors"] == 1
+    await pg.set_status(live[0], "completed")
+
+    counters = await pg.tick(now + timedelta(seconds=60))
+    assert counters["spawned"] == 1
+    row = await pg.row(mid)
+    assert (row["status"], row["outcome_kind"], row["send_attempts"]) == (
+        "requested",
+        None,
+        1,
+    )
+    assert "auto_join_error" not in row["data"]
+    assert len(pg.runtime.specs) == 1
+
+
+@pg_only
+async def test_pg_the_attempt_limit_is_the_setting(pg):
+    one = Pg(pg.engine, send_max_attempts=1)
+    now = _now()
+    await _full_account(one, now)
+    mid = await one.put("e1", now, now + timedelta(minutes=30))
+    await one.tick(now)
+    row = await one.row(mid)
+    assert (row["status"], row["outcome_detail"], row["send_attempts"]) == (
+        "failed",
+        "account_limit",
+        1,
+    )

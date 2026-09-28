@@ -179,6 +179,8 @@ def make_settings(
     lead_s: int = 300,
     max_active_entries: int = 100_000,
     blocked_hosts: frozenset[str] = frozenset({"meet.abroadworks.com"}),
+    send_max_attempts: int = 3,
+    send_retry_backoff_s: int = 60,
 ) -> IntakeSettings:
     return IntakeSettings(
         max_days_ahead=30,
@@ -186,6 +188,8 @@ def make_settings(
         lead_s=lead_s,
         blocked_hosts=blocked_hosts,
         max_active_entries=max_active_entries,
+        send_max_attempts=send_max_attempts,
+        send_retry_backoff_s=send_retry_backoff_s,
     )
 
 
@@ -196,12 +200,14 @@ def make_harness(
     max_active_entries: int = 100_000,
     blocked_hosts: frozenset[str] = frozenset({"meet.abroadworks.com"}),
     spawn_failure: Optional[SpawnOutcome] = None,
+    send_max_attempts: int = 3,
 ) -> Harness:
     clock = FakeClock(ts(now))
     settings = make_settings(
         lead_s=lead_s,
         max_active_entries=max_active_entries,
         blocked_hosts=blocked_hosts,
+        send_max_attempts=send_max_attempts,
     )
     store = InMemoryIntakeStore(clock=clock, lead_s=lead_s)
     spawn = FakeSpawn(store, failure=spawn_failure)

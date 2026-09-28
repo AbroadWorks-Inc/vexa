@@ -131,6 +131,7 @@ CREATE TABLE meeting_aw_state (
 	outcome_at TIMESTAMP WITH TIME ZONE, 
 	last_error_code TEXT, 
 	last_error_message TEXT, 
+	send_attempts INTEGER DEFAULT '0' NOT NULL, 
 	waiting_for_room_sent_at TIMESTAMP WITH TIME ZONE, 
 	export_state TEXT, 
 	export_s3_path TEXT, 

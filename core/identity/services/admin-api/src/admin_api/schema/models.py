@@ -290,6 +290,7 @@ class MeetingAwState(Base):  # type: ignore[valid-type,misc]
     outcome_at = Column(DateTime(timezone=True), nullable=True)
     last_error_code = Column(Text, nullable=True)
     last_error_message = Column(Text, nullable=True)
+    send_attempts = Column(Integer, nullable=False, server_default="0")
     waiting_for_room_sent_at = Column(DateTime(timezone=True), nullable=True)
     export_state = Column(Text, nullable=True)
     export_s3_path = Column(Text, nullable=True)

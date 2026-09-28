@@ -676,6 +676,20 @@
    "targets": ["helm"]
   },
   {
+   "key": "BOT_SEND_MAX_ATTEMPTS",
+   "class": "defaulted",
+   "default": "3",
+   "description": "intake and auto-join (§6.9 F-K): an entry-managed meeting's bot send is tried at most this many times in total; the last failure ends the meeting not_sent with its typed code",
+   "targets": []
+  },
+  {
+   "key": "BOT_SEND_RETRY_BACKOFF_S",
+   "class": "defaulted",
+   "default": "60",
+   "description": "intake and auto-join (§6.9 F-K): seconds between two sends of an entry-managed meeting's bot after a failure (entry-less rows keep AUTO_JOIN_RETRY_BACKOFF_S)",
+   "targets": []
+  },
+  {
    "key": "INTAKE_MAX_ACTIVE_ENTRIES",
    "class": "defaulted",
    "default": "100000",

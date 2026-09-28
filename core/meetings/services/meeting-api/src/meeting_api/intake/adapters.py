@@ -24,7 +24,7 @@ never offered to an entry (Ruling R15). ``count_active_entries`` counts on the p
 cached generic plan still matches the index.
 
 ``overdue_meetings`` is the not-sent sweep's read (§1.5): ``scheduled`` meetings that have an entry
-row and whose ``scheduled_end_at`` has passed (an open-ended one: its start plus ``open_ended_s``).
+row and whose ``scheduled_end_at`` has passed (an open-ended one is never overdue).
 A meeting's end is never before its start, so the read also bounds the meeting time by ``now`` and
 walks the partial index ``ix_meeting_scheduled_due`` (``status = 'scheduled'`` is a literal for the
 same generic-plan reason).
@@ -48,7 +48,7 @@ imports without SQLAlchemy installed.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -204,11 +204,9 @@ class PostgresIntakeStore:
                 await take_link_lock(db, user_id, room)
             yield PostgresIntakeTx(db)
 
-    async def overdue_meetings(
-        self, now: datetime, *, open_ended_s: int
-    ) -> list[MeetingView]:
+    async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
         async with self._reading() as tx:
-            return await tx._overdue(now, open_ended_s=open_ended_s)
+            return await tx._overdue(now)
 
     @asynccontextmanager
     async def _reading(self) -> AsyncIterator[PostgresIntakeTx]:
@@ -315,9 +313,9 @@ class PostgresIntakeTx:
         )
         return await self._views(meetings)
 
-    async def _overdue(self, now: datetime, *, open_ended_s: int) -> list[MeetingView]:
+    async def _overdue(self, now: datetime) -> list[MeetingView]:
         """``PostgresIntakeStore.overdue_meetings``'s read."""
-        from sqlalchemy import and_, exists, func, or_, select, text
+        from sqlalchemy import exists, func, select, text
 
         from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
 
@@ -334,13 +332,7 @@ class PostgresIntakeTx:
                 text("meetings.status = 'scheduled'"),
                 event_time <= naive,
                 exists().where(MeetingEntry.meeting_id == Meeting.id),
-                or_(
-                    end <= aware,
-                    and_(
-                        end.is_(None),
-                        event_time <= naive - timedelta(seconds=open_ended_s),
-                    ),
-                ),
+                end <= aware,
             )
             .order_by(Meeting.id)
         )
@@ -489,6 +481,23 @@ class PostgresIntakeTx:
         aw.last_error_code = code
         aw.last_error_message = message
         await self._db.flush()
+
+    async def record_send_failure(
+        self, meeting_id: int, code: str, message: str, *, retry_at: datetime
+    ) -> int:
+        meeting = await self._locked_meeting(meeting_id)
+        data = meeting.data if isinstance(meeting.data, dict) else {}
+        meeting.data = {
+            **data,
+            "auto_join_error": message,
+            "auto_join_next_retry": retry_at.isoformat(),
+        }
+        aw = await lock_aw_state(self._db, meeting_id)
+        aw.last_error_code = code
+        aw.last_error_message = message
+        aw.send_attempts = int(aw.send_attempts or 0) + 1
+        await self._db.flush()
+        return int(aw.send_attempts)
 
     async def record_outcome(self, meeting_id: int, outcome: Outcome) -> None:
         await self._locked_meeting(meeting_id)
