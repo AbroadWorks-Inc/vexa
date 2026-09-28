@@ -482,8 +482,9 @@ def create_app(
             if user_data.get("webhook_events"):
                 headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
         headers[TRACE_HEADER] = get_trace_id() or ""
-        # §1.10: meeting-api and admin-api believe x-user-id only with a fresh signature over the
-        # forwarded method and path. Without the secret there is no identity to vouch for.
+        # §1.10: meeting-api and admin-api believe x-user-id only with a fresh signature, which
+        # _sign adds once the exact query and body to forward are known. Without the secret there
+        # is no identity to vouch for.
         secret = identity_secret()
         if not secret:
             log_event(
@@ -495,8 +496,14 @@ def create_app(
                 fields={"method": method, "path": request.url.path},
             )
             return None, _refusal(request.url.path, 503, "GATEWAY_IDENTITY_SECRET is not configured")
-        headers[SIGNATURE_HEADER] = sign_now(secret, headers["x-user-id"], method, url)
         return headers, None
+
+    # §1.10, §6.9 F-E: the signature covers the method, the path and query of the URL httpx sends,
+    # and the SHA-256 of the exact body bytes forwarded.
+    def _sign(headers: dict, method: str, url: str, params: Optional[dict], content: bytes) -> None:
+        headers[SIGNATURE_HEADER] = sign_now(
+            identity_secret(), headers["x-user-id"], method, url, params, content
+        )
 
     # --- the REST proxy: faithful carve of main.forward_request for client (non-admin) routes.
     async def _forward(method: str, url: str, request: Request, *, api_key: Optional[str] = None) -> Response:
@@ -505,15 +512,17 @@ def create_app(
             return error
 
         content = await request.body()
+        params = dict(request.query_params) or None
         # A public gateway must not LEAK its own 500 for an UPSTREAM fault: map a slow upstream → 504 and
         # an unreachable/transport-failed upstream → 502, so a client can tell "backend down" from
         # "gateway broke" (and get a retryable signal). Timeout is a subclass of RequestError → catch it first.
         try:
+            _sign(headers, method, url, params, content)
             resp = await downstream.request(
                 method,
                 url,
                 headers=headers,
-                params=dict(request.query_params) or None,
+                params=params,
                 content=content,
             )
         except httpx.InvalidURL:
@@ -965,6 +974,7 @@ def create_app(
             return error
         content = await request.body()
         params = dict(request.query_params) or None
+        _sign(headers, method, url, params, content)
 
         async def body():
             async for chunk in downstream.stream(method, url, headers=headers, params=params, content=content):
@@ -991,6 +1001,7 @@ def create_app(
             return error
         content = await request.body()
         params = dict(request.query_params) or None
+        _sign(headers, method, url, params, content)
 
         stack = AsyncExitStack()
         try:

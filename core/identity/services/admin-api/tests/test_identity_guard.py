@@ -1,14 +1,16 @@
 """Only the gateway can say who is calling (design §1.10).
 
-A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` over the request's
-method and path. Unsigned, forged, stale, future, wrong-user and duplicated identities answer 401
-before any route runs; so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't
-configured. The operator's ``/admin/*`` surface, ``/internal/*`` and ``/health`` are exempt, and
+A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` (version ``v2``)
+over the request's method, path, raw query and body (§6.9 F-E). Unsigned, forged, stale, future,
+wrong-user, wrong-query, wrong-body, v1 and duplicated identities answer 401 before any route runs;
+so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't configured. A signature under
+``GATEWAY_IDENTITY_SECRET_PREVIOUS`` is accepted only while that key is set. The operator's ``/admin/*`` surface, ``/internal/*`` and ``/health`` are exempt, and
 every route of the app is checked against that list.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -20,7 +22,12 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.routing import Route
 
-from admin_api.app.identity_guard import MAX_SKEW_S, is_exempt, verify_signature
+from admin_api.app.identity_guard import (
+    MAX_SKEW_S,
+    IdentityGuard,
+    is_exempt,
+    verify_signature,
+)
 from admin_api.app.main import create_app
 from gateway_identity import load_vectors, signature, signed_headers, via_gateway
 
@@ -54,12 +61,17 @@ EXEMPT = {
 
 @pytest.mark.parametrize("case", VECTORS["verify_cases"], ids=lambda c: c["case"])
 def test_the_verifier_agrees_with_the_shared_vectors(case):
+    secrets = [VECTORS["secret"]]
+    if case["previous_secret"] is not None:
+        secrets.append(case["previous_secret"])
     reason = verify_signature(
-        VECTORS["secret"],
+        secrets,
         case["user_id"],
         case["header"],
         case["method"],
         case["path"],
+        case["query"],
+        case["body"].encode("utf-8"),
         case["now"],
     )
     assert (reason is None) is case["valid"], reason
@@ -93,7 +105,7 @@ def test_a_key_alone_is_401(client):
 
 
 def test_a_forged_signature_is_401(client):
-    forged = f"t={int(time.time())},v1={'0' * 64}"
+    forged = f"t={int(time.time())},v2={'0' * 64}"
     r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": forged})
     assert r.status_code == 401
 
@@ -121,6 +133,135 @@ def test_a_signature_for_another_route_is_401(client):
     assert r.status_code == 401
 
 
+def test_a_signed_query_passes(client):
+    r = client.get("/?limit=5", headers=signed_headers(7, "GET", "/", query="limit=5"))
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("sent", ["/?limit=6", "/", "/?limit=5&x=1"])
+def test_a_replay_with_another_query_is_401(client, sent):
+    headers = signed_headers(7, "GET", "/", query="limit=5")
+    assert client.get(sent, headers=headers).status_code == 401
+
+
+BODY = b'{"url":"https://portal.example/hook","events":["meeting.completed"]}'
+
+
+def test_a_signed_body_passes(client):
+    headers = signed_headers(7, "GET", "/", body=BODY)
+    assert client.request("GET", "/", headers=headers, content=BODY).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [BODY.replace(b"hook", b"hool"), b"", BODY + b" "],
+    ids=["one-byte", "dropped", "appended"],
+)
+def test_a_replay_with_another_body_is_401(client, sent):
+    headers = signed_headers(7, "GET", "/", body=BODY)
+    assert client.request("GET", "/", headers=headers, content=sent).status_code == 401
+
+
+def test_a_v1_signature_is_401(client):
+    v1 = "t={},v1={}".format(int(time.time()), "0" * 64)
+    r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": v1})
+    assert r.status_code == 401
+
+
+PREVIOUS = "test-gateway-identity-previous-admin-api"
+
+
+def test_the_previous_key_is_accepted_while_it_is_configured(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
+    sig = signature("7", "GET", "/", secret=PREVIOUS)
+    r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 200, r.text
+    assert client.get("/", headers=signed_headers(7, "GET", "/")).status_code == 200
+
+
+def test_the_previous_key_is_refused_once_it_is_dropped(client, monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", raising=False)
+    sig = signature("7", "GET", "/", secret=PREVIOUS)
+    r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 401
+
+
+def test_the_previous_key_alone_accepts_nothing(client, monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET")
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
+    sig = signature("7", "GET", "/", secret=PREVIOUS)
+    r = client.get("/", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 401
+
+
+async def _echo(scope, receive, send):
+    chunks = []
+    while True:
+        message = await receive()
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body", False):
+            break
+    body = b"".join(chunks)
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": body})
+
+
+def _drive(app, headers, chunks, query=b""):
+    """Call ``app`` over raw ASGI with the body in ``chunks``; returns (status, body, reads)."""
+    pending = [
+        {"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+        for i, c in enumerate(chunks)
+    ]
+    reads = []
+    sent: list[dict] = []
+
+    async def receive():
+        reads.append(1)
+        if pending:
+            return pending.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/echo",
+        "query_string": query,
+        "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+    }
+    asyncio.run(app(scope, receive, send))
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+    return status, body, len(reads)
+
+
+def test_a_body_in_chunks_is_hashed_whole_and_passed_on_intact():
+    body = b'{"a":' + b"1" * 70000 + b"}"
+    chunks = [body[:10], body[10:40000], body[40000:]]
+    headers = signed_headers(7, "POST", "/echo", query="x=1", body=body)
+    status, echoed, _ = _drive(IdentityGuard(_echo), headers, chunks, query=b"x=1")
+    assert status == 200
+    assert echoed == body
+
+
+def test_a_chunked_body_with_one_byte_changed_is_401():
+    body = b"0123456789" * 10
+    headers = signed_headers(7, "POST", "/echo", body=body)
+    tampered = [body[:50], b"X" + body[51:]]
+    status, _, _ = _drive(IdentityGuard(_echo), headers, tampered)
+    assert status == 401
+
+
+def test_an_unsigned_request_is_refused_without_reading_its_body():
+    status, _, reads = _drive(IdentityGuard(_echo), {"x-user-id": "7"}, [b"x" * 1000])
+    assert status == 401
+    assert reads == 0
+
+
 def test_a_duplicated_user_id_is_401(client):
     headers = [
         ("x-user-id", "7"),
@@ -142,7 +283,7 @@ def test_a_v2_route_answers_the_v2_error_shape(client):
 
 
 def test_the_rejection_is_logged_without_the_signature(client, caplog):
-    forged = f"t={int(time.time())},v1={'a' * 64}"
+    forged = f"t={int(time.time())},v2={'a' * 64}"
     with caplog.at_level(logging.WARNING, logger="admin_api.identity_guard"):
         client.get("/?x=1", headers={"x-user-id": "7", "x-gateway-signature": forged})
     assert "reason=mismatch method=GET path=/" in caplog.text

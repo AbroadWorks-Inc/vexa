@@ -1,14 +1,16 @@
 """Only the gateway can say who is calling (design §1.10).
 
-A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` over the request's
-method and path. Unsigned, forged, stale, future, wrong-user, wrong-route and duplicated identities
-answer 401 before any route runs; so does every client request when ``GATEWAY_IDENTITY_SECRET``
-isn't configured. The exempt routes are listed, and every route of the production app is checked
+A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` (version ``v2``)
+over the request's method, path, raw query and body (§6.9 F-E). Unsigned, forged, stale, future,
+wrong-user, wrong-route, wrong-query, wrong-body, v1 and duplicated identities answer 401 before any
+route runs; so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't configured. A
+signature under ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` is accepted only while that key is set. The exempt routes are listed, and every route of the production app is checked
 against that list.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -28,7 +30,12 @@ from gateway_identity import (
     via_gateway,
 )
 from meeting_api import create_app
-from meeting_api.identity_guard import MAX_SKEW_S, is_exempt, verify_signature
+from meeting_api.identity_guard import (
+    MAX_SKEW_S,
+    IdentityGuard,
+    is_exempt,
+    verify_signature,
+)
 
 VECTORS = load_vectors()
 
@@ -45,12 +52,17 @@ EXEMPT = {
 
 @pytest.mark.parametrize("case", VECTORS["verify_cases"], ids=lambda c: c["case"])
 def test_the_verifier_agrees_with_the_shared_vectors(case):
+    secrets = [VECTORS["secret"]]
+    if case["previous_secret"] is not None:
+        secrets.append(case["previous_secret"])
     reason = verify_signature(
-        VECTORS["secret"],
+        secrets,
         case["user_id"],
         case["header"],
         case["method"],
         case["path"],
+        case["query"],
+        case["body"].encode("utf-8"),
         case["now"],
     )
     assert (reason is None) is case["valid"], reason
@@ -81,7 +93,7 @@ def test_no_identity_at_all_is_401(client):
 
 
 def test_a_forged_signature_is_401(client):
-    forged = f"t={int(time.time())},v1={'0' * 64}"
+    forged = f"t={int(time.time())},v2={'0' * 64}"
     r = client.get(
         "/meetings", headers={"x-user-id": "7", "x-gateway-signature": forged}
     )
@@ -127,9 +139,153 @@ def test_a_signature_for_another_route_is_401(client, method, path):
     assert r.status_code == 401
 
 
-def test_the_query_string_is_not_signed(client):
-    r = client.get("/meetings?limit=5", headers=signed_headers(7, "GET", "/meetings"))
+def test_a_signed_query_passes(client):
+    headers = signed_headers(7, "GET", "/meetings", query="limit=5")
+    r = client.get("/meetings?limit=5", headers=headers)
     assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize(
+    "sent", ["/meetings?limit=6", "/meetings", "/meetings?limit=5&x=1"]
+)
+def test_a_replay_with_another_query_is_401(client, sent):
+    headers = signed_headers(7, "GET", "/meetings", query="limit=5")
+    assert client.get(sent, headers=headers).status_code == 401
+
+
+def test_a_query_on_an_unsigned_query_is_401(client):
+    r = client.get("/meetings?limit=5", headers=signed_headers(7, "GET", "/meetings"))
+    assert r.status_code == 401
+
+
+BODY = b'{"platform":"google_meet","native_meeting_id":"abc-defg-hij"}'
+
+
+def test_a_signed_body_reaches_the_route(client):
+    # The route parses the bytes the guard hashed: a JSON list is not a bot request.
+    headers = signed_headers(7, "POST", "/bots", body=b"[]")
+    r = client.post(
+        "/bots", headers={**headers, "content-type": "application/json"}, content=b"[]"
+    )
+    assert r.status_code == 422, r.text
+    assert r.json() == {"detail": "body must be an object"}
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [BODY.replace(b"hij", b"hik"), b"", BODY + b" "],
+    ids=["one-byte", "dropped", "appended"],
+)
+def test_a_replay_with_another_body_is_401(client, sent):
+    headers = signed_headers(7, "POST", "/bots", body=BODY)
+    r = client.post(
+        "/bots", headers={**headers, "content-type": "application/json"}, content=sent
+    )
+    assert r.status_code == 401
+
+
+def test_a_v1_signature_is_401(client):
+    v1 = "t={},v1={}".format(int(time.time()), "0" * 64)
+    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": v1})
+    assert r.status_code == 401
+
+
+PREVIOUS = "test-gateway-identity-previous-meeting-api"
+
+
+def test_the_previous_key_is_accepted_while_it_is_configured(client, monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
+    sig = signature("7", "GET", "/meetings", secret=PREVIOUS)
+    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 200, r.text
+    r = client.get("/meetings", headers=signed_headers(7, "GET", "/meetings"))
+    assert r.status_code == 200, r.text
+
+
+def test_the_previous_key_is_refused_once_it_is_dropped(client, monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", raising=False)
+    sig = signature("7", "GET", "/meetings", secret=PREVIOUS)
+    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 401
+
+
+def test_the_previous_key_alone_accepts_nothing(client, monkeypatch):
+    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET")
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET_PREVIOUS", PREVIOUS)
+    sig = signature("7", "GET", "/meetings", secret=PREVIOUS)
+    r = client.get("/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig})
+    assert r.status_code == 401
+
+
+# ── the guard reads the body it hashes, and the route still gets every byte ────────────────────
+
+
+async def _echo(scope, receive, send):
+    chunks = []
+    while True:
+        message = await receive()
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body", False):
+            break
+    body = b"".join(chunks)
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": body})
+
+
+def _drive(app, headers, chunks, query=b""):
+    """Call ``app`` over raw ASGI with the body in ``chunks``; returns (status, body, reads)."""
+    pending = [
+        {"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+        for i, c in enumerate(chunks)
+    ]
+    reads = []
+    sent: list[dict] = []
+
+    async def receive():
+        reads.append(1)
+        if pending:
+            return pending.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/echo",
+        "query_string": query,
+        "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+    }
+    asyncio.run(app(scope, receive, send))
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+    return status, body, len(reads)
+
+
+def test_a_body_in_chunks_is_hashed_whole_and_passed_on_intact():
+    body = b'{"a":' + b"1" * 70000 + b"}"
+    chunks = [body[:10], body[10:40000], body[40000:]]
+    headers = signed_headers(7, "POST", "/echo", query="x=1", body=body)
+    status, echoed, _ = _drive(IdentityGuard(_echo), headers, chunks, query=b"x=1")
+    assert status == 200
+    assert echoed == body
+
+
+def test_a_chunked_body_with_one_byte_changed_is_401():
+    body = b"0123456789" * 10
+    headers = signed_headers(7, "POST", "/echo", body=body)
+    tampered = [body[:50], b"X" + body[51:]]
+    status, _, _ = _drive(IdentityGuard(_echo), headers, tampered)
+    assert status == 401
+
+
+def test_an_unsigned_request_is_refused_without_reading_its_body():
+    status, _, reads = _drive(IdentityGuard(_echo), {"x-user-id": "7"}, [b"x" * 1000])
+    assert status == 401
+    assert reads == 0
 
 
 def test_a_duplicated_user_id_is_401(client):
@@ -155,7 +311,7 @@ def test_a_v2_route_answers_the_v2_error_shape(client):
 
 
 def test_the_rejection_is_logged_without_the_signature(client, capsys):
-    forged = f"t={int(time.time())},v1={'a' * 64}"
+    forged = f"t={int(time.time())},v2={'a' * 64}"
     client.get(
         "/meetings?x=1", headers={"x-user-id": "7", "x-gateway-signature": forged}
     )

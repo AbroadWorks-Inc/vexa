@@ -1,11 +1,16 @@
 {
-  "description": "Test vectors for the gateway identity signature (design §1.10). The gateway signs every request it forwards with x-user-id; meeting-api and admin-api verify. The secret here is a test-only literal, never deployed.",
+  "description": "Test vectors for the gateway identity signature, version v2 (design §1.10, §6.9 F-E). The gateway signs every request it forwards with x-user-id; meeting-api and admin-api verify. The secrets here are test-only literals, never deployed.",
   "header": "x-gateway-signature",
-  "format": "t=<unix seconds, digits only>,v1=<64 lower-case hex digits>",
-  "message": "<t>.<user_id>.<METHOD>.<path>",
-  "algorithm": "HMAC-SHA256, key = GATEWAY_IDENTITY_SECRET (UTF-8), message UTF-8",
-  "path_rule": "the request path as the receiving service routes it: percent-decoded, no query string, no scheme or host (ASGI scope['path']). The gateway takes httpx.URL(<downstream url>).path of the URL it forwards to.",
+  "version": "v2",
+  "format": "t=<unix seconds, digits only>,v2=<64 lower-case hex digits>",
+  "message": "v2\\n<t>\\n<user_id>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>",
+  "message_rule": "the seven fields joined by a line feed (\\n), in this order. Only the last field, path, can contain a line feed, so the join is unambiguous.",
+  "algorithm": "HMAC-SHA256 over the UTF-8 message, key = GATEWAY_IDENTITY_SECRET (UTF-8)",
+  "path_rule": "the request path as the receiving service routes it: percent-decoded, no query string, no scheme or host (ASGI scope['path']). The gateway takes httpx.URL(<forwarded url>).path.",
+  "query_rule": "the raw query string exactly as forwarded, without the leading '?', or empty when there is none (ASGI scope['query_string'], ASCII). The gateway takes the query of the URL httpx sends: httpx.URL(<downstream url>).copy_merge_params(<forwarded params>).query. Not parsed, not re-ordered, not re-encoded.",
+  "body_rule": "body_sha256 is the lower-case hex SHA-256 of the exact request body bytes: the bytes the gateway forwards, and the bytes the verifier receives before any handler reads them. An empty body hashes the empty string (e3b0c442...b855). In these vectors body is given as a UTF-8 string.",
   "user_id_rule": "the exact x-user-id header value; a request must carry exactly one x-user-id and exactly one x-gateway-signature",
+  "rotation_rule": "the gateway signs with GATEWAY_IDENTITY_SECRET only. A verifier accepts a signature that matches under GATEWAY_IDENTITY_SECRET or, when it is set, GATEWAY_IDENTITY_SECRET_PREVIOUS. Without GATEWAY_IDENTITY_SECRET a verifier accepts nothing, whatever the previous key.",
   "max_skew_s": 60,
   "secret": "test-gateway-identity-secret-0001",
   "vectors": [
@@ -14,48 +19,77 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
-      "message": "1790000000.7.GET./meetings",
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b"
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\n1790000000\n7\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d"
+    },
+    {
+      "t": 1790000000,
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=5&offset=10",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\n1790000000\n7\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nlimit=5&offset=10\n/meetings",
+      "header": "t=1790000000,v2=cb1f821e539e8c690fbdd599b42ffa0410182b5daba2389bfc33260a51d5594b"
     },
     {
       "t": 1790000000,
       "user_id": "7",
       "method": "POST",
       "path": "/bots",
-      "message": "1790000000.7.POST./bots",
-      "header": "t=1790000000,v1=c1dcd091b5da5539425e265634a6f9c0e02b9d5489b521dd4a0acc3418a16533"
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "body_sha256": "42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4",
+      "message": "v2\n1790000000\n7\nPOST\n42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4\n\n/bots",
+      "header": "t=1790000000,v2=ea169f35bf80a27649176a5976cbc7ba03bb09029cef4ee7d8f0d2073a0efefb"
     },
     {
       "t": 1790000000,
       "user_id": "42",
       "method": "PUT",
       "path": "/v2/entries",
-      "message": "1790000000.42.PUT./v2/entries",
-      "header": "t=1790000000,v1=e1873eab6b484ff98c3de4f48f477e151734be69952c2d35a5099ab48002a54e"
+      "query": "",
+      "body": "{\"entries\":[{\"source\":\"calendar\",\"meeting_url\":\"https://meet.google.com/abc-defg-hij\"}]}",
+      "body_sha256": "2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6",
+      "message": "v2\n1790000000\n42\nPUT\n2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6\n\n/v2/entries",
+      "header": "t=1790000000,v2=39351641862d200b852044dcd17048cbf45abb75707a5f72590bf58e82bedf59"
     },
     {
       "t": 1790000000,
       "user_id": "42",
       "method": "DELETE",
       "path": "/meetings/google_meet/abc-defg-hij",
-      "message": "1790000000.42.DELETE./meetings/google_meet/abc-defg-hij",
-      "header": "t=1790000000,v1=4a9d5f4be3d3d89083f372cc5eeffd8c948eee102ee581554d3dd41ce920bb3f"
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\n1790000000\n42\nDELETE\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings/google_meet/abc-defg-hij",
+      "header": "t=1790000000,v2=05396df9dd7bd661675bbd2d156a31374532b9218361720b153383393793db4b"
     },
     {
       "t": 1790000000,
       "user_id": "1",
       "method": "GET",
       "path": "/transcripts/zoom/85012345678",
-      "message": "1790000000.1.GET./transcripts/zoom/85012345678",
-      "header": "t=1790000000,v1=7ff5e4e18bca006069ba2d8846ee7eecf46e8df6df8f2a525b20f34d4793e52d"
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\n1790000000\n1\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/transcripts/zoom/85012345678",
+      "header": "t=1790000000,v2=fe127c5f17eaff817a7495772824bf01ec42e28469da8da465f40047363562d1"
     },
     {
       "t": 1790000000,
       "user_id": "7",
       "method": "GET",
       "path": "/meetings/teams/room one",
-      "message": "1790000000.7.GET./meetings/teams/room one",
-      "header": "t=1790000000,v1=7714833ad5edbf22b92c8fec5eb18ed29bf4da8f06ee8e79e500de0cdd98f3b3"
+      "query": "type=audio&x=%2F",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\n1790000000\n7\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ntype=audio&x=%2F\n/meetings/teams/room one",
+      "header": "t=1790000000,v2=c7fa89e3121b2ec49bca21813a8542337ecea10721bfe7b7c6699d79018f3613"
     }
   ],
   "verify_cases": [
@@ -64,8 +98,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": true
     },
     {
@@ -73,8 +110,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000060,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": true
     },
     {
@@ -82,8 +122,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000061,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -91,8 +134,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1789999940,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": true
     },
     {
@@ -100,8 +146,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1789999939,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -109,8 +158,11 @@
       "user_id": "8",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -118,8 +170,11 @@
       "user_id": "7",
       "method": "POST",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -127,8 +182,119 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings/1",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
+      "valid": false
+    },
+    {
+      "case": "with its query",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=5&offset=10",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=cb1f821e539e8c690fbdd599b42ffa0410182b5daba2389bfc33260a51d5594b",
+      "valid": true
+    },
+    {
+      "case": "query changed",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=6&offset=10",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=cb1f821e539e8c690fbdd599b42ffa0410182b5daba2389bfc33260a51d5594b",
+      "valid": false
+    },
+    {
+      "case": "query dropped",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=cb1f821e539e8c690fbdd599b42ffa0410182b5daba2389bfc33260a51d5594b",
+      "valid": false
+    },
+    {
+      "case": "query added",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=5",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
+      "valid": false
+    },
+    {
+      "case": "query reordered",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "offset=10&limit=5",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=cb1f821e539e8c690fbdd599b42ffa0410182b5daba2389bfc33260a51d5594b",
+      "valid": false
+    },
+    {
+      "case": "with its JSON body",
+      "user_id": "7",
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=ea169f35bf80a27649176a5976cbc7ba03bb09029cef4ee7d8f0d2073a0efefb",
+      "valid": true
+    },
+    {
+      "case": "body with one byte changed",
+      "user_id": "7",
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hik\"}",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=ea169f35bf80a27649176a5976cbc7ba03bb09029cef4ee7d8f0d2073a0efefb",
+      "valid": false
+    },
+    {
+      "case": "body dropped",
+      "user_id": "7",
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=ea169f35bf80a27649176a5976cbc7ba03bb09029cef4ee7d8f0d2073a0efefb",
+      "valid": false
+    },
+    {
+      "case": "body added to an empty-body signature",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "{}",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -136,8 +302,83 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=8a924d5d67f8f3ec944b968a783ae72ea127c174de6562b752cf73d064af84a7",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=b0a971359d177d9ae55717373d383c5441f518ae59c2862edbe07eba7ff96702",
+      "valid": false
+    },
+    {
+      "case": "under the previous secret, previous configured",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": "test-gateway-identity-secret-0000",
+      "header": "t=1790000000,v2=d97911c36ccc9c50d34ced721dd505e0fafc3585003334931014ff1c58b4009f",
+      "valid": true
+    },
+    {
+      "case": "under the previous secret, previous not configured",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v2=d97911c36ccc9c50d34ced721dd505e0fafc3585003334931014ff1c58b4009f",
+      "valid": false
+    },
+    {
+      "case": "under the current secret, previous configured",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": "test-gateway-identity-secret-0000",
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
+      "valid": true
+    },
+    {
+      "case": "under another secret, previous configured",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": "test-gateway-identity-secret-0000",
+      "header": "t=1790000000,v2=b0a971359d177d9ae55717373d383c5441f518ae59c2862edbe07eba7ff96702",
+      "valid": false
+    },
+    {
+      "case": "a v1 signature",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "valid": false
+    },
+    {
+      "case": "a v2 mac labelled v1",
+      "user_id": "7",
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "previous_secret": null,
+      "header": "t=1790000000,v1=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -145,7 +386,10 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
+      "previous_secret": null,
       "header": null,
       "valid": false
     },
@@ -154,8 +398,11 @@
       "user_id": null,
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -163,16 +410,22 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
+      "previous_secret": null,
       "header": "",
       "valid": false
     },
     {
-      "case": "no v1",
+      "case": "no v2",
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
+      "previous_secret": null,
       "header": "t=1790000000",
       "valid": false
     },
@@ -181,8 +434,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -190,8 +446,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b,t=1790000000",
+      "previous_secret": null,
+      "header": "v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d,t=1790000000",
       "valid": false
     },
     {
@@ -199,8 +458,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b,v0=00",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d,v0=00",
       "valid": false
     },
     {
@@ -208,8 +470,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=+1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=+1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
@@ -217,35 +482,47 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t= 1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t= 1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     },
     {
-      "case": "v1 upper-case hex",
+      "case": "v2 upper-case hex",
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90F0C6CD23D647551926C794FEBFAA3E5F663429B060B7BF5C825BF61414F30B",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82FB1D2B2BD1B329755E5396DD767B9EBBE87CB6726C90B3703D0660642BA12D",
       "valid": false
     },
     {
-      "case": "v1 too short",
+      "case": "v2 too short",
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f3",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba1",
       "valid": false
     },
     {
-      "case": "v1 not hex",
+      "case": "v2 not hex",
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000000,
-      "header": "t=1790000000,v1=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "previous_secret": null,
+      "header": "t=1790000000,v2=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
       "valid": false
     },
     {
@@ -253,8 +530,11 @@
       "user_id": "7",
       "method": "GET",
       "path": "/meetings",
+      "query": "",
+      "body": "",
       "now": 1790000001,
-      "header": "t=1790000001,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "previous_secret": null,
+      "header": "t=1790000001,v2=82fb1d2b2bd1b329755e5396dd767b9ebbe87cb6726c90b3703d0660642ba12d",
       "valid": false
     }
   ]

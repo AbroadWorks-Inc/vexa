@@ -112,7 +112,7 @@
    "class": "defaulted",
    "default": "(unset — every client route answers 401; the bot callbacks, /internal/*, /health and /metrics are unaffected)",
    "secret": true,
-   "description": "§1.10: the key the gateway signs x-user-id with (x-gateway-signature: t=<unix>,v1=<hex HMAC-SHA256 of \"<t>.<user_id>.<METHOD>.<path>\">). identity_guard.py refuses with 401 any client request whose signature is missing, malformed, wrong, for another user, or more than 60 s from this clock. The same value as the gateway's.",
+   "description": "§1.10, §6.9 F-E: the key the gateway signs x-user-id with (x-gateway-signature: t=<unix>,v2=<hex HMAC-SHA256 of \"v2\\n<t>\\n<user_id>\\n<METHOD>\\n<sha256 of the body>\\n<raw query>\\n<path>\">; core/gateway/contracts/gateway-identity). identity_guard.py refuses with 401 any client request whose signature is missing, malformed, not v2, wrong for its user, method, path, query or body, or more than 60 s from this clock. The same value as the gateway's.",
    "forbidden_values": [
     "vexa-internal-secret",
     "lite-internal-secret",
@@ -124,6 +124,24 @@
     "<REPLACE_ME>"
    ],
    "targets": ["compose", "helm", "lite"]
+  },
+  {
+   "key": "GATEWAY_IDENTITY_SECRET_PREVIOUS",
+   "class": "defaulted",
+   "default": "(unset — only GATEWAY_IDENTITY_SECRET is accepted)",
+   "secret": true,
+   "description": "§6.9 F-E: the gateway identity key being rotated out. While it is set, identity_guard.py also accepts a signature made with it (constant-time compare; the value is never logged). The gateway always signs with GATEWAY_IDENTITY_SECRET. Without GATEWAY_IDENTITY_SECRET nothing is accepted, whatever this holds. Rotation (core/gateway/contracts/gateway-identity/README.md): set the new key as GATEWAY_IDENTITY_SECRET and the old one here, roll this service, roll the gateway onto the new key, then unset this and roll again.",
+   "forbidden_values": [
+    "vexa-internal-secret",
+    "lite-internal-secret",
+    "changeme",
+    "change-me",
+    "CHANGE-ME",
+    "default",
+    "secret",
+    "<REPLACE_ME>"
+   ],
+   "targets": []
   },
   {
    "key": "DEFAULT_BOT_NAME",

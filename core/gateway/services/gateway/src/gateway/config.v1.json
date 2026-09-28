@@ -27,7 +27,7 @@
    "key": "GATEWAY_IDENTITY_SECRET",
    "class": "required-explicit",
    "secret": true,
-   "description": "§1.10: the key of the x-gateway-signature the gateway puts on every request it forwards with x-user-id (identity_signature.py). meeting-api and admin-api hold the same value and believe x-user-id only with a fresh signature, so without it every client route downstream answers 401: the boot refuses, and a gateway built without preflight refuses to forward (503).",
+   "description": "§1.10, §6.9 F-E: the key of the x-gateway-signature (v2: over the method, path, raw query and the SHA-256 of the exact body forwarded; core/gateway/contracts/gateway-identity) the gateway puts on every request it forwards with x-user-id (identity_signature.py). The gateway signs with this key only; during a rotation meeting-api and admin-api also accept their GATEWAY_IDENTITY_SECRET_PREVIOUS. meeting-api and admin-api hold the same value and believe x-user-id only with a fresh signature, so without it every client route downstream answers 401: the boot refuses, and a gateway built without preflight refuses to forward (503).",
    "forbidden_values": [
     "vexa-internal-secret",
     "lite-internal-secret",

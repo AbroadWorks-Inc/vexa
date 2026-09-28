@@ -1,19 +1,24 @@
 """Only the gateway can say who is calling (design §1.10).
 
 Client routes are reached through the gateway, which checks the caller's key, sets ``x-user-id``
-and signs it with ``GATEWAY_IDENTITY_SECRET``::
+and signs it with ``GATEWAY_IDENTITY_SECRET`` (§6.9 F-E)::
 
-    x-gateway-signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<user_id>.<METHOD>.<path>")>
+    x-gateway-signature: t=<unix seconds>,v2=<hex HMAC-SHA256(secret, message)>
+    message = "v2\n<t>\n<user_id>\n<METHOD>\n<body_sha256>\n<query>\n<path>"
 
 ``IdentityGuard`` answers 401 before any client route runs unless the request carries exactly one
 ``x-user-id`` and exactly one signature that
 
-- parses as ``t=<digits>,v1=<64 lower-case hex digits>``,
+- parses as ``t=<digits>,v2=<64 lower-case hex digits>``,
 - was made at most ``MAX_SKEW_S`` seconds before or after this service's clock, and
-- matches, in constant time, the HMAC over that ``t``, that ``x-user-id``, the request's method and
-  its path (``scope["path"]``: percent-decoded, no query string).
+- matches, in constant time, the HMAC over that ``t``, that ``x-user-id``, the request's method,
+  the SHA-256 of its body, its raw query (``scope["query_string"]``) and its path
+  (``scope["path"]``: percent-decoded), under ``GATEWAY_IDENTITY_SECRET`` or, while it is set,
+  ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` (the key being rotated out).
 
-Without ``GATEWAY_IDENTITY_SECRET`` every client request is refused.
+The guard reads the whole body to hash it, only once the header has parsed and is fresh, and hands
+the route the same bytes. Without ``GATEWAY_IDENTITY_SECRET`` every client request is refused,
+whatever the previous key.
 
 Routes that don't take a caller from the gateway are exempt, and they are listed here, not inferred:
 
@@ -34,7 +39,7 @@ import logging
 import os
 import re
 import time
-from typing import Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 SIGNATURE_HEADER = "x-gateway-signature"
 USER_HEADER = "x-user-id"
@@ -43,7 +48,7 @@ MAX_SKEW_S = 60
 EXEMPT_PATHS = frozenset({"/metrics"})
 EXEMPT_PREFIXES = ("/internal/", "/admin/", "/health")
 
-_SIGNATURE = re.compile(r"t=([0-9]{1,12}),v1=([0-9a-f]{64})")
+_SIGNATURE = re.compile(r"t=([0-9]{1,12}),v2=([0-9a-f]{64})")
 
 log = logging.getLogger("admin_api.identity_guard")
 
@@ -53,35 +58,101 @@ def is_exempt(path: str) -> bool:
     return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
 
 
-def identity_secret() -> str:
-    """``GATEWAY_IDENTITY_SECRET``, or ``""`` when it is not configured."""
-    return (os.getenv("GATEWAY_IDENTITY_SECRET") or "").strip()
+def identity_secrets() -> tuple[str, ...]:
+    """The keys a signature may be made with: ``GATEWAY_IDENTITY_SECRET``, then
+    ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` when it is set. Empty when the current key isn't set.
+    """
+    current = (os.getenv("GATEWAY_IDENTITY_SECRET") or "").strip()
+    previous = (os.getenv("GATEWAY_IDENTITY_SECRET_PREVIOUS") or "").strip()
+    if not current:
+        return ()
+    return (current, previous) if previous else (current,)
 
 
-def verify_signature(
-    secret: str,
+def precheck(
+    secrets: Sequence[str],
     user_id: Optional[str],
     header: Optional[str],
-    method: str,
-    path: str,
     now: float,
 ) -> Optional[str]:
-    """``None`` when ``header`` vouches for ``user_id`` on this request, else why it doesn't."""
-    if not secret:
+    """Why ``header`` can't vouch for anything, found without the body; ``None`` if it may."""
+    if not secrets or not secrets[0]:
         return "unconfigured"
     if not header or user_id is None:
         return "missing"
     match = _SIGNATURE.fullmatch(header)
     if match is None:
         return "malformed"
-    t = int(match.group(1))
-    if abs(now - t) > MAX_SKEW_S:
+    if abs(now - int(match.group(1))) > MAX_SKEW_S:
         return "expired"
-    message = f"{t}.{user_id}.{method.upper()}.{path}".encode("utf-8")
-    expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(match.group(2), expected):
-        return "mismatch"
     return None
+
+
+def verify_signature(
+    secrets: Sequence[str],
+    user_id: Optional[str],
+    header: Optional[str],
+    method: str,
+    path: str,
+    query: str,
+    body: bytes,
+    now: float,
+) -> Optional[str]:
+    """``None`` when ``header`` vouches for ``user_id`` on this request, else why it doesn't."""
+    reason = precheck(secrets, user_id, header, now)
+    if reason is not None:
+        return reason
+    match = _SIGNATURE.fullmatch(header or "")
+    if match is None or user_id is None:
+        return "malformed"
+    fields = [
+        "v2",
+        match.group(1),
+        user_id,
+        method.upper(),
+        hashlib.sha256(body).hexdigest(),
+        query,
+        path,
+    ]
+    message = "\n".join(fields).encode("utf-8")
+    matched = [
+        hmac.compare_digest(
+            match.group(2),
+            hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest(),
+        )
+        for secret in secrets
+        if secret
+    ]
+    return None if any(matched) else "mismatch"
+
+
+Receive = Callable[[], Awaitable[dict[str, Any]]]
+
+
+async def _read_body(receive: Receive) -> Optional[bytes]:
+    """The whole request body, or ``None`` when the client went away before sending it."""
+    chunks = []
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":
+            return None
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body", False):
+            return b"".join(chunks)
+
+
+def _replay(body: bytes, receive: Receive) -> Receive:
+    """A ``receive`` that hands the route ``body`` once, then the client's own messages."""
+    sent = False
+
+    async def replayed() -> dict[str, Any]:
+        nonlocal sent
+        if sent:
+            return await receive()
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return replayed
 
 
 def _single(headers: list, name: bytes) -> Optional[str]:
@@ -114,17 +185,28 @@ class IdentityGuard:
             return
         headers = scope.get("headers") or []
         path = scope["path"]
-        reason = verify_signature(
-            identity_secret(),
-            _single(headers, USER_HEADER.encode()),
-            _single(headers, SIGNATURE_HEADER.encode()),
-            scope["method"],
-            path,
-            self.clock(),
-        )
+        secrets = identity_secrets()
+        user_id = _single(headers, USER_HEADER.encode())
+        header = _single(headers, SIGNATURE_HEADER.encode())
+        now = self.clock()
+        reason = precheck(secrets, user_id, header, now)
         if reason is None:
-            await self.app(scope, receive, send)
-            return
+            body = await _read_body(receive)
+            if body is None:
+                return
+            reason = verify_signature(
+                secrets,
+                user_id,
+                header,
+                scope["method"],
+                path,
+                scope.get("query_string", b"").decode("latin-1"),
+                body,
+                now,
+            )
+            if reason is None:
+                await self.app(scope, _replay(body, receive), send)
+                return
         log.warning(
             "identity rejected: reason=%s method=%s path=%s",
             reason,

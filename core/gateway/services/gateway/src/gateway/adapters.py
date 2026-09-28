@@ -18,6 +18,7 @@ the conformance harness never imports it — it injects its own in-process fakes
 """
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -124,6 +125,9 @@ class AdminApiAuthorizer:
             # subscribe path fail-safe — surface it as an authorization error, not an unhandled 500.
             return {"authorized": [], "errors": [f"authorization_unavailable:{e}"]}
         url = f"{self._meeting_api_url}/ws/authorize-subscribe"
+        # §6.9 F-E: the signature covers the exact body bytes, so the body is encoded here.
+        body = json.dumps({"meetings": meetings}).encode("utf-8")
+        auth_headers["content-type"] = "application/json"
         if user_data:
             # §1.10: meeting-api believes x-user-id only with the gateway's signature.
             secret = identity_secret()
@@ -133,13 +137,11 @@ class AdminApiAuthorizer:
             auth_headers["x-user-id"] = str(user_data["user_id"])
             auth_headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
             auth_headers["x-user-limits"] = str(user_data.get("max_concurrent", 3))
-            auth_headers[SIGNATURE_HEADER] = sign_now(secret, auth_headers["x-user-id"], "POST", url)
-        try:
-            resp = await self._client.post(
-                url,
-                headers=auth_headers,
-                json={"meetings": meetings},
+            auth_headers[SIGNATURE_HEADER] = sign_now(
+                secret, auth_headers["x-user-id"], "POST", url, None, body
             )
+        try:
+            resp = await self._client.post(url, headers=auth_headers, content=body)
             if resp.status_code != 200:
                 return {"authorized": [], "errors": [f"authorization_service_error:{resp.status_code}"]}
             return resp.json()

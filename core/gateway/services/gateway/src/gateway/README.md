@@ -13,10 +13,12 @@ The production edge logic, injectable. Modules:
 - **`adapters.py`** — the real `httpx` + `redis` implementations of the ports, and
   `build_production_app(...)` (the prod entrypoint that wires them from env). Lazy-imports
   `httpx`/`redis` so the package imports cleanly in the test venv.
-- **`identity_signature.py`** — §1.10: the `x-gateway-signature` put on every forwarded request
-  carrying `x-user-id` (HMAC-SHA256 with `GATEWAY_IDENTITY_SECRET` over `<t>.<user_id>.<METHOD>.<path>`,
-  `path` = the forwarded URL's decoded path, no query). meeting-api and admin-api verify it; the rule
-  is pinned by `core/gateway/contracts/gateway-identity/signature.vectors.json`.
+- **`identity_signature.py`** — §1.10, §6.9 F-E: the `x-gateway-signature` (v2) put on every
+  forwarded request carrying `x-user-id`: HMAC-SHA256 with `GATEWAY_IDENTITY_SECRET` over the
+  version, `t`, the user, the method, the SHA-256 of the exact body forwarded, the raw query and the
+  decoded path of the URL httpx sends. meeting-api and admin-api verify it (also under their
+  optional previous key, for rotation); the rule is pinned by
+  `core/gateway/contracts/gateway-identity/signature.vectors.json`.
 - **`intake_limit.py`** — §1.13: the per-account entry-write budget (`INTAKE_RATE_LIMIT_PER_MIN`
   per 60 s window, `INCR` + `EXPIRE` in one `MULTI` on the gateway's Redis, shared by every replica).
   `create_app` applies it to `PUT /v2/entries` and `POST /v2/entries/remove` only.
