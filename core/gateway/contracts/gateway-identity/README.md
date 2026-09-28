@@ -9,10 +9,13 @@ pinned here as data that all three test suites read:
   ```
   x-gateway-signature: t=<unix seconds>,v2=<64 lower-case hex digits>
   v2 = hex HMAC-SHA256(GATEWAY_IDENTITY_SECRET, message), message UTF-8
-  message = "v2" LF <t> LF <user_id> LF <METHOD> LF <body_sha256> LF <query> LF <path>
+  message = "v2" LF <t> LF <user_id> LF <scopes> LF <limits> LF <METHOD> LF <body_sha256> LF <query> LF <path>
   ```
 
   - `user_id` is the exact `x-user-id` value; `METHOD` is upper-case.
+  - `scopes` and `limits` are the exact `x-user-scopes` and `x-user-limits` values as forwarded;
+    an absent header is an empty field. A request that carries either header more than once is
+    refused.
   - `body_sha256` is the lower-case hex SHA-256 of the exact request body bytes: the bytes the
     gateway forwards, and the bytes the verifier receives before any handler reads them. An empty
     body hashes the empty string.
@@ -29,7 +32,7 @@ pinned here as data that all three test suites read:
 
   `vectors` pin the signer (`gateway/identity_signature.py`); `verify_cases` pin the verifiers
   (`meeting_api/identity_guard.py`, `admin_api/app/identity_guard.py`), including the changed
-  query and body cases and the previous key.
+  scopes, limits, query and body cases and the previous key.
 
 The secrets in the file are test-only literals; no deployed secret is ever written here.
 

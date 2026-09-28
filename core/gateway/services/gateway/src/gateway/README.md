@@ -15,7 +15,7 @@ The production edge logic, injectable. Modules:
   `httpx`/`redis` so the package imports cleanly in the test venv.
 - **`identity_signature.py`** — §1.10, §6.9 F-E: the `x-gateway-signature` (v2) put on every
   forwarded request carrying `x-user-id`: HMAC-SHA256 with `GATEWAY_IDENTITY_SECRET` over the
-  version, `t`, the user, the method, the SHA-256 of the exact body forwarded, the raw query and the
+  version, `t`, the user, the forwarded `x-user-scopes` and `x-user-limits`, the method, the SHA-256 of the exact body forwarded, the raw query and the
   decoded path of the URL httpx sends. meeting-api and admin-api verify it (also under their
   optional previous key, for rotation); the rule is pinned by
   `core/gateway/contracts/gateway-identity/signature.vectors.json`.

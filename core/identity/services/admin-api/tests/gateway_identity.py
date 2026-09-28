@@ -2,9 +2,10 @@
 
 admin-api believes ``x-user-id`` only with the gateway's ``x-gateway-signature``. A route test
 that sends ``x-user-id`` stands for a request the gateway forwarded, so it reaches the app through
-``via_gateway(app)``, which signs such a request the way the gateway does: over its method, its
-path (``scope["path"]``), its raw query (``scope["query_string"]``), the SHA-256 of its body and
-the ``x-user-id`` it carries, with ``SECRET``. A request that already carries a signature, or
+``via_gateway(app)``, which signs such a request the way the gateway does: over the ``x-user-id``,
+``x-user-scopes`` and ``x-user-limits`` it carries (an absent header is an empty field), its
+method, its path (``scope["path"]``), its raw query (``scope["query_string"]``) and the SHA-256 of
+its body, with ``SECRET``. A request that already carries a signature, or
 carries no ``x-user-id``, passes through untouched, which is how the guard's own tests send
 unsigned and forged requests.
 
@@ -38,6 +39,8 @@ def signature(
     method: str,
     path: str,
     *,
+    scopes: str = "",
+    limits: str = "",
     query: str = "",
     body: bytes = b"",
     t: Optional[int] = None,
@@ -49,6 +52,8 @@ def signature(
         "v2",
         str(t),
         user_id,
+        scopes,
+        limits,
         method.upper(),
         hashlib.sha256(body).hexdigest(),
         query,
@@ -63,14 +68,30 @@ def signed_headers(
     method: str,
     path: str,
     *,
+    scopes: Optional[str] = None,
+    limits: Optional[str] = None,
     query: str = "",
     body: bytes = b"",
     **extra: str,
 ) -> dict[str, str]:
-    """``x-user-id`` with its signature, plus any extra headers."""
+    """``x-user-id`` with its signature, plus any extra headers. ``scopes`` and ``limits``, when
+    given, are sent as ``x-user-scopes`` and ``x-user-limits`` and signed."""
     uid = str(user_id)
-    sig = signature(uid, method, path, query=query, body=body)
-    return {"x-user-id": uid, SIGNATURE_HEADER: sig, **extra}
+    sig = signature(
+        uid,
+        method,
+        path,
+        scopes=scopes or "",
+        limits=limits or "",
+        query=query,
+        body=body,
+    )
+    headers = {"x-user-id": uid, SIGNATURE_HEADER: sig}
+    if scopes is not None:
+        headers["x-user-scopes"] = scopes
+    if limits is not None:
+        headers["x-user-limits"] = limits
+    return {**headers, **extra}
 
 
 class _ViaGateway:
@@ -95,13 +116,13 @@ class _ViaGateway:
                     if not message.get("more_body", False):
                         break
                 body = b"".join(chunks)
-                uid = next(
-                    value for key, value in headers if key == b"x-user-id"
-                ).decode("latin-1")
+                uid = _first(headers, b"x-user-id")
                 sig = signature(
                     uid,
                     scope["method"],
                     scope["path"],
+                    scopes=_first(headers, b"x-user-scopes"),
+                    limits=_first(headers, b"x-user-limits"),
                     query=scope.get("query_string", b"").decode("latin-1"),
                     body=body,
                 )
@@ -111,6 +132,11 @@ class _ViaGateway:
                 }
                 receive = _replay(body, receive)
         await self.app(scope, receive, send)
+
+
+def _first(headers: list, name: bytes) -> str:
+    """The header's first value, or ``""`` when it is absent."""
+    return next((value.decode("latin-1") for key, value in headers if key == name), "")
 
 
 def _replay(body: bytes, receive: Any) -> Any:

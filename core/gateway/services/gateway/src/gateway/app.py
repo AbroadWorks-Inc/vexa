@@ -498,12 +498,11 @@ def create_app(
             return None, _refusal(request.url.path, 503, "GATEWAY_IDENTITY_SECRET is not configured")
         return headers, None
 
-    # §1.10, §6.9 F-E: the signature covers the method, the path and query of the URL httpx sends,
-    # and the SHA-256 of the exact body bytes forwarded.
+    # §1.10, §6.9 F-E: the signature covers the forwarded x-user-id, x-user-scopes and
+    # x-user-limits, the method, the path and query of the URL httpx sends, and the SHA-256 of the
+    # exact body bytes forwarded.
     def _sign(headers: dict, method: str, url: str, params: Optional[dict], content: bytes) -> None:
-        headers[SIGNATURE_HEADER] = sign_now(
-            identity_secret(), headers["x-user-id"], method, url, params, content
-        )
+        headers[SIGNATURE_HEADER] = sign_now(identity_secret(), headers, method, url, params, content)
 
     # --- the REST proxy: faithful carve of main.forward_request for client (non-admin) routes.
     async def _forward(method: str, url: str, request: Request, *, api_key: Optional[str] = None) -> Response:

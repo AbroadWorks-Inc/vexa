@@ -5,9 +5,11 @@ admin-api believe that header only when it arrives with a fresh signature made w
 ``GATEWAY_IDENTITY_SECRET``, which only the gateway holds::
 
     x-gateway-signature: t=<unix seconds>,v2=<hex HMAC-SHA256(secret, message)>
-    message = "v2\\n<t>\\n<user_id>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>"
+    message = "v2\\n<t>\\n<user_id>\\n<scopes>\\n<limits>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>"
 
 - ``user_id`` is the exact ``x-user-id`` value forwarded.
+- ``scopes`` and ``limits`` are the exact ``x-user-scopes`` and ``x-user-limits`` values forwarded,
+  empty when the header isn't forwarded.
 - ``METHOD`` is the forwarded method, upper-case.
 - ``body_sha256`` is the lower-case hex SHA-256 of the exact body bytes forwarded (the empty
   string's digest for an empty body).
@@ -58,6 +60,8 @@ def signed_target(
 def sign(
     secret: str,
     user_id: str,
+    scopes: str,
+    limits: str,
     method: str,
     path: str,
     query: str,
@@ -69,6 +73,8 @@ def sign(
         VERSION,
         str(t),
         user_id,
+        scopes,
+        limits,
         method.upper(),
         hashlib.sha256(body).hexdigest(),
         query,
@@ -81,12 +87,25 @@ def sign(
 
 def sign_now(
     secret: str,
-    user_id: str,
+    headers: Mapping[str, str],
     method: str,
     url: str,
     params: Optional[Mapping[str, str]],
     body: bytes,
 ) -> str:
-    """Sign a request forwarded now to ``url`` with ``params`` and ``body``."""
+    """Sign a request forwarded now to ``url`` with ``headers``, ``params`` and ``body``.
+
+    ``headers`` are the lower-case headers forwarded; the signature covers their ``x-user-id``,
+    ``x-user-scopes`` and ``x-user-limits``."""
     path, query = signed_target(url, params)
-    return sign(secret, user_id, method, path, query, body, int(time.time()))
+    return sign(
+        secret,
+        headers["x-user-id"],
+        headers.get("x-user-scopes", ""),
+        headers.get("x-user-limits", ""),
+        method,
+        path,
+        query,
+        body,
+        int(time.time()),
+    )

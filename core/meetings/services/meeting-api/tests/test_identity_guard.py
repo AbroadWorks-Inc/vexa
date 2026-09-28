@@ -1,9 +1,9 @@
 """Only the gateway can say who is calling (design §1.10).
 
 A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` (version ``v2``)
-over the request's method, path, raw query and body (§6.9 F-E). Unsigned, forged, stale, future,
-wrong-user, wrong-route, wrong-query, wrong-body, v1 and duplicated identities answer 401 before any
-route runs; so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't configured. A
+over the request's user, ``x-user-scopes``, ``x-user-limits``, method, path, raw query and body
+(§6.9 F-E). Unsigned, forged, stale, future, wrong-user, wrong-scopes, wrong-limits, wrong-route,
+wrong-query, wrong-body, v1 and duplicated identities answer 401 before any route runs; so does every client request when ``GATEWAY_IDENTITY_SECRET`` isn't configured. A
 signature under ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` is accepted only while that key is set. The exempt routes are listed, and every route of the production app is checked
 against that list.
 """
@@ -58,6 +58,8 @@ def test_the_verifier_agrees_with_the_shared_vectors(case):
     reason = verify_signature(
         secrets,
         case["user_id"],
+        case["scopes"],
+        case["limits"],
         case["header"],
         case["method"],
         case["path"],
@@ -181,6 +183,50 @@ def test_a_replay_with_another_body_is_401(client, sent):
     r = client.post(
         "/bots", headers={**headers, "content-type": "application/json"}, content=sent
     )
+    assert r.status_code == 401
+
+
+def test_signed_scopes_and_limits_pass(client):
+    headers = signed_headers(7, "GET", "/meetings", scopes="bot,tx", limits="3")
+    r = client.get("/meetings", headers=headers)
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize(
+    "header,value",
+    [
+        ("x-user-scopes", "bot,tx,export"),
+        ("x-user-scopes", ""),
+        ("x-user-limits", "45"),
+        ("x-user-limits", ""),
+    ],
+    ids=["scopes-changed", "scopes-emptied", "limits-changed", "limits-emptied"],
+)
+def test_a_replay_with_another_scopes_or_limits_header_is_401(client, header, value):
+    headers = signed_headers(7, "GET", "/meetings", scopes="bot,tx", limits="3")
+    r = client.get("/meetings", headers={**headers, header: value})
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("header", ["x-user-scopes", "x-user-limits"])
+def test_a_dropped_scopes_or_limits_header_is_401(client, header):
+    headers = signed_headers(7, "GET", "/meetings", scopes="bot,tx", limits="3")
+    del headers[header]
+    assert client.get("/meetings", headers=headers).status_code == 401
+
+
+@pytest.mark.parametrize("header", ["x-user-scopes", "x-user-limits"])
+def test_an_added_scopes_or_limits_header_is_401(client, header):
+    headers = signed_headers(7, "GET", "/meetings")
+    r = client.get("/meetings", headers={**headers, header: "bot,tx,export"})
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("header", ["x-user-scopes", "x-user-limits"])
+def test_a_duplicated_scopes_or_limits_header_is_401(client, header):
+    signed = signed_headers(7, "GET", "/meetings", scopes="bot,tx", limits="3")
+    pairs = [*signed.items(), (header, signed[header])]
+    r = client.get("/meetings", headers=httpx.Headers(pairs))
     assert r.status_code == 401
 
 

@@ -137,9 +137,7 @@ class AdminApiAuthorizer:
             auth_headers["x-user-id"] = str(user_data["user_id"])
             auth_headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
             auth_headers["x-user-limits"] = str(user_data.get("max_concurrent", 3))
-            auth_headers[SIGNATURE_HEADER] = sign_now(
-                secret, auth_headers["x-user-id"], "POST", url, None, body
-            )
+            auth_headers[SIGNATURE_HEADER] = sign_now(secret, auth_headers, "POST", url, None, body)
         try:
             resp = await self._client.post(url, headers=auth_headers, content=body)
             if resp.status_code != 200:

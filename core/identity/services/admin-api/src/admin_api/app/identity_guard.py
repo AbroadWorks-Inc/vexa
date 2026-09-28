@@ -4,14 +4,16 @@ Client routes are reached through the gateway, which checks the caller's key, se
 and signs it with ``GATEWAY_IDENTITY_SECRET`` (§6.9 F-E)::
 
     x-gateway-signature: t=<unix seconds>,v2=<hex HMAC-SHA256(secret, message)>
-    message = "v2\n<t>\n<user_id>\n<METHOD>\n<body_sha256>\n<query>\n<path>"
+    message = "v2\n<t>\n<user_id>\n<scopes>\n<limits>\n<METHOD>\n<body_sha256>\n<query>\n<path>"
 
 ``IdentityGuard`` answers 401 before any client route runs unless the request carries exactly one
-``x-user-id`` and exactly one signature that
+``x-user-id``, at most one ``x-user-scopes`` and one ``x-user-limits``, and exactly one signature
+that
 
 - parses as ``t=<digits>,v2=<64 lower-case hex digits>``,
 - was made at most ``MAX_SKEW_S`` seconds before or after this service's clock, and
-- matches, in constant time, the HMAC over that ``t``, that ``x-user-id``, the request's method,
+- matches, in constant time, the HMAC over that ``t``, that ``x-user-id``, the ``x-user-scopes``
+  and ``x-user-limits`` values (empty when absent), the request's method,
   the SHA-256 of its body, its raw query (``scope["query_string"]``) and its path
   (``scope["path"]``: percent-decoded), under ``GATEWAY_IDENTITY_SECRET`` or, while it is set,
   ``GATEWAY_IDENTITY_SECRET_PREVIOUS`` (the key being rotated out).
@@ -43,6 +45,8 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 
 SIGNATURE_HEADER = "x-gateway-signature"
 USER_HEADER = "x-user-id"
+SCOPES_HEADER = "x-user-scopes"
+LIMITS_HEADER = "x-user-limits"
 MAX_SKEW_S = 60
 
 EXEMPT_PATHS = frozenset({"/metrics"})
@@ -91,6 +95,8 @@ def precheck(
 def verify_signature(
     secrets: Sequence[str],
     user_id: Optional[str],
+    scopes: str,
+    limits: str,
     header: Optional[str],
     method: str,
     path: str,
@@ -109,6 +115,8 @@ def verify_signature(
         "v2",
         match.group(1),
         user_id,
+        scopes,
+        limits,
         method.upper(),
         hashlib.sha256(body).hexdigest(),
         query,
@@ -163,6 +171,14 @@ def _single(headers: list, name: bytes) -> Optional[str]:
     return values[0].decode("latin-1")
 
 
+def _at_most_one(headers: list, name: bytes) -> Optional[str]:
+    """The header's value, ``""`` when it is absent, or ``None`` when it appears more than once."""
+    values = [value for key, value in headers if key.lower() == name]
+    if len(values) > 1:
+        return None
+    return values[0].decode("latin-1") if values else ""
+
+
 def _unauthorized(path: str) -> bytes:
     message = "the caller's identity must come from the gateway"
     if path.startswith("/v2/"):
@@ -187,16 +203,22 @@ class IdentityGuard:
         path = scope["path"]
         secrets = identity_secrets()
         user_id = _single(headers, USER_HEADER.encode())
+        scopes = _at_most_one(headers, SCOPES_HEADER.encode())
+        limits = _at_most_one(headers, LIMITS_HEADER.encode())
         header = _single(headers, SIGNATURE_HEADER.encode())
         now = self.clock()
         reason = precheck(secrets, user_id, header, now)
-        if reason is None:
+        if reason is None and (scopes is None or limits is None):
+            reason = "duplicated"
+        if reason is None and scopes is not None and limits is not None:
             body = await _read_body(receive)
             if body is None:
                 return
             reason = verify_signature(
                 secrets,
                 user_id,
+                scopes,
+                limits,
                 header,
                 scope["method"],
                 path,
