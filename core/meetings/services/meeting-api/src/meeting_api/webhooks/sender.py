@@ -8,6 +8,10 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    ``FOR UPDATE SKIP LOCKED``, set ``state = 'sending'`` and ``lease_until = now + LEASE_S``, and
    commit. Two replicas never claim the same row; a crashed replica's row is claimed again once its
    lease has passed. Every instant here is the database's ``now()``, never a replica's clock.
+   The claim also reads the subscription's sealed secrets from ``webhook_subscriptions``
+   (``Claim.secrets``), so a delivery claimed after ``rotate-secret`` is signed with the new
+   secret and the previous one at once; the cached subscription read (``subscriptions.py``) only
+   supplies the URL and is never used for a secret.
 2. **Re-check** each claim, concurrently: the subscription is still active in
    ``webhook_subscriptions`` (else the row is ``cancelled``, with no attempt), and its URL passes
    the SSRF guard (``ssrf.validate_webhook_url`` with ``WEBHOOK_PRIVATE_HOST_ALLOWLIST``, resolved
@@ -15,7 +19,7 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    Before posting, the claim must still have ``SEND_TIMEOUT_S + LEASE_MARGIN_S`` of its lease left,
    measured on the monotonic clock from just before the claim. If it hasn't (a slow subscription
    read or DNS), nothing is sent or written and the row is left for the next claim.
-3. **Sign** the stored ``payload_text`` (``signing.signed_headers``; the secret opened by
+3. **Sign** the stored ``payload_text`` (``signing.signed_headers``; the claim's secret opened by
    ``secret_box.py``, the previous one too while it is still valid) and post those exact bytes,
    under ``SEND_TIMEOUT_S`` in total, to the address the guard validated.
 4. **Record** one attempt row and move the row, in one transaction:
@@ -65,7 +69,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Collection, List, Mapping, Optional, Protocol
 
@@ -96,6 +100,7 @@ __all__ = [
     "PostgresDeliveryStore",
     "SenderSettings",
     "SenderSettingsError",
+    "SigningSecrets",
     "TransportError",
     "WebhookSender",
 ]
@@ -148,8 +153,31 @@ class SenderSettings:
 
 
 @dataclass(frozen=True)
+class SigningSecrets:
+    """A subscription's sealed secrets as ``webhook_subscriptions`` holds them when the delivery is
+    claimed; opened by ``secret_box.py`` only to sign."""
+
+    secret_enc: bytes = field(repr=False)
+    enc_key_id: str
+    previous_secret_enc: Optional[bytes] = field(default=None, repr=False)
+    previous_enc_key_id: Optional[str] = None
+    previous_secret_expires_at: Optional[datetime] = None
+
+    def previous_live(self, now: datetime) -> bool:
+        """Whether the previous secret still signs (the 24 h after a rotation)."""
+        return (
+            self.previous_secret_enc is not None
+            and self.previous_enc_key_id is not None
+            and self.previous_secret_expires_at is not None
+            and self.previous_secret_expires_at > now
+        )
+
+
+@dataclass(frozen=True)
 class Claim:
-    """A delivery this sender holds until ``lease_until``; ``attempt`` is the one it will make."""
+    """A delivery this sender holds until ``lease_until``; ``attempt`` is the one it will make.
+    ``secrets`` is the subscription's signing material read with the claim (``None`` when the
+    subscription row is gone)."""
 
     id: int
     event_id: str
@@ -159,6 +187,7 @@ class Claim:
     attempt: int
     lease_until: datetime
     payload_text: str
+    secrets: Optional[SigningSecrets] = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -342,13 +371,19 @@ class WebhookSender:
                 retry_in_s=None,
             )
 
+        sealed = claim.secrets
+        if sealed is None:
+            return _unsent(claim, self._schedule, "secret could not be opened")
         try:
-            secret = self._box.decrypt(sub.secret_enc, sub.enc_key_id)
+            secret = self._box.decrypt(sealed.secret_enc, sealed.enc_key_id)
         except SecretBoxError:
             return _unsent(claim, self._schedule, "secret could not be opened")
         previous = None
-        previous_enc, previous_key = sub.previous_secret_enc, sub.previous_enc_key_id
-        if sub.previous_live(now) and previous_enc and previous_key:
+        previous_enc, previous_key = (
+            sealed.previous_secret_enc,
+            sealed.previous_enc_key_id,
+        )
+        if sealed.previous_live(now) and previous_enc and previous_key:
             try:
                 previous = self._box.decrypt(previous_enc, previous_key)
             except SecretBoxError:
@@ -494,6 +529,19 @@ class HttpxPoster:
         return resp.status_code
 
 
+def _secrets(row: Any) -> Optional[SigningSecrets]:
+    if row.secret_enc is None or row.enc_key_id is None:
+        return None
+    previous = row.previous_secret_enc
+    return SigningSecrets(
+        bytes(row.secret_enc),
+        row.enc_key_id,
+        previous_secret_enc=None if previous is None else bytes(previous),
+        previous_enc_key_id=row.previous_enc_key_id,
+        previous_secret_expires_at=row.previous_secret_expires_at,
+    )
+
+
 class PostgresDeliveryStore:
     """``DeliveryStore`` over ``webhook_deliveries`` / ``webhook_delivery_attempts`` /
     ``webhook_outbox`` / ``webhook_subscriptions`` (one short transaction per call).
@@ -523,9 +571,12 @@ class PostgresDeliveryStore:
             RETURNING d.id, d.event_id, d.subscription_id, d.user_id, d.attempts, d.lease_until
         )
         SELECT c.id, c.event_id, c.subscription_id, c.user_id, c.attempts, c.lease_until,
-               o.event_type, o.payload_text
+               o.event_type, o.payload_text,
+               s.secret_enc, s.enc_key_id, s.previous_secret_enc, s.previous_enc_key_id,
+               s.previous_secret_expires_at
         FROM claimed AS c
         JOIN webhook_outbox AS o ON o.event_id = c.event_id
+        LEFT JOIN webhook_subscriptions AS s ON s.id = c.subscription_id
         ORDER BY c.id
     """
 
@@ -564,6 +615,7 @@ class PostgresDeliveryStore:
                 attempt=int(row.attempts) + 1,
                 lease_until=row.lease_until,
                 payload_text=row.payload_text,
+                secrets=_secrets(row),
             )
             for row in rows
         ]

@@ -4,8 +4,12 @@ Subscriptions live in admin-api. meeting-api reads an account's active ones thro
 internal door ``GET {ADMIN_API_URL}/internal/users/{id}/webhook-subscriptions`` (header
 ``X-Internal-Secret``), which answers ``{"user_id", "subscriptions": [...]}``: per subscription
 its ``id``, ``url``, ``events``, the sealed ``secret_enc`` (base64) with its ``enc_key_id``, and
-the ``previous_*`` secret only while it is still valid. No plaintext secret ever crosses; the
-sender opens them with ``secret_box.py`` at signing time.
+the ``previous_*`` secret only while it is still valid. No plaintext secret ever crosses.
+
+The publisher uses this read to match events to subscribers and the sender uses it for the URL.
+Neither signs with the secrets in it: the sender reads each subscription's secrets from
+``webhook_subscriptions`` when it claims the delivery (``sender.py``), so a rotated secret signs
+the next delivery at once.
 
 Each account's answer is cached for ``CACHE_TTL_S`` (30 s). ``find`` reads the account again once
 when a subscription isn't in the cached answer (one created after it was read). A read that fails

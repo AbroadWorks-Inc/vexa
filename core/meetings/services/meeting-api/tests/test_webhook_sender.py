@@ -46,6 +46,7 @@ from meeting_api.webhooks.sender import (
     PostgresDeliveryStore,
     SenderSettings,
     SenderSettingsError,
+    SigningSecrets,
     TransportError,
     WebhookSender,
 )
@@ -76,6 +77,8 @@ def _vectors() -> dict[str, Any]:
 RING = _vectors()["key_ring"]
 SECRET = "whsec-current-0123456789"
 OLD_SECRET = "whsec-previous-9876543210"
+NEW_SECRET = "whsec-rotated-5555555555"
+ROTATION_WINDOW = timedelta(hours=24)  # admin-api's PREVIOUS_SECRET_TTL
 
 
 def seal(plaintext: str, key_id: str = "k1") -> bytes:
@@ -108,6 +111,31 @@ def exporter_verify(
         return False
     mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
     return hmac.compare_digest(signature, f"sha256={mac.hexdigest()}")
+
+
+def portal_verify(
+    body: bytes, headers: Mapping[str, str], secret: str, now: float
+) -> bool:
+    """The portal's ``verifySignature`` (``portal/src/lib/aw-bots-webhook.ts``): the receiver's
+    one secret must match ``X-Webhook-Signature`` or ``X-Webhook-Signature-Previous``.
+    """
+    lowered = {k.lower(): v for k, v in headers.items()}
+    timestamp = lowered.get("x-webhook-timestamp")
+    if timestamp is None or not re.fullmatch(r"[0-9]{1,12}", timestamp):
+        return False
+    if abs(now - int(timestamp)) > 300:
+        return False
+    mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
+    expected = f"sha256={mac.hexdigest()}"
+    return any(
+        candidate is not None
+        and re.fullmatch(r"sha256=[0-9a-f]{64}", candidate) is not None
+        and hmac.compare_digest(candidate, expected)
+        for candidate in (
+            lowered.get("x-webhook-signature"),
+            lowered.get("x-webhook-signature-previous"),
+        )
+    )
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────────────────────
@@ -192,9 +220,31 @@ class MemoryHarness:
         self.store = InMemoryDeliveryStore(clock=self.clock)
 
     async def add_subscription(
-        self, sub_id: str, user_id: int, active: bool = True
+        self,
+        sub_id: str,
+        user_id: int,
+        active: bool = True,
+        *,
+        secrets: Optional[SigningSecrets] = None,
     ) -> None:
         self.store.active[sub_id] = active
+        self.store.secrets[sub_id] = secrets or SigningSecrets(seal(SECRET), "k1")
+
+    async def rotate(self, sub_id: str, new_secret: str) -> None:
+        """admin-api's ``rotate-secret``: the current secret becomes the previous one for 24 h."""
+        old = self.store.secrets[sub_id]
+        self.store.secrets[sub_id] = SigningSecrets(
+            seal(new_secret),
+            "k1",
+            previous_secret_enc=old.secret_enc,
+            previous_enc_key_id=old.enc_key_id,
+            previous_secret_expires_at=self.clock.now + ROTATION_WINDOW,
+        )
+
+    async def set_key_id(self, sub_id: str, key_id: str) -> None:
+        self.store.secrets[sub_id] = replace(
+            self.store.secrets[sub_id], enc_key_id=key_id
+        )
 
     async def add_event(self, event_id: str, event_type: str, payload: str) -> None:
         self.store.outbox[event_id] = {
@@ -232,6 +282,7 @@ class MemoryHarness:
 
     async def delete_subscription(self, sub_id: str) -> None:
         self.store.active.pop(sub_id, None)
+        self.store.secrets.pop(sub_id, None)
 
     async def admin_cancel_pending(self, sub_id: str) -> None:
         """admin-api's pause/delete: ``state='cancelled'`` for pending and sending rows."""
@@ -259,16 +310,48 @@ class PgHarness:
             return await conn.execute(text(sql), params)
 
     async def add_subscription(
-        self, sub_id: str, user_id: int, active: bool = True
+        self,
+        sub_id: str,
+        user_id: int,
+        active: bool = True,
+        *,
+        secrets: Optional[SigningSecrets] = None,
     ) -> None:
+        sealed = secrets or SigningSecrets(seal(SECRET), "k1")
         await self._exec(
             "INSERT INTO webhook_subscriptions (id, user_id, url, secret_enc, enc_key_id, "
-            "secret_last4, events, active) VALUES (CAST(:id AS uuid), :uid, 'https://x.test/', "
-            ":enc, 'k1', '6789', '{}', :active)",
+            "secret_last4, previous_secret_enc, previous_enc_key_id, "
+            "previous_secret_expires_at, events, active) VALUES (CAST(:id AS uuid), :uid, "
+            "'https://x.test/', :enc, :key, '6789', :prev, :prev_key, :prev_until, '{}', :active)",
             id=sub_id,
             uid=user_id,
-            enc=seal(SECRET),
+            enc=sealed.secret_enc,
+            key=sealed.enc_key_id,
+            prev=sealed.previous_secret_enc,
+            prev_key=sealed.previous_enc_key_id,
+            prev_until=sealed.previous_secret_expires_at,
             active=active,
+        )
+
+    async def rotate(self, sub_id: str, new_secret: str) -> None:
+        """admin-api's ``rotate-secret`` (``webhook_subscriptions.py``), column for column."""
+        await self._exec(
+            "UPDATE webhook_subscriptions SET previous_secret_enc = secret_enc, "
+            "previous_enc_key_id = enc_key_id, previous_secret_expires_at = :until, "
+            "secret_enc = :enc, enc_key_id = 'k1', secret_last4 = :last4, updated_at = :now "
+            "WHERE id = CAST(:id AS uuid)",
+            until=self.clock.now + ROTATION_WINDOW,
+            enc=seal(new_secret),
+            last4=new_secret[-4:],
+            now=self.clock.now,
+            id=sub_id,
+        )
+
+    async def set_key_id(self, sub_id: str, key_id: str) -> None:
+        await self._exec(
+            "UPDATE webhook_subscriptions SET enc_key_id = :k WHERE id = CAST(:id AS uuid)",
+            k=key_id,
+            id=sub_id,
         )
 
     async def add_event(self, event_id: str, event_type: str, payload: str) -> None:
@@ -389,7 +472,17 @@ class World:
             previous_enc_key_id="k2" if previous else None,
             previous_secret_expires_at=previous[1] if previous else None,
         )
-        await self.h.add_subscription(sub.id, user_id)
+        await self.h.add_subscription(
+            sub.id,
+            user_id,
+            secrets=SigningSecrets(
+                sub.secret_enc,
+                sub.enc_key_id,
+                previous_secret_enc=sub.previous_secret_enc,
+                previous_enc_key_id=sub.previous_enc_key_id,
+                previous_secret_expires_at=sub.previous_secret_expires_at,
+            ),
+        )
         self.subs.put(user_id, sub)
         return sub
 
@@ -917,6 +1010,65 @@ async def test_the_previous_header_appears_only_during_a_rotation(world):
     assert "X-Webhook-Signature-Previous" not in after.headers
 
 
+async def test_a_rotated_secret_signs_the_next_delivery_at_once(world):
+    """§6.9 F-C: the secrets are read from ``webhook_subscriptions`` with the claim, never from
+    the subscription read's cache, so the delivery right after ``rotate-secret`` is signed with the
+    new secret and carries the old one as ``X-Webhook-Signature-Previous``."""
+    sub = await world.subscribe()
+    await world.event(sub)
+    await world.sender.run_once()
+    (before,) = world.receiver.posted
+    assert "X-Webhook-Signature-Previous" not in before.headers
+    world.receiver.posted.clear()
+
+    await world.h.rotate(
+        sub.id, NEW_SECRET
+    )  # the cached read still holds the old secret only
+    world.clock.advance(1)
+    _, body = await world.event(sub)
+    assert await world.sender.run_once() == 1
+
+    (post,) = world.receiver.posted
+    now = world.clock.now.timestamp()
+    assert post.body == body
+    assert exporter_verify(body, post.headers, NEW_SECRET, now=now)
+    assert not exporter_verify(body, post.headers, SECRET, now=now)
+    previous_view = {
+        "X-Webhook-Timestamp": post.headers["X-Webhook-Timestamp"],
+        "X-Webhook-Signature": post.headers["X-Webhook-Signature-Previous"],
+    }
+    assert exporter_verify(body, previous_view, SECRET, now=now)
+    # a receiver on either secret accepts it (the portal's check)
+    assert portal_verify(body, post.headers, NEW_SECRET, now=now)
+    assert portal_verify(body, post.headers, SECRET, now=now)
+    assert not portal_verify(body, post.headers, OLD_SECRET, now=now)
+
+    # once the window has passed, only the new secret signs
+    world.clock.advance(ROTATION_WINDOW.total_seconds())
+    world.receiver.posted.clear()
+    await world.event(sub)
+    await world.sender.run_once()
+    (after,) = world.receiver.posted
+    assert "X-Webhook-Signature-Previous" not in after.headers
+    assert exporter_verify(
+        after.body, after.headers, NEW_SECRET, now=world.clock.now.timestamp()
+    )
+
+
+async def test_a_rotated_then_paused_subscription_is_cancelled_not_signed(world):
+    sub = await world.subscribe()
+    did, _ = await world.event(sub)
+    await world.h.rotate(sub.id, NEW_SECRET)
+    await world.h.set_active(sub.id, False)
+
+    assert await world.sender.run_once() == 1
+
+    assert world.receiver.posted == []
+    row = await world.h.delivery(did)
+    assert (row["state"], row["attempts"]) == ("cancelled", 0)
+    assert await world.h.attempt_rows(did) == []
+
+
 # ── the URL guard at send time ───────────────────────────────────────────────────────────────
 
 
@@ -1005,7 +1157,7 @@ async def test_an_unreadable_subscription_list_is_retried_without_a_send(world):
 
 async def test_a_secret_the_ring_cannot_open_is_retried_without_a_send(world):
     sub = await world.subscribe()
-    world.subs.put(USER, replace(sub, enc_key_id="k-gone"))
+    await world.h.set_key_id(sub.id, "k-gone")
     did, _ = await world.event(sub)
 
     await world.sender.run_once()
@@ -1241,7 +1393,7 @@ async def test_no_secret_key_or_url_reaches_the_logs(world, capsys, caplog):
     await world.event(rotating)
     await world.event(failing)
     await world.event(retrying)
-    world.subs.put(USER, replace(retrying, enc_key_id="k-gone"))
+    await world.h.set_key_id(retrying.id, "k-gone")
 
     await world.sender.run_once()
 

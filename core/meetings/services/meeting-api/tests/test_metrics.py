@@ -557,7 +557,7 @@ def _sender(code: int, *, active: bool = True) -> tuple[Any, _Receiver]:
 
     from meeting_api.webhooks.fakes import InMemoryDeliveryStore
     from meeting_api.webhooks.secret_box import SecretBox
-    from meeting_api.webhooks.sender import WebhookSender
+    from meeting_api.webhooks.sender import SigningSecrets, WebhookSender
     from meeting_api.webhooks.subscriptions import Subscription
 
     ring = _ring()
@@ -575,6 +575,7 @@ def _sender(code: int, *, active: bool = True) -> tuple[Any, _Receiver]:
     now = datetime(2026, 9, 29, 4, 0, 0, tzinfo=UTC)
     store = InMemoryDeliveryStore(clock=lambda: now)
     store.active[sub.id] = active
+    store.secrets[sub.id] = SigningSecrets(sealed, "k1")
     store.outbox["evt_1"] = {
         "event_type": "meeting.completed",
         "payload_text": json.dumps({"data": {"transcript": "hello there"}}),

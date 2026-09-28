@@ -4,7 +4,8 @@
     ``PostgresDeliveryStore``: due rows claimed in ``(next_attempt_at, id)`` order, every move out
     of ``sending`` refused unless the row is still ``sending`` under the claim's own lease, and the
     attempt row kept even when the move is refused. Its ``clock`` is what the database's ``now()``
-    is to ``PostgresDeliveryStore``.
+    is to ``PostgresDeliveryStore``; ``secrets`` is what ``webhook_subscriptions`` holds, attached
+    to each claim as the Postgres claim reads it.
 
 These carry NO production logic; they stand in for Postgres so the sender's scenarios run offline.
 """
@@ -14,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from .sender import Claim, DeliveryResult
+from .sender import Claim, DeliveryResult, SigningSecrets
 
 __all__ = ["InMemoryDeliveryStore"]
 
@@ -32,6 +33,7 @@ class InMemoryDeliveryStore:
         self.attempts: list[dict[str, Any]] = []
         self.outbox: dict[str, dict[str, Any]] = {}
         self.active: dict[str, bool] = {}
+        self.secrets: dict[str, SigningSecrets] = {}
         self._next_id = 1
 
     async def claim(self, *, lease_s: int, limit: int) -> list[Claim]:
@@ -61,6 +63,7 @@ class InMemoryDeliveryStore:
                     attempt=d["attempts"] + 1,
                     lease_until=lease_until,
                     payload_text=event["payload_text"],
+                    secrets=self.secrets.get(d["subscription_id"]),
                 )
             )
         return claims
