@@ -157,14 +157,13 @@ class Meeting(Base):
         # ROB1/ROB2 DB-level backstop (mirror of meeting-api's sessions/models.py; §1.2): at most
         # ONE LIVE meeting per (user, platform, native_meeting_id) — a partial unique index over the
         # bot-lifecycle statuses only. A user's meeting_entries can hold many `scheduled` occurrences
-        # for one link (recurring series), so the dedup key can no longer cover 'scheduled' the way
-        # `uq_meeting_active_user_platform_native` used to — only a row the bot has actually spawned
-        # for is live. The in-txn pg_advisory_xact_lock in create_meeting_guarded serializes
-        # same-process spawns; this index backstops the cross-process race → IntegrityError →
-        # DuplicateMeeting.
+        # for one link (recurring series), so 'scheduled' is outside the key: only a row the bot has
+        # actually been spawned for is live. The in-txn pg_advisory_xact_lock in
+        # create_meeting_guarded serializes same-process spawns; this index backstops the
+        # cross-process race → IntegrityError → DuplicateMeeting.
         #
-        # `ensure_schema` matches indexes BY NAME and never alters one in place, so swapping the old
-        # dedup index for this one is a manual runbook (CONCURRENTLY, before the deploy) —
+        # `ensure_schema` matches indexes BY NAME and never alters one in place, so on an existing
+        # database this index is built by a manual runbook (CONCURRENTLY, before the deploy) —
         # see schema/MIGRATION-0008-meeting-live-dedup-index.md.
         Index(
             "uq_meeting_live_user_platform_native",
