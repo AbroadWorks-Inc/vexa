@@ -1366,6 +1366,45 @@ async def test_pg_a_change_stored_while_live_reruns_after_every_finishing_writer
     )
 
 
+async def test_pg_an_update_back_to_the_finished_time_closes_the_kept_entry(pg):
+    """The kept entry is put back on the finished meeting's time before the sweep reaches it:
+    ``not_changed_finished``, the entry is ``closed`` (with ``closed_at``) on that meeting, and the
+    sweep creates nothing."""
+    from datetime import timedelta
+
+    from intake_builders import entry_body
+
+    from meeting_api.intake.sweeps import OutboxOnly, not_sent_tick
+
+    store, service = _intake(pg)
+    mid, _ = await _moved_while_live(pg, service, reach_the_call=True)
+    await _finish_by_callback(pg, mid)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    back = await service.put_entry(
+        USER,
+        entry_body(
+            start=_iso(now - timedelta(minutes=10)),
+            end=_iso(now + timedelta(minutes=50)),
+        ),
+    )
+    assert back["result"] == "not_changed_finished"
+    assert back["entry"]["state"] == "closed"
+    state, closed_at, on = (
+        await pg.exec("SELECT state, closed_at, meeting_id FROM meeting_entries")
+    ).one()
+    assert (state, on) == ("closed", mid) and closed_at is not None
+
+    meetings = await pg.scalar("SELECT count(*) FROM meetings")
+    await not_sent_tick(
+        store,
+        service,
+        publisher=OutboxOnly(),
+        now=datetime.now(timezone.utc),
+        open_ended_s=3600,
+    )
+    assert await pg.scalar("SELECT count(*) FROM meetings") == meetings
+
+
 class _NoSpawnPort:
     async def spawn_exact(self, user_id: int, meeting_id: int) -> Any:
         raise AssertionError("no spawn in this test")

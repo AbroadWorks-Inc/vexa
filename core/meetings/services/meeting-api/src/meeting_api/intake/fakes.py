@@ -447,6 +447,9 @@ class _FakeTx:
             entry, state="removed", removed_reason=reason
         )
 
+    async def close_entry(self, entry_id: int) -> None:
+        self._s.entries[entry_id] = replace(self._s.entries[entry_id], state="closed")
+
     async def active_entries(self, meeting_id: int) -> list[EntryView]:
         return self._s.entries_of(meeting_id)
 

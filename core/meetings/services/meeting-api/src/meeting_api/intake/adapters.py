@@ -468,6 +468,16 @@ class PostgresIntakeTx:
         row.removed_at = func.now()
         await self._db.flush()
 
+    async def close_entry(self, entry_id: int) -> None:
+        from ..sessions.models import MeetingEntry
+
+        row = await self._db.get(MeetingEntry, entry_id, populate_existing=True)
+        if row is None:
+            raise LookupError(f"entry {entry_id} not found")
+        row.state = "closed"
+        row.closed_at = datetime.now(timezone.utc).replace(microsecond=0)
+        await self._db.flush()
+
     async def apply_plan(self, meeting_id: int, room: Room, plan: Plan) -> None:
         meeting = await self._locked_meeting(meeting_id)
         data = meeting.data if isinstance(meeting.data, dict) else {}

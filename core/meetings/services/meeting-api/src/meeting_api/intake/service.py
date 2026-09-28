@@ -16,7 +16,9 @@ and spawns run after the commit, each through its own port.
   3. a new entry, or a ``removed`` one coming back, takes the R1 path: it joins the meeting R1
      matches (``joined_existing``) or gets a new ``scheduled`` meeting (``created``). A ``closed``
      entry, or one waiting to re-run on a finished meeting, does the same only if the update
-     points to a new future time (R7); otherwise → ``not_changed_finished``;
+     points to a new future time (R7); otherwise → ``not_changed_finished``, and an entry that
+     was waiting to re-run is closed with its finished meeting, so the re-run never uses the time
+     the update replaced;
   4. an entry of a live meeting is stored and the meeting is left as it is (``not_changed_live``);
   5. an entry of a scheduled meeting stays on it while it still overlaps the meeting's other
      entries; otherwise it joins the meeting R1 matches on its link, or the meeting follows it when
@@ -388,6 +390,11 @@ class IntakeService:
             return await self._attach(w, user_id, entry, room, now, previous=old)
         if existing.state == "closed" or old.status in FINISHED_STATUSES:
             if not is_future_move(entry, old, now=now):
+                if existing.state == "active":
+                    # It was waiting to re-run (R7); the sender now puts it on the finished
+                    # meeting's time, so it belongs to that meeting and never re-runs.
+                    await tx.close_entry(existing.id)
+                    old = await tx.meeting(old.id)
                 return _Done("not_changed_finished", old)
             if existing.state == "closed":
                 await self._check_quota(tx, user_id)

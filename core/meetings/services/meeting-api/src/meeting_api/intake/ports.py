@@ -265,6 +265,11 @@ class IntakeTx(Protocol):
         self, entry_id: int, reason: Optional[str]
     ) -> None: ...
 
+    async def close_entry(self, entry_id: int) -> None:
+        """The entry becomes ``closed`` (stamped ``closed_at``): it belongs to its finished
+        meeting, as ``write_status`` step 4 leaves every entry that doesn't re-run."""
+        ...
+
     async def active_entries(self, meeting_id: int) -> list[EntryView]: ...
 
     async def apply_plan(self, meeting_id: int, room: Room, plan: Plan) -> None:

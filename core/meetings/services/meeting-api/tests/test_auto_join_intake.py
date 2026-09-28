@@ -542,6 +542,35 @@ async def test_a_rerun_the_sweep_reaches_after_its_time_ends_not_sent():
     assert _outcome(h, new)[:3] == ("failed", "not_sent", "ended_before_sent")
 
 
+async def test_an_update_to_an_entry_waiting_to_rerun_decides_it():
+    """An entry kept for a re-run is updated before the sweep reaches it. Back to the finished
+    meeting's time: ``not_changed_finished``, the entry is closed with it and never re-runs. To
+    another future time: a meeting at that time, and the sweep adds nothing."""
+    h = make_harness()
+    uuid = await _moved_while_live(h)
+    h.clock.set("2026-09-29T09:55:00Z")
+    h.set_status(uuid, "completed")
+    back = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    assert back["result"] == "not_changed_finished"
+    assert (_entry(h).state, _entry(h).meeting_id) == ("closed", h.meeting_id(uuid))
+    meetings, mark = len(h.store.meetings), h.mark()
+    await _sweep(h, "2026-09-29T09:56:00Z")
+    assert (len(h.store.meetings), h.events(mark)) == (meetings, [])
+
+    h = make_harness()
+    uuid = await _moved_while_live(h)
+    h.clock.set("2026-09-29T09:55:00Z")
+    h.set_status(uuid, "completed")
+    later = await h.put(start="2026-09-29T17:00:00Z", end="2026-09-29T18:00:00Z")
+    assert (later["result"], later["meeting"]["start"]) == (
+        "created",
+        "2026-09-29T17:00:00Z",
+    )
+    meetings, mark = len(h.store.meetings), h.mark()
+    await _sweep(h, "2026-09-29T09:56:00Z")
+    assert (len(h.store.meetings), h.events(mark)) == (meetings, [])
+
+
 # ══ Postgres ════════════════════════════════════════════════════════════════════════════════
 
 pg_only = pytest.mark.skipif(
