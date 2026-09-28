@@ -51,7 +51,7 @@ the shared Whisper large-v3 transcriber instead. Live transcription is a setting
 ### The `/v2` API
 
 Apps send meetings to AW Bots through the gateway. **Client developers start with the
-[`/v2` API reference](integrations/out/aw-notetaker/docs/2026-09-28-v2-api-reference.md)**: every
+[`/v2` API reference](core/meetings/services/meeting-api/V2-API.md)**: every
 route, field, reply, error and webhook, with `curl` examples and signature-check code. The rules
 behind it are Part 2 of the
 [intake design](integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md);
@@ -389,7 +389,7 @@ The full suite additionally starts the whole stack in Docker, which needs the mi
 
 - [Design](integrations/out/aw-notetaker/docs/2026-09-23-aw-rearchitecture-design.md): the architecture, decisions, deployment settings and risks.
 - [Meeting intake and webhooks design](integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md): the `/v2` API, webhooks, keys, signed identity and the rollout order.
-- [`/v2` API reference](integrations/out/aw-notetaker/docs/2026-09-28-v2-api-reference.md): for client developers — every route, field, reply, error and webhook, with examples.
+- [`/v2` API reference](core/meetings/services/meeting-api/V2-API.md): for client developers — every route, field, reply, error and webhook, with examples.
 - [Speaker activity design](integrations/out/aw-notetaker/docs/2026-09-23-speaker-activity-design.md): the who-spoke-when file.
 - [Completion report](integrations/out/aw-notetaker/docs/2026-09-23-aw-exporter-completion-report.md): what was built, how it was checked, what is pending.
 - Upstream Vexa docs: [`docs/docs`](docs/docs) and [docs.vexa.ai](https://docs.vexa.ai).

@@ -37,6 +37,9 @@ and stays in their ecosystem (FastAPI + redis + DB).
 **Consumes:** `core/runtime/contracts/runtime.v1` (spawn the bot workload) and api.v1
 (`MeetingListResponse` / `TranscriptionResponse` response shapes). All sealed in `contracts.seal.json`.
 
+**Client reference for the `/v2` API** (entries, meetings, stop, erase, export, webhook
+subscriptions): [`V2-API.md`](V2-API.md).
+
 ## Isolated evaluation
 
 ```bash

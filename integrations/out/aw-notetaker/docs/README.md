@@ -6,4 +6,3 @@
 - [`2026-09-23-speaker-activity-design.md`](2026-09-23-speaker-activity-design.md) — the small who-spoke-when file aw-bots writes for speaker names (replaces the debug tape for naming).
 - [`2026-09-23-speaker-activity-plan.md`](2026-09-23-speaker-activity-plan.md) — its implementation plan.
 - [`2026-09-25-meeting-intake-and-webhooks-design.md`](2026-09-25-meeting-intake-and-webhooks-design.md) — how calendars and apps send meetings to aw-bots (entries, external_id, UUID) and how aw-bots reports every result (webhook subscriptions).
-- [`2026-09-28-v2-api-reference.md`](2026-09-28-v2-api-reference.md) — the `/v2` API reference for client developers: every route, field, reply, error and webhook, with `curl` examples and signature-check code.
