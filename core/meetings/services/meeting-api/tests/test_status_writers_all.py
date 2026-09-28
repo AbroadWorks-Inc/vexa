@@ -1523,3 +1523,137 @@ async def test_pg_the_system_url_still_receives_meeting_completed_now_with_uuid(
     assert meeting["sequence"] == await pg.seq(mid) == 3
     assert meeting["entries"] == []
     assert meeting["outcome"] is None
+
+
+# ── Postgres: aw_meetings_failed_total, once per failed bot (§6.9 F-B) ──────────────────────
+
+
+def _failed_count(reason: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_meetings_failed_total", {"reason": reason, "user_id": str(USER)}
+    )
+    return value or 0.0
+
+
+def _failed_total() -> float:
+    from meeting_api.metrics import registry
+
+    return sum(
+        s.value
+        for f in registry().collect()
+        for s in f.samples
+        if s.name == "aw_meetings_failed_total"
+    )
+
+
+async def test_pg_a_bot_failure_through_the_callback_counts_once(pg):
+    mid = await pg.seed("requested", session_uid="sess-cb")
+    before = _failed_count("join_failure")
+    failed = _event("failed", completion_reason="join_failure", exit_code=1)
+    await _callback(pg.repo, _event("joining"), failed, failed)  # the bot's retry
+    assert await pg.status(mid) == "failed"
+    assert _failed_count("join_failure") == before + 1
+
+
+async def test_pg_a_bot_failure_through_the_runtime_destroy_counts_once(pg):
+    from meeting_api import create_app
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    mid = await pg.seed("active", session_uid="sess-cb")
+    before = _failed_count("evicted")
+    app = create_app(meeting_repo=pg.repo)
+    for _ in range(2):
+        await app.state.apply_lifecycle_event(
+            {
+                "connection_id": "sess-cb",
+                "status": "failed",
+                "completion_reason": "evicted",
+            },
+            transition_source=TransitionSource.RUNTIME_DESTROY,
+            force_terminal_on_destroy=True,
+        )
+    assert await pg.status(mid) == "failed"
+    assert _failed_count("evicted") == before + 1
+
+
+async def test_pg_fail_meeting_counts_once_by_its_completion_reason(pg):
+    mid = await pg.seed("requested")
+    before = _failed_count("start_failed")
+    for _ in range(2):
+        await pg.repo.fail_meeting(meeting_id=mid, reason="workload dead on arrival")
+    assert await pg.status(mid) == "failed"
+    assert _failed_count("start_failed") == before + 1
+
+
+async def test_pg_a_not_sent_failure_keeps_its_own_counter(pg):
+    from meeting_api.intake.status import Outcome
+    from meeting_api.metrics import registry
+
+    mid = await pg.seed("requested")
+    failed_before = _failed_total()
+    not_sent_before = (
+        registry().get_sample_value(
+            "aw_meetings_not_sent_total",
+            {"detail": "spawn_error", "user_id": str(USER)},
+        )
+        or 0.0
+    )
+    await pg.repo.fail_meeting(
+        meeting_id=mid,
+        reason="bot workload failed to start",
+        outcome=Outcome("not_sent", "spawn_error", "bot workload failed to start"),
+    )
+    assert _failed_total() == failed_before
+    assert (
+        registry().get_sample_value(
+            "aw_meetings_not_sent_total",
+            {"detail": "spawn_error", "user_id": str(USER)},
+        )
+        == not_sent_before + 1
+    )
+
+
+async def test_pg_a_planned_meeting_that_fails_is_not_a_failed_bot(pg):
+    """R8: a scheduled meeting that ends ``failed`` never had a bot."""
+    from meeting_api.intake.status import write_status
+
+    mid = await pg.seed("scheduled")
+    before = _failed_total()
+    async with pg.session_factory() as db, db.begin():
+        await write_status(
+            db,
+            mid,
+            "failed",
+            expected_from={"scheduled"},
+            data_patch={"completion_reason": "stopped"},
+        )
+    assert _failed_total() == before
+
+
+async def test_pg_a_failed_write_that_rolls_back_and_is_retried_counts_once(pg):
+    """Counted after the commit: the rolled-back first try counts nothing."""
+    from meeting_api.intake.status import write_status
+
+    class _Abort(Exception):
+        pass
+
+    mid = await pg.seed("active")
+    before = _failed_count("evicted")
+    for attempt in range(2):
+        try:
+            async with pg.session_factory() as db, db.begin():
+                await write_status(
+                    db,
+                    mid,
+                    "failed",
+                    expected_from={"active"},
+                    data_patch={"completion_reason": "evicted"},
+                )
+                if attempt == 0:
+                    raise _Abort
+        except _Abort:
+            assert _failed_count("evicted") == before
+    assert await pg.status(mid) == "failed"
+    assert _failed_count("evicted") == before + 1

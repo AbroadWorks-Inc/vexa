@@ -48,6 +48,7 @@ MEETING_API_METRICS = {
     "aw_intake_request_seconds": "histogram",
     "aw_meetings_by_status": "gauge",
     "aw_meetings_not_sent_total": "counter",
+    "aw_meetings_failed_total": "counter",
     "aw_autojoin_lag_seconds": "histogram",
     "aw_webhook_deliveries_total": "counter",
     "aw_webhook_delivery_seconds": "histogram",
@@ -64,6 +65,7 @@ LABELS = {
     "aw_intake_request_seconds": set(),
     "aw_meetings_by_status": {"status", "user_id"},
     "aw_meetings_not_sent_total": {"detail", "user_id"},
+    "aw_meetings_failed_total": {"reason", "user_id"},
     "aw_autojoin_lag_seconds": set(),
     "aw_webhook_deliveries_total": {"event_type", "outcome", "user_id"},
     "aw_webhook_delivery_seconds": set(),
@@ -128,6 +130,7 @@ def test_metrics_serves_every_meeting_api_metric_in_the_text_format():
 def test_every_metric_carries_exactly_its_labels():
     metrics.intake_request("PUT /v2/entries", "created", 7, 0.01)
     metrics.meeting_not_sent(7, "room_busy")
+    metrics.meeting_failed(7, "join_failure")
     metrics.autojoin_lag(12.0)
     metrics.webhook_delivery("meeting.completed", "delivered", 7, 0.2)
     metrics.export_recorded("handed_off", 7)

@@ -233,6 +233,9 @@ class _Session:
         self._entries = list(entries)
         self._subscription = subscription
         self.added: list = []
+        self.info: dict = (
+            {}
+        )  # AsyncSession.info: the status writer's after-commit actions
 
     async def __aenter__(self) -> "_Session":
         return self

@@ -21,7 +21,12 @@ workload that never started and the auto-join retry rule reads.
      (``project_meeting``), serialised once; the stored ``payload_text`` is the exact body sent.
 
 A ``not_sent`` outcome also moves ``aw_meetings_not_sent_total{detail,user_id}`` (§1.13) once the
-five steps are written; the count is taken inside the caller's transaction, before its commit.
+five steps are written; the count is taken inside the caller's transaction, before its commit. A
+meeting whose bot was sent (it changes from a live status) that ends ``failed`` with any other
+outcome moves ``aw_meetings_failed_total{reason,user_id}`` (§6.9 F-B) once, when the caller's
+transaction commits (``after_commit``): a rolled-back write counts nothing, and a repeated one is
+refused before it counts. The reason is ``data.completion_reason``, else the change's typed code
+(``change_reason``), else ``unknown``.
 
 Lock order (§1.4): the caller takes the link's advisory lock first, then ``write_status`` locks the
 meeting row, then ``meeting_aw_state``. ``meeting_aw_state`` is always reached through its meeting
@@ -40,11 +45,11 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional, Sequence
 
-from ..metrics import meeting_not_sent
+from ..metrics import meeting_failed, meeting_not_sent
 from .projection import iso_utc, project_meeting
-from .rules import FINISHED_STATUSES
+from .rules import FINISHED_STATUSES, is_live
 from .settings import auto_join_lead_s
 
 if TYPE_CHECKING:
@@ -53,6 +58,7 @@ if TYPE_CHECKING:
 __all__ = [
     "API_VERSION",
     "FINISHED_STATUSES",
+    "after_commit",
     "STATUS_CHANGE_EVENT",
     "Outcome",
     "StatusConflict",
@@ -189,6 +195,34 @@ def stamp_now() -> datetime:
     """The status writer's current instant in its stored form, for a stamp written beside it (an
     entry closed outside a status change, R7)."""
     return _stamp(_now())
+
+
+_AFTER_COMMIT = "aw_after_commit"
+_LISTENING = False
+
+
+def after_commit(db: Any, action: Callable[[], None]) -> None:
+    """Run ``action`` once ``db``'s transaction commits; drop it if the transaction rolls back.
+    The actions ride on the session's ``info`` and one pair of ``Session`` listeners runs or
+    drops them, so a count is never taken for a write that didn't happen."""
+    global _LISTENING
+    if not _LISTENING:
+        from sqlalchemy import event
+        from sqlalchemy.orm import Session
+
+        event.listen(Session, "after_commit", _run_after_commit)
+        event.listen(Session, "after_rollback", _drop_after_commit)
+        _LISTENING = True
+    db.info.setdefault(_AFTER_COMMIT, []).append(action)
+
+
+def _run_after_commit(session: Any) -> None:
+    for action in session.info.pop(_AFTER_COMMIT, ()):
+        action()
+
+
+def _drop_after_commit(session: Any) -> None:
+    session.info.pop(_AFTER_COMMIT, None)
 
 
 async def lock_meeting(db: AsyncSession, meeting_id: int) -> Any:
@@ -347,6 +381,13 @@ async def write_status(
     )
     if outcome is not None and outcome.kind == "not_sent":
         meeting_not_sent(meeting.user_id, outcome.detail)
+    elif (
+        to_status == "failed" and is_live(from_status) and aw.outcome_kind != "not_sent"
+    ):
+        data = meeting.data if isinstance(meeting.data, dict) else {}
+        reason = data.get("completion_reason") or change_reason or "unknown"
+        user_id = meeting.user_id
+        after_commit(db, lambda: meeting_failed(user_id, reason))
     return WrittenEvent(event_id, int(aw.event_seq))
 
 

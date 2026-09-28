@@ -140,6 +140,9 @@ class RecordingSession:
         self.entries = list(entries)
         self.added: list = []
         self.calls: list[tuple] = []
+        self.info: dict[str, Any] = (
+            {}
+        )  # AsyncSession.info: the after-commit actions ride on it
 
     async def get(self, cls, ident, *, with_for_update=None, populate_existing=False):
         table = cls.__tablename__

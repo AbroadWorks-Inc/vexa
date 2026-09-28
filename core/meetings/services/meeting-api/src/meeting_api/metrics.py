@@ -12,6 +12,10 @@ metric                                                moved by
 ``aw_intake_request_seconds``                         every ``/v2`` request
 ``aw_meetings_not_sent_total{detail,user_id}``        ``intake.status.write_status`` writing a
                                                       ``not_sent`` outcome
+``aw_meetings_failed_total{reason,user_id}``          ``intake.status.write_status`` ending a
+                                                      sent bot's meeting ``failed`` (not
+                                                      ``not_sent``), once its transaction
+                                                      commits
 ``aw_autojoin_lag_seconds``                           the auto-join sweep, per bot sent: the tick's
                                                       time minus (``scheduled_at`` − lead)
 ``aw_webhook_deliveries_total{event_type,outcome,     the subscription sender, per claimed delivery
@@ -62,6 +66,7 @@ __all__ = [
     "autojoin_lag",
     "export_recorded",
     "intake_request",
+    "meeting_failed",
     "meeting_not_sent",
     "non_terminal_statuses",
     "registry",
@@ -108,6 +113,12 @@ class _Metrics:
             "aw_meetings_not_sent_total",
             "Meetings ended not_sent, by reason.",
             ["detail", "user_id"],
+            registry=r,
+        )
+        self.failed = Counter(
+            "aw_meetings_failed_total",
+            "Meetings whose bot was sent that ended failed (not not_sent), by reason.",
+            ["reason", "user_id"],
             registry=r,
         )
         self.autojoin_lag = Histogram(
@@ -165,6 +176,10 @@ def intake_request(route: str, result: str, user_id: Any, seconds: float) -> Non
 
 def meeting_not_sent(user_id: Any, detail: Optional[str]) -> None:
     _metrics().not_sent.labels(detail=detail or "", user_id=_account(user_id)).inc()
+
+
+def meeting_failed(user_id: Any, reason: Optional[str]) -> None:
+    _metrics().failed.labels(reason=reason or "", user_id=_account(user_id)).inc()
 
 
 def autojoin_lag(seconds: float) -> None:
