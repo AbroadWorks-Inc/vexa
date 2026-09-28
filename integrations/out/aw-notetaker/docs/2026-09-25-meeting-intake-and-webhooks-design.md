@@ -31,7 +31,7 @@
   3. Every client goes through the gateway, which signs the identity it forwards. The bots alone talk to meeting-api directly, as Vexa does, checked with the internal secret.
   4. The exporter reads through the gateway and reports its export result through the gateway.
   5. A finished meeting's entries are closed in the same transaction, and only unfinished meetings count toward the entry limit.
-  6. A future time is always a new meeting. A change stored while a meeting was live is applied when it finishes.
+  6. A future time is always a new meeting, also while the meeting is live (R7, owner 2026-09-28): the entry moves at once and the live meeting keeps its bot.
   7. Every status change goes through one writer, which also writes the outbox.
   8. Delivery state lives in Postgres (leased workers, `SKIP LOCKED`). Redis is not used for webhooks.
   9. There is one lock order, and intake status changes are conditional.
@@ -106,6 +106,7 @@
   53. MIGRATION-0008 sets the `uuid` default before the backfill, so no row inserted in between is left NULL for `SET NOT NULL`; every locking step runs under `SET lock_timeout`; after step 3 the old unique index can't simply be recreated, because a link then holds several scheduled rows (§6.4 A1, Part 5).
   54. Every `helm upgrade` in Part 5 (steps 11, 14) uses the values file from aw-notetaker `feat/portal-aw-bots`; the runbook checks the rendered chart before upgrading (Part 5).
   55. Owner follow-ups after the final review: §6.9 (F-A … F-K). F-K replaces R19; F-J replaces R8.
+  56. Owner decision: a move while live is a new time handled at once (R7); the finish-time re-run and R39 are removed (§6.9 F-R7). Sweeps are batched and paged with bounded per-item retries (F-I); a redundancy audit follows (F-L).
 
 ---
 
@@ -181,7 +182,7 @@ Portal ──instant join / stop / read (always "for whom")───────
 - If `end` passes without a bot, it ends `failed`, outcome `not_sent`, with the typed reason and exact message (§1.13), and a webhook goes out.
 
 **R7: Changes while live or after the finish.**
-- **While live:** an update is stored on the entry, but doesn't change the meeting (`not_changed_live`). When the meeting finishes, any stored entry whose time is now in the future and doesn't overlap the finished meeting becomes a new meeting automatically. Removing the last entry stops the bot (R5).
+- **While live:** an update that moves the entry to a **future time that doesn't overlap** the live meeting (its start is at or after the later of now and the live meeting's planned end) is a new time like any other: the entry leaves the live meeting at once and takes the R1 path (`created`/`joined_existing`, with `previous_meeting_id`). The live meeting keeps its bot (a move is not a removal, so R5 doesn't apply), and it keeps the entry as closed history, so the entry's owner still sees the meeting and its events name them. Any other update while live (title, attendees, an end moved later, a start that still overlaps) is stored on the entry but doesn't change the meeting (`not_changed_live`). Removing the last entry stops the bot (R5). (Owner decision 2026-09-28, V12.)
 - **After the finish:** the meeting is history. An update about that meeting's time replies `not_changed_finished`. An update that moves the entry to a **future time that doesn't overlap** the finished meeting is treated as a new entry. It gets a new meeting, and `previous_meeting_id` names the old one.
 
 **R8: Removed meetings are kept as history.** A meeting whose last entry is removed before its bot was sent ends `failed`, `completion_reason: "stopped"`, outcome `cancelled_by_calendar`, with `meeting.removed`. The row is kept.
@@ -272,7 +273,7 @@ The module talks to storage through one narrow port, `IntakeStore`, with an in-m
 2. Read the entry by (`user_id`, `source_user`, `external_id`) **under the lock**. If its link changed since the lock was chosen, restart once.
 3. **An unchanged active entry** (same `content_hash`) → `unchanged`.
 4. **A `removed` or `closed` entry comes back**, even with the same `content_hash` → it becomes active and takes the R1 path (`created`/`joined_existing`, with `previous_meeting_id`). A `closed` entry does this only if R7's future-time rule applies. Otherwise → `not_changed_finished`.
-5. **Its meeting is live** → store the change on the entry and reply `not_changed_live` (applied at finish, R7).
+5. **Its meeting is live** → a move to a future, non-overlapping time leaves the live meeting now and continues at step 6 (R7); any other change is stored on the entry and replies `not_changed_live`.
 6. Otherwise, match R1. Found → attach. Not found → create a meeting (`scheduled`, `data.auto_join=true`).
 7. A meeting left with no active entries is removed (R8, detail `entry_moved`).
 8. Recompute the affected meetings' times.
@@ -307,7 +308,7 @@ In the caller's transaction, `write_status` does five things in order:
 1. Lock the meeting row (`FOR UPDATE`). If its status isn't one the caller expects, raise `StatusConflict` and write nothing. This is what makes every change conditional ("only if still `scheduled`").
 2. Write the status (and any data patch).
 3. Lock `meeting_aw_state` (creating the row if missing), set the outcome if given, and increment `event_seq`.
-4. **On a finished status:** close the active entries. The exception is an entry whose stored time is in the future and doesn't overlap: it is returned for automatic re-run (R7).
+4. **On a finished status:** close the active entries (a move while live has already left, R7, so nothing is re-run at finish).
 5. Insert the event into `webhook_outbox`. The id is `evt_` + sha256(uuid | event_type | sequence), full 64 hex. The payload is the §2.7 envelope built with the one meeting projection, serialized once and stored as the exact text that will be sent.
 
 A guard test fails if anything else in meeting-api writes `meetings.status`.
@@ -595,7 +596,7 @@ Metrics are labelled by `user_id`.
 | `joined_existing` | The entry joined a meeting already there (R1): same UUID, no second bot |
 | `updated` | The entry changed and the meeting was updated; `previous_meeting_id` names the meeting it left, if it moved |
 | `unchanged` | Same data as before; nothing done. Safe to send as often as you like |
-| `not_changed_live` | The meeting is live; the change is stored and applied when it finishes if it points to a future time (R7) |
+| `not_changed_live` | The meeting is live and the change doesn't move the entry to a future, non-overlapping time; it is stored on the entry and the meeting is unchanged (R7) |
 | `not_changed_finished` | The meeting has finished and the change doesn't point to a new future time (R7) |
 | `removed` | Remove: it was the last entry; the meeting is removed (R8) |
 | `entry_removed` | Remove: other entries remain |
@@ -1583,7 +1584,9 @@ The owner asked for all of these. Every limit is a setting (the service's `confi
 | F-H | The sender's DNS checks run on the sender's own threads with a timeout, not the default pool that recording storage uses. A "lease short" skip is a failed attempt on the retry schedule, so it ends `dead` like any other failure. | `WEBHOOK_DNS_THREADS` (`4`), `WEBHOOK_DNS_TIMEOUT_S` (`5`) |
 | F-B | `aw_meetings_failed_total{reason,user_id}`: every meeting that ends `failed` after its bot was sent, counted once, by reason, at the one status writer. Alert when any occurs. | — |
 | F-D | A database constraint race is retried inside aw-bots a bounded number of times; if it still fails, the answer is 500 `internal_error` (logged, counted), not 503. | `INTAKE_CONFLICT_RETRIES` (`3`) |
-| F-I | The kept-entry re-run (R39) works in batches, is counted, and gives up on an entry after a bounded number of failures, telling the entry's owner by webhook. | `RERUN_BATCH_SIZE` (`200`), `RERUN_MAX_FAILURES` (`5`) |
+| F-R7 | A move while live is handled at once as a new time (R7 above). The finish-time re-run (`rerun_kept`, `kept_entries`, the kept-entry close, R39) is removed with its tests, since no entry is kept any more. | — |
+| F-I | Every intake sweep and background job reads its work in bounded, paged batches, and each item that fails is retried a bounded number of times, then logged and counted as failed, never retried forever. | `SWEEP_BATCH_SIZE` (`200`), `SWEEP_MAX_ITEM_FAILURES` (`5`) |
+| F-L | Redundancy audit of the whole branch: duplicated logic, dead code and paths that no longer have a caller are removed, one implementation per rule. | — |
 | F-K | Sending a bot for an entry-managed meeting (calendar or `join_now`) is tried a bounded number of times with a fixed gap; after the last failure the meeting ends `not_sent` with the last typed code (webhook, counter). The meeting's end stays the outer bound. `JOIN_NOW_ADOPT_AHEAD_S` is used only for the de-duplication look-ahead, never as a give-up time (replaces R19). | `BOT_SEND_MAX_ATTEMPTS` (`3`), `BOT_SEND_RETRY_BACKOFF_S` (`60`) |
 | F-E | The gateway signature also covers the query string and a SHA-256 of the body (a new signature version in the gateway-identity contract, re-sealed). Verifiers also accept an optional previous key, so the key can be rotated with no downtime. | `GATEWAY_IDENTITY_SECRET_PREVIOUS` (unset) |
 | F-J | Seal `core/flows/contracts/flows.v1` once, so `pnpm seal:contracts` needs no hand edit (replaces R8). | — |
