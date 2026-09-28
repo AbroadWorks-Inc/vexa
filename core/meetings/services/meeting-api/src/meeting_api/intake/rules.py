@@ -1,8 +1,8 @@
 """The R1 matching rules and the meeting windows (§1.1, R7, R10) — pure: no storage, no clock.
 
 This module is the one home of the window and overlap logic. The entry service decides with it
-which meeting an entry belongs to, and the status writer (``status.py``) decides with it which
-entries of a finished meeting re-run.
+which meeting an entry belongs to, and whether an update moves the entry away from a meeting that
+has started.
 
   * ``overlaps`` — half-open intervals: ``a_start < b_end and a_end > b_start``; a missing end is
     unbounded. Back-to-back times (15:00 end, 15:00 start) don't overlap.
@@ -19,12 +19,14 @@ entries of a finished meeting re-run.
     past its planned end: its bot is in the call now, and a pasted link never gets a second bot.
   * ``recompute`` — a meeting's plan from its active entries: earliest start, latest end (none if
     any entry is open-ended), and the first title, time zone and link in start order.
-  * ``finished_window`` / ``is_rerun`` — R10: a finished meeting's window is ``[meeting start,
-    finish)``, the end clamped to be no earlier than the start. An entry re-runs when it doesn't
-    overlap that window, starts after the meeting start and starts after the finish.
-  * ``is_future_move`` — R7 after the finish: the same rule with ``now`` as the finish. The
-    meeting finished at or before ``now``, so for an entry starting after ``now`` both windows
-    give the same answer.
+  * ``finished_window`` — R10: a started meeting's window is ``[meeting start, finish)``, the end
+    clamped to be no earlier than the start.
+  * ``is_future_move`` — R7: an update moves the entry to a new future time, away from a meeting
+    that has started, when it doesn't overlap that meeting's window, starts after the meeting
+    start and starts after ``now``. A finished meeting's window ends ``now`` (it finished at or
+    before ``now``, so for an entry starting after ``now`` both give the same answer); a live
+    one's at the later of ``now`` and its planned end; an open-ended live one's at ``now + lead``,
+    the horizon R1 matches it by.
   * ``is_overdue`` — R6: a meeting still without a bot is past its end: its ``end``, or for an
     open-ended meeting ``start + open_ended_s`` (the not-sent sweep passes
     ``JOIN_NOW_ADOPT_AHEAD_S``, the window a pasted link adopts by).
@@ -46,7 +48,6 @@ __all__ = [
     "is_future_move",
     "is_live",
     "is_overdue",
-    "is_rerun",
     "join_now_target",
     "match_entry",
     "meeting_start",
@@ -229,23 +230,23 @@ def finished_window(
     return begin, max(finish, begin)
 
 
-def is_rerun(
-    start: Optional[datetime],
-    end: Optional[datetime],
-    window: tuple[datetime, datetime],
-    *,
-    finish: datetime,
+def is_future_move(
+    entry: Timed, meeting: MeetingLike, *, now: datetime, lead_s: float
 ) -> bool:
-    """R7/R10: no overlap with the finished window, after the meeting start, after the finish."""
-    if start is None:
-        return False
-    return not overlaps(start, end, *window) and start > window[0] and start > finish
-
-
-def is_future_move(entry: Timed, finished: MeetingLike, *, now: datetime) -> bool:
-    """R7: an update to a finished meeting's entry that points to a new future time."""
-    window = finished_window(finished.start, finish=now)
-    return is_rerun(entry.start, entry.end, window, finish=now)
+    """R7: an update of an entry of a started (live or finished) meeting that points the entry to
+    a new future time (see the module docstring)."""
+    if meeting.status in FINISHED_STATUSES:
+        finish = now
+    elif meeting.end is not None:
+        finish = max(now, meeting.end)
+    else:
+        finish = now + timedelta(seconds=lead_s)
+    window = finished_window(meeting.start, finish=finish)
+    return (
+        not overlaps(entry.start, entry.end, *window)
+        and entry.start > window[0]
+        and entry.start > now
+    )
 
 
 def is_overdue(

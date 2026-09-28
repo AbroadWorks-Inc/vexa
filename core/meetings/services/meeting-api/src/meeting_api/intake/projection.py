@@ -29,8 +29,6 @@ from .rules import scheduled_time
 
 __all__ = ["iso_utc", "project_meeting"]
 
-_FINISHED_STATUSES = frozenset({"completed", "failed"})
-
 
 def iso_utc(value: Any) -> Optional[str]:
     """A datetime or an ISO-8601 string → a UTC ISO-8601 string with a trailing ``Z``.
@@ -106,6 +104,22 @@ def _entry(entry: Mapping[str, Any]) -> dict:
     }
 
 
+def _listed(entries: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """R9, R7: the meeting's active and closed entries, never removed ones, each entry once. A
+    closed entry is history: who a finished meeting was for, or an entry that moved from a live
+    meeting to a new time. An entry holding two rows here (it left and came back) is listed at
+    its first place with its active row, else its newest closed one."""
+    chosen: dict[tuple[Any, Any], Mapping[str, Any]] = {}
+    for entry in entries:
+        if entry.get("state") not in ("active", "closed"):
+            continue
+        key = (entry.get("source_user"), entry.get("external_id"))
+        held = chosen.get(key)
+        if held is None or held.get("state") != "active":
+            chosen[key] = entry
+    return list(chosen.values())
+
+
 def project_meeting(
     meeting: Mapping[str, Any],
     aw: Optional[Mapping[str, Any]],
@@ -120,9 +134,6 @@ def project_meeting(
     below, never a verbatim copy of ``data`` or ``aw``.
     """
     data = _data_of(meeting)
-    # R9: a finished meeting lists who it was for (its closed entries); any other meeting lists its
-    # active ones. Removed entries are never listed.
-    listed_state = "closed" if meeting.get("status") in _FINISHED_STATUSES else "active"
     return {
         "id": str(meeting["uuid"]),
         "status": meeting.get("status"),
@@ -137,7 +148,7 @@ def project_meeting(
         "end": iso_utc(aw.get("scheduled_end_at")) if aw is not None else None,
         "time_zone": aw.get("time_zone") if aw is not None else None,
         "bot_joins_at": _bot_joins_at(meeting, data, lead_s=lead_s),
-        "entries": [_entry(e) for e in entries if e.get("state") == listed_state],
+        "entries": [_entry(e) for e in _listed(entries)],
         "export": _export(aw),
         "sequence": aw.get("event_seq", 0) if aw is not None else 0,
     }

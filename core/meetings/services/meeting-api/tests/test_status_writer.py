@@ -307,9 +307,8 @@ async def test_fake_terminal_write_closes_active_entries(orm):
     removed = _entry(orm, 2, start=now - timedelta(hours=1), end=now, state="removed")
     db = RecordingSession(orm, meeting, aw, [past, removed])
 
-    written = await write_status(db, 11, "completed", expected_from={"active"})
+    await write_status(db, 11, "completed", expected_from={"active"})
 
-    assert written.rerun_entry_ids == ()
     assert past.state == "closed" and past.closed_at is not None
     assert removed.state == "removed" and removed.closed_at is None
     # R9: the terminal event lists who the meeting was for — its closed entries, never removed ones
@@ -319,7 +318,7 @@ async def test_fake_terminal_write_closes_active_entries(orm):
     ]
 
 
-# ── R10: the finished window is [meeting start, actual finish) ──────────────────────────────
+# ── the finish closes every active entry ────────────────────────────────────────────────────
 
 T10 = datetime(2026, 9, 29, 10, 0, tzinfo=UTC)
 
@@ -328,44 +327,33 @@ def _finish_at(monkeypatch, instant: datetime) -> None:
     monkeypatch.setattr("meeting_api.intake.status._now", lambda: instant)
 
 
-async def test_r10_a_entry_moved_past_an_early_finish_is_rerun(orm, monkeypatch):
-    """Meeting 10:00–11:00, the bot leaves at 10:20; the entry was moved during the call to
-    10:40–11:40 → it no longer overlaps what actually happened, so it re-runs. The scheduled end
-    (11:00) doesn't widen the finished window."""
+async def test_a_finish_closes_every_active_entry_whatever_its_time(orm, monkeypatch):
+    """A move while live has already left the meeting (R7), so at the finish every entry still
+    active is the meeting's own, a later one included: all of them close and the terminal event
+    lists them."""
     _finish_at(monkeypatch, T10 + timedelta(minutes=20))
     meeting = _meeting(orm, status="active", scheduled_at=T10)
     aw = _aw(orm, scheduled_end_at=T10 + timedelta(hours=1))
-    moved = _entry(
-        orm, 1, start=T10 + timedelta(minutes=40), end=T10 + timedelta(minutes=100)
+    own = _entry(orm, 1, start=T10, end=T10 + timedelta(hours=1))
+    later = _entry(
+        orm, 2, start=T10 + timedelta(minutes=40), end=T10 + timedelta(minutes=100)
     )
-    db = RecordingSession(orm, meeting, aw, [moved])
+    db = RecordingSession(orm, meeting, aw, [own, later])
 
-    written = await write_status(db, 11, "completed", expected_from={"active"})
+    await write_status(db, 11, "completed", expected_from={"active"})
 
-    assert written.rerun_entry_ids == (1,)
-    assert moved.state == "active" and moved.closed_at is None
-    # R9: a re-run entry (still active) is not on the finished meeting's final event
+    assert (own.state, later.state) == ("closed", "closed")
     envelope = json.loads(db.outbox()[0].payload_text)
-    assert envelope["data"]["meeting"]["entries"] == []
+    assert [e["external_id"] for e in envelope["data"]["meeting"]["entries"]] == [
+        "google:1",
+        "google:2",
+    ]
 
 
-async def test_r10_b_unchanged_entry_is_closed(orm, monkeypatch):
-    _finish_at(monkeypatch, T10 + timedelta(minutes=20))
-    meeting = _meeting(orm, status="active", scheduled_at=T10)
-    aw = _aw(orm, scheduled_end_at=T10 + timedelta(hours=1))
-    same = _entry(orm, 1, start=T10, end=T10 + timedelta(hours=1))
-    db = RecordingSession(orm, meeting, aw, [same])
-
-    written = await write_status(db, 11, "completed", expected_from={"active"})
-
-    assert written.rerun_entry_ids == ()
-    assert same.state == "closed"
-
-
-async def test_r10_c_join_now_finishing_in_its_start_second_is_closed(orm, monkeypatch):
-    """A join_now entry starting 10:00:00.700 (no end) on a meeting that fails at 10:00:00.900:
-    the comparison uses the full-precision finish, so the entry is the meeting's own and closes.
-    Only the display values (closed_at, change.at, created_at) are whole seconds."""
+async def test_the_finish_stamps_are_whole_seconds(orm, monkeypatch):
+    """A join_now entry starting 10:00:00.700 (no end) on a meeting that fails at 10:00:00.900
+    closes; the displayed values (closed_at, change.at, created_at) are whole seconds.
+    """
     _finish_at(monkeypatch, T10.replace(microsecond=900_000))
     start = T10.replace(microsecond=700_000)
     meeting = _meeting(
@@ -374,84 +362,12 @@ async def test_r10_c_join_now_finishing_in_its_start_second_is_closed(orm, monke
     entry = _entry(orm, 1, start=start, end=None)
     db = RecordingSession(orm, meeting, _aw(orm), [entry])
 
-    written = await write_status(db, 11, "failed", expected_from={"requested"})
+    await write_status(db, 11, "failed", expected_from={"requested"})
 
-    assert written.rerun_entry_ids == ()
     assert entry.state == "closed"
     assert entry.closed_at == T10
     envelope = json.loads(db.outbox()[0].payload_text)
     assert envelope["created_at"] == envelope["data"]["change"]["at"] == _iso(T10)
-
-
-async def test_r10_entry_started_earlier_in_the_finishing_second_is_closed(
-    orm, monkeypatch
-):
-    """Meeting from 09:00 finishing at 10:00:00.900; an entry (no end) that started at
-    10:00:00.700 is already under way at the finish, so it closes. A whole-second finish
-    (10:00:00) would wrongly call it future and re-run it."""
-    _finish_at(monkeypatch, T10.replace(microsecond=900_000))
-    meeting = _meeting(orm, status="active", scheduled_at=T10 - timedelta(hours=1))
-    entry = _entry(orm, 1, start=T10.replace(microsecond=700_000), end=None)
-    db = RecordingSession(orm, meeting, _aw(orm), [entry])
-
-    written = await write_status(db, 11, "completed", expected_from={"active"})
-
-    assert written.rerun_entry_ids == ()
-    assert entry.state == "closed"
-
-
-async def test_r10_d_open_ended_meeting_finishing_before_its_start_closes_its_entry(
-    orm, monkeypatch
-):
-    """An open-ended meeting scheduled for 10:00 that fails at 09:50: the window clamps to
-    [10:00, 10:00), and its own 10:00 entry (not after the meeting start) is closed."""
-    _finish_at(monkeypatch, T10 - timedelta(minutes=10))
-    meeting = _meeting(orm, status="scheduled", scheduled_at=T10)
-    entry = _entry(orm, 1, start=T10, end=None)
-    db = RecordingSession(orm, meeting, _aw(orm, scheduled_end_at=None), [entry])
-
-    written = await write_status(db, 11, "failed", expected_from={"scheduled"})
-
-    assert written.rerun_entry_ids == ()
-    assert entry.state == "closed"
-
-
-async def test_r10_entry_after_the_meeting_start_and_the_finish_is_rerun(
-    orm, monkeypatch
-):
-    """Finished before its start (09:50, scheduled 10:00): an entry moved to 12:00 is after both
-    the meeting start and the finish, so it re-runs."""
-    _finish_at(monkeypatch, T10 - timedelta(minutes=10))
-    meeting = _meeting(orm, status="scheduled", scheduled_at=T10)
-    own = _entry(orm, 1, start=T10, end=T10 + timedelta(hours=1))
-    later = _entry(orm, 2, start=T10 + timedelta(hours=2), end=T10 + timedelta(hours=3))
-    aw = _aw(orm, scheduled_end_at=T10 + timedelta(hours=1))
-    db = RecordingSession(orm, meeting, aw, [own, later])
-
-    written = await write_status(db, 11, "failed", expected_from={"scheduled"})
-
-    assert written.rerun_entry_ids == (2,)
-    assert (own.state, later.state) == ("closed", "active")
-
-
-async def test_fake_open_ended_meeting_window_ends_at_the_finish(orm):
-    """No `scheduled_end_at` (a `join_now` meeting): the window is [scheduled_at, finish), so any
-    entry that starts after the finish comes back, and one with no end of its own too.
-    """
-    now = _now()
-    meeting = _meeting(orm, status="active", scheduled_at=now - timedelta(hours=1))
-    aw = _aw(orm, scheduled_end_at=None)
-    started = _entry(orm, 1, start=now - timedelta(hours=1), end=None)
-    later = _entry(
-        orm, 2, start=now + timedelta(minutes=1), end=now + timedelta(hours=1)
-    )
-    later_open = _entry(orm, 3, start=now + timedelta(hours=2), end=None)
-    db = RecordingSession(orm, meeting, aw, [started, later, later_open])
-
-    written = await write_status(db, 11, "failed", expected_from={"active"})
-
-    assert written.rerun_entry_ids == (2, 3)
-    assert started.state == "closed"
 
 
 async def test_fake_non_terminal_write_leaves_entries_alone(orm):
@@ -462,9 +378,8 @@ async def test_fake_non_terminal_write_leaves_entries_alone(orm):
     )
     db = RecordingSession(orm, meeting, _aw(orm), [past])
 
-    written = await write_status(db, 11, "requested", expected_from={"scheduled"})
+    await write_status(db, 11, "requested", expected_from={"scheduled"})
 
-    assert written.rerun_entry_ids == ()
     assert past.state == "active"
 
 
@@ -564,7 +479,7 @@ async def test_fake_write_event_without_change(orm):
     written = await write_event(db, 11, "meeting.waiting_for_room")
 
     assert meeting.status == "scheduled"
-    assert written.sequence == 3 and written.rerun_entry_ids == ()
+    assert written.sequence == 3
     (row,) = db.outbox()
     envelope = json.loads(row.payload_text)
     assert "change" not in envelope["data"]
@@ -778,7 +693,7 @@ async def test_pg_terminal_write_closes_entries_in_the_same_transaction(pg_schem
         )
 
     snap = await _snapshot(pg_schema, meeting_id)
-    assert written.rerun_entry_ids == ()
+    assert written.sequence == 1
     assert snap["status"] == "completed"
     assert snap["entries"] == {e1: "closed", e2: "closed"}
     assert [r.sequence for r in snap["outbox"]] == [1]
@@ -788,9 +703,7 @@ async def test_pg_terminal_write_closes_entries_in_the_same_transaction(pg_schem
 
 
 @pg
-async def test_pg_future_non_overlapping_entry_is_rerun_not_closed(pg_schema):
-    from sqlalchemy import text
-
+async def test_pg_a_finish_closes_a_later_active_entry_too(pg_schema):
     now = _now()
     meeting_id = await _seed_meeting(
         pg_schema,
@@ -805,34 +718,17 @@ async def test_pg_future_non_overlapping_entry_is_rerun_not_closed(pg_schema):
         now - timedelta(hours=1),
         now + timedelta(minutes=30),
     )
-    moved = await _seed_entry(
+    later = await _seed_entry(
         pg_schema, meeting_id, "g:2", now + timedelta(hours=3), now + timedelta(hours=4)
     )
 
     async with _sessions(pg_schema)() as db, db.begin():
-        written = await write_status(
-            db, meeting_id, "completed", expected_from={"active"}
-        )
+        await write_status(db, meeting_id, "completed", expected_from={"active"})
 
-    assert written.rerun_entry_ids == (moved,)
     snap = await _snapshot(pg_schema, meeting_id)
-    assert snap["entries"] == {current: "closed", moved: "active"}
+    assert snap["entries"] == {current: "closed", later: "closed"}
     listed = json.loads(snap["outbox"][0].payload_text)["data"]["meeting"]["entries"]
-    assert [e["external_id"] for e in listed] == [
-        "g:1"
-    ]  # the re-run entry isn't listed
-    async with pg_schema.begin() as conn:
-        closed_at = dict(
-            (
-                await conn.execute(
-                    text(
-                        "SELECT id, closed_at FROM meeting_entries WHERE meeting_id = :id"
-                    ),
-                    {"id": meeting_id},
-                )
-            ).all()
-        )
-    assert closed_at[current] is not None and closed_at[moved] is None
+    assert [e["external_id"] for e in listed] == ["g:1", "g:2"]
 
 
 @pg

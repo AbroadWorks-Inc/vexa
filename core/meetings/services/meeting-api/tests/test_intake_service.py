@@ -96,7 +96,9 @@ async def test_closed_entry_comes_back_only_for_a_future_time():
     later = await h.put(start="2026-09-29T11:00:00Z", end="2026-09-29T12:00:00Z")
     assert (later["result"], later["previous_meeting_id"]) == ("created", uuid)
     assert later["entry"]["state"] == "active"
-    assert h.meeting(uuid).project(lead_s=300)["entries"] == []
+    # the finished meeting keeps the entry as history (a closed row stays where it closed)
+    assert [e["user"] for e in h.meeting(uuid).project(lead_s=300)["entries"]] == [A]
+    assert [e.state for e in h.meeting(uuid).entries] == ["closed"]
 
 
 async def test_remove_of_an_unknown_entry_is_entry_not_found():
@@ -385,46 +387,6 @@ async def test_merge_into_live_refuses_a_bounded_or_finished_pair():
     assert h.meeting(due).status == "scheduled" and h.events(mark) == []
 
 
-# ── R7 re-run ────────────────────────────────────────────────────────────────────────────────
-
-
-async def test_rerun_leaves_an_entry_that_already_moved():
-    h = make_harness()
-    uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
-        "meeting"
-    ]["id"]
-    h.clock.set("2026-09-29T09:00:00Z")
-    h.set_status(uuid, "active")
-    await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    h.clock.set("2026-09-29T09:30:00Z")
-    written = h.set_status(uuid, "completed")
-    await h.service.rerun_entries(1, written.rerun_entry_ids)
-    mark, meetings = h.mark(), len(h.store.meetings)
-    await h.service.rerun_entries(1, written.rerun_entry_ids)
-    assert h.events(mark) == [] and len(h.store.meetings) == meetings
-
-
-async def test_rerun_joins_a_meeting_already_on_the_new_time():
-    h = make_harness()
-    uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
-        "meeting"
-    ]["id"]
-    other = (
-        await h.put(
-            "google:b", user=B, start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z"
-        )
-    )["meeting"]["id"]
-    h.clock.set("2026-09-29T09:00:00Z")
-    h.set_status(uuid, "active")
-    await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    h.clock.set("2026-09-29T09:30:00Z")
-    written = h.set_status(uuid, "completed")
-    mark = h.mark()
-    await h.service.rerun_entries(1, written.rerun_entry_ids)
-    assert [e.source_user for e in h.meeting(other).active_entries()] == [A, B]
-    assert h.events(mark) == [(other, "meeting.updated")]
-
-
 # ── join_now details ─────────────────────────────────────────────────────────────────────────
 
 
@@ -608,27 +570,34 @@ async def test_remove_after_a_link_change_while_live_locks_the_meeting_link():
     assert [c[1] for c in h.stop.calls] == [h.meeting_id(uuid)]
 
 
-async def test_finish_after_a_link_change_while_live_reruns_on_the_new_link():
+async def test_a_link_change_to_a_new_time_while_live_leaves_on_the_new_link():
+    """R7 with a new link: the move takes both links' locks and lands on the new link at once."""
     h = make_harness()
-    uuid = await _live_with_link_changed(
-        h, start="2026-09-29T15:00:00Z", end="2026-09-29T15:30:00Z"
-    )
-    h.clock.set("2026-09-29T09:20:00Z")
-    written = h.set_status(uuid, "completed")
+    uuid = (await h.put())["meeting"]["id"]  # on GROOM, 09:00–09:30
+    h.clock.set("2026-09-29T09:01:00Z")
+    h.set_status(uuid, "active")
     locks = len(h.store.lock_log)
-    await h.service.rerun_entries(1, written.rerun_entry_ids)
-    assert h.store.lock_log[locks:] == [(1, ()), (1, (GROOM_OTHER, GROOM))]
-    moved = h.store.find_entry(1, A, "google:3n5kq8example")
-    new = h.store.view(moved.meeting_id)
-    assert (new.uuid != uuid, new.room, new.status) == (True, GROOM_OTHER, "scheduled")
+    reply = await h.put(
+        meeting_url=GMEET_OTHER,
+        start="2026-09-29T15:00:00Z",
+        end="2026-09-29T15:30:00Z",
+    )
+    assert h.store.lock_log[locks:] == [
+        (1, (GROOM_OTHER,)),
+        (1, (GROOM_OTHER, GROOM)),
+    ]
+    assert (reply["result"], reply["previous_meeting_id"]) == ("created", uuid)
+    new = h.meeting(reply["meeting"]["id"])
+    assert (new.room, new.status) == (GROOM_OTHER, "scheduled")
+    assert h.meeting(uuid).status == "active"
+    assert [e.state for e in h.meeting(uuid).entries] == ["closed"]
 
 
 async def test_a_link_change_while_live_then_the_same_time_is_closed_at_finish():
     h = make_harness()
     uuid = await _live_with_link_changed(h)
     h.clock.set("2026-09-29T09:20:00Z")
-    written = h.set_status(uuid, "completed")
-    assert written.rerun_entry_ids == ()
+    h.set_status(uuid, "completed")
     assert h.store.find_entry(1, A, "google:3n5kq8example").state == "closed"
     again = await h.remove(reason="cancelled")
     assert again["result"] == "already_removed"
@@ -726,24 +695,25 @@ async def test_last_entry_removed_as_the_meeting_finishes_is_entry_removed():
     assert h.events(mark) == [] and h.stop.calls == []
 
 
-async def test_removing_an_entry_waiting_to_rerun_is_entry_removed():
+async def test_removing_an_entry_that_moved_while_live_leaves_the_live_meeting_alone():
+    """After a move while live, remove acts on the entry's new meeting; the live meeting keeps its
+    bot and its history."""
     h = make_harness()
     uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
         "meeting"
     ]["id"]
     h.clock.set("2026-09-29T09:00:00Z")
     h.set_status(uuid, "active")
-    await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    h.clock.set("2026-09-29T09:30:00Z")
-    assert h.set_status(uuid, "completed").rerun_entry_ids
+    moved = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
     mark = h.mark()
     reply = await h.remove(reason="cancelled")
-    assert (reply["result"], reply["entry"]["state"], reply["meeting"]["status"]) == (
-        "entry_removed",
+    assert (reply["result"], reply["meeting"]["id"]) == (
         "removed",
-        "completed",
+        moved["meeting"]["id"],
     )
-    assert h.events(mark) == []
+    assert h.events(mark) == [(moved["meeting"]["id"], "meeting.removed")]
+    assert h.meeting(uuid).status == "active" and h.stop.calls == []
+    assert [e.state for e in h.meeting(uuid).entries] == ["closed"]
 
 
 # ── minors ───────────────────────────────────────────────────────────────────────────────────

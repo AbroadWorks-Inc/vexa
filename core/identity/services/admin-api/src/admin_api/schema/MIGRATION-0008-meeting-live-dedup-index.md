@@ -117,7 +117,6 @@ CREATE TABLE meeting_entries (
 	removed_at TIMESTAMP WITH TIME ZONE, 
 	closed_at TIMESTAMP WITH TIME ZONE, 
 	PRIMARY KEY (id), 
-	CONSTRAINT uq_meeting_entries_user_source_external UNIQUE (user_id, source_user, external_id), 
 	FOREIGN KEY(meeting_id) REFERENCES meetings (id) ON DELETE RESTRICT
 );
 
@@ -205,6 +204,8 @@ CREATE TABLE webhook_delivery_attempts (
 ```
 
 (Every other index on these six tables — `ix_meeting_entries_meeting_id`,
+`uq_meeting_entries_user_source_external` (unique where `state <> 'closed'`: one row per entry
+that isn't closed; closed rows are history), `ix_meeting_entries_user_source_external`,
 `ix_meeting_entries_user_platform_native_state`, `ix_meeting_entries_attendees_gin`,
 `ix_meeting_entries_active_user`, `ix_webhook_subscriptions_user_id`,
 `ix_webhook_outbox_unpublished`, `ix_webhook_deliveries_due`,

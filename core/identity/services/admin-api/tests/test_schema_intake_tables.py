@@ -133,14 +133,18 @@ def test_meeting_entries_fk_meeting_id_restrict():
 
 
 def test_meeting_entries_unique_constraint_and_indexes():
+    """One row per entry that isn't closed; closed rows are history (R7), found through the plain
+    key index."""
     t = MeetingEntry.__table__
-    uqs = {
-        c.name: c for c in t.constraints if c.__class__.__name__ == "UniqueConstraint"
-    }
-    uc = uqs["uq_meeting_entries_user_source_external"]
-    assert [c.name for c in uc.columns] == ["user_id", "source_user", "external_id"]
+    assert not [c for c in t.constraints if c.__class__.__name__ == "UniqueConstraint"]
 
     idx = _indexes(t)
+    key = ["user_id", "source_user", "external_id"]
+    unique = idx["uq_meeting_entries_user_source_external"]
+    assert [c.name for c in unique.columns] == key and unique.unique is True
+    assert str(unique.dialect_options["postgresql"]["where"]) == "state <> 'closed'"
+    lookup = idx["ix_meeting_entries_user_source_external"]
+    assert [c.name for c in lookup.columns] == key and not lookup.unique
     assert [c.name for c in idx["ix_meeting_entries_meeting_id"].columns] == [
         "meeting_id"
     ]

@@ -6,11 +6,11 @@
     the link's live meetings and the non-finished ones that have an entry (Ruling R15). Its status
     and event writes behave as ``write_status`` / ``write_event`` (§1.4): the status change is
     conditional (``StatusConflict``, nothing written), each event adds 1 to the meeting's
-    sequence, a finished status closes the active entries except the ones that re-run
-    (``rules.is_rerun``, returned in ``rerun_entry_ids``), and every event is recorded in order in
-    ``events`` with the meeting as projected at that moment. ``overdue_meetings`` applies
-    ``rules.is_overdue`` to the ``scheduled`` meetings that have an entry, as the Postgres read does;
-    ``kept_entries`` returns the active entries of finished meetings.
+    sequence, a finished status closes the active entries, and every event is recorded in order in
+    ``events`` with the meeting as projected at that moment. An entry's rows are found as the
+    Postgres store finds them: its one row that isn't ``closed``, else its newest closed row; a
+    closed row is history, so saving the entry then adds a row. ``overdue_meetings`` applies
+    ``rules.is_overdue`` to the ``scheduled`` meetings that have an entry, as the Postgres read does.
   * ``FakeSpawn`` — ``SpawnPort``: claims a ``scheduled`` row (status ``requested``), answers
     ``already_live`` for any other row, or returns the failure it was given: before the claim by
     default, after it with ``after_claim=True`` (the row then ends ``failed``, outcome
@@ -67,11 +67,8 @@ from .resolver import LinkRow
 from .rules import (
     FINISHED_STATUSES,
     Plan,
-    finished_window,
     is_live,
     is_overdue,
-    is_rerun,
-    meeting_start,
 )
 from .status import (
     Outcome,
@@ -134,7 +131,8 @@ class InMemoryIntakeStore:
         self.meetings: dict[int, dict[str, Any]] = {}
         self.aw: dict[int, dict[str, Any]] = {}
         self.entries: dict[int, EntryView] = {}
-        self._entry_keys: dict[tuple[int, str, str], int] = {}
+        #: every row id of each entry key, oldest first
+        self._entry_rows: dict[tuple[int, str, str], tuple[int, ...]] = {}
         self.events: list[RecordedEvent] = []
         self.lock_log: list[tuple[int, tuple[Room, ...]]] = []
         self.on_lock: Optional[
@@ -156,12 +154,12 @@ class InMemoryIntakeStore:
         if self.on_lock is not None:
             self.on_lock(self, ordered)
         meetings, aw, entries = dict(self.meetings), dict(self.aw), dict(self.entries)
-        keys, events = dict(self._entry_keys), len(self.events)
+        keys, events = dict(self._entry_rows), len(self.events)
         try:
             yield _FakeTx(self)
         except BaseException:
             self.meetings, self.aw, self.entries = meetings, aw, entries
-            self._entry_keys = keys
+            self._entry_rows = keys
             del self.events[events:]
             raise
 
@@ -179,8 +177,11 @@ class InMemoryIntakeStore:
     def find_entry(
         self, user_id: int, source_user: str, external_id: str
     ) -> Optional[EntryView]:
-        entry_id = self._entry_keys.get((user_id, source_user, external_id))
-        return None if entry_id is None else self.entries[entry_id]
+        ids = self._entry_rows.get((user_id, source_user, external_id), ())
+        rows = [self.entries[i] for i in ids if i in self.entries]
+        current = [e for e in rows if e.state != "closed"]
+        found = current or rows
+        return found[-1] if found else None
 
     async def overdue_meetings(
         self, now: datetime, *, open_ended_s: int
@@ -195,14 +196,6 @@ class InMemoryIntakeStore:
             v
             for v in views
             if is_overdue(v.start, v.end, now=now, open_ended_s=open_ended_s)
-        ]
-
-    async def kept_entries(self) -> list[EntryView]:
-        return [
-            e
-            for _, e in sorted(self.entries.items())
-            if e.state == "active"
-            and self.meetings[e.meeting_id]["status"] in FINISHED_STATUSES
         ]
 
     def entries_of(self, meeting_id: int, state: str = "active") -> list[EntryView]:
@@ -281,8 +274,13 @@ class InMemoryIntakeStore:
         self, user_id: int, entry: EntryIn, room: Room, meeting_id: int
     ) -> EntryView:
         existing = self.find_entry(user_id, entry.user, entry.external_id)
+        current = existing is not None and existing.state != "closed"
         saved = EntryView(
-            id=existing.id if existing is not None else next(self._entry_ids),
+            id=(
+                existing.id
+                if existing is not None and current
+                else next(self._entry_ids)
+            ),
             user_id=user_id,
             source_user=entry.user,
             external_id=entry.external_id,
@@ -302,7 +300,9 @@ class InMemoryIntakeStore:
             state="active",
         )
         self.entries[saved.id] = saved
-        self._entry_keys[(user_id, entry.user, entry.external_id)] = saved.id
+        key = (user_id, entry.user, entry.external_id)
+        if not current:
+            self._entry_rows[key] = (*self._entry_rows.get(key, ()), saved.id)
         return saved
 
     def write_status(
@@ -339,17 +339,11 @@ class InMemoryIntakeStore:
                 "outcome_message": outcome.message,
                 "outcome_at": now.replace(microsecond=0),
             }
-        rerun: list[int] = []
         if to_status in FINISHED_STATUSES:
-            start = meeting_start(row["data"], row["start_time"], row["created_at"])
-            window = finished_window(start, finish=now)
             for entry in self.entries_of(meeting_id):
-                if is_rerun(entry.start, entry.end, window, finish=now):
-                    rerun.append(entry.id)
-                else:
-                    self.entries[entry.id] = replace(
-                        entry, state="closed", closed_at=now.replace(microsecond=0)
-                    )
+                self.entries[entry.id] = replace(
+                    entry, state="closed", closed_at=now.replace(microsecond=0)
+                )
         change = {
             "from": from_status,
             "to": to_status,
@@ -360,7 +354,7 @@ class InMemoryIntakeStore:
         written = self.write_event(
             meeting_id, event_type or typed, change, event_data=event_data
         )
-        return WrittenEvent(written.event_id, written.sequence, tuple(rerun))
+        return WrittenEvent(written.event_id, written.sequence)
 
     def write_event(
         self,
@@ -388,7 +382,7 @@ class InMemoryIntakeStore:
                 event_data=dict(event_data) if event_data is not None else None,
             )
         )
-        return WrittenEvent(event_id, sequence, ())
+        return WrittenEvent(event_id, sequence)
 
 
 class _FakeTx:
@@ -604,8 +598,8 @@ class FakeStop:
 
 
 class NoStop:
-    """``StopPort`` for an ``IntakeService`` that must never stop a bot (the scheduler's merge and
-    re-run never do), so a call here is a fault."""
+    """``StopPort`` for an ``IntakeService`` that must never stop a bot (the scheduler's merge
+    never does), so a call here is a fault."""
 
     async def stop_live(
         self, user_id: int, meeting_id: int, *, outcome: Optional[Outcome]
@@ -710,9 +704,6 @@ class InMemoryIntakeReads:
         ]
         for entry in gone:
             del self._s.entries[entry.id]
-            del self._s._entry_keys[
-                (entry.user_id, entry.source_user, entry.external_id)
-            ]
         return ErasedRows(entries=len(gone), outbox=len(events), deliveries=deliveries)
 
     async def record_export(

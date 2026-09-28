@@ -250,7 +250,7 @@ async def test_auto_join_tick_gets_the_intake_store_service_and_publisher(monkey
 async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
-    from meeting_api.intake import IntakeService, OutboxOnly, PostgresIntakeStore
+    from meeting_api.intake import OutboxOnly, PostgresIntakeStore
     from meeting_api.intake import sweeps as sweeps_mod
     from meeting_api.sweeps.single_flight import sweep_lock_key
 
@@ -259,8 +259,8 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
     async def _stub_auto_join(*args, **kwargs):
         calls.append(("auto-join", kwargs["store"]))
 
-    async def _stub_not_sent(store, service, **kwargs):
-        calls.append(("not-sent", store, service, kwargs))
+    async def _stub_not_sent(store, **kwargs):
+        calls.append(("not-sent", store, kwargs))
         return 0
 
     monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub_auto_join)
@@ -273,9 +273,8 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
 
     (not_sent,) = [c for c in calls if c[0] == "not-sent"]
     (auto_join,) = [c for c in calls if c[0] == "auto-join"]
-    _, store, service, kwargs = not_sent
+    _, store, kwargs = not_sent
     assert isinstance(store, PostgresIntakeStore) and store is auto_join[1]
-    assert isinstance(service, IntakeService)
     assert isinstance(kwargs["publisher"], OutboxOnly)
     assert kwargs["open_ended_s"] == 1800
     assert abs(kwargs["now"] - datetime.now(timezone.utc)) < timedelta(seconds=30)

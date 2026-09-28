@@ -261,8 +261,12 @@ class MeetingEntry(Base):  # type: ignore[valid-type,misc]
     closed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "source_user", "external_id",
-                          name="uq_meeting_entries_user_source_external"),
+        # One row per entry that isn't closed; closed rows are history (R7), any number of them.
+        Index("uq_meeting_entries_user_source_external",
+              "user_id", "source_user", "external_id", unique=True,
+              postgresql_where=text("state <> 'closed'")),
+        Index("ix_meeting_entries_user_source_external",
+              "user_id", "source_user", "external_id"),
         Index("ix_meeting_entries_user_platform_native_state",
               "user_id", "platform", "native_meeting_id", "state"),
         Index("ix_meeting_entries_attendees_gin", "attendees", postgresql_using="gin"),

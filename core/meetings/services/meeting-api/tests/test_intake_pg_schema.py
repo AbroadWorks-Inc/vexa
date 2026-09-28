@@ -29,6 +29,7 @@ Then, with the throwaway Postgres running (constraints.md):
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -310,6 +311,66 @@ async def test_restrict_blocks_delete_when_a_meeting_entry_exists(intake_pg_engi
             await conn.execute(
                 text("DELETE FROM meetings WHERE id = :id"), {"id": meeting_id}
             )
+
+
+_ENTRY_SQL = (
+    "INSERT INTO meeting_entries (user_id, source_user, external_id, meeting_id, "
+    "meeting_url, platform, native_meeting_id, start_at, content_hash, state) VALUES "
+    "(1, 'me@example.com', 'evt-1', :meeting_id, 'https://meet.example/x', 'google_meet', "
+    "'abc-123', now(), 'hash', :state)"
+)
+
+
+async def test_an_entry_has_one_row_that_is_not_closed_and_any_closed_ones(
+    intake_pg_engine,
+):
+    """R7: closed rows are history, any number of them beside the entry's one current row; a
+    second current row is refused. The key lookup reads through an index, never a table scan.
+    """
+    await admin_sync.ensure_schema(intake_pg_engine, admin_models.Base)
+    async with intake_pg_engine.begin() as conn:
+        meeting_id = (
+            await conn.execute(
+                text(
+                    "INSERT INTO meetings (user_id, platform, status) VALUES (1, 'google_meet', "
+                    "'active') RETURNING id"
+                )
+            )
+        ).scalar_one()
+        for state in ("closed", "closed", "active"):
+            await conn.execute(
+                text(_ENTRY_SQL), {"meeting_id": meeting_id, "state": state}
+            )
+
+    for state in ("active", "removed"):
+        with pytest.raises(IntegrityError):
+            async with intake_pg_engine.begin() as conn:
+                await conn.execute(
+                    text(_ENTRY_SQL), {"meeting_id": meeting_id, "state": state}
+                )
+
+    async with intake_pg_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO meeting_entries (user_id, source_user, external_id, meeting_id, "
+                "meeting_url, platform, native_meeting_id, start_at, content_hash, state) "
+                "SELECT 1, 'me@example.com', 'evt-x' || g, :meeting_id, 'https://meet.example/x', "
+                "'google_meet', 'abc-123', now(), 'hash', 'closed' FROM generate_series(1, 5000) g"
+            ),
+            {"meeting_id": meeting_id},
+        )
+        await conn.execute(text("ANALYZE meeting_entries"))
+        plan = (
+            await conn.execute(
+                text(
+                    "EXPLAIN (FORMAT JSON) SELECT * FROM meeting_entries WHERE user_id = 1 "
+                    "AND source_user = 'me@example.com' AND external_id = 'evt-1'"
+                )
+            )
+        ).scalar_one()
+    plan = plan if isinstance(plan, list) else json.loads(plan)
+    assert "Seq Scan" not in str(plan)
+    assert "ix_meeting_entries_user_source_external" in str(plan)
 
 
 async def test_cascade_removes_aw_state_when_the_meeting_is_deleted(intake_pg_engine):

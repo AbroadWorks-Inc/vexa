@@ -27,8 +27,12 @@ cached generic plan still matches the index.
 row and whose ``scheduled_end_at`` has passed (an open-ended one: its start plus ``open_ended_s``).
 A meeting's end is never before its start, so the read also bounds the meeting time by ``now`` and
 walks the partial index ``ix_meeting_scheduled_due`` (``status = 'scheduled'`` is a literal for the
-same generic-plan reason). ``kept_entries`` is its re-run read (R7): the active entries of finished
-meetings, its ``state = 'active'`` literal matching the partial index ``ix_meeting_entries_active_user``.
+same generic-plan reason).
+
+An entry has at most one row that isn't ``closed`` (the partial unique index
+``uq_meeting_entries_user_source_external``); ``closed`` rows are history. ``find_entry`` reads the
+entry's rows through ``ix_meeting_entries_user_source_external`` and takes the one that isn't
+closed, else the newest closed one; ``save_entry`` writes that row, or adds one when it is closed.
 
 ``link_rows(db, user_id, room)`` is the link resolver's read (§1.6): the account's rows on one link
 in the caller's session, narrow (no ``data`` beyond ``scheduled_at``), for ``resolver.resolve``.
@@ -66,6 +70,7 @@ from .status import (
     lock_aw_state,
     lock_meeting,
     row_mapping,
+    stamp_now,
     write_event,
     write_status,
 )
@@ -205,10 +210,6 @@ class PostgresIntakeStore:
         async with self._reading() as tx:
             return await tx._overdue(now, open_ended_s=open_ended_s)
 
-    async def kept_entries(self) -> list[EntryView]:
-        async with self._reading() as tx:
-            return await tx._kept()
-
     @asynccontextmanager
     async def _reading(self) -> AsyncIterator[PostgresIntakeTx]:
         async with self._session_factory() as db:
@@ -271,11 +272,14 @@ class PostgresIntakeTx:
         from ..sessions.models import MeetingEntry
 
         found = await self._scalars(
-            select(MeetingEntry).where(
+            select(MeetingEntry)
+            .where(
                 MeetingEntry.user_id == user_id,
                 MeetingEntry.source_user == source_user,
                 MeetingEntry.external_id == external_id,
             )
+            .order_by((MeetingEntry.state == "closed").asc(), MeetingEntry.id.desc())
+            .limit(1)
         )
         return found[0] if found else None
 
@@ -341,24 +345,6 @@ class PostgresIntakeTx:
             .order_by(Meeting.id)
         )
         return await self._views(await self._scalars(stmt))
-
-    async def _kept(self) -> list[EntryView]:
-        """``PostgresIntakeStore.kept_entries``'s read: the ``state = 'active'`` literal lets the
-        planner use the partial index ``ix_meeting_entries_active_user``."""
-        from sqlalchemy import select, text
-
-        from ..sessions.models import Meeting, MeetingEntry
-
-        rows = await self._scalars(
-            select(MeetingEntry)
-            .join(Meeting, Meeting.id == MeetingEntry.meeting_id)
-            .where(
-                text("meeting_entries.state = 'active'"),
-                Meeting.status.in_(FINISHED_STATUSES),
-            )
-            .order_by(MeetingEntry.id)
-        )
-        return [_entry_view(row) for row in rows]
 
     async def meeting(self, meeting_id: int) -> MeetingView:
         from sqlalchemy import select
@@ -430,7 +416,7 @@ class PostgresIntakeTx:
         from ..sessions.models import MeetingEntry
 
         row = await self._entry_row(user_id, entry.user, entry.external_id)
-        if row is None:
+        if row is None or row.state == "closed":
             row = MeetingEntry(
                 user_id=user_id, source_user=entry.user, external_id=entry.external_id
             )
@@ -475,7 +461,7 @@ class PostgresIntakeTx:
         if row is None:
             raise LookupError(f"entry {entry_id} not found")
         row.state = "closed"
-        row.closed_at = datetime.now(timezone.utc).replace(microsecond=0)
+        row.closed_at = stamp_now()
         await self._db.flush()
 
     async def apply_plan(self, meeting_id: int, room: Room, plan: Plan) -> None:

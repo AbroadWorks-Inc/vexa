@@ -15,9 +15,8 @@ workload that never started and the auto-join retry rule reads.
      ``StatusConflict`` having written nothing;
   2. write the status and the optional ``data`` patch (a shallow merge into ``meetings.data``);
   3. lock ``meeting_aw_state`` (created if missing), set the outcome if given, ``event_seq += 1``;
-  4. on a finished status (``completed`` / ``failed``), close the active entries, except an entry
-     that re-runs (R7, R10, below): it stays active and its id comes back in ``rerun_entry_ids``;
-     the not-sent sweep gives every such entry its meeting (``sweeps.rerun_kept``), whoever called;
+  4. on a finished status (``completed`` / ``failed``), close the active entries (an entry moved to
+     a new time while the meeting was live has already left it, R7);
   5. insert the event into ``webhook_outbox``: the §2.7 envelope around the one meeting projection
      (``project_meeting``), serialised once; the stored ``payload_text`` is the exact body sent.
 
@@ -28,17 +27,8 @@ Lock order (§1.4): the caller takes the link's advisory lock first, then ``writ
 meeting row, then ``meeting_aw_state``. ``meeting_aw_state`` is always reached through its meeting
 row's lock, which is why creating a missing row here cannot race another writer.
 
-The finished meeting's window (R10) is what actually happened: ``[meeting start, finish)``. The
-meeting start is ``data.scheduled_at``, else ``start_time``, else ``created_at`` (the
-``meeting_event_time()`` order); the end is the finish instant, clamped to be no earlier than the
-start. An active entry re-runs when all three hold: its ``[start_at, end_at)`` (unbounded without
-an ``end_at``) doesn't overlap that window (half-open, as R1's), its ``start_at`` is after the
-meeting start (an entry that isn't belongs to this meeting), and its ``start_at`` is after the
-finish instant. Every other active entry is closed. The window and the rule are ``rules.py``'s
-``meeting_start``, ``finished_window`` and ``is_rerun``, the one definition the entry service
-uses too. The comparison uses the full-precision finish
-instant; only the stored and displayed stamps (``closed_at``, ``outcome_at``, ``change.at``,
-``created_at``) are whole seconds.
+Only the stored and displayed stamps (``closed_at``, ``outcome_at``, ``change.at``, ``created_at``)
+are whole seconds.
 
 SQLAlchemy and the ORM models are imported inside the functions that touch the database, the way
 ``collector/adapters.py`` does, so the pure helpers here import without SQLAlchemy installed.
@@ -54,13 +44,7 @@ from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
 
 from ..metrics import meeting_not_sent
 from .projection import iso_utc, project_meeting
-from .rules import (
-    FINISHED_STATUSES,
-    as_utc,
-    finished_window,
-    is_rerun,
-    meeting_start,
-)
+from .rules import FINISHED_STATUSES
 from .settings import auto_join_lead_s
 
 if TYPE_CHECKING:
@@ -82,6 +66,7 @@ __all__ = [
     "lock_meeting",
     "project_stored",
     "row_mapping",
+    "stamp_now",
     "typed_event",
     "write_event",
     "write_status",
@@ -135,7 +120,6 @@ class Outcome:
 class WrittenEvent:
     event_id: str
     sequence: int
-    rerun_entry_ids: tuple[int, ...]
 
 
 def derive_event_id_v2(meeting_uuid: str, event_type: str, sequence: int) -> str:
@@ -199,6 +183,12 @@ def _stamp(instant: datetime) -> datetime:
     """The whole-second form stored and displayed (``closed_at``, ``outcome_at``, ``change.at``,
     ``created_at``)."""
     return instant.replace(microsecond=0)
+
+
+def stamp_now() -> datetime:
+    """The status writer's current instant in its stored form, for a stamp written beside it (an
+    entry closed outside a status change, R7)."""
+    return _stamp(_now())
 
 
 async def lock_meeting(db: AsyncSession, meeting_id: int) -> Any:
@@ -333,18 +323,9 @@ async def write_status(
     aw.event_seq = int(aw.event_seq or 0) + 1
 
     entries = await _entries(db, meeting_id)
-    rerun: list[int] = []
     if to_status in FINISHED_STATUSES:
-        start = meeting_start(meeting.data, meeting.start_time, meeting.created_at)
-        window = finished_window(start, finish=now)
         for entry in entries:
-            if entry.state != "active":
-                continue
-            if is_rerun(
-                as_utc(entry.start_at), as_utc(entry.end_at), window, finish=now
-            ):
-                rerun.append(int(entry.id))
-            else:
+            if entry.state == "active":
                 entry.state = "closed"
                 entry.closed_at = _stamp(now)
 
@@ -366,7 +347,7 @@ async def write_status(
     )
     if outcome is not None and outcome.kind == "not_sent":
         meeting_not_sent(meeting.user_id, outcome.detail)
-    return WrittenEvent(event_id, int(aw.event_seq), tuple(rerun))
+    return WrittenEvent(event_id, int(aw.event_seq))
 
 
 async def insert_meeting(
@@ -457,4 +438,4 @@ async def write_event(
     event_id = await _insert_outbox(
         db, meeting, aw, entries, event_type, change, now=now
     )
-    return WrittenEvent(event_id, int(aw.event_seq), ())
+    return WrittenEvent(event_id, int(aw.event_seq))

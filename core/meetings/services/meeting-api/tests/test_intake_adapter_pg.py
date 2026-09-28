@@ -920,6 +920,49 @@ async def s_merge_into_live(h: Any) -> list[dict]:
     return [live, due, {"merged": merged}]
 
 
+async def _live_at_half_past(h: Any, **fields: Any) -> dict:
+    first = await h.put(
+        start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z", **fields
+    )
+    h.clock.set("2026-09-29T09:00:00Z")
+    await _set(h, first["meeting"]["id"], "active")
+    h.clock.set("2026-09-29T09:30:00Z")
+    return first
+
+
+async def s_r7_moved_tomorrow(h: Any) -> list[dict]:
+    first = await _live_at_half_past(h)
+    tomorrow = dict(start="2026-09-30T09:00:00Z", end="2026-09-30T10:00:00Z")
+    moved = await h.put(**tomorrow)
+    again = await h.put(**tomorrow)
+    h.clock.set("2026-09-29T10:00:00Z")
+    await _set(h, first["meeting"]["id"], "completed")
+    return [first, moved, again]
+
+
+async def s_r7_shared_invite(h: Any) -> list[dict]:
+    first = await _live_at_half_past(h)
+    joined = await h.put(
+        user=B, start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"
+    )
+    later = dict(start="2026-09-29T10:30:00Z", end="2026-09-29T11:00:00Z")
+    return [first, joined, await h.put(**later), await h.put(user=B, **later)]
+
+
+async def s_r7_not_changed_live(h: Any) -> list[dict]:
+    first = await _live_at_half_past(h)
+    extended = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:30:00Z")
+    overlapping = await h.put(start="2026-09-29T09:45:00Z", end="2026-09-29T10:15:00Z")
+    return [first, extended, overlapping]
+
+
+async def s_r7_moved_back(h: Any) -> list[dict]:
+    first = await _live_at_half_past(h)
+    moved = await h.put(start="2026-09-30T09:00:00Z", end="2026-09-30T10:00:00Z")
+    back = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    return [first, moved, back]
+
+
 PARITY = [
     ("2.6.1", s_2_6_1, "2026-09-26T12:00:00Z", None),
     ("2.6.2", s_2_6_2_instant, "2026-09-26T12:00:00Z", None),
@@ -934,6 +977,10 @@ PARITY = [
     ("R12", s_r12, "2026-09-29T09:00:00Z", ACCOUNT_LIMIT),
     ("R15", s_r15_upstream_row, "2026-09-29T09:45:00Z", ACCOUNT_LIMIT),
     ("R2 merge", s_merge_into_live, "2026-09-26T12:00:00Z", None),
+    ("R7 moved tomorrow", s_r7_moved_tomorrow, "2026-09-26T12:00:00Z", None),
+    ("R7 shared invite", s_r7_shared_invite, "2026-09-26T12:00:00Z", None),
+    ("R7 not changed live", s_r7_not_changed_live, "2026-09-26T12:00:00Z", None),
+    ("R7 moved back", s_r7_moved_back, "2026-09-26T12:00:00Z", None),
 ]
 
 AW_KEYS = (

@@ -310,7 +310,6 @@ async def _sweep(h, at: str, *, open_ended_s: int = 3600) -> int:
     h.clock.set(at)
     return await not_sent_tick(
         h.store,
-        h.service,
         publisher=h.publisher,
         now=h.clock(),
         open_ended_s=open_ended_s,
@@ -425,179 +424,6 @@ async def test_the_not_sent_sweep_leaves_entry_less_and_live_meetings_alone():
     assert h.store.meetings[live]["status"] == "active"
 
 
-async def test_the_not_sent_sweep_reruns_a_kept_entry():
-    """R7: an entry the finished meeting kept active becomes a meeting of its own."""
-    h = make_harness()
-    first = parse_entry(entry_body("e1"), now=h.clock(), max_days_ahead=30)
-    later = parse_entry(
-        entry_body("e2", start="2026-09-30T09:00:00Z", end="2026-09-30T09:30:00Z"),
-        now=h.clock(),
-        max_days_ahead=30,
-    )
-    mid = h.store.seed_meeting(
-        USER,
-        ROOM,
-        status="scheduled",
-        plan=Plan(first.start, first.end, None, None, GMEET),
-        entries=[(first, "active"), (later, "active")],
-    )
-    await _sweep(h, "2026-09-29T09:30:00Z")
-    assert h.store.meetings[mid]["status"] == "failed"
-    moved = h.store.find_entry(USER, later.user, later.external_id)
-    assert moved is not None and moved.meeting_id != mid
-    assert h.store.meetings[moved.meeting_id]["status"] == "scheduled"
-
-
-async def _moved_while_live(h) -> str:
-    """A 09:00–10:00 call goes live; at 09:30 its entry moves to 15:00–16:00 (``not_changed_live``).
-    Returns the live meeting's uuid."""
-    reply = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
-    uuid = reply["meeting"]["id"]
-    h.clock.set("2026-09-29T09:00:00Z")
-    h.set_status(uuid, "active")
-    h.clock.set("2026-09-29T09:30:00Z")
-    held = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    assert held["result"] == "not_changed_live"
-    return uuid
-
-
-def _entry(h):
-    return h.store.find_entry(USER, "a@abroadworks.com", "google:3n5kq8example")
-
-
-async def test_the_sweep_reruns_an_entry_whichever_writer_finished_its_meeting():
-    """R7, I1: the bot's own finish (the lifecycle writer, not intake) keeps the moved entry
-    active; the sweep's next tick gives it a meeting of its own, and a later PUT with the same
-    content is ``unchanged`` on that meeting."""
-    h = make_harness()
-    uuid = await _moved_while_live(h)
-    h.clock.set("2026-09-29T09:55:00Z")
-    h.set_status(uuid, "completed")
-    assert (_entry(h).state, _entry(h).meeting_id) == ("active", h.meeting_id(uuid))
-
-    mark = h.mark()
-    assert await _sweep(h, "2026-09-29T09:55:30Z") == 0
-    new = h.store.view(_entry(h).meeting_id)
-    assert new.uuid != uuid
-    projected = new.project(lead_s=300)
-    assert (projected["status"], projected["start"], projected["end"]) == (
-        "scheduled",
-        "2026-09-29T15:00:00Z",
-        "2026-09-29T16:00:00Z",
-    )
-    assert h.events(mark) == [(new.uuid, "meeting.scheduled")]
-
-    again = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    assert (again["result"], again["meeting"]["id"]) == ("unchanged", new.uuid)
-    mark = h.mark()
-    assert await _sweep(h, "2026-09-29T09:56:00Z") == 0
-    assert h.events(mark) == []
-
-
-async def test_a_join_now_failure_after_the_claim_reruns_the_adopted_entry():
-    """A 09:45 paste adopts the 10:00 meeting and its spawn fails after the claim, which ends the
-    meeting ``not_sent`` (Ruling R17). The calendar entry, later than that finish, keeps its 10:00
-    meeting through the sweep."""
-    from meeting_api.intake.ports import SpawnOutcome
-
-    h = make_harness(
-        "2026-09-29T09:00:00Z",
-        spawn_failure=SpawnOutcome("failed", "spawn_error", "bot workload failed"),
-    )
-    h.spawn.after_claim = True
-    reply = await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T11:00:00Z")
-    adopted = reply["meeting"]["id"]
-    h.clock.set("2026-09-29T09:45:00Z")
-    pasted = await h.instant("manual:1", GMEET)
-    assert pasted["meeting"]["id"] == adopted
-    assert h.meeting(adopted).status == "failed"
-
-    await _sweep(h, "2026-09-29T09:45:30Z")
-    new = h.store.view(_entry(h).meeting_id)
-    assert new.uuid != adopted
-    projected = new.project(lead_s=300)
-    assert (projected["status"], projected["start"], projected["end"]) == (
-        "scheduled",
-        "2026-09-29T10:00:00Z",
-        "2026-09-29T11:00:00Z",
-    )
-
-
-async def test_a_rerun_the_sweep_reaches_after_its_time_ends_not_sent():
-    """R6 after R7: a kept entry whose own time has passed when the sweep reaches it gets its
-    meeting, which the next tick ends ``not_sent`` (``ended_before_sent``)."""
-    h = make_harness()
-    reply = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
-    uuid = reply["meeting"]["id"]
-    h.clock.set("2026-09-29T09:00:00Z")
-    h.set_status(uuid, "active")
-    await h.put(start="2026-09-29T10:30:00Z", end="2026-09-29T10:45:00Z")
-    h.clock.set("2026-09-29T09:55:00Z")
-    h.set_status(uuid, "completed")
-
-    await _sweep(h, "2026-09-29T11:00:00Z")
-    new = _entry(h).meeting_id
-    assert h.store.meetings[new]["status"] == "scheduled"
-    assert await _sweep(h, "2026-09-29T11:00:30Z") == 1
-    assert _outcome(h, new)[:3] == ("failed", "not_sent", "ended_before_sent")
-
-
-async def test_an_update_to_an_entry_waiting_to_rerun_decides_it():
-    """An entry kept for a re-run is updated before the sweep reaches it. Back to the finished
-    meeting's time: ``not_changed_finished``, the entry is closed with it and never re-runs. To
-    another future time: a meeting at that time, and the sweep adds nothing."""
-    h = make_harness()
-    uuid = await _moved_while_live(h)
-    h.clock.set("2026-09-29T09:55:00Z")
-    h.set_status(uuid, "completed")
-    back = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
-    assert back["result"] == "not_changed_finished"
-    assert (_entry(h).state, _entry(h).meeting_id) == ("closed", h.meeting_id(uuid))
-    meetings, mark = len(h.store.meetings), h.mark()
-    await _sweep(h, "2026-09-29T09:56:00Z")
-    assert (len(h.store.meetings), h.events(mark)) == (meetings, [])
-
-    h = make_harness()
-    uuid = await _moved_while_live(h)
-    h.clock.set("2026-09-29T09:55:00Z")
-    h.set_status(uuid, "completed")
-    later = await h.put(start="2026-09-29T17:00:00Z", end="2026-09-29T18:00:00Z")
-    assert (later["result"], later["meeting"]["start"]) == (
-        "created",
-        "2026-09-29T17:00:00Z",
-    )
-    meetings, mark = len(h.store.meetings), h.mark()
-    await _sweep(h, "2026-09-29T09:56:00Z")
-    assert (len(h.store.meetings), h.events(mark)) == (meetings, [])
-
-
-async def test_a_kept_entry_put_back_then_moved_again_gets_its_meeting():
-    """N1: the kept entry (moved to 15:00 while live) is put back on the finished meeting's time
-    before the sweep: it is closed WITH that update's content (hash, time) and ``closed_at``.
-    When the organiser moves it to 15:00 again, that is a new future move: ``created``, a
-    ``scheduled`` 15:00 meeting, never ``unchanged``."""
-    h = make_harness()
-    uuid = await _moved_while_live(h)
-    h.clock.set("2026-09-29T09:55:00Z")
-    h.set_status(uuid, "completed")
-    back = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
-    assert back["result"] == "not_changed_finished"
-    closed = _entry(h)
-    assert (closed.state, closed.meeting_id) == ("closed", h.meeting_id(uuid))
-    assert closed.start == ts("2026-09-29T09:00:00Z")
-    assert closed.closed_at == ts("2026-09-29T09:55:00Z")
-
-    h.clock.set("2026-09-29T11:00:00Z")
-    again = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    assert (again["result"], again["previous_meeting_id"]) == ("created", uuid)
-    projected = again["meeting"]
-    assert (projected["status"], projected["start"], projected["end"]) == (
-        "scheduled",
-        "2026-09-29T15:00:00Z",
-        "2026-09-29T16:00:00Z",
-    )
-
-
 # ══ Postgres ════════════════════════════════════════════════════════════════════════════════
 
 pg_only = pytest.mark.skipif(
@@ -673,7 +499,6 @@ class Pg:
     async def not_sent(self, now: datetime) -> int:
         return await not_sent_tick(
             self.store,
-            self.service,
             publisher=self.publisher,
             now=now,
             open_ended_s=3600,

@@ -16,7 +16,6 @@ from meeting_api.intake.rules import (
     Plan,
     finished_window,
     is_future_move,
-    is_rerun,
     join_now_target,
     match_entry,
     meeting_start,
@@ -255,7 +254,7 @@ def test_recompute_needs_an_entry():
         recompute([])
 
 
-# ── R7 / R10: finished windows ───────────────────────────────────────────────────────────────
+# ── R7 / R10: a move away from a started meeting ───────────────────────────────────────────────────────────────
 
 
 def test_finished_window_is_start_to_finish_clamped():
@@ -264,33 +263,62 @@ def test_finished_window_is_start_to_finish_clamped():
     assert finished_window(None, finish=at(9, 50)) == (at(9, 50), at(9, 50))
 
 
-def test_rerun_needs_no_overlap_a_later_start_and_a_future_start():
-    window = (at(9), at(9, 20))
-    assert is_rerun(at(9, 30), at(10), window, finish=at(9, 20))
-    assert not is_rerun(at(9, 10), at(9, 30), window, finish=at(9, 20))  # overlaps
-    assert not is_rerun(
-        at(8), at(8, 30), window, finish=at(9, 20)
-    )  # before the meeting
-    assert not is_rerun(None, None, window, finish=at(9, 20))
-
-
 def test_same_time_after_finish_is_not_a_future_move():
     finished = M(1, "failed", at(9), at(10))
-    assert not is_future_move(E(at(9), at(10)), finished, now=at(11))
+    assert not is_future_move(E(at(9), at(10)), finished, now=at(11), lead_s=LEAD)
 
 
 def test_future_time_after_finish_is_a_future_move():
     finished = M(1, "failed", at(9), at(10))
-    assert is_future_move(E(at(15), at(16)), finished, now=at(11))
+    assert is_future_move(E(at(15), at(16)), finished, now=at(11), lead_s=LEAD)
 
 
 def test_a_past_time_is_never_a_future_move():
     finished = M(1, "completed", at(9), at(10))
-    assert not is_future_move(E(at(10, 30), at(10, 45)), finished, now=at(11))
+    assert not is_future_move(
+        E(at(10, 30), at(10, 45)), finished, now=at(11), lead_s=LEAD
+    )
 
 
 def test_an_entry_not_after_the_meeting_start_belongs_to_it():
     # finished before its planned start (an early instant join); the same time is not new
     finished = M(1, "completed", at(10), at(10, 30))
-    assert not is_future_move(E(at(10), at(10, 30)), finished, now=at(9, 55))
-    assert is_future_move(E(at(10, 5), at(10, 30)), finished, now=at(9, 55))
+    assert not is_future_move(
+        E(at(10), at(10, 30)), finished, now=at(9, 55), lead_s=LEAD
+    )
+    assert is_future_move(
+        E(at(10, 5), at(10, 30)), finished, now=at(9, 55), lead_s=LEAD
+    )
+
+
+def test_an_early_finish_then_a_later_time_is_a_future_move():
+    # R10: the finished window ends at the finish, not at the planned end
+    finished = M(1, "completed", at(9), at(10))
+    assert is_future_move(E(at(9, 40), at(10)), finished, now=at(9, 30), lead_s=LEAD)
+
+
+@pytest.mark.parametrize("status", ["requested", "active", "stopping"])
+def test_a_live_meeting_is_left_from_the_later_of_now_and_its_planned_end(status):
+    live = M(1, status, at(9), at(10))
+    now = at(9, 30)
+    assert is_future_move(
+        E(at(9, 0, day=30), at(10, 0, day=30)), live, now=now, lead_s=LEAD
+    )
+    assert is_future_move(E(at(10), at(10, 30)), live, now=now, lead_s=LEAD)
+    assert not is_future_move(E(at(9, 59), at(10, 30)), live, now=now, lead_s=LEAD)
+    assert not is_future_move(E(at(9), at(10, 30)), live, now=now, lead_s=LEAD)
+    assert not is_future_move(E(at(9, 45), at(10, 15)), live, now=now, lead_s=LEAD)
+
+
+def test_a_live_meeting_past_its_planned_end_is_left_from_now():
+    live = M(1, "active", at(9), at(10))
+    assert is_future_move(E(at(10, 35), at(11)), live, now=at(10, 30), lead_s=LEAD)
+    assert not is_future_move(E(at(10, 20), at(11)), live, now=at(10, 30), lead_s=LEAD)
+
+
+def test_an_open_ended_live_meeting_is_left_past_the_r1_due_horizon():
+    # R1: an open-ended live meeting matches an entry due by now + lead; a move past it leaves
+    live = M(1, "active", at(9), None)
+    now = at(9, 30)
+    assert not is_future_move(E(at(9, 34), at(10)), live, now=now, lead_s=LEAD)
+    assert is_future_move(E(at(9, 36), at(10)), live, now=now, lead_s=LEAD)

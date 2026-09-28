@@ -14,8 +14,11 @@ meeting. ``reads.py`` holds the Postgres implementation.
 room given, taken in the order given (the caller passes them sorted); an empty ``rooms`` is a plain
 transaction with no link lock. The transaction commits when the block exits normally and rolls
 back when it raises. ``IntakeStore.overdue_meetings(now, open_ended_s=...)`` is the not-sent
-sweep's read across every account (§1.5), and ``IntakeStore.kept_entries()`` its read of the
-entries finished meetings kept for a re-run (R7).
+sweep's read across every account (§1.5).
+
+An entry is keyed by (``user_id``, ``source_user``, ``external_id``) and has at most one row that
+isn't ``closed``. A ``closed`` row is history: it stays on the meeting it belonged to, a finished
+one or a live one the entry moved away from (R7), and saving the entry again adds a new row.
 
 The views are what the service reads. ``MeetingView`` carries the ``meetings`` row and the
 ``meeting_aw_state`` row as column-name mappings plus the meeting's entries, so the reply is the
@@ -150,23 +153,6 @@ class EntryView:
             closed_at=row.get("closed_at"),
         )
 
-    def as_entry_in(self) -> EntryIn:
-        """The stored entry as the request that would store it (for a re-run, R7)."""
-        return EntryIn(
-            external_id=self.external_id,
-            user=self.source_user,
-            meeting_url=self.meeting_url,
-            start=self.start,
-            end=self.end,
-            time_zone=self.time_zone,
-            title=self.title,
-            attendees=self.attendees,
-            series_id=self.series_id,
-            join_now=self.join_now,
-            metadata=self.metadata,
-            content_hash=self.content_hash,
-        )
-
 
 @dataclass(frozen=True)
 class MeetingView:
@@ -235,7 +221,9 @@ class IntakeTx(Protocol):
 
     async def find_entry(
         self, user_id: int, source_user: str, external_id: str
-    ) -> Optional[EntryView]: ...
+    ) -> Optional[EntryView]:
+        """The entry's row that isn't ``closed``, else its newest ``closed`` row."""
+        ...
 
     async def entry(self, entry_id: int) -> Optional[EntryView]: ...
 
@@ -260,8 +248,9 @@ class IntakeTx(Protocol):
     async def save_entry(
         self, user_id: int, entry: EntryIn, room: Room, meeting_id: int
     ) -> EntryView:
-        """Insert or update the entry keyed by (``user_id``, ``entry.user``,
-        ``entry.external_id``): its content, link and meeting, state ``active``."""
+        """Store the entry keyed by (``user_id``, ``entry.user``, ``entry.external_id``): its
+        content, link and meeting, state ``active``, on its row that isn't ``closed``, else on a
+        new row (a closed row stays as history)."""
         ...
 
     async def mark_entry_removed(
@@ -269,8 +258,8 @@ class IntakeTx(Protocol):
     ) -> None: ...
 
     async def close_entry(self, entry_id: int) -> None:
-        """The entry becomes ``closed`` (stamped ``closed_at``): it belongs to its finished
-        meeting, as ``write_status`` step 4 leaves every entry that doesn't re-run."""
+        """The entry's row becomes ``closed`` (stamped ``closed_at``) on its meeting, as history:
+        the entry moved away from that live meeting to a new time (R7)."""
         ...
 
     async def active_entries(self, meeting_id: int) -> list[EntryView]: ...
@@ -350,13 +339,6 @@ class IntakeStore(Protocol):
         """Every account's ``scheduled`` meetings that entries manage and that are past their end
         at ``now`` (``rules.is_overdue``), by id: the not-sent sweep's candidates (§1.5). Read
         without a link lock; the sweep reads each one again under its link lock."""
-        ...
-
-    async def kept_entries(self) -> list[EntryView]:
-        """Every account's ``active`` entries whose meeting has finished, by id: the entries a
-        finish kept for R7's re-run (``write_status`` step 4), whichever writer finished the
-        meeting. Read without a link lock; ``IntakeService.rerun_entries`` reads each one again
-        under its links' locks."""
         ...
 
 

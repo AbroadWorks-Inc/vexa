@@ -14,7 +14,7 @@ its closed entries, any other meeting its active ones; removed entries are never
 `meetings.status` (§1.4). In the caller's transaction it locks the meeting row (`StatusConflict`,
 writing nothing, if the status isn't expected), writes the status and data patch, locks
 `meeting_aw_state` (created if missing) to set the outcome and bump `event_seq`, closes the active
-entries on `completed`/`failed` (returning a future, non-overlapping entry's id for re-run, R7), and
+entries on `completed`/`failed` (an entry moved to a new time while live has already left, R7), and
 inserts one `webhook_outbox` row whose `payload_text` is the exact §2.7 envelope that gets sent.
 Its event type is the caller's, else `typed_event` of the change (Ruling R25): `meeting.started`
 on `active`, `meeting.completed` on `completed`, `meeting.not_sent` / `bot.failed` on `failed`
@@ -39,9 +39,9 @@ the legacy system and per-user webhooks' meeting block takes `uuid`, `entries`, 
 
 `rules.py` holds the R1 matching rules and the meeting windows (§1.1, R7, R10), pure: `overlaps`
 (half-open, a missing end is unbounded), `meeting_start`, `meeting_window`, `match_entry`,
-`join_now_target`, `recompute`, `finished_window` / `is_rerun` / `is_future_move`, and `is_overdue`
-(R6, the not-sent sweep's end). It is the one
-definition of these windows; the status writer's re-run rule uses it.
+`join_now_target`, `recompute`, `finished_window` / `is_future_move` (R7: an update that moves the
+entry away from a live or finished meeting to a new future time), and `is_overdue` (R6, the
+not-sent sweep's end). It is the one definition of these windows.
 
 `resolver.py` is the one link resolver (§1.6): which meeting an upstream route that takes a link
 (platform + room code) means. `resolve(rows, kind, *, now)` over the link's rows as `LinkRow`
@@ -64,14 +64,17 @@ R21), so upstream calendar sync skips it.
 `IntakeService` (`service.py`) is the behaviour of `PUT /v2/entries` and `POST /v2/entries/remove`
 (§1.3, every §2.6 case): under the entry's link lock (both links, sorted, when the link changes;
 restarted once when the entry's link changed before the read), it answers `unchanged`, attaches
-an entry to the meeting R1 matches or creates one, keeps a live meeting as it is
-(`not_changed_live`), treats a finished meeting as history unless the entry points to a new future
-time, removes a meeting that lost its last entry (R8) or stops its bot when live (R5), and checks
+an entry to the meeting R1 matches or creates one, moves an entry of a live meeting that the
+update points to a new future time (from the later of now and the planned end) to its R1 meeting
+at once, leaving its row `closed` on the live meeting as history and the bot in the call (R7),
+otherwise keeps a live meeting as it is (`not_changed_live`), treats a finished meeting as history
+unless the entry points to a new future time, removes a meeting that lost its last entry (R8) or stops its bot when live (R5), and checks
 the active-entry quota only when a write adds an entry. Events are published after the commit;
 a `join_now` entry's meeting is then spawned on that exact row (a failure ends it `not_sent`,
 unless it was adopted with other entries on it: then only the pasted entry goes, Ruling R12). `merge_into_live` (R2's exception)
-and `rerun_entries` (R7) are for the scheduler: the auto-join tick merges, and the not-sent sweep
-re-runs every entry a finished meeting kept active, whichever writer finished it. The service reaches
+is for the scheduler: the auto-join tick merges. An entry has at most one row that isn't `closed`
+(the partial unique index `uq_meeting_entries_user_source_external`); closed rows are history, and
+the projection lists each entry of a meeting once, its active row first (R9). The service reaches
 storage, spawn, stop and publishing only through `ports.py` (`IntakeStore`/`IntakeTx`,
 `SpawnPort`, `StopPort`, `EventPublisher`); `fakes.py` holds the in-memory implementations.
 `PostgresIntakeStore(session_factory)` (`adapters.py`) is the `IntakeStore` over Postgres: each
@@ -135,7 +138,7 @@ and its stop commit together, and the `/v2` stop opens a transaction for it. Aft
 `bot_commands:meeting:{id}` and deletes the workload of a bot still booting; when R5's leave fails,
 the removal still answers `bot_stopping` and the stale-stopping reconcile sweep ends the bot. A meeting with no live bot, or already stop-requested, is left as it is; a command bus
 that can't be reached is 503 `unavailable`, with the stop already recorded.
-`sweeps.py` is the scheduler's intake side (§1.5, R2, R6, R7). `check_room` reads a due entry-managed
+`sweeps.py` is the scheduler's intake side (§1.5, R2, R6). `check_room` reads a due entry-managed
 meeting and its link again under the link lock: `free`, `gone`, `merge` (the live meeting is an
 open-ended meeting with an active `join_now` entry whose bot isn't `stopping`, `is_merge_target`,
 the same predicate `merge_into_live` re-checks: `merge_into_live`), or `waiting` (any other live
@@ -146,9 +149,7 @@ single-flight) ends every `scheduled` entry-managed meeting past its end (`Intak
 `rules.is_overdue`; an open-ended one's end is its start plus `JOIN_NOW_ADOPT_AHEAD_S`) `failed`,
 outcome `not_sent`, under its link lock, with detail `last_error_code` (message `last_error_message`),
 else `room_busy` ("another bot was still on this meeting link when the meeting ended"), else
-`ended_before_sent` ("the meeting ended before a bot was sent"); then `rerun_kept` gives every entry a
-finished meeting kept active (`IntakeStore.kept_entries`, R7) a meeting of its own, whichever writer
-finished that meeting (the lifecycle callback, the runtime's destroy, `fail_meeting`, intake's own).
+`ended_before_sent` ("the meeting ended before a bot was sent").
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.

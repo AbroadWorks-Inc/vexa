@@ -279,7 +279,7 @@ def _all_values(obj) -> list:
     return values
 
 
-# ── entries: active on a live/scheduled meeting, closed on a finished one (R9) ───────────────
+# ── entries: active and closed ones, never removed (R9, R7) ──────────────────────────────────
 
 
 def _three_entries() -> list[dict]:
@@ -292,23 +292,51 @@ def _three_entries() -> list[dict]:
 
 @pytest.mark.parametrize(
     "status",
-    ["scheduled", "requested", "joining", "awaiting_admission", "active", "stopping"],
+    [
+        "scheduled",
+        "requested",
+        "joining",
+        "awaiting_admission",
+        "active",
+        "stopping",
+        "completed",
+        "failed",
+    ],
 )
-def test_entries_of_an_unfinished_meeting_are_its_active_ones(status):
+def test_every_meeting_lists_its_active_and_closed_entries(status):
+    """A closed entry is history: a live meeting keeps the entry that moved to a new time (R7), a
+    finished one who it was for. Both are listed, whatever the status."""
     result = _project(
         meeting=_meeting(status=status), aw=_aw(), entries=_three_entries()
     )
-    assert [e["external_id"] for e in result["entries"]] == ["google:active-1"]
+    assert [e["external_id"] for e in result["entries"]] == [
+        "google:active-1",
+        "google:closed-1",
+    ]
 
 
-@pytest.mark.parametrize("status", ["completed", "failed"])
-def test_entries_of_a_finished_meeting_are_its_closed_ones(status):
-    """A finished meeting lists who it was for (its closed entries); an entry still active on it
-    is waiting to re-run elsewhere (R7) and isn't listed."""
+def test_an_entry_listed_twice_is_listed_once_as_its_active_row():
+    """An entry that left the live meeting and came back holds a closed row and an active row on
+    it: one entry, the active row's content, at the place it was first listed."""
+    closed = _entry(external_id="google:x", state="closed", attendees=["old@x.com"])
+    other = _entry(external_id="google:y")
+    active = _entry(external_id="google:x", attendees=["new@x.com"])
     result = _project(
-        meeting=_meeting(status=status), aw=_aw(), entries=_three_entries()
+        meeting=_meeting(status="active"), aw=_aw(), entries=[closed, other, active]
     )
-    assert [e["external_id"] for e in result["entries"]] == ["google:closed-1"]
+    assert [(e["external_id"], e["attendees"]) for e in result["entries"]] == [
+        ("google:x", ["new@x.com"]),
+        ("google:y", _entry()["attendees"]),
+    ]
+
+
+def test_an_entry_closed_twice_is_listed_once_as_its_newest_row():
+    first = _entry(external_id="google:x", state="closed", attendees=["old@x.com"])
+    later = _entry(external_id="google:x", state="closed", attendees=["new@x.com"])
+    result = _project(
+        meeting=_meeting(status="completed"), aw=_aw(), entries=[first, later]
+    )
+    assert [e["attendees"] for e in result["entries"]] == [["new@x.com"]]
 
 
 @pytest.mark.parametrize("status", ["scheduled", "completed"])

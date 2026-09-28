@@ -595,7 +595,7 @@ def _attach_background_loops(
     fetch_bot_context = _bot_context_fetcher(admin_api_url, internal_secret)
 
     # The scheduler's intake side (§1.5): the store (link locks, the link check, typed failure
-    # codes) and the entry service it merges (R2) and re-runs entries (R7) through. Its events stay
+    # codes) and the entry service it merges through (R2). Its events stay
     # in the outbox for the outbox publisher (§1.8).
     intake_store = intake_service = scheduler_publisher = None
     if intake is not None:
@@ -659,7 +659,7 @@ def _attach_background_loops(
 
         async def _tick():
             await sweeps.not_sent_tick(
-                intake_store, intake_service,
+                intake_store,
                 publisher=scheduler_publisher,
                 now=datetime.now(timezone.utc),
                 open_ended_s=join_now_adopt_ahead_s(),

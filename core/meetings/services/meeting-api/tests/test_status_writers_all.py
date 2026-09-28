@@ -1226,10 +1226,10 @@ async def test_pg_an_r5_stopped_meetings_terminal_event_carries_the_outcome(pg):
     assert terminal["meeting"]["outcome"]["detail"] == "deleted"
 
 
-# ── Postgres: R7's re-run after every finishing writer (I1) ─────────────────────────────────
+# ── Postgres: a move while live, then every finishing writer (R7) ───────────────────────────
 
 
-def _intake(pg: _Pg) -> tuple[Any, Any]:
+def _intake(pg: _Pg, spawn: Any = None) -> tuple[Any, Any]:
     from intake_builders import make_settings
 
     from meeting_api.intake import IntakeService, PostgresIntakeStore
@@ -1238,16 +1238,30 @@ def _intake(pg: _Pg) -> tuple[Any, Any]:
 
     store = PostgresIntakeStore(pg.session_factory)
     return store, IntakeService(
-        store, _NoSpawnPort(), NoStop(), OutboxOnly(), make_settings()
+        store, spawn or _NoSpawnPort(), NoStop(), OutboxOnly(), make_settings()
     )
+
+
+def _tomorrow_body() -> dict:
+    from datetime import timedelta
+
+    from intake_builders import entry_body
+
+    tomorrow = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)
+    return entry_body(start=_iso(tomorrow), end=_iso(tomorrow + timedelta(hours=1)))
+
+
+async def _uuid(pg: _Pg, mid: int) -> str:
+    return str(await pg.scalar("SELECT uuid FROM meetings WHERE id = :m", m=mid))
 
 
 async def _moved_while_live(
     pg: _Pg, service: Any, *, reach_the_call: bool
-) -> tuple[int, dict]:
+) -> tuple[int, dict, dict]:
     """A call that started 5 minutes ago gets its bot (claimed; with ``reach_the_call`` it goes
     ``joining`` → ``active`` through the lifecycle callback); then its entry moves to tomorrow,
-    answered ``not_changed_live``. Returns the meeting id and the moved entry's body."""
+    which leaves the live meeting at once (R7). Returns the live meeting's id, the moved body and
+    the reply."""
     from datetime import timedelta
 
     from intake_builders import entry_body
@@ -1276,11 +1290,13 @@ async def _moved_while_live(
     await pg.session(mid, "sess-cb")
     if reach_the_call:
         await _callback(pg.repo, _event("joining"), _event("active"))
-    tomorrow = now + timedelta(days=1)
-    moved = entry_body(start=_iso(tomorrow), end=_iso(tomorrow + timedelta(hours=1)))
-    held = await service.put_entry(USER, moved)
-    assert held["result"] == "not_changed_live"
-    return mid, moved
+    moved = _tomorrow_body()
+    left = await service.put_entry(USER, moved)
+    assert (left["result"], left["previous_meeting_id"]) == (
+        "created",
+        reply["meeting"]["id"],
+    )
+    return mid, moved, left
 
 
 async def _finish_by_callback(pg: _Pg, mid: int) -> None:
@@ -1315,127 +1331,159 @@ async def _finish_by_fail_meeting(pg: _Pg, mid: int) -> None:
     )
 
 
+async def _history_holds(pg: _Pg, live: int, new_uuid: str) -> None:
+    """The live meeting keeps the entry as closed history, its terminal event names the owner,
+    the owner still sees it; the new meeting keeps the entry active."""
+    from meeting_api.intake.ports import MeetingQuery
+    from meeting_api.intake.reads import PostgresIntakeReads
+
+    from intake_builders import A
+
+    rows = (
+        await pg.exec(
+            "SELECT meeting_id, state FROM meeting_entries ORDER BY id",
+        )
+    ).all()
+    new = int(
+        await pg.scalar(
+            "SELECT id FROM meetings WHERE uuid = CAST(:u AS uuid)", u=new_uuid
+        )
+    )
+    assert [tuple(r) for r in rows] == [(live, "closed"), (new, "active")]
+    terminal = (await pg.events(live))[-1]["payload"]["data"]["meeting"]
+    assert [e["user"] for e in terminal["entries"]] == [A]
+    reads = PostgresIntakeReads(pg.session_factory)
+    seen = {m.uuid for m in await reads.meetings(USER, MeetingQuery(user=A))}
+    assert seen == {await _uuid(pg, live), new_uuid}
+    assert await reads.visible_to(USER, live, A)
+    assert await pg.status(new) == "scheduled"
+    assert [e["event_type"] for e in await pg.events(new)] == ["meeting.scheduled"]
+
+
 @pytest.mark.parametrize(
-    "finish, reach_the_call, finished",
+    "finish, reach_the_call, finished, terminal",
     [
-        (_finish_by_callback, True, "completed"),
-        (_finish_by_runtime_destroy, True, "completed"),
-        (_finish_by_fail_meeting, False, "failed"),
+        (_finish_by_callback, True, "completed", "meeting.completed"),
+        (_finish_by_runtime_destroy, True, "completed", "meeting.completed"),
+        (_finish_by_fail_meeting, False, "failed", "meeting.not_sent"),
     ],
     ids=["lifecycle_callback", "runtime_destroy", "fail_meeting"],
 )
-async def test_pg_a_change_stored_while_live_reruns_after_every_finishing_writer(
-    pg, finish, reach_the_call, finished
+async def test_pg_a_move_while_live_survives_every_finishing_writer(
+    pg, finish, reach_the_call, finished, terminal
 ):
-    """R7 end to end: the entry moved while the bot was in the call; the meeting finishes through
-    a real writer; the not-sent sweep's next tick gives the entry a meeting of its own at the new
-    time (``meeting.scheduled``), and a later PUT with the same content is ``unchanged`` there.
-    """
-    from meeting_api.intake.sweeps import OutboxOnly, not_sent_tick
-
-    store, service = _intake(pg)
-    mid, moved = await _moved_while_live(pg, service, reach_the_call=reach_the_call)
+    """R7 end to end: the entry moved while the bot was in the call and got its new meeting at
+    once; the live meeting then finishes through a real writer. Its terminal event lists the
+    entry, the owner still sees it, the new meeting is untouched, and a later PUT with the same
+    content is ``unchanged`` there."""
+    _, service = _intake(pg)
+    mid, moved, left = await _moved_while_live(
+        pg, service, reach_the_call=reach_the_call
+    )
     await finish(pg, mid)
     assert await pg.status(mid) == finished
-    assert (
-        await pg.scalar(
-            "SELECT state FROM meeting_entries WHERE meeting_id = :m", m=mid
-        )
-        == "active"
-    )
-
-    await not_sent_tick(
-        store,
-        service,
-        publisher=OutboxOnly(),
-        now=datetime.now(timezone.utc),
-        open_ended_s=3600,
-    )
-
-    new = int(await pg.scalar("SELECT meeting_id FROM meeting_entries"))
-    assert new != mid
-    assert await pg.status(new) == "scheduled"
-    assert [e["event_type"] for e in await pg.events(new)] == ["meeting.scheduled"]
-    scheduled = (await pg.events(new))[0]["payload"]["data"]["meeting"]
-    assert (scheduled["start"], scheduled["end"]) == (moved["start"], moved["end"])
+    assert (await pg.events(mid))[-1]["event_type"] == terminal
+    await _history_holds(pg, mid, left["meeting"]["id"])
 
     again = await service.put_entry(USER, moved)
-    assert again["result"] == "unchanged"
-    assert again["meeting"]["id"] == str(
-        await pg.scalar("SELECT uuid FROM meetings WHERE id = :m", m=new)
+    assert (again["result"], again["meeting"]["id"]) == (
+        "unchanged",
+        left["meeting"]["id"],
     )
 
 
-async def test_pg_an_update_back_to_the_finished_time_closes_the_kept_entry(pg):
-    """The kept entry is put back on the finished meeting's time before the sweep reaches it:
-    ``not_changed_finished``, the entry is ``closed`` (with ``closed_at``) on that meeting, and the
-    sweep creates nothing."""
+class _MoveThenFail:
+    """A runtime whose workload start fails after the claim, having first let ``during`` run (a
+    calendar update arriving while the claimed bot is starting)."""
+
+    def __init__(self, during: Any) -> None:
+        self.during = during
+        self.specs: list[dict] = []
+
+    async def create_workload(self, spec: dict) -> dict:
+        from meeting_api.bot_spawn.ports import SpawnFailed
+
+        self.specs.append(spec)
+        await self.during()
+        raise SpawnFailed("kernel could not start the workload")
+
+    async def delete_workload(self, workload_id: str) -> None:
+        return None
+
+    async def get_workload(self, workload_id: str) -> Any:
+        return None
+
+
+async def test_pg_a_move_while_a_join_now_bot_starts_survives_its_failure(pg):
+    """The join_now writer path: a pasted link adopts the calendar meeting under way and claims
+    it; while its bot starts, the calendar entry moves to tomorrow (it leaves at once, R7); then
+    the workload fails, which ends the meeting ``not_sent``. The new meeting is untouched and the
+    failed one keeps the calendar entry as history."""
     from datetime import timedelta
 
-    from intake_builders import entry_body
+    from intake_builders import GMEET, entry_body, instant_body
 
-    from meeting_api.intake.sweeps import OutboxOnly, not_sent_tick
+    from meeting_api.intake import ExactRowSpawn, PostgresIntakeStore
+    from meeting_api.intake.sweeps import OutboxOnly
 
-    store, service = _intake(pg)
-    mid, _ = await _moved_while_live(pg, service, reach_the_call=True)
-    await _finish_by_callback(pg, mid)
+    moved = _tomorrow_body()
+    replies: dict[str, dict] = {}
+
+    async def the_move() -> None:
+        replies["moved"] = await service.put_entry(USER, moved)
+
+    async def ctx(_user_id: int) -> dict:
+        return {"max_concurrent": 45}
+
+    store = PostgresIntakeStore(pg.session_factory)
+    spawn = ExactRowSpawn(
+        pg.repo,
+        _MoveThenFail(the_move),
+        store=store,
+        fetch_bot_context=ctx,
+        publisher=OutboxOnly(),
+        token_secret="s",
+        redis_url="redis://r",
+    )
+    _, service = _intake(pg, spawn)
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    back = await service.put_entry(
+    calendar = await service.put_entry(
         USER,
         entry_body(
-            start=_iso(now - timedelta(minutes=10)),
-            end=_iso(now + timedelta(minutes=50)),
+            start=_iso(now - timedelta(minutes=5)),
+            end=_iso(now + timedelta(minutes=55)),
         ),
     )
-    assert back["result"] == "not_changed_finished"
-    assert back["entry"]["state"] == "closed"
-    state, closed_at, on = (
-        await pg.exec("SELECT state, closed_at, meeting_id FROM meeting_entries")
-    ).one()
-    assert (state, on) == ("closed", mid) and closed_at is not None
-
-    meetings = await pg.scalar("SELECT count(*) FROM meetings")
-    await not_sent_tick(
-        store,
-        service,
-        publisher=OutboxOnly(),
-        now=datetime.now(timezone.utc),
-        open_ended_s=3600,
+    pasted = await service.put_entry(USER, instant_body("paste:1", GMEET))
+    live_uuid = calendar["meeting"]["id"]
+    assert pasted["meeting"]["id"] == live_uuid
+    assert (replies["moved"]["result"], replies["moved"]["previous_meeting_id"]) == (
+        "created",
+        live_uuid,
     )
-    assert await pg.scalar("SELECT count(*) FROM meetings") == meetings
-
-
-async def test_pg_a_kept_entry_put_back_then_moved_again_gets_its_meeting(pg):
-    """N1 on Postgres: the put-back stores its content (time and hash) on the closed entry, so
-    the organiser's later move back to the kept time is ``created`` at that time."""
-    from datetime import timedelta
-
-    from intake_builders import entry_body
-
-    store, service = _intake(pg)
-    mid, moved = await _moved_while_live(pg, service, reach_the_call=True)
-    await _finish_by_callback(pg, mid)
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    back_body = entry_body(
-        start=_iso(now - timedelta(minutes=10)),
-        end=_iso(now + timedelta(minutes=50)),
+    live = int(
+        await pg.scalar(
+            "SELECT id FROM meetings WHERE uuid = CAST(:u AS uuid)", u=live_uuid
+        )
     )
-    back = await service.put_entry(USER, back_body)
-    assert back["result"] == "not_changed_finished"
-    state, start_at, closed_at = (
-        await pg.exec("SELECT state, start_at, closed_at FROM meeting_entries")
-    ).one()
-    assert state == "closed" and closed_at is not None
-    assert _iso(start_at) == back_body["start"]
-
-    again = await service.put_entry(USER, moved)
-    assert again["result"] == "created"
-    new = int(await pg.scalar("SELECT meeting_id FROM meeting_entries"))
-    assert new != mid and await pg.status(new) == "scheduled"
-    assert (again["meeting"]["start"], again["meeting"]["end"]) == (
-        moved["start"],
-        moved["end"],
+    assert await pg.status(live) == "failed"
+    assert (await pg.events(live))[-1]["event_type"] == "meeting.not_sent"
+    listed = (await pg.events(live))[-1]["payload"]["data"]["meeting"]["entries"]
+    assert sorted(e["external_id"] for e in listed) == [
+        "google:3n5kq8example",
+        "paste:1",
+    ]
+    new = int(
+        await pg.scalar(
+            "SELECT id FROM meetings WHERE uuid = CAST(:u AS uuid)",
+            u=replies["moved"]["meeting"]["id"],
+        )
     )
+    assert await pg.status(new) == "scheduled"
+    state = await pg.scalar(
+        "SELECT state FROM meeting_entries WHERE meeting_id = :m", m=new
+    )
+    assert state == "active"
 
 
 class _NoSpawnPort:

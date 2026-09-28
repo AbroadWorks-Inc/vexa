@@ -769,43 +769,169 @@ async def test_2_6_16_future_time_after_finish():
     assert h.spawn.calls == [] and h.stop.calls == []
 
 
-async def test_r7_moved_while_live_reruns_at_finish():
-    h = make_harness()
-    uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
-        "meeting"
-    ]["id"]
+# ── R7: a move while live is a new time, at once ──────────────────────────────────────────────
+
+
+async def _live_call(h, **fields) -> str:
+    """A 09:00–10:00 call whose bot is in it at 09:30; returns its uuid."""
+    uuid = (
+        await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z", **fields)
+    )["meeting"]["id"]
     h.clock.set("2026-09-29T09:00:00Z")
     h.set_status(uuid, "active")
     h.clock.set("2026-09-29T09:30:00Z")
-    held = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
-    assert (held["result"], held["meeting"]["start"]) == (
-        "not_changed_live",
-        "2026-09-29T09:00:00Z",
-    )
-    h.clock.set("2026-09-29T09:55:00Z")
+    return uuid
+
+
+async def test_r7_a_live_occurrence_moved_to_tomorrow_is_a_new_meeting_at_once():
+    from meeting_api.intake.fakes import InMemoryIntakeReads
+    from meeting_api.intake.ports import MeetingQuery
+
+    h = make_harness()
+    live = await _live_call(h)
     mark = h.mark()
-    written = h.set_status(uuid, "completed")
-    entry_id = h.store.find_entry(1, A, "google:3n5kq8example").id
-    assert written.rerun_entry_ids == (entry_id,)
-
-    await h.service.rerun_entries(1, written.rerun_entry_ids)
-
-    moved = h.store.find_entry(1, A, "google:3n5kq8example")
-    new = h.store.view(moved.meeting_id)
-    assert new.uuid != uuid and moved.state == "active"
-    projected = new.project(lead_s=300)
-    assert (projected["status"], projected["start"], projected["end"]) == (
+    reply = await h.put(start="2026-09-30T09:00:00Z", end="2026-09-30T10:00:00Z")
+    new = reply["meeting"]
+    assert (reply["result"], reply["previous_meeting_id"]) == ("created", live)
+    assert reply["entry"]["state"] == "active"
+    assert new["id"] != live
+    assert (new["status"], new["start"], new["end"]) == (
         "scheduled",
-        "2026-09-29T15:00:00Z",
-        "2026-09-29T16:00:00Z",
+        "2026-09-30T09:00:00Z",
+        "2026-09-30T10:00:00Z",
     )
-    assert projected["entries"][0]["user"] == A
-    assert h.events(mark) == [
-        (uuid, "meeting.completed"),
-        (new.uuid, "meeting.scheduled"),
-    ]
-    assert h.published()[-1] == h.store.events[-1].event_id
+    assert _users(reply) == [A]
+    assert h.events(mark) == [(new["id"], "meeting.scheduled")]
     assert h.spawn.calls == [] and h.stop.calls == []
+
+    # the bot in the call stays, and the live meeting keeps the entry as closed history
+    kept = h.meeting(live)
+    assert kept.status == "active" and kept.active_entries() == ()
+    assert [(e.source_user, e.state) for e in kept.entries] == [(A, "closed")]
+    assert [e["user"] for e in kept.project(lead_s=300)["entries"]] == [A]
+    reads = InMemoryIntakeReads(h.store)
+    seen = await reads.meetings(1, MeetingQuery(user=A))
+    assert {m.uuid for m in seen} == {live, new["id"]}
+    assert await reads.visible_to(1, h.meeting_id(live), A)
+
+    # its meeting.completed names them; the new meeting keeps the entry active
+    h.clock.set("2026-09-29T10:00:00Z")
+    mark = h.mark()
+    h.set_status(live, "completed")
+    assert h.events(mark) == [(live, "meeting.completed")]
+    assert [e["user"] for e in h.store.events[-1].meeting["entries"]] == [A]
+    assert [e.state for e in h.meeting(new["id"]).entries] == ["active"]
+
+
+async def test_r7_moved_to_later_today_waits_for_the_bot_on_the_link():
+    from meeting_api.intake.sweeps import RoomCheck, check_room
+
+    h = make_harness()
+    live = await _live_call(h)
+    reply = await h.put(start="2026-09-29T10:30:00Z", end="2026-09-29T11:00:00Z")
+    assert (reply["result"], reply["previous_meeting_id"]) == ("created", live)
+    later = h.meeting_id(reply["meeting"]["id"])
+    h.clock.set("2026-09-29T10:25:00Z")
+    assert await check_room(h.store, 1, later, GROOM) == RoomCheck("waiting")
+    h.set_status(live, "completed")
+    assert await check_room(h.store, 1, later, GROOM) == RoomCheck("free")
+
+
+async def test_r7_a_new_time_at_the_planned_end_is_a_new_meeting():
+    h = make_harness()
+    live = await _live_call(h)
+    reply = await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T10:30:00Z")
+    assert (reply["result"], reply["previous_meeting_id"]) == ("created", live)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        dict(start="2026-09-29T09:00:00Z", end="2026-09-29T10:30:00Z"),  # end extended
+        dict(
+            start="2026-09-29T09:45:00Z", end="2026-09-29T10:15:00Z"
+        ),  # still overlaps
+        dict(
+            start="2026-09-29T09:59:00Z", end="2026-09-29T10:30:00Z"
+        ),  # starts before the end
+        dict(
+            start="2026-09-29T09:00:00Z",
+            end="2026-09-29T10:00:00Z",
+            title="Renamed while live",
+        ),
+    ],
+    ids=["end_extended", "start_moved_overlapping", "starts_before_end", "title"],
+)
+async def test_r7_any_other_change_while_live_is_not_changed_live(fields):
+    h = make_harness()
+    live = await _live_call(h)
+    mark, meetings = h.mark(), len(h.store.meetings)
+    reply = await h.put(**fields)
+    assert (reply["result"], reply["meeting"]["id"]) == ("not_changed_live", live)
+    assert (reply["meeting"]["start"], reply["meeting"]["end"]) == (
+        "2026-09-29T09:00:00Z",
+        "2026-09-29T10:00:00Z",
+    )
+    assert reply["entry"]["state"] == "active"
+    assert len(h.store.meetings) == meetings and h.events(mark) == []
+    assert [e.start for e in h.store.entries_of(h.meeting_id(live))] == [
+        ts(fields["start"])
+    ]
+
+
+async def test_r7_a_shared_invite_moved_while_live_is_one_new_meeting():
+    """R14 while live: the first user's move makes the new meeting, the second joins it; the live
+    meeting keeps its bot and both users as history."""
+    h = make_harness()
+    live = await _live_call(h)
+    await h.put(user=B, start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    tomorrow = dict(start="2026-09-30T09:00:00Z", end="2026-09-30T10:00:00Z")
+    first = await h.put(**tomorrow)
+    second = await h.put(user=B, **tomorrow)
+    assert (first["result"], first["previous_meeting_id"]) == ("created", live)
+    assert (second["result"], second["previous_meeting_id"]) == (
+        "joined_existing",
+        live,
+    )
+    assert second["meeting"]["id"] == first["meeting"]["id"]
+    assert _users(second) == [A, B]
+    kept = h.meeting(live)
+    assert kept.status == "active" and h.stop.calls == []
+    assert [e["user"] for e in kept.project(lead_s=300)["entries"]] == [A, B]
+
+
+async def test_r7_the_same_content_again_is_unchanged_on_the_new_meeting():
+    h = make_harness()
+    await _live_call(h)
+    tomorrow = dict(start="2026-09-30T09:00:00Z", end="2026-09-30T10:00:00Z")
+    moved = await h.put(**tomorrow)
+    mark = h.mark()
+    again = await h.put(**tomorrow)
+    assert (again["result"], again["meeting"]["id"]) == (
+        "unchanged",
+        moved["meeting"]["id"],
+    )
+    assert again["entry"]["state"] == "active" and h.events(mark) == []
+
+
+async def test_r7_moved_back_into_the_live_call_is_listed_once():
+    """The entry leaves for tomorrow, then comes back to the live call's time: it joins the live
+    meeting again (``updated``), the meeting made for tomorrow is removed (R8, ``entry_moved``),
+    and the live meeting lists the entry once."""
+    h = make_harness()
+    live = await _live_call(h)
+    moved = await h.put(start="2026-09-30T09:00:00Z", end="2026-09-30T10:00:00Z")
+    back = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    assert (back["result"], back["meeting"]["id"], back["previous_meeting_id"]) == (
+        "updated",
+        live,
+        moved["meeting"]["id"],
+    )
+    assert back["entry"]["state"] == "active" and _users(back) == [A]
+    assert h.meeting(moved["meeting"]["id"]).row["status"] == "failed"
+    assert h.store.aw[h.meeting_id(moved["meeting"]["id"])]["outcome_detail"] == (
+        "entry_moved"
+    )
 
 
 # ── 2.6.17 / 2.6.18 ──────────────────────────────────────────────────────────────────────────

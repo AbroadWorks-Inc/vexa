@@ -6,8 +6,8 @@ Front door (P6): import from here, never a deep module path.
 Public surface:
   * ``project_meeting(meeting, aw, entries, *, lead_s)`` — ``projection.py``. Pure: renders one
     aw-bots ``meeting`` object (§2.4) from a ``meetings`` row mapping, a ``meeting_aw_state`` row
-    mapping (or ``None``), and the meeting's ``meeting_entries`` row mappings; it lists the closed
-    entries of a finished meeting and the active entries of any other (R9). Every reply, read and
+    mapping (or ``None``), and the meeting's ``meeting_entries`` row mappings; it lists the active
+    and closed entries, each entry once (R9, R7). Every reply, read and
     webhook that ships a meeting goes through this one function.
   * ``parse_entry(body, *, now, max_days_ahead)`` / ``parse_remove(body)`` — ``validation.py``.
     The ONLY way a `PUT /v2/entries` / `POST /v2/entries/remove` body becomes a typed, normalised
@@ -20,7 +20,7 @@ Public surface:
     (an ORM row as the column-name mapping ``project_meeting`` reads) come with it.
   * ``IntakeService(store, spawn, stop, publisher, settings)`` — ``service.py``. The behaviour of
     ``PUT /v2/entries`` (``put_entry``) and ``POST /v2/entries/remove`` (``remove_entry``) under
-    the link locks, plus R2's ``merge_into_live`` and R7's ``rerun_entries`` (§1.3). It reaches
+    the link locks, plus R2's ``merge_into_live`` (§1.3). It reaches
     storage, spawning, stopping and publishing only through the ports in ``ports.py``
     (``IntakeStore``/``IntakeTx``, ``SpawnPort``, ``StopPort``, ``EventPublisher``); the
     in-memory fakes are in ``fakes.py``. ``IntakeSettings.from_env()`` — ``settings.py``.
@@ -34,10 +34,10 @@ Public surface:
     booting keeps its stage and gets the flag and the outcome (``record_stop``, which R5 runs in the
     removal's own transaction); then ``leave`` (``stop_meeting_row``) sends the leave command and
     deletes a booting bot's workload.
-  * ``check_room`` / ``not_sent_tick`` / ``rerun_kept`` — ``sweeps.py``. The scheduler's intake
-    side (§1.5): the link check under the link lock before a bot is sent to an entry-managed meeting
-    (wait, or merge into an open-ended live meeting, R2), the not-sent sweep (R6), and the re-run of
-    every entry a finished meeting kept active (R7). ``OutboxOnly`` is the outbox-only publisher.
+  * ``check_room`` / ``not_sent_tick`` — ``sweeps.py``. The scheduler's intake side (§1.5): the
+    link check under the link lock before a bot is sent to an entry-managed meeting (wait, or merge
+    into an open-ended live meeting, R2) and the not-sent sweep (R6). ``OutboxOnly`` is the
+    outbox-only publisher.
   * ``PostgresIntakeStore(session_factory)`` — ``adapters.py``. The ``IntakeStore`` over Postgres:
     one transaction per ``room_lock`` holding the links' advisory locks (§1.4), status changes and
     events through ``write_status`` / ``write_event`` in that transaction.
@@ -89,7 +89,6 @@ from .sweeps import (
     check_room,
     not_sent_cause,
     not_sent_tick,
-    rerun_kept,
 )
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
@@ -102,7 +101,6 @@ __all__ = [
     "record_stop",
     "check_room",
     "not_sent_tick",
-    "rerun_kept",
     "not_sent_cause",
     "RoomCheck",
     "OutboxOnly",

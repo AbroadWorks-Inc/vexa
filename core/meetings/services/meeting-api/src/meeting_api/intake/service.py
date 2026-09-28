@@ -4,7 +4,7 @@ Every write runs under the link locks of the entry's link and of its meeting's l
 after a link change while live), plus the new link on an update, all sorted, through
 ``IntakeStore.room_lock``. The entry is read under the lock; if a link it needs isn't covered, the
 transaction ends without writing and the service starts again once with those links added. A
-remove or a re-run doesn't know the links before reading, so it first reads without a link lock.
+remove doesn't know the links before reading, so it first reads without a link lock.
 Events are published after the transaction commits (a failed publish is logged: the outbox holds
 them). A stop (R5) is recorded inside the transaction (``stop.record_stop``); the leave command
 and spawns run after the commit, each through its own port.
@@ -15,11 +15,15 @@ and spawns run after the commit, each through its own port.
   2. an active or closed entry with the same ``content_hash`` → ``unchanged``, nothing written;
   3. a new entry, or a ``removed`` one coming back, takes the R1 path: it joins the meeting R1
      matches (``joined_existing``) or gets a new ``scheduled`` meeting (``created``). A ``closed``
-     entry, or one waiting to re-run on a finished meeting, does the same only if the update
-     points to a new future time (R7); otherwise → ``not_changed_finished``, and an entry that
-     was waiting to re-run stores the update and is closed with its finished meeting, so the
-     re-run never uses the time the update replaced and a later move is judged against it;
-  4. an entry of a live meeting is stored and the meeting is left as it is (``not_changed_live``);
+     entry does the same only if the update points to a new future time (R7); otherwise →
+     ``not_changed_finished``;
+  4. an entry of a live meeting that the update moves to a new future time (R7,
+     ``rules.is_future_move``: from the later of now and the meeting's planned end) leaves it at
+     once and takes the R1 path, with ``previous_meeting_id``. Its row stays on the live meeting,
+     ``closed``, as history (the owner still sees the meeting, and its events list them), and the
+     entry continues as a new row; the live meeting keeps its bot (a move is not a removal, R5).
+     Any other update of a live meeting's entry is stored and the meeting is left as it is
+     (``not_changed_live``);
   5. an entry of a scheduled meeting stays on it while it still overlaps the meeting's other
      entries; otherwise it joins the meeting R1 matches on its link, or the meeting follows it when
      it was the meeting's only entry, or it gets a new meeting (``updated``, with
@@ -42,9 +46,7 @@ one is stopped with that outcome (``bot_stopping``, R5). The status change is co
 meeting that went live meanwhile takes the live branch. When the meeting has already finished,
 only the entry goes (``entry_removed``) and the finished meeting is left as history.
 
-``merge_into_live`` is R2's exception and ``rerun_entries`` R7's re-run after a finish; the scheduler
-calls both, never a route: the auto-join tick merges, and the not-sent sweep re-runs every entry a
-finished meeting kept active, whichever writer finished it (``sweeps.rerun_kept``).
+``merge_into_live`` is R2's exception; the auto-join tick calls it, never a route.
 
 Events: ``meeting.scheduled`` for a meeting an entry created, ``meeting.updated`` when a
 meeting's time, link, title or entries change, ``meeting.removed`` (R8, R2), and
@@ -264,32 +266,6 @@ class IntakeService:
         await self._publish(w.events)
         return True
 
-    async def rerun_entries(self, user_id: int, entry_ids: Sequence[int]) -> None:
-        """R7: each entry a finished meeting kept active (a future, non-overlapping time) becomes
-        a meeting of its own, by the R1 path. An entry no longer waiting on a finished meeting is
-        left alone."""
-        for entry_id in entry_ids:
-
-            async def read(tx: IntakeTx, i: int = entry_id) -> Optional[EntryView]:
-                return await tx.entry(i)
-
-            async def body_(w: _Work, existing: Optional[EntryView]) -> Optional[_Done]:
-                if existing is None or existing.state != "active":
-                    return None
-                finished = await w.tx.meeting(existing.meeting_id)
-                if finished.status not in FINISHED_STATUSES:
-                    return None
-                return await self._attach(
-                    w,
-                    user_id,
-                    existing.as_entry_in(),
-                    existing.room,
-                    self._clock(),
-                    previous=finished,
-                )
-
-            await self._locked(user_id, frozenset(), read, body_, restarts=2)
-
     # ── the locked unit of work ─────────────────────────────────────────────────────────────
 
     async def _locked(
@@ -388,20 +364,16 @@ class IntakeService:
         if existing.state == "removed":
             await self._check_quota(tx, user_id)
             return await self._attach(w, user_id, entry, room, now, previous=old)
+        lead_s = self._settings.lead_s
         if existing.state == "closed" or old.status in FINISHED_STATUSES:
-            if not is_future_move(entry, old, now=now):
-                if existing.state == "active":
-                    # It was waiting to re-run (R7); the sender now puts it on the finished
-                    # meeting's time, so it belongs to that meeting and never re-runs. The
-                    # update is stored first, so the closed entry holds what the sender holds.
-                    await tx.save_entry(user_id, entry, room, old.id)
-                    await tx.close_entry(existing.id)
-                    old = await tx.meeting(old.id)
+            if not is_future_move(entry, old, now=now, lead_s=lead_s):
                 return _Done("not_changed_finished", old)
-            if existing.state == "closed":
-                await self._check_quota(tx, user_id)
+            await self._check_quota(tx, user_id)
             return await self._attach(w, user_id, entry, room, now, previous=old)
         if old.status != "scheduled":
+            if is_future_move(entry, old, now=now, lead_s=lead_s):
+                await tx.close_entry(existing.id)
+                return await self._attach(w, user_id, entry, room, now, previous=old)
             await tx.save_entry(user_id, entry, room, old.id)
             return _Done("not_changed_live", await tx.meeting(old.id))
         return await self._move(w, user_id, entry, room, existing, old, now)
@@ -661,18 +633,18 @@ class IntakeService:
             return "finished"
 
     def _reply(self, done: _Done, user: str, external_id: str) -> dict[str, Any]:
-        entry = next(
-            (
-                e
-                for e in done.meeting.entries
-                if (e.source_user, e.external_id) == (user, external_id)
-            ),
-            None,
-        )
-        if entry is None:
+        rows = [
+            e
+            for e in done.meeting.entries
+            if (e.source_user, e.external_id) == (user, external_id)
+        ]
+        current = [e for e in rows if e.state != "closed"]
+        found = current or rows
+        if not found:
             raise LookupError(
                 f"entry {external_id!r} of {user!r} is not on meeting {done.meeting.uuid}"
             )
+        entry = found[-1]
         return {
             "result": done.result,
             "previous_meeting_id": done.previous,
