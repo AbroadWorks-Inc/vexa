@@ -24,6 +24,7 @@
       "outcome_kind": "Column(Text, nullable=True)",
       "outcome_message": "Column(Text, nullable=True)",
       "scheduled_end_at": "Column(DateTime(timezone=True), nullable=True)",
+      "send_attempts": "Column(Integer, nullable=False, server_default='0')",
       "time_zone": "Column(Text, nullable=True)",
       "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
       "waiting_for_room_sent_at": "Column(DateTime(timezone=True), nullable=True)"
@@ -164,6 +165,7 @@
       "outcome_kind": "Column(Text, nullable=True)",
       "outcome_message": "Column(Text, nullable=True)",
       "scheduled_end_at": "Column(DateTime(timezone=True), nullable=True)",
+      "send_attempts": "Column(Integer, nullable=False, server_default='0')",
       "time_zone": "Column(Text, nullable=True)",
       "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())",
       "waiting_for_room_sent_at": "Column(DateTime(timezone=True), nullable=True)"
