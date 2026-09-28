@@ -103,6 +103,7 @@
   50. The portal publishes only the meeting's `id`, `status`, `completion_reason` and `sequence` to Redis, so titles and attendee emails stay out of the shared Redis (Part 4).
   51. Owner decision (2026-09-28): the calendar module (Part B) and the portal (Part C) are handed to the aw-notetaker developer for review; they sit on aw-notetaker branches `feat/calendar-aw-bots` and `feat/portal-aw-bots`, each with a technical handoff in `$N/docs/handoffs/`. This build's focus stays aw-bots (§6.5, §6.6).
   52. Owner decision (2026-09-28): only people on the meeting may stop its bot from the portal — the host and invitees who haven't declined. The portal allows stop only for a user who owns an active entry on the meeting; a declined guest, or an invitee without a connected calendar, can see the meeting but not stop it (Part 4).
+  53. MIGRATION-0008 sets the `uuid` default before the backfill, so no row inserted in between is left NULL for `SET NOT NULL`; every locking step runs under `SET lock_timeout`; after step 3 the old unique index can't simply be recreated, because a link then holds several scheduled rows (§6.4 A1, Part 5).
 
 ---
 
@@ -969,8 +970,8 @@ Run it in a window with no meeting in progress: a bot started before step 14 has
   - **Step 1:**
     1. the new tables (SQL generated from the models in the test, pasted verbatim);
     2. `ADD COLUMN uuid uuid` (nullable);
-    3. backfill in batches of 1000;
-    4. `SET DEFAULT gen_random_uuid()`;
+    3. `SET DEFAULT gen_random_uuid()`, so rows inserted from here on get a UUID;
+    4. backfill the existing rows in batches of 1000 (V12);
     5. `CREATE UNIQUE INDEX CONCURRENTLY`, with the exact name SQLAlchemy generates;
     6. a `NOT VALID` check, then `VALIDATE`, then `SET NOT NULL`;
     7. the live-link index `CONCURRENTLY`;
