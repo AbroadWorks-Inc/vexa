@@ -436,7 +436,21 @@
    "key": "WEBHOOK_RETRY_SCHEDULE_S",
    "class": "defaulted",
    "default": "60,300,1800,7200",
-   "description": "webhooks (§1.8, §6.9 F-A): the subscription sender's retry waits (s), comma-separated, 1 to 20 positive whole numbers. Its length is the number of retries: after a 5xx, 429, timeout, connection error or nothing to sign or resolve with, attempt n waits entry n; one failure after the last entry the delivery is dead (the default: 4 retries, 5 attempts). Set but malformed, meeting-api refuses to start.",
+   "description": "webhooks (§1.8, §6.9 F-A): the subscription sender's retry waits (s), comma-separated, 1 to 20 positive whole numbers. Its length is the number of retries: after a 5xx, 429, timeout, connection error, DNS timeout, too little lease left to post (lease short) or nothing to sign or resolve with, attempt n waits entry n; one failure after the last entry the delivery is dead (the default: 4 retries, 5 attempts). Set but malformed, meeting-api refuses to start.",
+   "targets": []
+  },
+  {
+   "key": "WEBHOOK_DNS_THREADS",
+   "class": "defaulted",
+   "default": "4",
+   "description": "webhooks (§1.8, §6.9 F-H): threads in the subscription sender's own DNS pool (the send-time SSRF guard's lookups), per replica; a whole number of at least 1. The pool is separate from the default executor recording storage uses, so slow DNS never delays recordings, and it is shut down on app shutdown. Set but malformed, meeting-api refuses to start.",
+   "targets": []
+  },
+  {
+   "key": "WEBHOOK_DNS_TIMEOUT_S",
+   "class": "defaulted",
+   "default": "5",
+   "description": "webhooks (§1.8, §6.9 F-H): the most (s, above 0, decimals allowed) one send-time DNS lookup may take, waiting for a pool thread included. A lookup that takes longer is a failed attempt (error 'dns timeout') on WEBHOOK_RETRY_SCHEDULE_S. Set but malformed, meeting-api refuses to start.",
    "targets": []
   },
   {

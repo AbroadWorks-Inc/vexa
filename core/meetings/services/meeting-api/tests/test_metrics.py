@@ -760,6 +760,9 @@ async def test_the_sender_loop_stamps_its_last_run(monkeypatch):
         async def run_once(self) -> int:
             return 0
 
+        def close(self) -> None:
+            pass
+
     monkeypatch.setattr(sender_mod, "WebhookSender", _Sender)
     monkeypatch.setenv("ADMIN_API_URL", "http://admin-api.test")
     started = time.time()

@@ -742,15 +742,18 @@ def _attach_background_loops(
             allowlist=webhook_allowlist,
             settings=webhook_sender_settings,
         )
-        while True:
-            try:
-                await sender.run_once()
-                sweep_ran("webhook-sender")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("webhook sender tick failed")
-            await asyncio.sleep(webhook_send_interval)
+        try:
+            while True:
+                try:
+                    await sender.run_once()
+                    sweep_ran("webhook-sender")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("webhook sender tick failed")
+                await asyncio.sleep(webhook_send_interval)
+        finally:
+            sender.close()  # the app's shutdown ends the sender's own DNS threads
 
     # Calendar sync: each sweep discovers every user with a connected ICS feed (admin-api internal
     # edge), fetches it over the SSRF-pinned transport, and upserts planned meetings (one row per

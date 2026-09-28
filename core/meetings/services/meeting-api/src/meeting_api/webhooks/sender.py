@@ -14,11 +14,13 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    supplies the URL and is never used for a secret.
 2. **Re-check** each claim, concurrently: the subscription is still active in
    ``webhook_subscriptions`` (else the row is ``cancelled``, with no attempt), and its URL passes
-   the SSRF guard (``ssrf.validate_webhook_url`` with ``WEBHOOK_PRIVATE_HOST_ALLOWLIST``, resolved
-   in a worker thread under ``URL_CHECK_TIMEOUT_S``).
+   the SSRF guard (``ssrf.validate_webhook_url`` with ``WEBHOOK_PRIVATE_HOST_ALLOWLIST``). The
+   guard's DNS lookup runs on the sender's own pool of ``WEBHOOK_DNS_THREADS`` threads, never the
+   default executor recording storage uses, under ``WEBHOOK_DNS_TIMEOUT_S`` per lookup; a lookup
+   that times out is a failed attempt (``dns timeout``). ``close()`` shuts the pool down.
    Before posting, the claim must still have ``SEND_TIMEOUT_S + LEASE_MARGIN_S`` of its lease left,
    measured on the monotonic clock from just before the claim. If it hasn't (a slow subscription
-   read or DNS), nothing is sent or written and the row is left for the next claim.
+   read or DNS), nothing is sent and a failed attempt (``lease short``) is recorded.
 3. **Sign** the stored ``payload_text`` (``signing.signed_headers``; the claim's secret opened by
    ``secret_box.py``, the previous one too while it is still valid) and post those exact bytes,
    under ``SEND_TIMEOUT_S`` in total, to the address the guard validated.
@@ -30,9 +32,9 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    2xx                                           ``delivered``          ``delivered``
    5xx, 429, timeout, connection error, or       ``pending`` after the  ``retry``
    nothing to sign or resolve with (the          next wait in
-   subscription read, the secret, DNS), or a     ``WEBHOOK_RETRY_       ``dead``
-   fault the sender does not map (stored as      SCHEDULE_S``; then
-   ``sender error``)                             ``dead``
+   subscription read, the secret, DNS), too      ``WEBHOOK_RETRY_       ``dead``
+   little lease left, or a fault the sender      SCHEDULE_S``; then
+   does not map (stored as ``sender error``)     ``dead``
    any other answer, or a URL the guard refuses  ``failed``             ``failed``
    ============================================  =====================  ==================
 
@@ -55,7 +57,7 @@ not used anywhere here.
 
 Metrics (§1.13): each claim moves ``aw_webhook_deliveries_total{event_type,outcome,user_id}`` once,
 with the attempt's ``outcome`` (``delivered``, ``retry``, ``failed``, ``dead``) or what happened
-instead (``cancelled``, ``superseded``, ``lease_short``, or ``crashed`` when the attempt could not
+instead (``cancelled``, ``superseded``, or ``crashed`` when the attempt could not
 be recorded); each post made moves
 ``aw_webhook_delivery_seconds``.
 
@@ -67,9 +69,12 @@ the guard validated with the Host header and TLS SNI of the real host).
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from datetime import datetime, timezone
 from typing import Any, Callable, Collection, List, Mapping, Optional, Protocol
 
@@ -88,10 +93,11 @@ from .subscriptions import SubscriptionSource, SubscriptionsUnavailable
 
 __all__ = [
     "CLAIM_LIMIT",
+    "DEFAULT_DNS_THREADS",
+    "DEFAULT_DNS_TIMEOUT_S",
     "DEFAULT_RETRY_SCHEDULE_S",
     "LEASE_S",
     "SEND_TIMEOUT_S",
-    "URL_CHECK_TIMEOUT_S",
     "Claim",
     "DeliveryResult",
     "DeliveryStore",
@@ -108,7 +114,8 @@ __all__ = [
 LEASE_S = 60
 LEASE_MARGIN_S = 5.0
 SEND_TIMEOUT_S = 10.0
-URL_CHECK_TIMEOUT_S = 5.0
+DEFAULT_DNS_THREADS = 4
+DEFAULT_DNS_TIMEOUT_S = 5.0
 DEFAULT_RETRY_SCHEDULE_S = (60, 300, 1800, 7200)
 MAX_RETRIES = 20
 CLAIM_LIMIT = 50
@@ -134,21 +141,50 @@ def _retry_schedule(raw: str) -> tuple[int, ...]:
     )
 
 
+def _dns_threads(raw: str) -> int:
+    if raw.isascii() and raw.isdigit() and int(raw) >= 1:
+        return int(raw)
+    raise SenderSettingsError(
+        "WEBHOOK_DNS_THREADS must be a whole number of at least 1"
+    )
+
+
+def _dns_timeout_s(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if math.isfinite(value) and value > 0:
+        return value
+    raise SenderSettingsError(
+        "WEBHOOK_DNS_TIMEOUT_S must be a number of seconds above 0"
+    )
+
+
 @dataclass(frozen=True)
 class SenderSettings:
     """The sender's settings (``config.v1.json``). ``retry_schedule_s`` holds one wait per
-    retry."""
+    retry; ``dns_threads`` sizes the sender's own DNS pool and ``dns_timeout_s`` bounds each
+    lookup."""
 
     retry_schedule_s: tuple[int, ...] = DEFAULT_RETRY_SCHEDULE_S
+    dns_threads: int = DEFAULT_DNS_THREADS
+    dns_timeout_s: float = DEFAULT_DNS_TIMEOUT_S
 
     @classmethod
     def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> SenderSettings:
         """The settings from the environment; an unset or empty key takes its default, and a
         malformed one raises ``SenderSettingsError``."""
         env = os.environ if environ is None else environ
-        raw = (env.get("WEBHOOK_RETRY_SCHEDULE_S") or "").strip()
+        schedule = (env.get("WEBHOOK_RETRY_SCHEDULE_S") or "").strip()
+        threads = (env.get("WEBHOOK_DNS_THREADS") or "").strip()
+        timeout = (env.get("WEBHOOK_DNS_TIMEOUT_S") or "").strip()
         return cls(
-            retry_schedule_s=_retry_schedule(raw) if raw else DEFAULT_RETRY_SCHEDULE_S
+            retry_schedule_s=(
+                _retry_schedule(schedule) if schedule else DEFAULT_RETRY_SCHEDULE_S
+            ),
+            dns_threads=_dns_threads(threads) if threads else DEFAULT_DNS_THREADS,
+            dns_timeout_s=_dns_timeout_s(timeout) if timeout else DEFAULT_DNS_TIMEOUT_S,
         )
 
 
@@ -283,7 +319,6 @@ class WebhookSender:
         monotonic: Callable[[], float] = time.monotonic,
         claim_limit: int = CLAIM_LIMIT,
         send_timeout_s: float = SEND_TIMEOUT_S,
-        url_check_timeout_s: float = URL_CHECK_TIMEOUT_S,
         settings: SenderSettings = SenderSettings(),
     ) -> None:
         self._store = store
@@ -296,8 +331,15 @@ class WebhookSender:
         self._monotonic = monotonic
         self._claim_limit = claim_limit
         self._send_timeout_s = send_timeout_s
-        self._url_check_timeout_s = url_check_timeout_s
         self._schedule = settings.retry_schedule_s
+        self._dns_timeout_s = settings.dns_timeout_s
+        self._dns_pool = ThreadPoolExecutor(
+            max_workers=settings.dns_threads, thread_name_prefix="webhook-dns"
+        )
+
+    def close(self) -> None:
+        """Shut the DNS pool down: queued lookups are dropped, and none is waited for."""
+        self._dns_pool.shutdown(wait=False, cancel_futures=True)
 
     async def run_once(self) -> int:
         """One tick: claim what is due and deliver it. Returns how many rows were claimed."""
@@ -347,20 +389,18 @@ class WebhookSender:
         if sub is None:
             return _unsent(claim, self._schedule, error)
 
+        lookup = partial(
+            validate_webhook_url, sub.url, self._resolver, allowlist=self._allowlist
+        )
         try:
             target = await asyncio.wait_for(
-                asyncio.to_thread(
-                    validate_webhook_url,
-                    sub.url,
-                    self._resolver,
-                    allowlist=self._allowlist,
-                ),
-                timeout=self._url_check_timeout_s,
+                asyncio.get_running_loop().run_in_executor(self._dns_pool, lookup),
+                timeout=self._dns_timeout_s,
             )
         except UnresolvableHost:
             return _unsent(claim, self._schedule, "host could not be resolved")
         except asyncio.TimeoutError:
-            return _unsent(claim, self._schedule, "host resolution timed out")
+            return _unsent(claim, self._schedule, "dns timeout")
         except SSRFError as exc:
             return DeliveryResult(
                 state="failed",
@@ -400,10 +440,9 @@ class WebhookSender:
             self._monotonic() - claimed_at + self._send_timeout_s + LEASE_MARGIN_S
             > LEASE_S
         ):
-            # Too little lease left to post and record inside it: send nothing, write nothing,
-            # and let the lease run out so the row is claimed again.
-            self._log(claim, "lease_short", None)
-            return None
+            # Too little lease left to post and record inside it: send nothing, and record a
+            # failed attempt so the row moves along the retry schedule like any other failure.
+            return _unsent(claim, self._schedule, "lease short")
         body = claim.payload_text.encode("utf-8")
         headers = signed_headers(
             body,

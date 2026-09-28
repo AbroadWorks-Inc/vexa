@@ -19,18 +19,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Iterator, Optional
 
 import pytest
 
@@ -518,7 +521,7 @@ def resolve_public(host: str) -> list[str]:
 
 
 @pytest.fixture
-def world(h) -> World:
+def world(h) -> Iterator[World]:
     clock = h.clock
     subs = StaticSubscriptions()
     receiver = Receiver()
@@ -532,7 +535,8 @@ def world(h) -> World:
         resolver=resolve_public,
         clock=clock,
     )
-    return World(h, clock, subs, receiver, sender)
+    yield World(h, clock, subs, receiver, sender)
+    sender.close()
 
 
 # ── delivered ────────────────────────────────────────────────────────────────────────────────
@@ -833,12 +837,13 @@ async def test_an_expired_lease_is_reclaimed_and_the_old_claim_cannot_write(worl
     assert len(world.receiver.posted) == 1
 
 
-async def test_a_claim_whose_lease_is_nearly_spent_is_left_for_reclaim(h):
+async def test_a_lease_short_claim_is_a_failed_attempt_that_ends_dead(h):
     """Before it posts, the sender checks the claim still has SEND_TIMEOUT_S + LEASE_MARGIN_S of
-    its lease left (measured on the monotonic clock from before the claim, so no wall clock is
-    involved). If not, it sends nothing and writes nothing: the lease runs out and the row is
-    claimed again."""
-    mono = Monotonic()
+    its lease left (measured on the monotonic clock from before the claim). If not, it sends
+    nothing and records a failed attempt (``lease short``) on the retry schedule, so the claim
+    ends ``dead`` like any other failure. The other rows of the same tick are still delivered.
+    """
+    skew: contextvars.ContextVar[float] = contextvars.ContextVar("skew", default=0.0)
     subs = StaticSubscriptions()
     receiver = Receiver()
     sender = WebhookSender(
@@ -849,36 +854,56 @@ async def test_a_claim_whose_lease_is_nearly_spent_is_left_for_reclaim(h):
         allowlist=frozenset(),
         resolver=resolve_public,
         clock=h.clock,
-        monotonic=mono,
+        monotonic=lambda: 1000.0 + skew.get(),
+        settings=SenderSettings(retry_schedule_s=(5, 10)),
     )
     w = World(h, h.clock, subs, receiver, sender)
-    did, body = await w.event(await w.subscribe())
     budget = LEASE_S - SEND_TIMEOUT_S - LEASE_MARGIN_S
+    slow = await w.subscribe()
+    skews = {slow.id: budget + 0.5}
+    read = subs.find
 
-    def slow_read() -> None:
-        mono.t += budget + 0.5
+    async def slow_read(user_id: int, subscription_id: str) -> Any:
+        # only this delivery's task sees the time its read took
+        skew.set(skews.get(subscription_id, 0.0))
+        return await read(user_id, subscription_id)
 
-    subs.on_find = slow_read
+    subs.find = slow_read  # type: ignore[method-assign]
+    did, slow_body = await w.event(slow)
+
+    for n, wait in enumerate((5, 10), start=1):
+        others = [(await w.event(await w.subscribe()))[0] for _ in range(2)]
+        assert await sender.run_once() == 3
+        row = await h.delivery(did)
+        assert (row["state"], row["attempts"], row["lease_until"]) == (
+            "pending",
+            n,
+            None,
+        )
+        assert row["last_error"] == "lease short"
+        assert row["next_attempt_at"] == w.clock.now + timedelta(seconds=wait)
+        for other in others:
+            assert (await h.delivery(other))["state"] == "delivered"
+        w.clock.advance(wait)
+
     assert await sender.run_once() == 1
-    assert receiver.posted == []
-    assert await h.attempt_rows(did) == []
     row = await h.delivery(did)
-    assert (row["state"], row["attempts"]) == ("sending", 0)
-
-    subs.on_find = None
-    h.clock.advance(30)
-    assert await sender.run_once() == 0  # still leased
-    h.clock.advance(LEASE_S - 30 + 1)
-    assert await sender.run_once() == 1
-    assert [p.body for p in receiver.posted] == [body]
-    row = await h.delivery(did)
-    assert (row["state"], row["attempts"]) == ("delivered", 1)
+    assert (row["state"], row["attempts"], row["lease_until"]) == ("dead", 3, None)
+    attempts = await h.attempt_rows(did)
+    assert [a["outcome"] for a in attempts] == ["retry", "retry", "dead"]
+    assert {(a["status_code"], a["error"]) for a in attempts} == {(None, "lease short")}
+    assert slow_body not in [p.body for p in receiver.posted]
+    assert len(receiver.posted) == 4
+    w.clock.advance(86_400)
+    assert await sender.run_once() == 0
 
     # a read that leaves exactly the budget still sends
-    did2, _ = await w.event(await w.subscribe())
-    subs.on_find = lambda: setattr(mono, "t", mono.t + budget - 0.5)
+    edge = await w.subscribe()
+    skews[edge.id] = budget - 0.5
+    did2, _ = await w.event(edge)
     await sender.run_once()
     assert (await h.delivery(did2))["state"] == "delivered"
+    sender.close()
 
 
 async def test_claims_leases_and_retries_run_on_the_database_clock(pg_engine):
@@ -1136,6 +1161,164 @@ async def test_a_host_that_does_not_resolve_is_retried(h):
         "host could not be resolved",
     )
     assert receiver.posted == []
+
+
+# ── the sender's own DNS threads (WEBHOOK_DNS_THREADS, WEBHOOK_DNS_TIMEOUT_S) ─────────────────
+
+
+async def _until(predicate: Callable[[], bool], timeout_s: float = 2.0) -> None:
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout_s)
+
+
+async def test_a_slow_resolver_never_holds_the_default_executor(h):
+    """The URL check resolves on the sender's own bounded pool, not the default executor that
+    recording storage offloads to (``recordings/adapters.py``)."""
+    loop = asyncio.get_running_loop()
+    default = ThreadPoolExecutor(max_workers=1, thread_name_prefix="default")
+    loop.set_default_executor(default)
+    release = threading.Event()
+    resolving: list[str] = []
+
+    def slow_resolver(host: str) -> list[str]:
+        resolving.append(threading.current_thread().name)
+        release.wait(5)
+        return resolve_public(host)
+
+    subs = StaticSubscriptions()
+    receiver = Receiver()
+    sender = WebhookSender(
+        h.store,
+        subs,
+        box(),
+        receiver,
+        allowlist=frozenset(),
+        resolver=slow_resolver,
+        clock=h.clock,
+        settings=SenderSettings(dns_threads=2, dns_timeout_s=5.0),
+    )
+    w = World(h, h.clock, subs, receiver, sender)
+    dids = [(await w.event(await w.subscribe()))[0] for _ in range(3)]
+
+    tick = asyncio.create_task(sender.run_once())
+    try:
+        await _until(lambda: len(resolving) == 2)
+        # every sender DNS thread is busy, and the default executor still answers at once
+        free = await asyncio.wait_for(loop.run_in_executor(None, lambda: "free"), 1.0)
+        assert free == "free"
+        await asyncio.sleep(0.05)
+        assert (
+            len(resolving) == 2
+        )  # bounded: the third lookup waits for a sender thread
+    finally:
+        release.set()
+    assert await tick == 3
+    assert len(resolving) == 3
+    assert all(name.startswith("webhook-dns") for name in resolving), resolving
+    for did in dids:
+        assert (await h.delivery(did))["state"] == "delivered"
+    sender.close()
+
+
+async def test_a_dns_timeout_is_a_failed_attempt_on_the_schedule(h):
+    release = threading.Event()
+
+    def hung_resolver(host: str) -> list[str]:
+        release.wait(5)
+        return resolve_public(host)
+
+    subs = StaticSubscriptions()
+    receiver = Receiver()
+    sender = WebhookSender(
+        h.store,
+        subs,
+        box(),
+        receiver,
+        allowlist=frozenset(),
+        resolver=hung_resolver,
+        clock=h.clock,
+        settings=SenderSettings(retry_schedule_s=(5,), dns_timeout_s=0.05),
+    )
+    w = World(h, h.clock, subs, receiver, sender)
+    did, _ = await w.event(await w.subscribe())
+    try:
+        assert await sender.run_once() == 1
+        row = await h.delivery(did)
+        assert (row["state"], row["attempts"], row["last_error"]) == (
+            "pending",
+            1,
+            "dns timeout",
+        )
+        assert row["next_attempt_at"] == w.clock.now + timedelta(seconds=5)
+        w.clock.advance(5)
+        assert await sender.run_once() == 1
+    finally:
+        release.set()
+    row = await h.delivery(did)
+    assert (row["state"], row["attempts"]) == ("dead", 2)
+    attempts = await h.attempt_rows(did)
+    assert [(a["outcome"], a["error"]) for a in attempts] == [
+        ("retry", "dns timeout"),
+        ("dead", "dns timeout"),
+    ]
+    assert receiver.posted == []
+    sender.close()
+
+
+async def test_close_shuts_the_dns_pool_down(world):
+    workers: list[threading.Thread] = []
+
+    def resolver(host: str) -> list[str]:
+        workers.append(threading.current_thread())
+        return resolve_public(host)
+
+    sender = WebhookSender(
+        world.h.store,
+        world.subs,
+        box(),
+        world.receiver,
+        allowlist=frozenset(),
+        resolver=resolver,
+        clock=world.clock,
+    )
+    await world.event(await world.subscribe())
+    assert await sender.run_once() == 1
+    (worker,) = workers
+    assert worker.is_alive()
+    sender.close()
+    worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_the_default_dns_settings():
+    settings = SenderSettings.from_env({})
+    assert (settings.dns_threads, settings.dns_timeout_s) == (4, 5.0)
+    assert SenderSettings.from_env(
+        {"WEBHOOK_DNS_THREADS": "8", "WEBHOOK_DNS_TIMEOUT_S": "2.5"}
+    ) == SenderSettings(dns_threads=8, dns_timeout_s=2.5)
+
+
+@pytest.mark.parametrize(
+    "key, raw",
+    [
+        ("WEBHOOK_DNS_THREADS", "0"),
+        ("WEBHOOK_DNS_THREADS", "-1"),
+        ("WEBHOOK_DNS_THREADS", "2.5"),
+        ("WEBHOOK_DNS_THREADS", "four"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "0"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "-3"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "soon"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "nan"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "inf"),
+    ],
+)
+def test_a_malformed_dns_setting_is_refused(key, raw):
+    with pytest.raises(SenderSettingsError) as err:
+        SenderSettings.from_env({key: raw})
+    assert key in str(err.value)
 
 
 # ── nothing to sign with ─────────────────────────────────────────────────────────────────────
@@ -1638,12 +1821,20 @@ def test_a_key_ring_set_but_wrong_refuses_to_boot(monkeypatch):
         main_mod.build_production_app()
 
 
-def test_a_malformed_retry_schedule_refuses_to_boot(monkeypatch):
+@pytest.mark.parametrize(
+    "key, raw",
+    [
+        ("WEBHOOK_RETRY_SCHEDULE_S", "60,soon"),
+        ("WEBHOOK_DNS_THREADS", "0"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "never"),
+    ],
+)
+def test_a_malformed_sender_setting_refuses_to_boot(monkeypatch, key, raw):
     import meeting_api.__main__ as main_mod
 
     _production_env(monkeypatch)
-    monkeypatch.setenv("WEBHOOK_RETRY_SCHEDULE_S", "60,soon")
-    with pytest.raises(SenderSettingsError, match="WEBHOOK_RETRY_SCHEDULE_S"):
+    monkeypatch.setenv(key, raw)
+    with pytest.raises(SenderSettingsError, match=key):
         main_mod.build_production_app()
 
 
@@ -1748,8 +1939,17 @@ async def test_the_sender_settings_reach_the_sender(monkeypatch):
             seen.update(kw)
             super().__init__(*a, **kw)
 
+        def close(self) -> None:
+            seen["closed"] = True
+            super().close()
+
     monkeypatch.setattr(sender_mod, "WebhookSender", Capturing)
     monkeypatch.setenv("WEBHOOK_RETRY_SCHEDULE_S", "5,10")
+    monkeypatch.setenv("WEBHOOK_DNS_THREADS", "2")
+    monkeypatch.setenv("WEBHOOK_DNS_TIMEOUT_S", "1.5")
     _, ticks = await _run_lifespan_once(monkeypatch, secret_box=box())
     assert ticks == ["send"]
-    assert seen["settings"].retry_schedule_s == (5, 10)
+    assert seen["settings"] == SenderSettings(
+        retry_schedule_s=(5, 10), dns_threads=2, dns_timeout_s=1.5
+    )
+    assert seen["closed"] is True  # the app's shutdown shuts the sender's DNS pool down
