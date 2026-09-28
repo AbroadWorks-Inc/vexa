@@ -644,7 +644,9 @@ async def test_pg_r5_outcome_survives_the_bots_completion(pg_engine):
         "bot_logs": ["[ACT] leave received"],
     }
     async with http(app) as client:
-        r = await client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
+        r = await client.post(
+            "/bots/internal/callback/lifecycle", headers=BOT, json=event
+        )
     assert r.status_code == 200, r.text
 
     row = await s.repo.get_meeting(mid)

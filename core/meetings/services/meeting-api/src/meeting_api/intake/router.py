@@ -168,9 +168,7 @@ class _IntakeRoute(APIRoute):
                     fields={"path": request.url.path, "error": type(exc).__name__},
                 )
                 result = "unavailable"
-                return _error(
-                    IntakeError(result, "storage is unavailable; retry")
-                )
+                return _error(IntakeError(result, "storage is unavailable; retry"))
             finally:
                 intake_request(
                     label,

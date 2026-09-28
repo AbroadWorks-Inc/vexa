@@ -769,7 +769,9 @@ async def _callback(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         for event in events:
-            r = await client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
+            r = await client.post(
+                "/bots/internal/callback/lifecycle", headers=BOT, json=event
+            )
             assert r.status_code == 200, r.text
 
 
