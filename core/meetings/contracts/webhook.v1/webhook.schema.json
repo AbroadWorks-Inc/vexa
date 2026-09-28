@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://vexa.ai/schemas/webhook.v1",
   "title": "webhook.v1",
-  "description": "The outbound webhook wire shape: the delivery envelope POSTed to a subscriber's URL, plus the signed-header scheme that authenticates it. Derived from the parent meeting-api's real envelope (webhook_delivery.build_envelope) + header builder (build_headers). Both the system hooks (billing/analytics) and per-client hooks (user-configured webhook_url) share this shape.",
+  "description": "The outbound webhook wire shape: the delivery envelope POSTed to a subscriber's URL, plus the signed-header scheme that authenticates it. Two producers share it. Subscription deliveries (the /v2/webhooks subscribers, §2.7) are MeetingEvent and TestEvent envelopes: meeting-api's status writer stores each event in webhook_outbox (intake/status.py, intake/outbox.py) and webhooks/sender.py posts the stored body, signed under the subscriber's secret. Legacy deliveries (the system hook and a meeting's per-user webhook_url) are built by lifecycle/webhook.py and posted by webhooks/delivery.py. Every delivery of either producer is an Envelope.",
   "$defs": {
     "EventType": {
       "description": "The webhook event types this contract delivers. meeting.* mirror the meeting FSM (lifecycle.v1) plus the intake.v1 entry lifecycle (scheduled/updated/removed/waiting_for_room/not_sent); recording.* / transcription.* are post-meeting artifacts; export.* is the exporter's handoff result; webhook.test is an on-demand subscriber test send; bot.retry is reserved for the lobby-timeout retry, not yet emitted.",
@@ -25,14 +25,14 @@
       ]
     },
     "Envelope": {
-      "description": "The standardized webhook payload envelope. Every delivery — system or per-client — is exactly this shape. The body POSTed to the subscriber is `JSON.stringify(Envelope)`; the HMAC signs `\"<timestamp>.\" + body`.",
+      "description": "The outer shape of every delivery, subscription or legacy. The body POSTed to the subscriber is the serialised Envelope; the HMAC signs `\"<timestamp>.\" + body`. A subscription delivery is also a MeetingEvent or a TestEvent, which pin its data. A legacy delivery's data is `{ meeting, status_change? }`, with the legacy meeting block (integer id plus uuid).",
       "type": "object",
       "additionalProperties": false,
       "required": ["event_id", "event_type", "api_version", "created_at", "data"],
       "properties": {
         "event_id": {
           "type": "string",
-          "description": "stable identity of the logical event (`evt_<hex>`); delivery is at-least-once and the receiver dedupes on this key. The SAME logical event carries the SAME event_id across every (re)delivery — see the webhook.v1 README 'Delivery semantics'."
+          "description": "stable identity of the logical event; delivery is at-least-once and the receiver dedupes on this key. The SAME logical event carries the SAME event_id across every (re)delivery. Subscription: `evt_` + sha256 hex of `<meeting id>|<event_type>|<sequence>` (webhook.test: `evt_test_` + 32 random hex). Legacy: `evt_` + the first 32 hex of sha256 of `<connection_id>|<event_type>|<new_status>`. See the webhook.v1 README 'Delivery semantics'."
         },
         "event_type": { "$ref": "#/$defs/EventType" },
         "api_version": {
@@ -46,12 +46,81 @@
         },
         "data": {
           "type": "object",
-          "description": "event-type-specific body. For meeting.* events this is `{ meeting: {...}, status_change?: {...} }`; kept open (no additionalProperties lock) so post-meeting artifact events can carry their own shapes."
+          "description": "event-type-specific body, kept open here. Subscription deliveries: see MeetingEvent and TestEvent. Legacy deliveries: `{ meeting: {...}, status_change?: {...} }`."
+        }
+      }
+    },
+    "Change": {
+      "description": "The status step a subscription meeting event records (§2.7). `from` is null on a meeting's first event (it came into being in `to`); `reason` is the step's reason when it has one; `at` is the whole-second UTC instant of the step.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "reason", "at"],
+      "properties": {
+        "from": { "type": ["string", "null"] },
+        "to": { "type": "string" },
+        "reason": { "type": ["string", "null"] },
+        "at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "MeetingEvent": {
+      "description": "A subscription delivery of a meeting event (§2.7): every event type except webhook.test. One event per meeting step, stored by the status writer (meeting_api.intake.status) in webhook_outbox and posted as stored by webhooks/sender.py. data.meeting is the intake.v1 Meeting (the §2.4 projection: UUID id, sequence). data.change is present on every status change and on meeting.scheduled. data.merged_into is present only on a meeting.removed that merged the meeting into a live one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "event_type", "api_version", "created_at", "data"],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^evt_[0-9a-f]{64}$",
+          "description": "`evt_` + sha256 hex of `<data.meeting.id>|<event_type>|<data.meeting.sequence>`: the same on every redelivery, distinct for every event of a meeting"
+        },
+        "event_type": { "allOf": [{ "$ref": "#/$defs/EventType" }, { "not": { "const": "webhook.test" } }] },
+        "api_version": { "const": "2026-09-25" },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "whole-second UTC instant the event was recorded"
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["meeting"],
+          "properties": {
+            "meeting": { "$ref": "https://vexa.ai/schemas/intake.v1#/$defs/Meeting" },
+            "change": { "$ref": "#/$defs/Change" },
+            "merged_into": {
+              "type": "string",
+              "description": "the id (UUID) of the live meeting this one was merged into"
+            }
+          }
+        }
+      }
+    },
+    "TestEvent": {
+      "description": "A subscription test send (§2.7, POST /v2/webhooks/{id}/test): stored by meeting_api.intake.outbox.PostgresWebhookTests and posted, signed, to that one subscriber. It carries no meeting.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "event_type", "api_version", "created_at", "data"],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^evt_test_[0-9a-f]{32}$",
+          "description": "`evt_test_` + 32 random hex, one per test send"
+        },
+        "event_type": { "const": "webhook.test" },
+        "api_version": { "const": "2026-09-25" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["subscription_id"],
+          "properties": {
+            "subscription_id": { "type": "string", "format": "uuid" }
+          }
         }
       }
     },
     "SignatureHeaders": {
-      "description": "The headers a verifier recomputes to authenticate a delivery. The signature is `sha256=<hex(hmac_sha256(secret, \"<X-Webhook-Timestamp>.\" + raw_body))>`. X-Webhook-Timestamp bounds replay. Present only when the subscriber configured a webhook_secret.",
+      "description": "The headers a verifier recomputes to authenticate a delivery. The signature is `sha256=<hex(hmac_sha256(secret, \"<X-Webhook-Timestamp>.\" + raw_body))>`. X-Webhook-Timestamp bounds replay. Subscription deliveries always carry them and never carry Authorization. Legacy deliveries carry them only when the per-user webhook_secret is set, with Authorization alongside.",
       "type": "object",
       "required": ["X-Webhook-Signature", "X-Webhook-Timestamp", "Content-Type"],
       "properties": {
@@ -69,11 +138,11 @@
         "X-Webhook-Signature-Previous": {
           "type": "string",
           "pattern": "^sha256=[0-9a-f]{64}$",
-          "description": "sha256=<hmac under the OLD secret> — present only during the 24h window after a rotate-secret call; a receiver accepts a match on either signature header"
+          "description": "sha256=<hmac under the previous secret>: subscription deliveries only, during the 24h after a rotate-secret call; a receiver accepts a match on either signature header"
         },
         "Authorization": {
           "type": "string",
-          "description": "Bearer <secret> — legacy shared-secret auth, carried alongside the HMAC for back-compat"
+          "description": "Bearer <secret>: legacy per-user deliveries only, alongside the HMAC. Subscription deliveries never carry it."
         }
       }
     }

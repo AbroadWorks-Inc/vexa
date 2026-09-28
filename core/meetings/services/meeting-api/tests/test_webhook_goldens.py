@@ -1,22 +1,35 @@
-"""The ``webhook.v1`` envelope goldens are the real builders' output (§1.8, §2.7).
+"""The ``webhook.v1`` goldens are the real emitters' output (§1.8, §2.7).
 
-``Envelope.meeting-completed.json`` and ``Envelope.bot-failed.json`` are what the lifecycle callback
-sends the legacy system and per-user URLs: ``lifecycle.webhook.build_typed_envelope`` around
-``app.legacy_meeting_projection`` of the row the repo's status write returns (the row plus the
-meeting's ``uuid``, ``entries``, ``outcome`` and ``sequence`` from the one meeting projection). Each
-test builds its envelope from fixed inputs and compares it with the golden file, so a builder change
-shows up here. The goldens are never edited by hand: to regenerate them after an intended change,
-run this module with ``WEBHOOK_V1_GOLDENS_WRITE=1``.
+Subscription deliveries (``MeetingEvent.*``, ``TestEvent.*``, ``SignatureHeaders.subscription`` and
+``SignatureHeaders.rotated``): the envelopes are the outbox rows the status writer
+(``intake.status.write_status`` / ``write_event``) and the test writer
+(``intake.outbox.PostgresWebhookTests.queue_test``) store, run over an in-memory session at a fixed
+instant; the headers are ``webhooks.signing.signed_headers`` over the stored body of
+``MeetingEvent.meeting-completed``. A golden re-serialised compactly with sorted keys is exactly the
+stored body, so the headers verify against it.
+
+Legacy deliveries (``Envelope.meeting-completed`` and ``Envelope.bot-failed``): what the lifecycle
+callback sends the legacy system and per-user URLs: ``lifecycle.webhook.build_typed_envelope``
+around ``app.legacy_meeting_projection`` of the row the repo's status write returns (the row plus
+the meeting's ``uuid``, ``entries``, ``outcome`` and ``sequence`` from the one meeting projection).
+
+Each test builds its payload from fixed inputs and compares it with the golden file, so an emitter
+change shows up here. The goldens are never edited by hand: to regenerate them after an intended
+change, run this module with ``WEBHOOK_V1_GOLDENS_WRITE=1``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import pytest
+from referencing import Registry, Resource
 
 from meeting_api.app import legacy_meeting_projection
 from meeting_api.bot_spawn.adapters import _with_projection
@@ -28,10 +41,10 @@ UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
 
 
 def _golden_path(name: str) -> Path:
-    rel = Path("meetings") / "contracts" / "webhook.v1" / "golden" / f"{name}.json"
+    rel = Path("meetings") / "contracts" / "webhook.v1" / "golden"
     for parent in Path(__file__).resolve().parents:
-        if (parent / rel).is_file():
-            return parent / rel
+        if (parent / rel).is_dir():
+            return parent / rel / f"{name}.json"
     raise FileNotFoundError(rel)
 
 
@@ -173,3 +186,321 @@ def test_the_legacy_meeting_block_carries_the_meetings_uuid_entries_outcome_and_
     assert meeting["sequence"] == 9
     assert meeting["outcome"] is None
     assert [e["external_id"] for e in meeting["entries"]] == ["google:3n5kq8example"]
+
+
+# ── subscription deliveries (§2.7) ───────────────────────────────────────────────────────────
+
+NOW = datetime(2026, 9, 29, 5, 12, 41, 250000, tzinfo=timezone.utc)
+MEETING_ID = 11367
+SUBSCRIPTION_ID = "2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f"
+TEST_NONCE = uuid.UUID("0c4d8e2f-6a1b-4c3d-9e8f-7a6b5c4d3e2f")
+SECRET = "whsec_demo_secret"
+PREVIOUS_SECRET = "whsec_demo_previous_secret"
+TIMESTAMP = 1790658761
+
+
+@pytest.fixture
+def orm():
+    pytest.importorskip("sqlalchemy", reason="the ORM models need SQLAlchemy")
+    from meeting_api.sessions import models
+
+    return models
+
+
+class _Rows:
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def scalars(self) -> "_Rows":
+        return self
+
+    def all(self) -> list:
+        return list(self._rows)
+
+    def scalar_one_or_none(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+
+class _Session:
+    """The part of an ``AsyncSession`` the status writer and the test writer use: one meeting, its
+    aw-state row and entries, one owned subscription, and every row added."""
+
+    def __init__(
+        self, orm, *, meeting=None, aw=None, entries=(), subscription=None
+    ) -> None:
+        self._orm = orm
+        self._rows = {orm.Meeting: meeting, orm.MeetingAwState: aw}
+        self._entries = list(entries)
+        self._subscription = subscription
+        self.added: list = []
+
+    async def __aenter__(self) -> "_Session":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def get(self, cls, ident, **_: Any) -> Any:
+        return self._rows.get(cls)
+
+    async def execute(self, stmt) -> _Rows:
+        entity = stmt.column_descriptions[0]["entity"]
+        if entity is self._orm.MeetingEntry:
+            return _Rows(self._entries)
+        if entity is self._orm.WebhookSubscription:
+            return _Rows([] if self._subscription is None else [self._subscription])
+        raise AssertionError(f"unexpected statement: {stmt}")
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+        if isinstance(obj, self._orm.MeetingAwState):
+            self._rows[self._orm.MeetingAwState] = obj
+
+    async def flush(self) -> None:
+        pass
+
+    async def commit(self) -> None:
+        pass
+
+    def body(self) -> str:
+        """The one outbox row's ``payload_text``: the exact body a subscriber receives."""
+        (row,) = [o for o in self.added if isinstance(o, self._orm.WebhookOutbox)]
+        return row.payload_text
+
+
+def _meeting(orm, status: str, **data: Any):
+    return orm.Meeting(
+        id=MEETING_ID,
+        uuid=uuid.UUID(UUID),
+        user_id=7,
+        platform="google_meet",
+        platform_specific_id="abc-defg-hij",
+        status=status,
+        data={
+            "title": "Weekly sync",
+            "constructed_meeting_url": "https://meet.google.com/abc-defg-hij",
+            "scheduled_at": "2026-09-29T04:30:00Z",
+            **data,
+        },
+        start_time=None,
+        end_time=None,
+        created_at=datetime(2026, 9, 29, 4, 20, 5),
+    )
+
+
+def _aw(orm, event_seq: int):
+    return orm.MeetingAwState(
+        meeting_id=MEETING_ID,
+        event_seq=event_seq,
+        scheduled_end_at=datetime(2026, 9, 29, 5, 0, tzinfo=timezone.utc),
+        time_zone="Asia/Kolkata",
+    )
+
+
+def _entries(orm) -> list:
+    return [
+        orm.MeetingEntry(
+            id=1,
+            user_id=7,
+            source_user="a@abroadworks.com",
+            external_id="google:3n5kq8example",
+            meeting_id=MEETING_ID,
+            meeting_url="https://meet.google.com/abc-defg-hij",
+            platform="google_meet",
+            native_meeting_id="abc-defg-hij",
+            start_at=datetime(2026, 9, 29, 4, 30, tzinfo=timezone.utc),
+            end_at=datetime(2026, 9, 29, 5, 0, tzinfo=timezone.utc),
+            series_id="google:series-weekly",
+            attendees=["a@abroadworks.com", "b@example.com"],
+            metadata_={"crm_id": "42"},
+            content_hash="h" * 64,
+            state="active",
+        )
+    ]
+
+
+@pytest.fixture
+def fixed(monkeypatch):
+    from meeting_api.intake import outbox, status
+
+    monkeypatch.setattr(status, "_now", lambda: NOW)
+    monkeypatch.setattr(outbox.uuid, "uuid4", lambda: TEST_NONCE)
+    monkeypatch.delenv("AUTO_JOIN_LEAD_S", raising=False)
+
+
+async def _subscription_completed(orm) -> str:
+    from meeting_api.intake.status import write_status
+
+    db = _Session(
+        orm,
+        meeting=_meeting(
+            orm, "stopping", auto_join_last_attempt="2026-09-29T04:25:00Z"
+        ),
+        aw=_aw(orm, 8),
+        entries=_entries(orm),
+    )
+    await write_status(
+        db,
+        MEETING_ID,
+        "completed",
+        expected_from={"stopping"},
+        data_patch={"completion_reason": "stopped"},
+        change_reason="stopped",
+    )
+    return db.body()
+
+
+async def _subscription_bot_failed(orm) -> str:
+    from meeting_api.intake.status import write_status
+
+    db = _Session(
+        orm,
+        meeting=_meeting(
+            orm, "awaiting_admission", auto_join_last_attempt="2026-09-29T04:25:00Z"
+        ),
+        aw=_aw(orm, 3),
+        entries=_entries(orm),
+    )
+    await write_status(
+        db,
+        MEETING_ID,
+        "failed",
+        expected_from={"awaiting_admission"},
+        data_patch={
+            "completion_reason": "awaiting_admission_rejected",
+            "failure_stage": "awaiting_admission",
+        },
+        change_reason="host denied admission",
+    )
+    return db.body()
+
+
+async def _subscription_updated(orm) -> str:
+    from meeting_api.intake.status import write_event
+
+    db = _Session(
+        orm, meeting=_meeting(orm, "scheduled"), aw=_aw(orm, 1), entries=_entries(orm)
+    )
+    await write_event(db, MEETING_ID, "meeting.updated")
+    return db.body()
+
+
+async def _subscription_test(orm) -> str:
+    from meeting_api.intake.outbox import PostgresWebhookTests
+
+    db = _Session(orm, subscription=uuid.UUID(SUBSCRIPTION_ID))
+    await PostgresWebhookTests(lambda: db, clock=lambda: NOW).queue_test(
+        7, SUBSCRIPTION_ID
+    )
+    return db.body()
+
+
+SUBSCRIPTION_GOLDENS = [
+    ("MeetingEvent.meeting-completed", _subscription_completed),
+    ("MeetingEvent.bot-failed", _subscription_bot_failed),
+    ("MeetingEvent.meeting-updated", _subscription_updated),
+    ("TestEvent.webhook-test", _subscription_test),
+]
+
+
+def _check(name: str, built: Any) -> None:
+    path = _golden_path(name)
+    if os.getenv("WEBHOOK_V1_GOLDENS_WRITE") == "1":
+        path.write_text(json.dumps(built, indent=2) + "\n")
+    assert json.loads(path.read_text()) == built
+
+
+def _compact(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+@pytest.mark.parametrize("name,build", SUBSCRIPTION_GOLDENS)
+async def test_the_subscription_golden_is_the_stored_body(orm, fixed, name, build):
+    body = await build(orm)
+    _check(name, json.loads(body))
+    assert _compact(json.loads(_golden_path(name).read_text())) == body
+
+
+def _signed(previous: bool) -> dict[str, str]:
+    from meeting_api.webhooks.signing import signed_headers
+
+    body = _compact(
+        json.loads(_golden_path("MeetingEvent.meeting-completed").read_text())
+    )
+    return signed_headers(
+        body.encode("utf-8"),
+        secret=SECRET,
+        timestamp=TIMESTAMP,
+        previous_secret=PREVIOUS_SECRET if previous else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "name,previous",
+    [("SignatureHeaders.subscription", False), ("SignatureHeaders.rotated", True)],
+)
+def test_the_subscription_header_golden_is_the_signers_output(name, previous):
+    _check(name, _signed(previous))
+
+
+def test_the_subscription_headers_verify_and_carry_no_authorization():
+    from meeting_api.webhooks.delivery import sign_payload, verify_signature
+
+    body = _compact(
+        json.loads(_golden_path("MeetingEvent.meeting-completed").read_text())
+    ).encode("utf-8")
+    rotated = json.loads(_golden_path("SignatureHeaders.rotated").read_text())
+    assert "Authorization" not in rotated
+    assert verify_signature(body, rotated, SECRET)
+    assert rotated["X-Webhook-Signature-Previous"] == sign_payload(
+        body, PREVIOUS_SECRET, rotated["X-Webhook-Timestamp"]
+    )
+
+
+def _contracts() -> Path:
+    return _golden_path("MeetingEvent.meeting-completed").parents[2]
+
+
+def _validator(shape: str) -> jsonschema.Draft202012Validator:
+    registry = Registry()
+    for rel in ("webhook.v1/webhook.schema.json", "intake.v1/intake.schema.json"):
+        schema = json.loads((_contracts() / rel).read_text())
+        registry = registry.with_resource(schema["$id"], Resource.from_contents(schema))
+    ref = (
+        "https://vexa.ai/schemas/intake.v1#/$defs/Meeting"
+        if shape == "Meeting"
+        else f"https://vexa.ai/schemas/webhook.v1#/$defs/{shape}"
+    )
+    return jsonschema.Draft202012Validator({"$ref": ref}, registry=registry)
+
+
+@pytest.mark.parametrize("name", [n for n, _ in SUBSCRIPTION_GOLDENS])
+def test_the_subscription_golden_conforms(name):
+    golden = json.loads(_golden_path(name).read_text())
+    _validator(name.split(".")[0]).validate(golden)
+    if name.startswith("MeetingEvent."):
+        _validator("Meeting").validate(golden["data"]["meeting"])
+
+
+def test_the_subscription_event_is_one_typed_event_with_the_change_and_the_v2_id():
+    from meeting_api.intake.status import derive_event_id_v2
+
+    completed = json.loads(_golden_path("MeetingEvent.meeting-completed").read_text())
+
+    assert completed["event_type"] == "meeting.completed"
+    assert completed["event_id"] == derive_event_id_v2(UUID, "meeting.completed", 9)
+    assert completed["data"]["change"] == {
+        "from": "stopping",
+        "to": "completed",
+        "reason": "stopped",
+        "at": "2026-09-29T05:12:41Z",
+    }
+    assert completed["data"]["meeting"]["id"] == UUID
+    assert completed["data"]["meeting"]["sequence"] == 9
+    assert "status_change" not in completed["data"]
+
+
+def test_the_legacy_goldens_do_not_satisfy_the_subscription_shape():
+    """The two producers differ on the wire: a legacy envelope is not a subscription event."""
+    legacy = json.loads(_golden_path("Envelope.meeting-completed").read_text())
+    assert not _validator("MeetingEvent").is_valid(legacy)

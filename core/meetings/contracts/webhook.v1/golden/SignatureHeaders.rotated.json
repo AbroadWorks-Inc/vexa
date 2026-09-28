@@ -1,7 +1,6 @@
 {
   "Content-Type": "application/json",
-  "Authorization": "Bearer whsec_demo_secret",
-  "X-Webhook-Signature": "sha256=3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
-  "X-Webhook-Signature-Previous": "sha256=5a230f9c9d8d836ebca17c32d85c7255eba931dba0aa944d45871aac333d032c",
-  "X-Webhook-Timestamp": "1771401720"
+  "X-Webhook-Timestamp": "1790658761",
+  "X-Webhook-Signature": "sha256=d4b79a595be48b0769c0e9a685672032fc9bb64275ae2ee05ec9ce237aeb98a4",
+  "X-Webhook-Signature-Previous": "sha256=aa4f779695565cf870fb62047fb5a3c068997ce06b54e0a92ea85de343975907"
 }

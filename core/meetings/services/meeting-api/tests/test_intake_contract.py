@@ -40,7 +40,11 @@ _WEBHOOK_GOLDEN = _CONTRACTS / "webhook.v1" / "golden"
 
 def _conforms(schema_path: Path, shape: str, obj: object) -> None:
     schema = json.loads(schema_path.read_text())
-    registry = Registry().with_resource(schema["$id"], Resource.from_contents(schema))
+    # webhook.v1's MeetingEvent references intake.v1's Meeting by $id, so both are registered.
+    registry = Registry()
+    for path in (_INTAKE_SCHEMA, _WEBHOOK_SCHEMA):
+        loaded = json.loads(path.read_text())
+        registry = registry.with_resource(loaded["$id"], Resource.from_contents(loaded))
     jsonschema.Draft202012Validator(
         {"$ref": f"{schema['$id']}#/$defs/{shape}"}, registry=registry
     ).validate(obj)
