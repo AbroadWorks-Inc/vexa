@@ -714,7 +714,7 @@ class SqlAlchemyMeetingRepo:
         await db.refresh(target)
         return _row_to_dict(target)
 
-    async def list_due_meetings(self, now, lead_s) -> list[dict]:
+    async def list_due_meetings(self, now, lead_s, *, after=None, limit=None) -> list[dict]:
         """The ``scheduled`` rows with a joinable link whose meeting time
         (``meeting_event_time``) is at or before ``now + lead_s`` — the auto-join sweep's
         candidates (§1.5), read through the partial index ``ix_meeting_scheduled_due``, so a
@@ -722,36 +722,44 @@ class SqlAlchemyMeetingRepo:
         cached generic plan miss the index's predicate. Each row carries its
         ``meeting_aw_state.scheduled_end_at`` / ``waiting_for_room_sent_at`` and ``has_entries``
         (a ``meeting_entries`` row points at it); the toggle/window/backoff filtering is the
-        sweep's pure ``due_rows``."""
+        sweep's pure ``due_rows``. Each row carries its ``event_time`` too: the read is one page of
+        ``limit`` rows in (meeting time, id) order after ``after``, such a pair (§6.9 F-I)."""
         from datetime import timedelta
 
-        from sqlalchemy import exists, func, select, text
+        from sqlalchemy import exists, func, select, text, tuple_
 
         from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
 
         event_time = func.meeting_event_time(Meeting.data, Meeting.start_time, Meeting.created_at)
         due_by = (now + timedelta(seconds=lead_s)).astimezone(timezone.utc).replace(tzinfo=None)
+        stmt = (
+            select(
+                Meeting,
+                MeetingAwState.scheduled_end_at,
+                MeetingAwState.waiting_for_room_sent_at,
+                exists().where(MeetingEntry.meeting_id == Meeting.id).label("has_entries"),
+                event_time.label("event_time"),
+            )
+            .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
+            .where(
+                text("meetings.status = 'scheduled'"),
+                event_time <= due_by,
+                Meeting.platform_specific_id.isnot(None),
+                Meeting.platform != "unknown",
+            )
+            .order_by(event_time, Meeting.id)
+        )
+        if after is not None:
+            stmt = stmt.where(tuple_(event_time, Meeting.id) > tuple_(*after))
+        if limit is not None:
+            stmt = stmt.limit(limit)
         async with self._session_factory() as db:
-            rows = (await db.execute(
-                select(
-                    Meeting,
-                    MeetingAwState.scheduled_end_at,
-                    MeetingAwState.waiting_for_room_sent_at,
-                    exists().where(MeetingEntry.meeting_id == Meeting.id).label("has_entries"),
-                )
-                .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
-                .where(
-                    text("meetings.status = 'scheduled'"),
-                    event_time <= due_by,
-                    Meeting.platform_specific_id.isnot(None),
-                    Meeting.platform != "unknown",
-                )
-                .order_by(event_time, Meeting.id)
-            )).all()
+            rows = (await db.execute(stmt)).all()
             return [
                 {**_row_to_dict(m), "scheduled_end_at": _iso_utc(end),
-                 "waiting_for_room_sent_at": _iso_utc(waiting), "has_entries": bool(managed)}
-                for m, end, waiting, managed in rows
+                 "waiting_for_room_sent_at": _iso_utc(waiting), "has_entries": bool(managed),
+                 "event_time": at}
+                for m, end, waiting, managed, at in rows
             ]
 
     async def list_live_meetings(self) -> list[dict]:

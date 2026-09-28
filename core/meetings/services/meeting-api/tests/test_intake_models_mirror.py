@@ -38,6 +38,7 @@ MIRRORED_TABLES = (
     "webhook_outbox",
     "webhook_deliveries",
     "webhook_delivery_attempts",
+    "sweep_item_failures",
 )
 
 
@@ -121,5 +122,6 @@ def test_no_extra_or_missing_mirrored_tables():
         "webhook_outbox",
         "webhook_deliveries",
         "webhook_delivery_attempts",
+        "sweep_item_failures",
     }
     assert admin_names == set(MIRRORED_TABLES)

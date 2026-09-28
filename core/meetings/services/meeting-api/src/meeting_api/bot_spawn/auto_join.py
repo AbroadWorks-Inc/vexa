@@ -62,6 +62,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any, Awaitable, Callable, Optional
 
 from ..metrics import autojoin_lag
@@ -171,6 +172,10 @@ def due_rows(rows: list[dict], *, now: datetime,
     return due
 
 
+#: The auto-join sweep's name in ``sweep_item_failures`` and ``aw_sweep_items_total``.
+AUTO_JOIN = "auto-join"
+
+
 # Every status in which a bot OWNS the room. A due row whose (user, platform, native) is held by
 # one of these on ANOTHER row must never spawn: two Vexa bots in one meeting is customer-visible
 # and never correct, however the two rows came to exist.
@@ -246,6 +251,8 @@ async def auto_join_tick(
     token_secret: Optional[str] = None,
     redis_url: Optional[str] = None,
     allow_uncapped: bool = False,
+    item_failures=None,
+    batch_size: Optional[int] = None,
 ) -> dict:
     """One sweep: spawn every due scheduled meeting. Returns counters for observability:
     ``{"due": n, "spawned": n, "already": n, "errors": n, "skipped_uncapped": n,
@@ -273,7 +280,13 @@ async def auto_join_tick(
     configured — the unsafe mode is then chosen, never defaulted.
 
     ``publish_status(user_id=…, meeting_id=…, native_id=…, status=…, when=…)`` optionally fans the
-    row's frame to ``u:{user}:meetings`` after an error stamp so the terminal refreshes."""
+    row's frame to ``u:{user}:meetings`` after an error stamp so the terminal refreshes.
+
+    §6.9 F-I: the due read is paged (``batch_size``, else ``SWEEP_BATCH_SIZE``; meeting time then
+    id) and every page is worked in the tick. Each row runs through
+    ``sweeps.item_failures.run_item`` over ``item_failures`` (the entrypoint's Postgres one): a row
+    that raises fails alone, logged with its id and stack and counted, and after
+    ``SWEEP_MAX_ITEM_FAILURES`` it is given up and skipped."""
     from ..intake.ports import Room
     from ..intake.spawn import (
         IDENTITY_UNAVAILABLE,
@@ -282,15 +295,18 @@ async def auto_join_tick(
         spawn_failure,
     )
     from ..intake.sweeps import check_room
+    from ..sweeps.item_failures import (
+        InMemoryItemFailures,
+        run_item,
+        sweep_batch_size,
+        sweep_max_item_failures,
+    )
     from .ports import TranscriptionNotConfigured
 
     now = now or datetime.now(timezone.utc)
     gate = transcribe_gate if transcribe_gate is not None else _production_transcribe_gate
 
-    rows = await repo.list_due_meetings(now, lead_s)
-    due = due_rows(rows, now=now, lead_s=lead_s, grace_s=grace_s,
-                   retry_backoff_s=retry_backoff_s)
-    counters = {"due": len(due), "spawned": 0, "already": 0, "errors": 0,
+    counters = {"due": 0, "spawned": 0, "already": 0, "errors": 0,
                 "skipped_uncapped": 0, "skipped_live": 0, "stopped": 0}
     # Duplicate-dispatch guard for entry-less rows (defense in depth behind the spawn's dedup): a
     # bot already owning this (user, platform, native) on a DIFFERENT row means the meeting is
@@ -357,21 +373,23 @@ async def auto_join_tick(
         else:
             await _stamp_error(row, message)
 
-    for row in due:
+    async def _one(row: dict) -> None:
+        """One due row: the link check, the gates, then the exact-row spawn."""
+        nonlocal uncapped_warned
         user_id = row["user_id"]
         if row.get("has_entries"):
             room = Room(row["platform"], row["native_meeting_id"])
             check = await check_room(store, user_id, row["id"], room, publisher=publisher)
             if check.kind == "gone":
-                continue
+                return
             if check.kind == "waiting":
                 counters["skipped_live"] += 1
-                continue
+                return
             if check.kind == "merge":
                 assert check.live_id is not None
                 if await intake.merge_into_live(user_id, row["id"], check.live_id):
                     counters["already"] += 1
-                continue
+                return
         else:
             holder = live.get((user_id, row.get("platform"), row.get("native_meeting_id")))
             if holder is not None and holder != row.get("id"):
@@ -385,11 +403,11 @@ async def auto_join_tick(
                     f"second bot never joins",
                     counter="skipped_live", event="auto_join_skipped_live",
                 )
-                continue
+                return
         gate_error = gate()
         if gate_error:
             await _failed(row, *spawn_failure(TranscriptionNotConfigured(gate_error)))
-            continue
+            return
 
         if fetch_bot_context is None:
             # No admin edge configured → the per-user cap is unresolvable. Fail closed: refuse to
@@ -406,12 +424,12 @@ async def auto_join_tick(
                         fields={"reason": "no ADMIN_API_URL/INTERNAL_API_SECRET — per-user cap "
                                 "unresolvable; refusing uncapped spawn. Set AUTO_JOIN_ALLOW_UNCAPPED=1 "
                                 "to opt into uncapped self-host spawns."})
-                continue
+                return
         elif await cached_context(user_id) is None:
             # identity configured but unreachable — skip this tick rather than spawn uncapped
             if row.get("has_entries"):
                 await _send_failed(row, "internal_error", IDENTITY_UNAVAILABLE)
-            continue
+            return
 
         data = row.get("data") if isinstance(row.get("data"), dict) else {}
         # Record the ATTEMPT before making it. Written first so it survives everything the attempt
@@ -429,11 +447,11 @@ async def auto_join_tick(
             # lock and sent nothing. The next tick decides it again.
             log_event("auto_join_not_due", audience="system", span="meetings.auto_join",
                       user_id=user_id, meeting_id=str(row["id"]))
-            continue
+            return
         if outcome.result == "already_live":
             # a manual "Send bot now" (or a racing sweep) already claimed it — success, not an error
             counters["already"] += 1
-            continue
+            return
         if outcome.result == "failed" and outcome.code == "meeting_stopped":
             # The user stopped it between this tick's read and the spawn fence. Not an error and not
             # a backoff-worthy failure: the row is already terminalized as stopped by the fence, and
@@ -442,17 +460,17 @@ async def auto_join_tick(
             log_event("auto_join_stopped", audience="user", span="meetings.auto_join",
                       user_id=user_id, meeting_id=str(row["id"]),
                       fields={"reason": "the user stopped this meeting while the bot was starting"})
-            continue
+            return
         if outcome.result == "failed":
             current = await repo.get_meeting(row["id"])
             if current is None or current.get("status") != "scheduled":
                 # The claim went through and the spawn failed after it: the spawn port already
                 # ended the meeting ``not_sent`` with the code and message.
                 counters["errors"] += 1
-                continue
+                return
             await _failed(row, outcome.code or "internal_error",
                           outcome.message or "bot workload failed to start")
-            continue
+            return
         counters["spawned"] += 1
         scheduled_at = _parse_iso(data.get("scheduled_at")) if isinstance(data, dict) else None
         if scheduled_at is not None:
@@ -465,5 +483,22 @@ async def auto_join_tick(
         log_event("auto_join_spawned", audience="user", span="meetings.auto_join",
                   user_id=user_id, meeting_id=str(row["id"]),
                   fields={"platform": row["platform"], "native": row["native_meeting_id"]})
+
+    limit = batch_size or sweep_batch_size()
+    failures = item_failures or InMemoryItemFailures(max_failures=sweep_max_item_failures())
+    after = None
+    while True:
+        rows = await repo.list_due_meetings(now, lead_s, after=after, limit=limit)
+        due = due_rows(rows, now=now, lead_s=lead_s, grace_s=grace_s,
+                       retry_backoff_s=retry_backoff_s)
+        counters["due"] += len(due)
+        skip = await failures.given_up(AUTO_JOIN, [str(row["id"]) for row in due])
+        for row in due:
+            if str(row["id"]) not in skip:
+                await run_item(failures, AUTO_JOIN, str(row["id"]),
+                               partial(_one, row), user_id=row["user_id"])
+        if len(rows) < limit:
+            break
+        after = (rows[-1]["event_time"], rows[-1]["id"])
 
     return counters

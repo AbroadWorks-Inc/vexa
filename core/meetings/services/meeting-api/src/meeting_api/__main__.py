@@ -602,6 +602,22 @@ def _attach_background_loops(
         intake_store, intake_service = intake.store, intake.service
         scheduler_publisher = intake.publisher
 
+    # §6.9 F-I: the intake sweeps read in pages of SWEEP_BATCH_SIZE, and an item that fails
+    # SWEEP_MAX_ITEM_FAILURES times (counted in sweep_item_failures, shared by the replicas) is
+    # given up. Postgres only, like the sweeps that use it.
+    from .sweeps.item_failures import (
+        PostgresItemFailures,
+        sweep_batch_size,
+        sweep_max_item_failures,
+    )
+
+    sweep_batch = sweep_batch_size()
+    item_failures = (
+        PostgresItemFailures(session_factory, max_failures=sweep_max_item_failures())
+        if session_factory is not None
+        else None
+    )
+
     async def _auto_join_loop() -> None:
         if intake_store is None or not hasattr(meeting_repo, "list_due_meetings"):
             return
@@ -631,6 +647,8 @@ def _attach_background_loops(
                 token_secret=os.getenv("ADMIN_TOKEN") or None,
                 redis_url=os.getenv("REDIS_URL"),
                 allow_uncapped=auto_join_allow_uncapped,
+                item_failures=item_failures,
+                batch_size=sweep_batch,
             )
 
         while True:
@@ -661,6 +679,8 @@ def _attach_background_loops(
                 intake_store,
                 publisher=scheduler_publisher,
                 now=datetime.now(timezone.utc),
+                failures=item_failures,
+                batch_size=sweep_batch,
             )
 
         while True:
@@ -706,7 +726,12 @@ def _attach_background_loops(
             return
         from .intake.outbox import OutboxPublisher
 
-        publisher = OutboxPublisher(session_factory, webhook_subscriptions)
+        publisher = OutboxPublisher(
+            session_factory,
+            webhook_subscriptions,
+            batch_size=sweep_batch,
+            failures=item_failures,
+        )
 
         async def _tick():
             await publisher.run_once()

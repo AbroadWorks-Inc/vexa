@@ -160,13 +160,21 @@ the outer bound. `JOIN_NOW_ADOPT_AHEAD_S` is only the look-ahead a pasted link a
 `BOT_SEND_RETRY_BACKOFF_S`, all declared in `config.v1.json`.
 
 `OutboxPublisher` (`outbox.py`, §1.8) turns unpublished `webhook_outbox` rows into
-`webhook_deliveries` rows: single-flight, every `WEBHOOK_PUBLISH_INTERVAL_S`, up to 500 rows oldest
-first. Each account's subscriptions come from admin-api's internal read (cached 30 s; an account
-whose read fails waits for the next tick). In one transaction per batch it re-reads
+`webhook_deliveries` rows: single-flight, every `WEBHOOK_PUBLISH_INTERVAL_S`, a page of
+`SWEEP_BATCH_SIZE` rows at a time, oldest first, every page each tick. Each account's subscriptions
+come from admin-api's internal read (cached 30 s; an account whose read fails waits for the next
+tick). In one transaction per page it re-reads
 `webhook_subscriptions.active` under `FOR SHARE`, inserts one `pending` delivery per matching active
 subscriber (`ON CONFLICT (event_id, subscription_id) DO NOTHING`) and sets `published_at`, so a
 crash before the commit is redone without duplicates and a concurrent pause in admin-api is either
-seen or cancels what was inserted. `webhook.test` rows are never fanned out.
+seen or cancels what was inserted. A page whose transaction fails is published row by row, and a
+row that keeps failing is given up (below). `webhook.test` rows are never fanned out.
+
+The three intake sweeps (the auto-join tick, the not-sent sweep, the publisher) are bounded the same
+way (§6.9 F-I, `sweeps/item_failures.py`): pages of at most `SWEEP_BATCH_SIZE` in a stable order,
+and each item through `run_item`, so one item's failure is logged with its id and stack, counted in
+`aw_sweep_items_total{sweep,result}`, and never stops the rest; after `SWEEP_MAX_ITEM_FAILURES`
+(counted per sweep in `sweep_item_failures`, shared by the replicas) the item is given up.
 `PostgresWebhookTests` backs `POST /internal/webhooks/test` (the route is
 `webhooks/internal_router.py`, internal secret): one `webhook.test` outbox row (sequence 0, `evt_test_<uuid4 hex>`, already published) and
 one delivery for that subscription, in one transaction; the reply is `{event_id}`.

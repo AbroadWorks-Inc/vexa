@@ -62,6 +62,7 @@ NEW_TABLE_CLASSES = [
     admin_models.WebhookOutbox,
     admin_models.WebhookDelivery,
     admin_models.WebhookDeliveryAttempt,
+    admin_models.SweepItemFailure,
 ]
 
 LIVE_STATUSES = (
@@ -230,6 +231,7 @@ async def test_ensure_schema_converges_cleanly_on_an_empty_db(intake_pg_engine):
         "webhook_outbox",
         "webhook_deliveries",
         "webhook_delivery_attempts",
+        "sweep_item_failures",
     ):
         assert name in names
 

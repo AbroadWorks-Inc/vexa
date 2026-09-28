@@ -299,6 +299,19 @@ class MeetingAwState(Base):  # type: ignore[valid-type,misc]
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class SweepItemFailure(Base):  # type: ignore[valid-type,misc]
+    """One intake sweep's failures of one item (§6.9 F-I, ``sweeps/item_failures.py``): the count,
+    the last error's type, and when the sweep gave the item up (it skips it from then on)."""
+    __tablename__ = "sweep_item_failures"
+
+    sweep = Column(String(64), primary_key=True)
+    item_id = Column(String(80), primary_key=True)
+    failures = Column(Integer, nullable=False, server_default="0")
+    last_error = Column(Text, nullable=True)
+    gave_up_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class WebhookSubscription(Base):  # type: ignore[valid-type,misc]
     """A user's webhook target (§1.2). `secret_enc`/`enc_key_id` are the encrypted-at-rest signing
     secret; `previous_*` carries the prior secret through a rotation window so both signatures

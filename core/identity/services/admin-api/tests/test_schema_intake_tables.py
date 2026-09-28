@@ -322,7 +322,7 @@ def test_webhook_delivery_attempts_indexes():
     ]
 
 
-def test_all_six_tables_registered_on_base_metadata():
+def test_all_seven_tables_registered_on_base_metadata():
     for name in (
         "meeting_entries",
         "meeting_aw_state",
@@ -330,5 +330,14 @@ def test_all_six_tables_registered_on_base_metadata():
         "webhook_outbox",
         "webhook_deliveries",
         "webhook_delivery_attempts",
+        "sweep_item_failures",
     ):
         assert name in Base.metadata.tables
+
+
+def test_sweep_item_failures_is_one_row_per_sweep_and_item():
+    """§6.9 F-I: a sweep's failures of one item, and when it gave the item up."""
+    t = Base.metadata.tables["sweep_item_failures"]
+    assert [c.name for c in t.primary_key.columns] == ["sweep", "item_id"]
+    assert t.c.failures.nullable is False
+    assert t.c.last_error.nullable is True and t.c.gave_up_at.nullable is True

@@ -36,6 +36,7 @@ from meeting_api.intake.sweeps import (
     not_sent_tick,
 )
 from meeting_api.intake.validation import parse_entry
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
 
 UTC = timezone.utc
 USER = 1
@@ -181,6 +182,79 @@ async def test_the_sweeps_uncapped_opt_in_reaches_the_exact_row_spawn():
     assert len(runtime.specs) == 1
 
 
+# ── the tick reads in pages and bounds each row (§6.9 F-I) ─────────────────────────────────
+
+
+async def _paged_tick(repo, runtime, **kw):
+    from intake_builders import send_clock, sweep_intake
+
+    from meeting_api.bot_spawn.auto_join import auto_join_tick
+
+    with send_clock(NOW):
+        return await auto_join_tick(
+            repo,
+            runtime,
+            **sweep_intake(
+                transcribe_gate=lambda: None,
+                now=NOW,
+                token_secret="s",
+                redis_url="redis://r",
+                allow_uncapped=True,
+                **kw,
+            ),
+        )
+
+
+def _seed_due(repo, n: int) -> list[int]:
+    for mid in range(1, n + 1):
+        _seed_repo(repo, mid, at=NOW - timedelta(minutes=n - mid))
+        repo._meetings[mid]["data"]["auto_join"] = True
+    return list(range(1, n + 1))
+
+
+async def test_the_tick_reads_the_due_rows_in_pages_and_sends_every_page():
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    mids = _seed_due(repo, 5)
+    pages: list[tuple] = []
+    read = repo.list_due_meetings
+
+    async def spy(now, lead_s, **page):
+        rows = await read(now, lead_s, **page)
+        pages.append((page["limit"], page["after"] is None, [r["id"] for r in rows]))
+        return rows
+
+    repo.list_due_meetings = spy
+    counters = await _paged_tick(repo, runtime, batch_size=2)
+    assert counters["spawned"] == 5 and counters["due"] == 5
+    assert pages == [(2, True, mids[:2]), (2, False, mids[2:4]), (2, False, mids[4:])]
+    assert len(runtime.specs) == 5
+
+
+async def test_a_poison_row_never_blocks_the_rest_and_is_given_up():
+    """One row whose tick raises fails alone; after ``SWEEP_MAX_ITEM_FAILURES`` the tick gives
+    it up and never tries it again."""
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    _seed_due(repo, 3)
+    stamp = repo.merge_meeting_data
+    tried: list[int] = []
+
+    async def merge(meeting_id, patch):
+        if meeting_id == 2:
+            tried.append(meeting_id)
+            raise RuntimeError("poison row")
+        await stamp(meeting_id, patch)
+
+    repo.merge_meeting_data = merge
+    failures = InMemoryItemFailures(max_failures=2)
+    counters = await _paged_tick(repo, runtime, item_failures=failures)
+    assert counters["spawned"] == 2
+    assert {repo._meetings[m]["status"] for m in (1, 3)} == {"requested"}
+    await _paged_tick(repo, runtime, item_failures=failures)
+    assert await failures.given_up("auto-join", ["2"]) == {"2"}
+    await _paged_tick(repo, runtime, item_failures=failures)
+    assert tried == [2, 2] and repo._meetings[2]["status"] == "scheduled"
+
+
 # ── the link check (under the link lock) ─────────────────────────────────────────────────────
 
 
@@ -306,9 +380,10 @@ def test_each_not_sent_cause_and_its_exact_message():
     }
 
 
-async def _sweep(h, at: str) -> int:
+async def _sweep(h, at: str, **kw) -> int:
     h.clock.set(at)
-    return await not_sent_tick(h.store, publisher=h.publisher, now=h.clock())
+    kw.setdefault("failures", InMemoryItemFailures(max_failures=5))
+    return await not_sent_tick(h.store, publisher=h.publisher, now=h.clock(), **kw)
 
 
 def _outcome(h, mid):
@@ -465,6 +540,62 @@ async def test_a_failed_send_on_a_meeting_no_longer_scheduled_changes_nothing():
     assert h.store.aw[mid]["send_attempts"] == 0 and h.events(mark) == []
 
 
+async def test_the_not_sent_sweep_reads_in_pages_and_ends_every_page():
+    """§6.9 F-I: the overdue read is paged (``SWEEP_BATCH_SIZE``) in id order, and every page is
+    worked in the same tick."""
+    h = make_harness()
+    mids = [
+        await _put(
+            h,
+            f"e{i}",
+            "2026-09-29T09:00:00Z",
+            "2026-09-29T09:30:00Z",
+            url=f"https://meet.google.com/aaa-bbbb-cc{letter}",
+        )
+        for i, letter in enumerate("abcde")
+    ]
+    reads: list[tuple] = []
+    read = h.store.overdue_meetings
+
+    async def spy(now, **kw):
+        page = await read(now, **kw)
+        reads.append((kw, [v.id for v in page]))
+        return page
+
+    h.store.overdue_meetings = spy
+    assert await _sweep(h, "2026-09-29T09:30:00Z", batch_size=2) == 5
+    assert reads == [
+        ({"after": None, "limit": 2}, mids[:2]),
+        ({"after": mids[1], "limit": 2}, mids[2:4]),
+        ({"after": mids[3], "limit": 2}, mids[4:]),
+    ]
+
+
+async def test_a_poison_meeting_never_blocks_the_rest_and_is_given_up():
+    """§6.9 F-I: a meeting whose end can't be written fails alone; after
+    ``SWEEP_MAX_ITEM_FAILURES`` it is given up and never tried again."""
+    h = make_harness()
+    poison = await _put(h, "e1", "2026-09-29T09:00:00Z", "2026-09-29T09:30:00Z")
+    good = await _put(
+        h, "e2", "2026-09-29T09:00:00Z", "2026-09-29T09:30:00Z", url=GMEET_OTHER
+    )
+    tried: list[int] = []
+
+    def refuse(store, rooms):
+        if rooms == (ROOM,):
+            tried.append(poison)
+            raise RuntimeError("poison row")
+
+    h.store.on_lock = refuse
+    failures = InMemoryItemFailures(max_failures=2)
+    assert await _sweep(h, "2026-09-29T09:30:00Z", failures=failures) == 1
+    assert h.store.meetings[good]["status"] == "failed"
+    assert await _sweep(h, "2026-09-29T09:31:00Z", failures=failures) == 0
+    assert await failures.given_up("not-sent", [str(poison)]) == {str(poison)}
+    assert await _sweep(h, "2026-09-29T09:32:00Z", failures=failures) == 0
+    assert len(tried) == 2 and h.store.meetings[poison]["status"] == "scheduled"
+
+
 async def test_the_not_sent_sweep_leaves_entry_less_and_live_meetings_alone():
     h = make_harness()
     upstream = h.store.seed_meeting(
@@ -561,7 +692,14 @@ class Pg:
         )
 
     async def not_sent(self, now: datetime) -> int:
-        return await not_sent_tick(self.store, publisher=self.publisher, now=now)
+        from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+        return await not_sent_tick(
+            self.store,
+            publisher=self.publisher,
+            now=now,
+            failures=PostgresItemFailures(self.session_factory, max_failures=5),
+        )
 
     async def put(
         self, external_id: str, start: datetime, end: datetime, *, url: str = GMEET
@@ -1203,3 +1341,53 @@ async def test_pg_the_attempt_limit_is_the_setting(pg):
         "account_limit",
         1,
     )
+
+
+# ── paged, bounded sweeps on Postgres (§6.9 F-I) ─────────────────────────────────────────────
+
+
+@pg_only
+async def test_pg_the_due_read_pages_by_meeting_time_then_id(pg):
+    now = _now()
+    ids = [
+        await pg.seed_upstream(now - timedelta(minutes=1), native=f"p{n}-aaaa-bbb")
+        for n in range(3)
+    ] + [await pg.seed_upstream(now, native=f"q{n}-aaaa-bbb") for n in range(2)]
+    first = await pg.repo.list_due_meetings(now, 300, after=None, limit=2)
+    rest = await pg.repo.list_due_meetings(
+        now, 300, after=(first[-1]["event_time"], first[-1]["id"]), limit=10
+    )
+    assert [r["id"] for r in first + rest] == ids
+    counters = await pg.tick(now, batch_size=2)
+    assert counters["spawned"] == 5 and len(pg.runtime.specs) == 5
+
+
+@pg_only
+async def test_pg_the_not_sent_read_pages_by_id_and_a_given_up_meeting_is_skipped(pg):
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    now = _now()
+    mids = [
+        await pg.put(
+            f"e{n}",
+            now - timedelta(minutes=30),
+            now + timedelta(minutes=1),
+            url=f"https://meet.google.com/aaa-bbbb-cc{letter}",
+        )
+        for n, letter in enumerate("abc")
+    ]
+    failures = PostgresItemFailures(pg.session_factory, max_failures=1)
+    await failures.failed("not-sent", str(mids[1]), RuntimeError("poison"))
+    ended = await not_sent_tick(
+        pg.store,
+        publisher=pg.publisher,
+        now=now + timedelta(minutes=2),
+        failures=failures,
+        batch_size=1,
+    )
+    assert ended == 2
+    assert [(await pg.row(m))["status"] for m in mids] == [
+        "failed",
+        "scheduled",
+        "failed",
+    ]

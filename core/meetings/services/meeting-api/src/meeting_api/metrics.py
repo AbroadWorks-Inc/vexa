@@ -24,6 +24,9 @@ user_id}``
 ``aw_export_total{state,user_id}``                    the export route, per new result
 ``aw_sweep_last_run_timestamp_seconds{sweep}``        each background loop whose tick ran to its
                                                       end on this replica
+``aw_sweep_items_total{sweep,result}``                ``sweeps.item_failures.run_item``: an intake
+                                                      sweep's item that failed (``failed``) or was
+                                                      given up (``given_up``)
 ====================================================  ==============================================
 
 Three gauges are read from the database when Prometheus scrapes (``MetricsSource``), within
@@ -71,6 +74,7 @@ __all__ = [
     "non_terminal_statuses",
     "registry",
     "render",
+    "sweep_item",
     "sweep_ran",
     "webhook_delivery",
 ]
@@ -142,6 +146,12 @@ class _Metrics:
             ["state", "user_id"],
             registry=r,
         )
+        self.sweep_items = Counter(
+            "aw_sweep_items_total",
+            "Intake sweep items that failed, or were given up, by sweep.",
+            ["sweep", "result"],
+            registry=r,
+        )
         self.sweep_last_run = Gauge(
             "aw_sweep_last_run_timestamp_seconds",
             "When each sweep last ran.",
@@ -199,6 +209,10 @@ def webhook_delivery(
 
 def export_recorded(state: str, user_id: Any) -> None:
     _metrics().exports.labels(state=state, user_id=_account(user_id)).inc()
+
+
+def sweep_item(sweep: str, result: str) -> None:
+    _metrics().sweep_items.labels(sweep=sweep, result=result).inc()
 
 
 def sweep_ran(sweep: str) -> None:

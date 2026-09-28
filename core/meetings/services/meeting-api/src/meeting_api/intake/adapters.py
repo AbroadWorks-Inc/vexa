@@ -26,7 +26,8 @@ never offered to an entry (Ruling R15). ``count_active_entries`` counts on the p
 cached generic plan still matches the index.
 
 ``overdue_meetings`` is the not-sent sweep's read (§1.5): ``scheduled`` meetings that have an entry
-row and whose ``scheduled_end_at`` has passed (an open-ended one is never overdue).
+row and whose ``scheduled_end_at`` has passed (an open-ended one is never overdue), a page at a
+time in id order.
 A meeting's end is never before its start, so the read also bounds the meeting time by ``now`` and
 walks the partial index ``ix_meeting_scheduled_due`` (``status = 'scheduled'`` is a literal for the
 same generic-plan reason).
@@ -217,9 +218,11 @@ class PostgresIntakeStore:
         except IntegrityError as exc:
             raise ConstraintRace(_constraint(exc)) from exc
 
-    async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
+    async def overdue_meetings(
+        self, now: datetime, *, after: Optional[int], limit: int
+    ) -> list[MeetingView]:
         async with self._reading() as tx:
-            return await tx._overdue(now)
+            return await tx._overdue(now, after=after, limit=limit)
 
     @asynccontextmanager
     async def _reading(self) -> AsyncIterator[PostgresIntakeTx]:
@@ -326,7 +329,9 @@ class PostgresIntakeTx:
         )
         return await self._views(meetings)
 
-    async def _overdue(self, now: datetime) -> list[MeetingView]:
+    async def _overdue(
+        self, now: datetime, *, after: Optional[int], limit: int
+    ) -> list[MeetingView]:
         """``PostgresIntakeStore.overdue_meetings``'s read."""
         from sqlalchemy import exists, func, select, text
 
@@ -348,7 +353,10 @@ class PostgresIntakeTx:
                 end <= aware,
             )
             .order_by(Meeting.id)
+            .limit(limit)
         )
+        if after is not None:
+            stmt = stmt.where(Meeting.id > after)
         return await self._views(await self._scalars(stmt))
 
     async def meeting(self, meeting_id: int) -> MeetingView:

@@ -7,13 +7,13 @@ are an **out-of-band ops step that MUST precede the deploy** — see "Production
 This is not a "should": for `meetings.uuid` specifically, deploying first turns `ensure_schema`'s
 additive column sync into an in-band, ACCESS-EXCLUSIVE-locking full-table rewrite — see "Deploy-order
 hazard" under Step 2. Fresh/empty DBs (tests, new envs) converge cleanly via `ensure_schema` and need
-no manual step; the six new tables likewise build cleanly on any DB via `ensure_schema`'s additive
+no manual step; the seven new tables likewise build cleanly on any DB via `ensure_schema`'s additive
 `create_all`, they are only listed here so the runbook can be run as one pass.
 
 ## Why
 
-**The six new tables** (`meeting_entries`, `meeting_aw_state`, `webhook_subscriptions`,
-`webhook_outbox`, `webhook_deliveries`, `webhook_delivery_attempts`) are ours — no upstream parent
+**The seven new tables** (`meeting_entries`, `meeting_aw_state`, `webhook_subscriptions`,
+`webhook_outbox`, `webhook_deliveries`, `webhook_delivery_attempts`, `sweep_item_failures`) are ours — no upstream parent
 had them. They need no dedup runbook: they are new tables with no existing rows, so
 `ensure_schema`'s ordinary `create_all` builds them (and every index on them) cleanly, with no
 lock-contention hazard. They are included in this migration's step 1 only so an operator can run
@@ -80,7 +80,7 @@ same step. The `CONCURRENTLY` steps and `VALIDATE` take only `SHARE UPDATE EXCLU
 queues no reader or writer; they run with `RESET lock_timeout;`, because a timeout part-way
 through a `CONCURRENTLY` build leaves an INVALID index to clean up.
 
-### Step 1.1 — the six new tables
+### Step 1.1 — the seven new tables
 
 Three of them reference `meetings` by foreign key, so each `CREATE TABLE` briefly takes
 `SHARE ROW EXCLUSIVE` on `meetings` (it blocks writes, not reads). Run
@@ -202,9 +202,19 @@ CREATE TABLE webhook_delivery_attempts (
 	PRIMARY KEY (id), 
 	FOREIGN KEY(delivery_id) REFERENCES webhook_deliveries (id) ON DELETE CASCADE
 );
+
+CREATE TABLE sweep_item_failures (
+	sweep VARCHAR(64) NOT NULL, 
+	item_id VARCHAR(80) NOT NULL, 
+	failures INTEGER DEFAULT '0' NOT NULL, 
+	last_error TEXT, 
+	gave_up_at TIMESTAMP WITH TIME ZONE, 
+	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), 
+	PRIMARY KEY (sweep, item_id)
+);
 ```
 
-(Every other index on these six tables — `ix_meeting_entries_meeting_id`,
+(Every other index on these seven tables — `ix_meeting_entries_meeting_id`,
 `uq_meeting_entries_user_source_external` (unique where `state <> 'closed'`: one row per entry
 that isn't closed; closed rows are history), `ix_meeting_entries_user_source_external`,
 `ix_meeting_entries_user_platform_native_state`, `ix_meeting_entries_attendees_gin`,
@@ -325,7 +335,7 @@ SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
 
 ## Step 2 — the deploy
 
-With `meetings.uuid`, the two new `meetings` indexes, and the six new tables already present and
+With `meetings.uuid`, the two new `meetings` indexes, and the seven new tables already present and
 committed, admin-api's boot `ensure_schema` finds all of it in the existing-table/-column/-index
 sets (matched by name) and no-ops on every one of them.
 
@@ -407,7 +417,7 @@ SET lock_timeout = '5s';
 ALTER TABLE meetings DROP COLUMN IF EXISTS uuid;
 ```
 
-(`DROP COLUMN` takes `ACCESS EXCLUSIVE` for a moment and rewrites nothing.) The six new tables are
+(`DROP COLUMN` takes `ACCESS EXCLUSIVE` for a moment and rewrites nothing.) The seven new tables are
 still empty at this point and can stay.
 
 **After step 2, before step 3.** Revert the code deploy alone. The old index is still in place, so

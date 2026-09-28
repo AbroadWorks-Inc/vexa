@@ -6,8 +6,9 @@ rows into ``webhook_deliveries`` rows, which the senders (``webhooks/sender.py``
 
 ``OutboxPublisher.run_once`` — single-flight, every ``WEBHOOK_PUBLISH_INTERVAL_S``:
 
-1. read up to ``BATCH_SIZE`` (500) unpublished rows, oldest first (the
-   ``ix_webhook_outbox_unpublished`` order), each with its meeting's account;
+1. read the unpublished rows a page of ``SWEEP_BATCH_SIZE`` (200) at a time, oldest first (the
+   ``ix_webhook_outbox_unpublished`` order, then ``event_id``), each with its meeting's account,
+   until the tick has read them all;
 2. read each account's subscriptions from admin-api (``webhooks/subscriptions.py``, cached 30 s),
    up to ``READ_CONCURRENCY`` at once. An account whose read fails keeps its rows unpublished, is
    read past (its rows left out of the query) for ``FAILED_READ_BACKOFF_S``, and the same tick reads
@@ -15,7 +16,11 @@ rows into ``webhook_deliveries`` rows, which the senders (``webhooks/sender.py``
 3. in ONE transaction for the rest of the batch: re-read ``webhook_subscriptions.active`` for the
    matching subscriptions under ``FOR SHARE``, insert one ``pending`` delivery due now per matching
    active subscriber (``ON CONFLICT (event_id, subscription_id) DO NOTHING``, ``INSERT_CHUNK``
-   rows per statement), and set ``published_at``.
+   rows per statement), and set ``published_at``. If that transaction fails, the page's rows are
+   published one at a time instead, each through ``sweeps.item_failures.run_item`` (§6.9 F-I): a
+   row that fails is logged with its event id and stack and counted, and after
+   ``SWEEP_MAX_ITEM_FAILURES`` it is given up and read past from then on (it stays unpublished,
+   so ``aw_webhook_outbox_unpublished`` keeps showing it). One bad row never holds back the rest.
 
 "Matching" is ``fan_out``: the subscription belongs to the meeting's account and wants the event
 (``events == []`` or the event type is listed). ``webhook.test`` rows are never fanned out: they
@@ -50,6 +55,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence
 
 from ..obs import log_event
+from ..sweeps.item_failures import (
+    InMemoryItemFailures,
+    ItemFailures,
+    run_item,
+    sweep_batch_size,
+    sweep_max_item_failures,
+)
 from ..webhooks.subscriptions import (
     Subscription,
     SubscriptionSource,
@@ -59,8 +71,8 @@ from .projection import iso_utc
 from .status import API_VERSION
 
 __all__ = [
-    "BATCH_SIZE",
     "INSERT_CHUNK",
+    "PUBLISHER",
     "TEST_EVENT",
     "Fanout",
     "OutboxPublisher",
@@ -72,9 +84,10 @@ __all__ = [
     "fan_out",
 ]
 
-BATCH_SIZE = 500
+#: The publisher's name in ``sweep_item_failures`` and ``aw_sweep_items_total``.
+PUBLISHER = "webhook-publisher"
 #: Deliveries per INSERT statement (8 values each): asyncpg refuses a statement with more than
-#: 32,767 arguments, and a full batch fans out to up to 500 x 20 subscribers.
+#: 32,767 arguments, and a page fans out to up to its rows x 20 subscribers.
 INSERT_CHUNK = 1000
 #: How long an account whose subscription read failed is read past before it is tried again (the
 #: read cache's own lifetime), and how many accounts are read at once.
@@ -94,6 +107,7 @@ class OutboxRow:
     event_type: str
     meeting_id: Optional[int]
     user_id: Optional[int]
+    created_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -142,21 +156,27 @@ class OutboxPublisher:
         session_factory: Any,
         subscriptions: SubscriptionSource,
         *,
-        batch_size: int = BATCH_SIZE,
+        batch_size: Optional[int] = None,
+        failures: Optional[ItemFailures] = None,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session_factory = session_factory
         self._subscriptions = subscriptions
-        self._batch_size = batch_size
+        self._batch_size = batch_size or sweep_batch_size()
+        self._failures = failures or InMemoryItemFailures(
+            max_failures=sweep_max_item_failures()
+        )
         self._clock = clock
         self._monotonic = monotonic
         self._reads = asyncio.Semaphore(READ_CONCURRENCY)
         #: account → monotonic instant its failed subscription read may be retried
         self._waiting: dict[int, float] = {}
 
-    async def _unpublished(self, exclude: Collection[int]) -> list[OutboxRow]:
-        from sqlalchemy import or_, select
+    async def _unpublished(
+        self, exclude: Collection[int], after: Optional[tuple[Any, str]]
+    ) -> list[OutboxRow]:
+        from sqlalchemy import or_, select, tuple_
 
         from ..sessions.models import Meeting, WebhookOutbox
 
@@ -166,6 +186,7 @@ class OutboxPublisher:
                 WebhookOutbox.event_type,
                 WebhookOutbox.meeting_id,
                 Meeting.user_id,
+                WebhookOutbox.created_at,
             )
             .outerjoin(Meeting, Meeting.id == WebhookOutbox.meeting_id)
             .where(WebhookOutbox.published_at.is_(None))
@@ -174,9 +195,16 @@ class OutboxPublisher:
             query = query.where(
                 or_(Meeting.user_id.is_(None), Meeting.user_id.notin_(sorted(exclude)))
             )
+        if after is not None:
+            query = query.where(
+                tuple_(WebhookOutbox.created_at, WebhookOutbox.event_id)
+                > tuple_(*after)
+            )
         async with self._session_factory() as db:
             result = await db.execute(
-                query.order_by(WebhookOutbox.created_at).limit(self._batch_size)
+                query.order_by(WebhookOutbox.created_at, WebhookOutbox.event_id).limit(
+                    self._batch_size
+                )
             )
             return [OutboxRow(*row) for row in result.all()]
 
@@ -200,14 +228,18 @@ class OutboxPublisher:
         waiting = {uid for uid, until in self._waiting.items() if until > now}
         self._waiting = {uid: self._waiting[uid] for uid in waiting}
         published = inserted = 0
+        after: Optional[tuple[Any, str]] = None
         while True:
-            rows = await self._unpublished(waiting)
+            rows = await self._unpublished(waiting, after)
             if not rows:
                 break
+            after = (rows[-1].created_at, rows[-1].event_id)
+            skip = await self._failures.given_up(PUBLISHER, [r.event_id for r in rows])
+            live = [row for row in rows if row.event_id not in skip]
             accounts = sorted(
                 {
                     row.user_id
-                    for row in rows
+                    for row in live
                     if row.user_id is not None and row.event_type != TEST_EVENT
                 }
             )
@@ -217,13 +249,43 @@ class OutboxPublisher:
             for uid in failed:
                 self._waiting[uid] = now + FAILED_READ_BACKOFF_S
             waiting |= failed
-            ready = [row for row in rows if row.user_id not in failed]
+            ready = [row for row in live if row.user_id not in failed]
             if ready:
-                inserted += await self._publish(ready, fan_out(ready, subs))
-                published += len(ready)
-            if not failed:
+                done, added = await self._publish_page(ready, subs)
+                published += done
+                inserted += added
+            if len(rows) < self._batch_size:
                 break
         return PublishResult(published, inserted, len(waiting))
+
+    async def _publish_page(
+        self, rows: Sequence[OutboxRow], subs: Mapping[int, Sequence[Subscription]]
+    ) -> tuple[int, int]:
+        """The page in one transaction; if that fails, each row on its own, bounded (§6.9 F-I).
+        Returns the rows published and the deliveries inserted."""
+        try:
+            return len(rows), await self._publish(rows, fan_out(rows, subs))
+        except Exception as exc:
+            log_event(
+                "webhook_publish_page_failed",
+                audience="operator",
+                level="warning",
+                span=_SPAN,
+                fields={"rows": len(rows), "error": type(exc).__name__},
+            )
+        published = inserted = 0
+        for row in rows:
+            added: list[int] = []
+
+            async def one(row: OutboxRow = row) -> None:
+                added.append(await self._publish([row], fan_out([row], subs)))
+
+            if await run_item(
+                self._failures, PUBLISHER, row.event_id, one, user_id=row.user_id
+            ):
+                published += 1
+                inserted += added[0]
+        return published, inserted
 
     async def _publish(
         self, rows: Sequence[OutboxRow], wanted: Sequence[Fanout]

@@ -227,12 +227,13 @@ class InMemoryMeetingRepo:
         self._meetings[mid] = row
         return dict(row)
 
-    async def list_due_meetings(self, now, lead_s) -> list:
+    async def list_due_meetings(self, now, lead_s, *, after=None, limit=None) -> list:
         """The real adapter's due read: ``scheduled`` rows with a joinable link whose meeting time
         (``data.scheduled_at``, else ``start_time``, else ``created_at``) is at or before
         ``now + lead_s``, by meeting time then id, each with its ``scheduled_end_at`` /
-        ``waiting_for_room_sent_at`` (ISO strings, as the adapter renders them) and
-        ``has_entries``."""
+        ``waiting_for_room_sent_at`` (ISO strings, as the adapter renders them), ``has_entries``
+        and ``event_time`` (the meeting time); one page of ``limit`` rows after ``after``, an
+        ``(event_time, id)`` pair."""
         from datetime import timedelta
 
         from ..intake.projection import iso_utc
@@ -247,13 +248,17 @@ class InMemoryMeetingRepo:
             at = meeting_start(m.get("data"), m.get("start_time"), m.get("created_at"))
             if at is None or at > due_by:
                 continue
+            if after is not None and (at, m["id"]) <= after:
+                continue
             due.append((at, m["id"], {
                 **m,
                 "scheduled_end_at": iso_utc(m.get("scheduled_end_at")),
                 "waiting_for_room_sent_at": iso_utc(m.get("waiting_for_room_sent_at")),
                 "has_entries": bool(m.get("has_entries")),
+                "event_time": at,
             }))
-        return [row for _, _, row in sorted(due, key=lambda item: (item[0], item[1]))]
+        rows = [row for _, _, row in sorted(due, key=lambda item: (item[0], item[1]))]
+        return rows if limit is None else rows[:limit]
 
     async def list_live_meetings(self) -> list:
         from .auto_join import LIVE_STATUSES

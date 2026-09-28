@@ -35,7 +35,6 @@ from referencing import Registry, Resource
 from intake_builders import http
 from meeting_api import create_app
 from meeting_api.intake.outbox import (
-    BATCH_SIZE,
     FAILED_READ_BACKOFF_S,
     OutboxPublisher,
     OutboxRow,
@@ -340,10 +339,10 @@ async def test_a_crash_before_commit_then_a_redo_creates_no_duplicates(pg):
     meeting = await seed_meeting(pg, 1)
     events = [await seed_event(pg, meeting, "meeting.updated") for _ in range(3)]
 
-    crashing = CrashingSessions(pg, fail=1)
-    with pytest.raises(RuntimeError, match="crash before commit"):
-        await OutboxPublisher(crashing, source).run_once()
-    assert await deliveries(pg) == set()  # rolled back with the publish
+    # the page's one transaction and each row's own fail: all rolled back, nothing published
+    crashing = CrashingSessions(pg, fail=4)
+    assert (await OutboxPublisher(crashing, source).run_once()).published == 0
+    assert await deliveries(pg) == set()
     assert await unpublished(pg) == set(events)
 
     # a delivery that already exists (a concurrent run) is left alone, not duplicated
@@ -366,12 +365,14 @@ async def test_a_crash_before_commit_then_a_redo_creates_no_duplicates(pg):
     assert len(await deliveries(pg)) == 6
 
 
-async def test_a_batch_is_at_most_500_rows_oldest_first(pg):
+async def test_the_rows_are_read_in_pages_oldest_first_and_all_published(pg):
+    """§6.9 F-I: pages of ``SWEEP_BATCH_SIZE`` (created_at, then event_id), every page in one
+    tick."""
+    from sqlalchemy import event, text
+
     source = StaticSubscriptions()
     await seed_subscription(pg, source, 1)
     meeting = await seed_meeting(pg, 1)
-    from sqlalchemy import text
-
     async with pg.begin() as conn:
         await conn.execute(
             text(
@@ -385,17 +386,55 @@ async def test_a_batch_is_at_most_500_rows_oldest_first(pg):
                     "s": n,
                     "c": T0 + timedelta(seconds=n),
                 }
-                for n in range(BATCH_SIZE + 1)
+                for n in range(501)
             ],
         )
-    assert BATCH_SIZE == 500
-    publisher = OutboxPublisher(sessions(pg), source)
-    assert (await publisher.run_once()).published == 500
-    assert await unpublished(pg) == {
-        f"evt_{BATCH_SIZE:04d}"
-    }  # the newest waits one tick
-    assert (await publisher.run_once()).published == 1
+    limits: list[Any] = []
+
+    def grab(conn, cursor, statement, parameters, context, executemany):
+        if "FROM webhook_outbox LEFT OUTER JOIN meetings" in statement:
+            limits.append(statement)
+
+    event.listen(pg.sync_engine, "before_cursor_execute", grab)
+    try:
+        result = await OutboxPublisher(sessions(pg), source, batch_size=200).run_once()
+    finally:
+        event.remove(pg.sync_engine, "before_cursor_execute", grab)
+    assert result.published == 501
+    assert await unpublished(pg) == set()
     assert len(await deliveries(pg)) == 501
+    assert len(limits) == 3  # 200 + 200 + 101
+
+
+async def test_a_poison_row_is_given_up_and_never_holds_back_the_rest(pg, monkeypatch):
+    """A row whose publish keeps failing fails alone (its page is published row by row); after
+    ``SWEEP_MAX_ITEM_FAILURES`` it is read past."""
+    from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
+    source = StaticSubscriptions()
+    await seed_subscription(pg, source, 1)
+    meeting = await seed_meeting(pg, 1)
+    poison, good = [await seed_event(pg, meeting, "meeting.updated") for _ in range(2)]
+    real = OutboxPublisher._publish
+    tried: list[str] = []
+
+    async def publish(self, rows, wanted):
+        if any(r.event_id == poison for r in rows):
+            tried.append(poison)
+            raise RuntimeError("poison row")
+        return await real(self, rows, wanted)
+
+    monkeypatch.setattr(OutboxPublisher, "_publish", publish)
+    failures = InMemoryItemFailures(max_failures=2)
+    publisher = OutboxPublisher(sessions(pg), source, failures=failures)
+    assert (await publisher.run_once()).published == 1
+    assert await unpublished(pg) == {poison}
+    await publisher.run_once()
+    assert await failures.given_up("webhook-publisher", [poison]) == {poison}
+    tried.clear()
+    assert (await publisher.run_once()).published == 0
+    assert tried == [] and await unpublished(pg) == {poison}
+    assert good not in await unpublished(pg)
 
 
 async def seed_many(
@@ -424,9 +463,9 @@ async def test_a_full_batch_to_nine_subscribers_publishes_in_one_tick(pg):
     """
     source = StaticSubscriptions()
     subs = [await seed_subscription(pg, source, 1) for _ in range(9)]
-    events = await seed_many(pg, await seed_meeting(pg, 1), BATCH_SIZE)
+    events = await seed_many(pg, await seed_meeting(pg, 1), 500)
 
-    result = await OutboxPublisher(sessions(pg), source).run_once()
+    result = await OutboxPublisher(sessions(pg), source, batch_size=500).run_once()
 
     assert (result.published, result.deliveries) == (500, 4500)
     assert await unpublished(pg) == set()
@@ -436,7 +475,7 @@ async def test_a_full_batch_to_nine_subscribers_publishes_in_one_tick(pg):
 
     # a redo of the same batch (a crash after the inserts, before the publish) adds nothing
     await execute(pg, "UPDATE webhook_outbox SET published_at = NULL")
-    again = await OutboxPublisher(sessions(pg), source).run_once()
+    again = await OutboxPublisher(sessions(pg), source, batch_size=500).run_once()
     assert (again.published, again.deliveries) == (500, 0)
     assert len(await deliveries(pg)) == 4500
 
@@ -461,14 +500,12 @@ async def test_an_account_whose_subscriptions_cannot_be_read_waits(pg):
 
 
 async def test_one_accounts_failing_read_never_stalls_the_others(pg):
-    """Account A's read keeps failing with more than a batch of rows queued ahead of account B's:
+    """Account A's read keeps failing with more than a page of rows queued ahead of account B's:
     the same tick reads past A's rows and publishes B's."""
     source = StaticSubscriptions()
     await seed_subscription(pg, source, 1)
     theirs = await seed_subscription(pg, source, 2)
-    stuck = await seed_many(
-        pg, await seed_meeting(pg, 1), BATCH_SIZE + 1, prefix="evt_a"
-    )
+    stuck = await seed_many(pg, await seed_meeting(pg, 1), 201, prefix="evt_a")
     m2 = await seed_meeting(pg, 2, "abc-defg-hij")
     going = [
         await seed_event(pg, m2, "meeting.updated", created=T0 + timedelta(hours=1))
@@ -491,8 +528,10 @@ async def test_one_accounts_failing_read_never_stalls_the_others(pg):
     assert source.reads.count(1) == 1
     source.unavailable.clear()
     clock.t += 1
-    assert (await publisher.run_once()).published == BATCH_SIZE
-    assert source.reads.count(1) == 2
+    assert (await publisher.run_once()).published == len(stuck)
+    assert (
+        source.reads.count(1) == 3
+    )  # one read per page (200 + 1); admin-api's is cached 30 s
 
 
 async def test_a_pause_committed_first_blocks_new_deliveries(pg):

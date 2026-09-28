@@ -13,8 +13,9 @@ meeting. ``reads.py`` holds the Postgres implementation.
 ``IntakeStore.room_lock(user_id, rooms)`` opens one transaction holding the link lock of every
 room given, taken in the order given (the caller passes them sorted); an empty ``rooms`` is a plain
 transaction with no link lock. The transaction commits when the block exits normally and rolls
-back when it raises; one that loses a race on a database constraint raises ``ConstraintRace``. ``IntakeStore.overdue_meetings(now)`` is the not-sent
-sweep's read across every account (§1.5).
+back when it raises; one that loses a race on a database constraint raises ``ConstraintRace``.
+``IntakeStore.overdue_meetings(now, after=, limit=)`` is the not-sent sweep's read across every
+account (§1.5), one page at a time.
 
 An entry is keyed by (``user_id``, ``source_user``, ``external_id``) and has at most one row that
 isn't ``closed``. A ``closed`` row is history: it stays on the meeting it belonged to, a finished
@@ -351,10 +352,13 @@ class IntakeStore(Protocol):
         self, user_id: int, rooms: Sequence[Room]
     ) -> AsyncContextManager[IntakeTx]: ...
 
-    async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
+    async def overdue_meetings(
+        self, now: datetime, *, after: Optional[int], limit: int
+    ) -> list[MeetingView]:
         """Every account's ``scheduled`` meetings that entries manage and that are past their end
-        at ``now`` (``rules.is_overdue``), by id: the not-sent sweep's candidates (§1.5). Read
-        without a link lock; the sweep reads each one again under its link lock."""
+        at ``now`` (``rules.is_overdue``), by id: the not-sent sweep's candidates (§1.5), one page
+        of at most ``limit``, with ids after ``after``. Read without a link lock; the sweep reads
+        each one again under its link lock."""
         ...
 
 

@@ -56,6 +56,7 @@ MEETING_API_METRICS = {
     "aw_webhook_outbox_unpublished": "gauge",
     "aw_export_total": "counter",
     "aw_sweep_last_run_timestamp_seconds": "gauge",
+    "aw_sweep_items_total": "counter",
 }
 
 #: The label names each metric carries (§1.13, plus ``user_id`` where it is per request, meeting
@@ -73,6 +74,7 @@ LABELS = {
     "aw_webhook_outbox_unpublished": set(),
     "aw_export_total": {"state", "user_id"},
     "aw_sweep_last_run_timestamp_seconds": {"sweep"},
+    "aw_sweep_items_total": {"sweep", "result"},
 }
 
 
@@ -135,6 +137,7 @@ def test_every_metric_carries_exactly_its_labels():
     metrics.webhook_delivery("meeting.completed", "delivered", 7, 0.2)
     metrics.export_recorded("handed_off", 7)
     metrics.sweep_ran("auto-join")
+    metrics.sweep_item("auto-join", "failed")
     _, text = scrape(StaticSource(COUNTS))
     seen: dict[str, set[str]] = {}
     for family in text_string_to_metric_families(text):

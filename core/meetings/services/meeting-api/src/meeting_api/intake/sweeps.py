@@ -15,7 +15,7 @@ under the link lock and answers one of:
     out. Nothing else is written (no retry stamp), so the bot goes on the first tick after the link
     is free.
 
-``not_sent_tick(store, *, publisher, now)`` is R6's backstop. Every
+``not_sent_tick(store, *, publisher, now, failures)`` is R6's backstop. Every
 entry-managed meeting past its end without a bot (``IntakeStore.overdue_meetings``) is read again
 under its link lock and, still ``scheduled`` and overdue (``rules.is_overdue``), ends ``failed``
 with outcome ``not_sent`` through the status writer (``meeting.not_sent``). An open-ended meeting
@@ -27,7 +27,10 @@ detail and message:
   * else ``room_busy`` when ``meeting.waiting_for_room`` went out;
   * else ``ended_before_sent``.
 
-One meeting's failure is logged with its stack and the sweep goes on to the next.
+The overdue read is paged (``SWEEP_BATCH_SIZE``, id order) and every page is worked in the tick.
+Each meeting runs through ``sweeps.item_failures.run_item`` (§6.9 F-I): one meeting's failure is
+logged with its id and stack, counted, and never stops the rest; after ``SWEEP_MAX_ITEM_FAILURES``
+the sweep gives it up and skips it.
 
 ``OutboxOnly`` is the ``EventPublisher`` of the production ``IntakeService`` the scheduler merges
 through (and the ``/v2`` routes use): events stay in ``webhook_outbox`` for the outbox
@@ -36,12 +39,12 @@ publisher (§1.8).
 
 from __future__ import annotations
 
-import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Mapping, Optional, Sequence
 
 from ..obs import log_event
+from ..sweeps.item_failures import ItemFailures, run_item, sweep_batch_size
 from .ports import EventPublisher, IntakeStore, MeetingView, Room
 from .rules import is_live, is_overdue
 from .service import is_merge_target
@@ -136,34 +139,40 @@ def not_sent_cause(aw: Optional[Mapping[str, object]]) -> tuple[str, str]:
     return "ended_before_sent", NOT_SENT_MESSAGES["ended_before_sent"]
 
 
+NOT_SENT = "not-sent"
+
+
 async def not_sent_tick(
     store: IntakeStore,
     *,
     publisher: Optional[EventPublisher] = None,
     now: datetime,
+    failures: ItemFailures,
+    batch_size: Optional[int] = None,
 ) -> int:
-    """End every overdue entry-managed meeting ``not_sent`` (R6); returns how many ended."""
-    ended = 0
-    for view in await store.overdue_meetings(now):
-        try:
-            if await _end_not_sent(store, publisher, view, now=now):
-                ended += 1
-        except Exception as exc:
-            log_event(
-                "not_sent_failed",
-                audience="operator",
-                level="error",
-                span="meetings.auto_join",
-                user_id=view.user_id,
-                meeting_id=str(view.id),
-                fields={
-                    "error": type(exc).__name__,
-                    "traceback": "".join(
-                        traceback.format_exception(type(exc), exc, exc.__traceback__)
-                    ),
-                },
-            )
-    return ended
+    """End every overdue entry-managed meeting ``not_sent`` (R6), a page at a time; returns how
+    many ended."""
+    limit = batch_size or sweep_batch_size()
+    ended: list[int] = []
+    after: Optional[int] = None
+    while True:
+        page = await store.overdue_meetings(now, after=after, limit=limit)
+        if not page:
+            break
+        after = page[-1].id
+        skip = await failures.given_up(NOT_SENT, [str(v.id) for v in page])
+        for view in page:
+            if str(view.id) in skip:
+                continue
+
+            async def end(view: MeetingView = view) -> None:
+                if await _end_not_sent(store, publisher, view, now=now):
+                    ended.append(view.id)
+
+            await run_item(failures, NOT_SENT, str(view.id), end, user_id=view.user_id)
+        if len(page) < limit:
+            break
+    return len(ended)
 
 
 async def _end_not_sent(

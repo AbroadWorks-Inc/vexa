@@ -252,12 +252,13 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
 
     from meeting_api.intake import OutboxOnly, PostgresIntakeStore
     from meeting_api.intake import sweeps as sweeps_mod
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
     from meeting_api.sweeps.single_flight import sweep_lock_key
 
     calls: list[tuple] = []
 
     async def _stub_auto_join(*args, **kwargs):
-        calls.append(("auto-join", kwargs["store"]))
+        calls.append(("auto-join", kwargs["store"], kwargs))
 
     async def _stub_not_sent(store, **kwargs):
         calls.append(("not-sent", store, kwargs))
@@ -268,7 +269,11 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
     guarded, delays = await _run_loops(
         monkeypatch,
         session_factory=_fake_session_factory,
-        env={"NOT_SENT_SWEEP_INTERVAL_S": "7"},
+        env={
+            "NOT_SENT_SWEEP_INTERVAL_S": "7",
+            "SWEEP_BATCH_SIZE": "50",
+            "SWEEP_MAX_ITEM_FAILURES": "4",
+        },
     )
 
     (not_sent,) = [c for c in calls if c[0] == "not-sent"]
@@ -276,7 +281,12 @@ async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch
     _, store, kwargs = not_sent
     assert isinstance(store, PostgresIntakeStore) and store is auto_join[1]
     assert isinstance(kwargs["publisher"], OutboxOnly)
-    assert set(kwargs) == {"publisher", "now"}
+    assert set(kwargs) == {"publisher", "now", "failures", "batch_size"}
+    # §6.9 F-I: both sweeps share the one Postgres failure record and the page size
+    assert isinstance(kwargs["failures"], PostgresItemFailures)
+    assert kwargs["failures"] is auto_join[2]["item_failures"]
+    assert kwargs["failures"]._max == 4
+    assert kwargs["batch_size"] == auto_join[2]["batch_size"] == 50
     assert abs(kwargs["now"] - datetime.now(timezone.utc)) < timedelta(seconds=30)
     assert sweep_lock_key("not-sent") in guarded
     assert 7.0 in delays

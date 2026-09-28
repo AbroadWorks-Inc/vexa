@@ -183,14 +183,18 @@ class InMemoryIntakeStore:
         found = current or rows
         return found[-1] if found else None
 
-    async def overdue_meetings(self, now: datetime) -> list[MeetingView]:
+    async def overdue_meetings(
+        self, now: datetime, *, after: Optional[int], limit: int
+    ) -> list[MeetingView]:
         managed = {e.meeting_id for e in self.entries.values()}
         views = [
             self.view(mid)
             for mid, row in sorted(self.meetings.items())
-            if row["status"] == "scheduled" and mid in managed
+            if row["status"] == "scheduled"
+            and mid in managed
+            and (after is None or mid > after)
         ]
-        return [v for v in views if is_overdue(v.end, now=now)]
+        return [v for v in views if is_overdue(v.end, now=now)][:limit]
 
     def entries_of(self, meeting_id: int, state: str = "active") -> list[EntryView]:
         return [

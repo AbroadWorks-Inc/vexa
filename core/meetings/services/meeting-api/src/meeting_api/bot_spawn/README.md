@@ -40,13 +40,16 @@ entry-less rows, upstream's rule, the newest, leaving out any starting after tha
 row is inserted. A future occurrence is never claimed.
 
 ### The auto-join sweep (§1.5)
-`auto_join.auto_join_tick` reads only the due rows (`list_due_meetings(now, lead_s)`: `scheduled`,
-meeting time at or before `now + lead_s`, through the partial index `ix_meeting_scheduled_due`) and
+`auto_join.auto_join_tick` reads only the due rows (`list_due_meetings(now, lead_s, after=, limit=)`:
+`scheduled`, meeting time at or before `now + lead_s`, through the partial index
+`ix_meeting_scheduled_due`, in pages of `SWEEP_BATCH_SIZE` by meeting time then id) and
 sends each bot through `intake.ExactRowSpawn`, claiming that exact row. An entry-less row keeps the
 `AUTO_JOIN_GRACE_S` window and its retry stamps; a meeting entries manage is due until its
 `scheduled_end_at`, has its link checked under the link lock (`intake.sweeps.check_room`: wait for
-a busy link with no retry pause, or merge into an open-ended `join_now` meeting), and stores a
-spawn failure's typed code in `meeting_aw_state.last_error_code`.
+a busy link with no retry pause, or merge into an open-ended `join_now` meeting), and counts a
+failed send with its typed code (`meeting_aw_state.send_attempts`, `last_error_code`; §6.9 F-K).
+Each row runs through `sweeps.item_failures.run_item`: a row that raises fails alone and, after
+`SWEEP_MAX_ITEM_FAILURES`, is given up (§6.9 F-I).
 
 ### P3c — `continue_meeting` (sequential multi-bot per meeting)
 When the prior meeting for `(platform, native_id)` is TERMINAL (`completed`/`failed`), reuse the

@@ -686,6 +686,20 @@
    "targets": []
   },
   {
+   "key": "SWEEP_BATCH_SIZE",
+   "class": "defaulted",
+   "default": "200",
+   "description": "intake sweeps (§6.9 F-I): the auto-join tick, the not-sent sweep and the outbox publisher read their work in pages of at most this many items, in a stable order, every page each tick",
+   "targets": []
+  },
+  {
+   "key": "SWEEP_MAX_ITEM_FAILURES",
+   "class": "defaulted",
+   "default": "5",
+   "description": "intake sweeps (§6.9 F-I): an item that fails this many times (counted per sweep in sweep_item_failures, across replicas) is logged, counted in aw_sweep_items_total{result=given_up} and never tried again by that sweep",
+   "targets": []
+  },
+  {
    "key": "CALENDAR_SYNC_INTERVAL_S",
    "class": "defaulted",
    "default": "300",

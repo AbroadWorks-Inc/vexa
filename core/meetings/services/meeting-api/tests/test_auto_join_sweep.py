@@ -154,7 +154,7 @@ async def test_manual_spawn_race_counts_as_already():
         """Delegates to the real repo but serves the STALE scheduled snapshot."""
         def __getattr__(self, name):
             return getattr(repo, name)
-        async def list_due_meetings(self, now, lead_s):
+        async def list_due_meetings(self, now, lead_s, *, after, limit):
             return snapshot
 
     counters = await _tick(_FrozenRepo(), runtime)
