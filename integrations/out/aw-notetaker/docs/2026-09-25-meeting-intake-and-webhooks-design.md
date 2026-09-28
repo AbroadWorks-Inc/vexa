@@ -101,6 +101,8 @@
   48. `webhook.test` carries only `data.subscription_id`, not a meeting (`intake/outbox.py`); the portal answers a signed test 200 and publishes nothing, so the Part 5 test send shows as delivered (§2.7, Part 4).
   49. The portal keeps seen `event_id`s for 48 h, not 24 h: sealed `webhook.v1`'s README requires ≥ 48 h (Part 4).
   50. The portal publishes only the meeting's `id`, `status`, `completion_reason` and `sequence` to Redis, so titles and attendee emails stay out of the shared Redis (Part 4).
+  51. Owner decision (2026-09-28): the calendar module (Part B) and the portal (Part C) are handed to the aw-notetaker developer for review; they sit on aw-notetaker branches `feat/calendar-aw-bots` and `feat/portal-aw-bots`, each with a technical handoff in `$N/docs/handoffs/`. This build's focus stays aw-bots (§6.5, §6.6).
+  52. Owner decision (2026-09-28): only people on the meeting may stop its bot from the portal — the host and invitees who haven't declined. The portal allows stop only for a user who owns an active entry on the meeting; a declined guest, or an invitee without a connected calendar, can see the meeting but not stop it (Part 4).
 
 ---
 
@@ -846,7 +848,7 @@ The portal decides what its users see and how its pages update. aw-bots only sen
 - **Who sees what.** Every read passes the signed-in user: `GET /v2/meetings?user=` and `GET /v2/meetings/{id}?user=`. aw-bots applies owner-or-invited, including declined guests (today's rule). Anything else is "not found".
 - **Transcripts:** read from `meeting.export.s3_path`. With no export yet, the page shows "processing". The transcript files belong to the notetaker.
 - **Join progress:** from `GET /v2/meetings/{id}?user=` and the pushed updates.
-- **Stop:** the button is shown while the meeting has a live bot, in the call or still joining. `no_live_bot` means there is no live bot at all.
+- **Stop:** the button is shown while the meeting has a live bot, in the call or still joining, and only to a user who owns an active entry on it (the host and invitees who haven't declined; V12). `no_live_bot` means there is no live bot at all.
 - **Webhook receiver** (`POST /api/webhooks/aw-bots`):
   1. Verify either signature header with the secret the portal supplied when subscribing (Secret `aw-bots-portal-webhook`), and reject more than 300 s of skew.
   2. Publish the meeting's `id`, `status`, `completion_reason` and `sequence` (not the raw event, which carries titles and emails) to the portal's Redis (`notetaker-redis`), channel `aw:meeting:<uuid>`. A signed `webhook.test` is answered 200 and publishes nothing.
@@ -1437,6 +1439,8 @@ WHERE m.status = 'scheduled' AND meeting_event_time(m.data, m.start_time, m.crea
 
 ## 6.5 Part B — calendar module (`$N`, branch `feat/calendar-aw-bots`; Part 3)
 
+> **Status:** built, pushed on aw-notetaker `feat/calendar-aw-bots`, awaiting review by the aw-notetaker developer. Handoff: `$N/docs/handoffs/2026-09-28-calendar-module-aw-bots.md` (V12).
+
 ### B1 — Migration 0011 `aw_entries`
 
 - [ ] Add `notetaker-postgres/.../versions/0011_add_aw_entries.py` and the `AwEntry` model (Part 3 columns).
@@ -1523,6 +1527,8 @@ class AwBotsClient:
 **M6:** verify, then push both branches.
 
 ## 6.6 Part C — portal (`$N/portal`; Part 4)
+
+> **Status:** built on aw-notetaker `feat/portal-aw-bots` (on top of `feat/calendar-aw-bots`, with the D1 docs), awaiting review by the aw-notetaker developer. Handoff: `$N/docs/handoffs/2026-09-28-portal-aw-bots.md` (V12).
 
 | Task | Build | Tests | Commit |
 |---|---|---|---|
