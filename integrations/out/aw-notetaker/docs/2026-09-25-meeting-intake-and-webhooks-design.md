@@ -108,6 +108,7 @@
   55. Owner follow-ups after the final review: §6.9 (F-A … F-K). F-K replaces R19; F-J replaces R8.
   56. Owner decision: a move while live is a new time handled at once (R7); the finish-time re-run and R39 are removed (§6.9 F-R7). Sweeps are batched and paged with bounded per-item retries (F-I); a redundancy audit follows (F-L).
   57. Owner decision: the gateway identity key is a key ring (`GATEWAY_IDENTITY_KEYS` + `GATEWAY_IDENTITY_ACTIVE_KEY`, `kid` in the header), the same pattern as the webhook secret encryption ring; `GATEWAY_IDENTITY_SECRET` and any "previous key" setting go (§1.10, §6.9 F-E).
+  58. As built (§6.9): a move while live leaves at once and the live meeting keeps the entry as closed history, so `meeting_entries` holds one row per entry that isn't closed plus any number of closed rows (the unique index is partial; `ix_meeting_entries_user_source_external` serves the paging, correcting item 18). Bot sending is bounded by `BOT_SEND_MAX_ATTEMPTS`/`BOT_SEND_RETRY_BACKOFF_S` (`meeting_aw_state.send_attempts`); a `join_now` failure before the claim answers `created` with the meeting `scheduled`, and the bot follows after the backoff. A constraint race is retried `INTAKE_CONFLICT_RETRIES` times (1 + N tries), then 500 `internal_error`, now in sealed `intake.v1`. `aw_meetings_failed_total{reason}` counts every bot that failed after it was sent. Every intake sweep reads in pages of `SWEEP_BATCH_SIZE` and gives up an item after `SWEEP_MAX_ITEM_FAILURES` (table `sweep_item_failures`), logged and counted.
 
 ---
 
@@ -226,7 +227,8 @@ class MeetingEntry:        # "meeting_entries"
     metadata_ JSONB null (column "metadata"); content_hash String(64) not null
     state String(16) not null  # 'active' | 'removed' | 'closed'
     removed_reason Text null; created_at/updated_at DateTime(tz) server_default now(); removed_at/closed_at DateTime(tz) null
-    UniqueConstraint(user_id, source_user, external_id, name="uq_meeting_entries_user_source_external")
+    Index("uq_meeting_entries_user_source_external", user_id, source_user, external_id, unique=True, postgresql_where=text("state <> 'closed'"))  # one row per entry that isn't closed; closed rows are history (R7)
+    Index("ix_meeting_entries_user_source_external", user_id, source_user, external_id)
     Index(meeting_id); Index(user_id, platform, native_meeting_id, state); Index(attendees, postgresql_using="gin")
     Index("ix_meeting_entries_active_user", user_id, postgresql_where=text("state = 'active'"))
 class MeetingAwState:      # "meeting_aw_state"; meeting_id Integer PK FK meetings.id ON DELETE CASCADE
@@ -623,6 +625,7 @@ Every error has the body `{ "error": { "code": "...", "message": "..." } }`. The
 | 409 | `no_live_bot` | stop on a meeting with no live bot (scheduled or finished) | to cancel a future meeting, remove its entry |
 | 429 | `rate_limited` | the account's write rate was hit; `Retry-After` set | wait, then resend |
 | 429 | `quota_exceeded` | a standing quota is full (entries, subscriptions); no `Retry-After` | stop; free entries or ask for a higher quota |
+| 500 | `internal_error` | a fault aw-bots could not resolve, including a database constraint race still failing after `INTAKE_CONFLICT_RETRIES` retries (logged with its stack, counted) | report it; don't retry blindly |
 | 503 | `unavailable` | database down; the gateway can't check the key, has no identity secret, or meeting-api or admin-api fails (502/504) | retry with backoff |
 
 ## 2.6 Every use case: what is sent and the reply
@@ -1201,7 +1204,7 @@ The behaviour is exactly §1.3. `test_intake_use_cases.py` has one test per §2.
 
 **Behaviour:**
 - Every route and scope is as §2.1.
-- **Paging:** `GET /v2/entries` pages by `external_id` (served by `uq_meeting_entries_user_source_external`). `GET /v2/meetings` pages by `(meeting_event_time, id)`, newest first, with a base64 cursor of that pair. No index is claimed for it, because visibility goes through the entries (V12).
+- **Paging:** `GET /v2/entries` pages by `external_id` (served by `ix_meeting_entries_user_source_external`). `GET /v2/meetings` pages by `(meeting_event_time, id)`, newest first, with a base64 cursor of that pair. No index is claimed for it, because visibility goes through the entries (V12).
 - **Errors:** the §2.5 shape. Validation failures on `/v2` are 400 (a route-scoped handler; upstream keeps 422). DB down → 503. Another account's uuid → 404.
 - **DELETE:** the upstream function first, then one transaction deleting deliveries (attempts cascade), outbox and entries. Reply `{meeting, deleted: {objects, entries, outbox, deliveries}}`.
 
