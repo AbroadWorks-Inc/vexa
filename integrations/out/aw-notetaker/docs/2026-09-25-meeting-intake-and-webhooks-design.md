@@ -98,6 +98,9 @@
   45. Upstream behaviour found during the build and left as it is: Part 9 #4–#8.
   46. Alert thresholds: sweep staleness is judged per sweep (about 5 min for meeting-api's 1–30 s loops, about 25 h for admin-api's daily `webhook-retention`), since all of them report on one metric; the outbox alert is `aw_webhook_outbox_unpublished > 0` for 5 min, because that gauge is a count, not an age (§1.13).
   47. The image workflow (`.github/workflows/aw-images.yml`) now builds and pushes `aw-bots-gateway` and `aw-bots-admin-api` too, with the same triggers as the other three (§1.10, Part 5).
+  48. `webhook.test` carries only `data.subscription_id`, not a meeting (`intake/outbox.py`); the portal answers a signed test 200 and publishes nothing, so the Part 5 test send shows as delivered (§2.7, Part 4).
+  49. The portal keeps seen `event_id`s for 48 h, not 24 h: sealed `webhook.v1`'s README requires ≥ 48 h (Part 4).
+  50. The portal publishes only the meeting's `id`, `status`, `completion_reason` and `sequence` to Redis, so titles and attendee emails stay out of the shared Redis (Part 4).
 
 ---
 
@@ -735,7 +738,7 @@ Each is handled by the same rules; the platform comes from parsing `meeting_url`
 - The URL is checked on save and again on every send by the SSRF guard (`webhooks/ssrf.py`). Private addresses are refused, except hosts in `WEBHOOK_PRIVATE_HOST_ALLOWLIST`.
 - Secrets are stored AES-256-GCM encrypted under a key ring (`WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY`). Each ciphertext stores its key id. Rotating the encryption key is: add a key, switch the active id, rows re-encrypt on next read, drop the old key once no row uses it. Secrets are decrypted only at signing time and never returned.
 
-**Events.** Every event carries the full meeting object (§2.4), including `id`, `entries` and `sequence`.
+**Events.** Every meeting event carries the full meeting object (§2.4), including `id`, `entries` and `sequence`. `webhook.test` carries only `data.subscription_id` (V12).
 
 | Event | When |
 |---|---|
@@ -846,8 +849,8 @@ The portal decides what its users see and how its pages update. aw-bots only sen
 - **Stop:** the button is shown while the meeting has a live bot, in the call or still joining. `no_live_bot` means there is no live bot at all.
 - **Webhook receiver** (`POST /api/webhooks/aw-bots`):
   1. Verify either signature header with the secret the portal supplied when subscribing (Secret `aw-bots-portal-webhook`), and reject more than 300 s of skew.
-  2. Publish the event to the portal's Redis (`notetaker-redis`), channel `aw:meeting:<uuid>`.
-  3. Only then mark `event_id` as seen (24 h).
+  2. Publish the meeting's `id`, `status`, `completion_reason` and `sequence` (not the raw event, which carries titles and emails) to the portal's Redis (`notetaker-redis`), channel `aw:meeting:<uuid>`. A signed `webhook.test` is answered 200 and publishes nothing.
+  3. Only then mark `event_id` as seen (48 h, as sealed `webhook.v1` requires).
   4. If Redis is down, answer 503 so aw-bots retries.
 - **Live pages:** Server-Sent Events. One Redis subscriber per portal server, shared by all open tabs. Each meeting id is authorised through `GET /v2/meetings/{id}?user=`. While disconnected, the page refreshes the meeting every 30 s until it reconnects.
 - **`tracked_meetings`:** the portal stops reading it. Meetings come only from aw-bots.
