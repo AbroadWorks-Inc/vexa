@@ -96,7 +96,10 @@ WHERE status NOT IN ('completed', 'failed')
 # MIGRATION-0008 steps, verbatim (also asserted, below, to be substrings of the runbook doc itself
 # — the drift guard: if the doc and this file diverge, that assertion fails).
 STEP_1_2_ADD_UUID = "ALTER TABLE meetings ADD COLUMN uuid uuid;"
-STEP_1_3_BACKFILL = """DO $$
+STEP_1_3_SET_DEFAULT = (
+    "ALTER TABLE meetings ALTER COLUMN uuid SET DEFAULT gen_random_uuid();"
+)
+STEP_1_4_BACKFILL = """DO $$
 DECLARE
   rows_updated integer;
 BEGIN
@@ -110,9 +113,6 @@ BEGIN
     COMMIT;
   END LOOP;
 END $$;"""
-STEP_1_4_SET_DEFAULT = (
-    "ALTER TABLE meetings ALTER COLUMN uuid SET DEFAULT gen_random_uuid();"
-)
 STEP_1_5_UUID_INDEX = "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ix_meetings_uuid ON meetings (uuid);"
 STEP_1_6_NOT_NULL = [
     "ALTER TABLE meetings ADD CONSTRAINT ck_meetings_uuid_not_null CHECK (uuid IS NOT NULL) NOT VALID;",
@@ -156,6 +156,28 @@ async def _run_autocommit(engine, *statements: str) -> None:
         await conn.close()
 
 
+async def _insert_meeting(engine, native: str) -> None:
+    """A row the running (pre-deploy) code inserts: it names no ``uuid``."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO meetings (user_id, platform, platform_specific_id, status) "
+                "VALUES (99, 'google_meet', :native, 'scheduled')"
+            ),
+            {"native": native},
+        )
+
+
+async def _uuid_of(engine, native: str):
+    async with engine.begin() as conn:
+        return (
+            await conn.execute(
+                text("SELECT uuid FROM meetings WHERE platform_specific_id = :n"),
+                {"n": native},
+            )
+        ).scalar_one()
+
+
 # ── the migration doc drift guard ────────────────────────────────────────────────────────────
 
 
@@ -178,8 +200,8 @@ def test_migration_doc_new_table_sql_matches_the_models():
     "step",
     [
         STEP_1_2_ADD_UUID,
-        STEP_1_3_BACKFILL,
-        STEP_1_4_SET_DEFAULT,
+        STEP_1_3_SET_DEFAULT,
+        STEP_1_4_BACKFILL,
         STEP_1_5_UUID_INDEX,
         *STEP_1_6_NOT_NULL,
         STEP_1_7_LIVE_DEDUP_INDEX,
@@ -386,23 +408,38 @@ async def test_migration_0008_applied_to_a_dirty_db(intake_pg_engine):
     async with intake_pg_engine.begin() as conn:
         await conn.execute(text(STEP_1_2_ADD_UUID))
 
-    # Step 1.3 — the backfill DO block issues its own internal COMMIT per batch, which Postgres
-    # only allows outside an explicit transaction block (autocommit, like the doc itself notes).
-    await _run_autocommit(intake_pg_engine, STEP_1_3_BACKFILL)
+    # The running code inserts a row before the default exists: it gets a NULL uuid.
+    await _insert_meeting(intake_pg_engine, "between-1.2-and-1.3")
+    assert await _uuid_of(intake_pg_engine, "between-1.2-and-1.3") is None
 
-    # Step 1.4 — default new rows going forward.
+    # Step 1.3 — default new rows going forward, before the backfill.
     async with intake_pg_engine.begin() as conn:
-        await conn.execute(text(STEP_1_4_SET_DEFAULT))
+        await conn.execute(text(STEP_1_3_SET_DEFAULT))
 
-    # Step 1.5, 1.7, 1.8 — CONCURRENTLY builds (autocommit, one statement per connection use).
+    # A row the running code inserts between the default and the backfill gets its uuid at insert.
+    await _insert_meeting(intake_pg_engine, "between-1.3-and-1.4")
+    assert await _uuid_of(intake_pg_engine, "between-1.3-and-1.4") is not None
+
+    # Step 1.4 — the backfill DO block issues its own internal COMMIT per batch, which Postgres
+    # only allows outside an explicit transaction block (autocommit, like the doc itself notes).
+    await _run_autocommit(intake_pg_engine, STEP_1_4_BACKFILL)
+    async with intake_pg_engine.begin() as conn:
+        left = (
+            await conn.execute(text("SELECT count(*) FROM meetings WHERE uuid IS NULL"))
+        ).scalar_one()
+    assert left == 0
+
+    # Step 1.5 — the unique uuid index (CONCURRENTLY: autocommit).
     await _run_autocommit(intake_pg_engine, STEP_1_5_UUID_INDEX)
-    await _run_autocommit(intake_pg_engine, STEP_1_7_LIVE_DEDUP_INDEX)
-    await _run_autocommit(intake_pg_engine, STEP_1_8_DUE_INDEX)
 
     # Step 1.6 — NOT NULL via a validated CHECK constraint.
     async with intake_pg_engine.begin() as conn:
         for stmt in STEP_1_6_NOT_NULL:
             await conn.execute(text(stmt))
+
+    # Steps 1.7, 1.8 — CONCURRENTLY builds (autocommit, one statement per connection use).
+    await _run_autocommit(intake_pg_engine, STEP_1_7_LIVE_DEDUP_INDEX)
+    await _run_autocommit(intake_pg_engine, STEP_1_8_DUE_INDEX)
 
     # Step 3 — drop the old index (post-deploy, but nothing here depends on a real deploy step).
     await _run_autocommit(intake_pg_engine, STEP_3_DROP_OLD_INDEX)
@@ -411,9 +448,9 @@ async def test_migration_0008_applied_to_a_dirty_db(intake_pg_engine):
         uuids = [
             r[0] for r in (await conn.execute(text("SELECT uuid FROM meetings"))).all()
         ]
-        assert len(uuids) == 3
+        assert len(uuids) == 5
         assert all(u is not None for u in uuids)
-        assert len(set(uuids)) == 3  # distinct
+        assert len(set(uuids)) == 5  # distinct
 
         not_null = (
             await conn.execute(
