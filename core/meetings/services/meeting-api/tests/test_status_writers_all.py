@@ -527,7 +527,8 @@ async def test_pg_an_intake_created_meetings_first_event_records_its_status(pg):
     from intake_builders import entry_body, make_settings
 
     from meeting_api.intake import IntakeService, PostgresIntakeStore
-    from meeting_api.intake.sweeps import NoStop, OutboxOnly
+    from meeting_api.intake.fakes import NoStop
+    from meeting_api.intake.sweeps import OutboxOnly
 
     store = PostgresIntakeStore(pg.session_factory)
     service = IntakeService(

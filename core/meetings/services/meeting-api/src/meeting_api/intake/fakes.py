@@ -17,6 +17,7 @@
   * ``FakeStop`` — ``StopPort``: ``stop_live`` moves a live meeting to ``stopping`` with the
     outcome given; ``leave`` records the stop it is handed (the entry service records R5's stop
     itself, in the removal's transaction).
+  * ``NoStop`` — ``StopPort`` for an ``IntakeService`` that must never stop a bot: a call raises.
   * ``FakePublisher`` — ``EventPublisher``: records each published batch.
   * ``InMemoryIntakeReads`` — ``IntakeReads`` over an ``InMemoryIntakeStore``: the same visibility,
     order and cursors as ``reads.PostgresIntakeReads``. The store has no delivery rows, so
@@ -87,6 +88,7 @@ __all__ = [
     "FakeStop",
     "InMemoryIntakeReads",
     "InMemoryIntakeStore",
+    "NoStop",
     "RecordedEvent",
     "link_rows_in",
 ]
@@ -581,6 +583,21 @@ class FakeStop:
 
     async def leave(self, user_id: int, stop: RecordedStop) -> None:
         self.calls.append((user_id, stop.meeting_id, stop.outcome))
+
+
+class NoStop:
+    """``StopPort`` for an ``IntakeService`` that must never stop a bot (the scheduler's merge and
+    re-run never do), so a call here is a fault."""
+
+    async def stop_live(
+        self, user_id: int, meeting_id: int, *, outcome: Optional[Outcome]
+    ) -> None:
+        raise RuntimeError(f"the scheduler never stops a bot (meeting {meeting_id})")
+
+    async def leave(self, user_id: int, stop: RecordedStop) -> None:
+        raise RuntimeError(
+            f"the scheduler never stops a bot (meeting {stop.meeting_id})"
+        )
 
 
 class FakePublisher:

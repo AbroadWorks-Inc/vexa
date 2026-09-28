@@ -479,7 +479,7 @@ class Pg:
         from meeting_api.intake import ExactRowSpawn, PostgresIntakeStore
         from meeting_api.intake.fakes import FakePublisher
         from meeting_api.intake.service import IntakeService
-        from meeting_api.intake.sweeps import NoStop
+        from meeting_api.intake.fakes import NoStop
 
         self.engine = engine
         self.session_factory = async_sessionmaker(engine, expire_on_commit=False)
