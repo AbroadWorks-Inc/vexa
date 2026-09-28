@@ -9,7 +9,8 @@ domain).
 ## Public surface
 - `parse_ics(text, now, horizon_days=14)` → `{"events": [PlannedEvent], "cancelled_uids": […]}`
   (pure). **One event per UID — the next upcoming occurrence only** (a recurring meeting reuses one
-  link; two active rows on one native id would violate `uq_meeting_active_user_platform_native`).
+  link, and the planned-meeting store keeps one non-finished row per link: a second answers
+  `duplicate`).
   Every event carries a JSON-safe snapshot of all VEVENT properties, parameters, nested components,
   top-level VCALENDAR properties, and the series master for an override. Link-less events still
   import honestly; only recognized Meet/Zoom/Teams links arm auto-join.
