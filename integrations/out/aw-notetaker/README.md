@@ -41,6 +41,32 @@ Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.m
    have no UUID, and `notetaker-worker` would see a new `idempotency_key` (the UUID instead of
    `vexa-<n>`) for a meeting it may already have.
 
+## Several bot sessions (design §6.9 F-K2)
+A meeting can have more than one bot session: a bot fails and a new one joins the same meeting.
+Each session with audio has its own recording, and the exporter makes them ONE folder, so there is
+one transcript with speaker names:
+- **One clock.** t=0 is the first session's recording origin (`created_at −
+  RECORD_CHUNK_TIMESLICE_MS`, spec §4.3). Each later session starts at its own origin's offset from
+  that; one whose origin falls inside the previous session's audio follows it directly
+  (`session_overlap` warning). Sessions are ordered by `created_at` (meeting-api lists newest first).
+- **Audio.** Each session's master is decoded as for one session (`aresample=async=1:first_pts=0`),
+  and `audio.wav` is the sessions in order with silence in each gap: its length is the end of the
+  last session minus the start of the first. `master.webm` is the same join, re-encoded as one opus
+  file (48 kHz mono) by ffmpeg.
+- **Speakers.** Each session's `signal/<user>/<meeting>/<session>/speaker-activity.jsonl` is read
+  and shifted to where its session starts, and held inside its session's span, so no speaker event
+  lands in a gap. `speaker_timeline.json` merges them; `participants.json` is the union of names.
+  `_export.json.speaker_activity` is the worst session's (`missing` > `invalid` > `capped` > `ok`),
+  and each session's problem is logged with its `session_uid`. The export waits
+  (`ActivityNotReady`) while any session's file is not uploaded yet.
+- **Unchanged files.** `meeting.json` stays the webhook's meeting row as sent (a copy of
+  `webhook.v1`, not ours to extend), and `recordings.json` lists every recording as meeting-api
+  returned it. A recording with no audio file (the bot failed before it recorded) is skipped with
+  the log line `recording_skipped … reason=no_audio`. With `EXPORT_DEBUG`, each session's signal
+  files go to `signal/<session_uid>/`.
+- **One session** is exported from its recording exactly as before: `master.webm` is a server-side
+  copy, `audio.wav` its transcode, `signal/*` flat.
+
 ## Config (names only — see spec §4.4)
 `GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `VEXA_WEBHOOK_SECRET`,
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,

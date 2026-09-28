@@ -151,8 +151,9 @@ replica; per-meeting jobs are independent.
    platform:<platform>, idempotency_key:"vexa-<id>"}`; backoff retry on connect errors/5xx.
 8. `_export.json {state:"handed_off", vexa_meeting_id, exported_at, elapsed_s, exporter_version,
    speaker_activity, speaker_activity_events, audio_recordings}` last; delete pending. `audio_recordings` counts the recordings with
-   an audio media file; when it is > 1 (a multi-session meeting) a warning is logged and only
-   the first is exported (see §9).
+   an audio media file — one per bot session. A meeting with several sessions (a bot failed and
+   a new one joined, intake design §6.9 F-K2) is exported as one folder on one clock: see
+   `README.md` "Several bot sessions".
 
 After `EXPORT_MAX_ATTEMPTS` (default 5, exponential backoff): `_export.json {state:"failed", error}`,
 pending moved to `aw-exporter/failed/`. `aw-bots` is never modified, so a re-run is always possible.
@@ -350,9 +351,9 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
   tape is ON (`capture_signal` defaults ON) only about 200 sessions fit the budget, so a late retry
   or a backfill can find the file gone and export `missing`. Mitigation: `capture_signal=false` as
   a rollout step (§7), or a larger `SIGNAL_TAPE_BUDGET_BYTES`.
-- Multi-session meetings (the bot rejoined → several audio recordings) export only one session;
-  the count is recorded in `_export.json.audio_recordings` and logged, the other sessions' audio
-  is not exported.
+- Multi-session meetings (several audio recordings) are joined on the clock of the recordings'
+  `created_at` origins (§4.3), so each session's placement carries that rule's residual; two
+  sessions whose origins overlap are placed back to back and logged (`session_overlap`).
 - With one Vexa service account (D11), every meeting's recordings JSONB lives under one user, so
   the recordings load meeting-api does per request grows with the total number of meetings.
 - Task 11 must also measure: the mixed-lane (Zoom/Teams) clock-origin residual (§4.3's rule is

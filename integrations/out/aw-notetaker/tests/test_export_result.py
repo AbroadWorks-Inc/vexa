@@ -16,6 +16,7 @@ import httpx
 import pytest
 from moto import mock_aws
 
+from exporter.audio import join_webm
 from exporter.config import Settings
 from exporter.export_result import (
     ERROR_MAX_CHARS,
@@ -239,6 +240,7 @@ def _deps(storage: Storage, gateway: _Gateway, notetaker: _Notetaker) -> Deps:
         export_result=_reporter(gateway),
         transcode=transcode,
         now=lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc),
+        join_webm=join_webm,
     )
 
 

@@ -12,7 +12,7 @@ import httpx
 import uvicorn
 
 from exporter.app import create_app
-from exporter.audio import webm_to_wav
+from exporter.audio import join_webm, webm_to_wav
 from exporter.config import Settings
 from exporter.export_result import ExportReporter
 from exporter.job import Deps
@@ -40,6 +40,7 @@ def main() -> None:
         ),
         transcode=webm_to_wav,
         now=lambda: datetime.now(timezone.utc),
+        join_webm=join_webm,
     )
     queue = PendingQueue(storage, settings.vexa_bucket)
     app = create_app(settings, queue, deps)

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import wave
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,9 @@ from moto import mock_aws
 
 from exporter.config import Settings
 import exporter.job as job_module
+from exporter.activity import names as activity_names
+from exporter.activity import parse_activity, speech_events
+from exporter.attribution import build_participants, build_speaker_timeline
 from exporter.job import (
     ActivityNotReady,
     Deps,
@@ -33,6 +38,8 @@ from tests.builders import (
     frame,
     header,
     two_speaker_gmeet_lines,
+    wav_samples,
+    write_constant_wav,
     write_silent_wav,
 )
 
@@ -81,9 +88,11 @@ class FakeMeetingApi:
         recordings: list[dict[str, Any]] | None = None,
         master: dict[str, Any] | None = None,
         transcript: dict[str, Any] | None = None,
+        masters: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         self.recordings = recordings if recordings is not None else []
         self._master = master
+        self._masters = masters
         self._transcript = transcript
         self.list_recordings_calls: list[int] = []
         self.master_calls: list[int] = []
@@ -95,6 +104,8 @@ class FakeMeetingApi:
 
     def master(self, recording_id: int) -> dict[str, Any]:
         self.master_calls.append(recording_id)
+        if self._masters is not None:
+            return self._masters[recording_id]
         assert self._master is not None
         return self._master
 
@@ -136,6 +147,10 @@ END_TIME = datetime(2026, 6, 18, 10, 42, 0, tzinfo=timezone.utc)
 
 def _fake_transcode(src: Path, dst: Path) -> None:
     write_silent_wav(dst, FAKE_WAV_SECONDS)
+
+
+def _no_join(parts: list[tuple[Path, float]], dst: Path) -> None:
+    raise AssertionError("a single-session meeting's master.webm is copied, not joined")
 
 
 def _transcode_of(duration_s: float) -> Callable[[Path, Path], None]:
@@ -182,6 +197,7 @@ def _deps(
     now: Callable[[], datetime] | None = None,
     transcode: Callable[[Path, Path], None] = _fake_transcode,
     export_result: Any = None,
+    join_webm: Callable[[list[tuple[Path, float]], Path], None] = _no_join,
 ) -> Deps:
     return Deps(
         settings=settings or _settings(),
@@ -191,6 +207,7 @@ def _deps(
         export_result=export_result or FakeExportResult(),
         transcode=transcode,
         now=now or (lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc)),
+        join_webm=join_webm,
     )
 
 
@@ -942,25 +959,6 @@ def test_audio_is_streamed_via_files_not_held_as_bytes(storage: Storage) -> None
     assert spy.uploads == [(BASE + "audio.wav", "audio/wav")]
 
 
-def test_multiple_audio_recordings_are_counted_and_warned(
-    storage: Storage, caplog: pytest.LogCaptureFixture
-) -> None:
-    storage_path = _put_master(storage, 31, "uid-31")
-    meeting_api = FakeMeetingApi(
-        recordings=[_audio_recording(31), _audio_recording(32)],
-        master={"storage_path": storage_path},
-    )
-    deps = _deps(storage, meeting_api, FakeNotetaker())
-
-    with caplog.at_level(logging.WARNING, logger="exporter"):
-        export_meeting(_envelope(), deps)
-
-    assert meeting_api.master_calls == [31]
-    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
-    assert marker["audio_recordings"] == 2
-    assert any("audio_recordings=2" in r.getMessage() for r in caplog.records)
-
-
 def test_single_audio_recording_logs_no_multi_session_warning(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1089,3 +1087,429 @@ def test_export_marker_records_elapsed_wall_time(storage: Storage) -> None:
     assert marker["exported_at"] == "2026-06-18T11:00:07.500000+00:00"
     assert marker["speaker_activity"] == "ok"
     assert marker["audio_recordings"] == 1
+
+
+def test_a_single_session_folder_is_built_exactly_as_from_its_one_recording(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 90, "uid-90")
+    lines = two_speaker_gmeet_lines(_origin_ms())
+    _put_activity(storage, "uid-90", lines)
+    deps = _deps(storage, _api_for(90, storage_path), FakeNotetaker())
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    settings = _settings()
+    started = datetime.fromtimestamp(_origin_ms() / 1000, tz=timezone.utc)
+    activity = parse_activity(lines)
+    events = speech_events(
+        activity,
+        _origin_ms(),
+        settings.rms_speech_threshold,
+        settings.speech_hangover_ms,
+    )
+    timeline = build_speaker_timeline(
+        events,
+        platform="google_meet",
+        meeting_id=MEETING_UUID,
+        room_name="https://meet.google.com/abc-defg-hij",
+        recording_started_at=started,
+        recording_ended_at=started + timedelta(seconds=FAKE_WAV_SECONDS),
+        min_dominant_utterance_ms=settings.min_dominant_utterance_ms,
+    )
+    participants = build_participants(
+        activity_names(activity),
+        platform="google_meet",
+        meeting_id=MEETING_UUID,
+        joined_at=started,
+        host_email=None,
+    )
+    assert storage.get_bytes(EXPORT_BUCKET, BASE + "speaker_timeline.json") == (
+        json.dumps(timeline.model_dump(mode="json")).encode()
+    )
+    assert storage.get_bytes(EXPORT_BUCKET, BASE + "participants.json") == (
+        json.dumps(participants.model_dump(mode="json")).encode()
+    )
+    assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"webm-bytes"
+    samples, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav"))
+    assert len(samples) / rate == FAKE_WAV_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Several bot sessions in one meeting (§6.9 F-K2): one folder, one clock
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Session:
+    rec_id: int
+    uid: str
+    created_at: str
+    seconds: float
+    value: int
+
+    @property
+    def origin_ms(self) -> int:
+        return recording_origin_ms({"created_at": self.created_at}, TIMESLICE_MS)
+
+
+# Origins 10:00:00 (A), 10:01:30 (B, 90 s in), 10:03:20 (C, 200 s in).
+SESSION_A = _Session(70, "uid-a", "2026-06-18T10:00:15.000Z", 60.0, 1)
+SESSION_B = _Session(71, "uid-b", "2026-06-18T10:01:45.000Z", 40.0, 2)
+SESSION_C = _Session(72, "uid-c", "2026-06-18T10:03:35.000Z", 20.0, 3)
+
+EXPECTED_KEYS = {
+    BASE + name
+    for name in (
+        "master.webm",
+        "audio.wav",
+        "speaker_timeline.json",
+        "participants.json",
+        "meeting.json",
+        "recordings.json",
+        "_export.json",
+    )
+}
+
+
+class FakeJoinWebm:
+    def __init__(self) -> None:
+        self.calls: list[list[tuple[bytes, float]]] = []
+
+    def __call__(self, parts: list[tuple[Path, float]], dst: Path) -> None:
+        self.calls.append([(path.read_bytes(), silence) for path, silence in parts])
+        dst.write_bytes(b"joined-webm")
+
+
+def _seed_sessions(
+    storage: Storage,
+    sessions: list[_Session],
+    extra: tuple[dict[str, Any], ...] = (),
+) -> tuple[FakeMeetingApi, Callable[[Path, Path], None]]:
+    """Each session's master in the Vexa bucket, listed NEWEST FIRST as
+    meeting-api lists them; the transcode writes each session's own wav."""
+    masters: dict[int, dict[str, Any]] = {}
+    by_body: dict[bytes, _Session] = {}
+    for session in sessions:
+        body = f"webm-{session.uid}".encode()
+        path = f"recordings/1/{session.rec_id}/{session.uid}/audio/master.webm"
+        storage.put_bytes(VEXA_BUCKET, path, body, "video/webm")
+        masters[session.rec_id] = {"storage_path": path}
+        by_body[body] = session
+    listed = [
+        _audio_recording(session.rec_id, created_at=session.created_at)
+        for session in sessions
+    ] + list(extra)
+    listed.sort(key=lambda rec: (rec["created_at"], rec["id"]), reverse=True)
+
+    def transcode(src: Path, dst: Path) -> None:
+        session = by_body[src.read_bytes()]
+        write_constant_wav(dst, session.seconds, session.value)
+
+    return FakeMeetingApi(recordings=listed, masters=masters), transcode
+
+
+def _speaks(origin_ms: int, name: str, at_ms: int) -> list[str]:
+    """`name` voiced for 768 ms from `origin_ms + at_ms`."""
+    return [frame(origin_ms + at_ms + i * 256, name, 0.2) for i in range(3)]
+
+
+def _intervals(timeline: dict[str, Any]) -> list[tuple[str, float, float]]:
+    return [
+        (iv["speaker_name"], iv["start_sec"], iv["end_sec"])
+        for iv in timeline["speaker_intervals"]
+    ]
+
+
+def test_two_sessions_with_a_gap_make_one_folder_on_one_clock(
+    storage: Storage,
+) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    _put_activity(storage, "uid-a", two_speaker_gmeet_lines(SESSION_A.origin_ms))
+    _put_activity(
+        storage,
+        "uid-b",
+        [header()]
+        + _speaks(SESSION_B.origin_ms, "Speaker Gamma", 0)
+        + _speaks(SESSION_B.origin_ms, "Speaker Alpha", 5000),
+    )
+    join = FakeJoinWebm()
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, meeting_api, notetaker, transcode=transcode, join_webm=join)
+
+    assert export_meeting(_envelope(), deps) == ExportResult("handed_off", FOLDER)
+
+    assert meeting_api.master_calls == [70, 71]
+    assert set(storage.list_keys(EXPORT_BUCKET, BASE)) == EXPECTED_KEYS
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+
+    samples, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav"))
+    assert len(samples) / rate == 130.0
+    assert samples == [1] * 6000 + [0] * 3000 + [2] * 4000
+    assert join.calls == [[(b"webm-uid-a", 0.0), (b"webm-uid-b", 30.0)]]
+    assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"joined-webm"
+    tags = storage._client.get_object_tagging(
+        Bucket=EXPORT_BUCKET, Key=BASE + "master.webm"
+    )["TagSet"]
+    assert {t["Key"]: t["Value"] for t in tags} == {"retention-class": "recording-mp4"}
+
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert timeline["duration_sec"] == 130.0
+    assert datetime.fromisoformat(timeline["recording_started_at"]) == datetime(
+        2026, 6, 18, 10, 0, 0, tzinfo=timezone.utc
+    )
+    assert _intervals(timeline) == [
+        ("Speaker Alpha", 0.0, 0.768),
+        ("Speaker Beta", 1.5, 2.268),
+        ("Speaker Gamma", 90.0, 90.768),
+        ("Speaker Alpha", 95.0, 95.768),
+    ]
+    participants = storage.get_json(EXPORT_BUCKET, BASE + "participants.json")
+    assert [p["id"] for p in participants["participants"]] == [
+        "speaker_alpha",
+        "speaker_beta",
+        "speaker_gamma",
+    ]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["audio_recordings"] == 2
+    assert marker["speaker_activity"] == "ok"
+    assert marker["speaker_activity_events"] == 8
+    assert storage.get_json(EXPORT_BUCKET, BASE + "meeting.json") == (
+        _envelope()["data"]["meeting"]
+    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "recordings.json") == {
+        "recordings": meeting_api.recordings
+    }
+
+
+def test_no_speaker_event_lands_in_the_gap_between_sessions(
+    storage: Storage,
+) -> None:
+    """Session A's activity runs past its audio and session B's starts before
+    its audio: both are held to their own session's span."""
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    _put_activity(
+        storage,
+        "uid-a",
+        two_speaker_gmeet_lines(SESSION_A.origin_ms)
+        + _speaks(SESSION_A.origin_ms, "Speaker Beta", 60_500),
+    )
+    _put_activity(
+        storage,
+        "uid-b",
+        [header()]
+        + _speaks(SESSION_B.origin_ms, "Speaker Gamma", -3000)
+        + _speaks(SESSION_B.origin_ms, "Speaker Gamma", 0),
+    )
+    deps = _deps(
+        storage,
+        meeting_api,
+        FakeNotetaker(),
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+    )
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert _intervals(timeline) == [
+        ("Speaker Alpha", 0.0, 0.768),
+        ("Speaker Beta", 1.5, 2.268),
+        ("Speaker Gamma", 90.0, 90.768),
+    ]
+    for point in timeline["speaker_timeline"]:
+        assert not 60.0 < point["relative_sec"] < 90.0, point
+    for _, start, end in _intervals(timeline):
+        assert end <= 60.0 or start >= 90.0
+
+
+def test_three_sessions_are_joined_in_order_with_every_gap_padded(
+    storage: Storage,
+) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B, SESSION_C])
+    _put_activity(storage, "uid-a", two_speaker_gmeet_lines(SESSION_A.origin_ms))
+    _put_activity(storage, "uid-b", [header()])
+    _put_activity(
+        storage,
+        "uid-c",
+        [header()] + _speaks(SESSION_C.origin_ms, "Speaker Delta", 1000),
+    )
+    join = FakeJoinWebm()
+    deps = _deps(
+        storage, meeting_api, FakeNotetaker(), transcode=transcode, join_webm=join
+    )
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert meeting_api.master_calls == [70, 71, 72]
+    samples, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav"))
+    assert len(samples) / rate == 220.0
+    assert samples == ([1] * 6000 + [0] * 3000 + [2] * 4000 + [0] * 7000 + [3] * 2000)
+    assert join.calls == [
+        [(b"webm-uid-a", 0.0), (b"webm-uid-b", 30.0), (b"webm-uid-c", 70.0)]
+    ]
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert timeline["duration_sec"] == 220.0
+    assert _intervals(timeline) == [
+        ("Speaker Alpha", 0.0, 0.768),
+        ("Speaker Beta", 1.5, 2.268),
+        ("Speaker Delta", 201.0, 201.768),
+    ]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["audio_recordings"] == 3
+    assert marker["speaker_activity"] == "ok"
+
+
+def test_a_session_without_a_recording_is_skipped_with_a_log_line(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bot of the middle session failed before it recorded: its recording
+    row carries no audio file. The folder is built from the other two."""
+    failed = {
+        "id": 80,
+        "status": "failed",
+        "created_at": "2026-06-18T10:01:05.000Z",
+        "media_files": [],
+    }
+    meeting_api, transcode = _seed_sessions(
+        storage, [SESSION_A, SESSION_B], extra=(failed,)
+    )
+    _put_activity(storage, "uid-a", two_speaker_gmeet_lines(SESSION_A.origin_ms))
+    _put_activity(storage, "uid-b", [header()])
+    notetaker = FakeNotetaker()
+    deps = _deps(
+        storage, meeting_api, notetaker, transcode=transcode, join_webm=FakeJoinWebm()
+    )
+
+    with caplog.at_level(logging.INFO, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert meeting_api.master_calls == [70, 71]
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    assert set(storage.list_keys(EXPORT_BUCKET, BASE)) == EXPECTED_KEYS
+    samples, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav"))
+    assert len(samples) / rate == 130.0
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["audio_recordings"] == 2
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("recording_skipped")
+    ] == ["recording_skipped vexa_meeting_id=11367 recording_id=80 reason=no_audio"]
+
+
+def test_a_session_starting_inside_the_previous_audio_follows_it_directly(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    early_b = _Session(71, "uid-b", "2026-06-18T10:00:45.000Z", 40.0, 2)
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, early_b])
+    _put_activity(storage, "uid-a", [header()])
+    _put_activity(
+        storage, "uid-b", [header()] + _speaks(early_b.origin_ms, "Speaker Gamma", 0)
+    )
+    join = FakeJoinWebm()
+    deps = _deps(
+        storage, meeting_api, FakeNotetaker(), transcode=transcode, join_webm=join
+    )
+
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    samples, _ = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav"))
+    assert samples == [1] * 6000 + [2] * 4000
+    assert join.calls == [[(b"webm-uid-a", 0.0), (b"webm-uid-b", 0.0)]]
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert _intervals(timeline) == [("Speaker Gamma", 60.0, 60.768)]
+    assert any(
+        r.getMessage().startswith("session_overlap vexa_meeting_id=11367")
+        and "recording_id=71" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_one_session_missing_its_activity_marks_the_export_missing(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    _put_activity(storage, "uid-a", two_speaker_gmeet_lines(SESSION_A.origin_ms))
+    deps = _deps(
+        storage,
+        meeting_api,
+        FakeNotetaker(),
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+        now=lambda: END_TIME + timedelta(seconds=121),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["speaker_activity"] == "missing"
+    assert marker["speaker_activity_events"] == 4
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert [name for name, _, _ in _intervals(timeline)] == [
+        "Speaker Alpha",
+        "Speaker Beta",
+    ]
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if "speaker_activity_missing" in r.getMessage()
+    ] == ["speaker_activity_missing vexa_meeting_id=11367 session_uid=uid-b"]
+
+
+def test_any_session_activity_not_yet_uploaded_waits_before_anything_is_written(
+    storage: Storage,
+) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    _put_activity(storage, "uid-b", [header()])
+    notetaker = FakeNotetaker()
+    deps = _deps(
+        storage,
+        meeting_api,
+        notetaker,
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+        now=lambda: END_TIME + timedelta(seconds=60),
+    )
+
+    with pytest.raises(ActivityNotReady, match="uid-a"):
+        export_meeting(_envelope(), deps)
+
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
+    assert notetaker.calls == []
+
+
+def test_debug_copies_each_sessions_signal_files_under_its_session_uid(
+    storage: Storage,
+) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    for uid in ("uid-a", "uid-b"):
+        _put_activity(storage, uid, [header()])
+        storage.put_bytes(
+            VEXA_BUCKET, f"signal/7/11367/{uid}/botlog.txt", uid.encode(), "text/plain"
+        )
+    deps = _deps(
+        storage,
+        meeting_api,
+        FakeNotetaker(),
+        settings=_settings(debug=True),
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+    )
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    signal = sorted(
+        key[len(BASE) :] for key in storage.list_keys(EXPORT_BUCKET, BASE + "signal/")
+    )
+    assert signal == [
+        "signal/uid-a/botlog.txt",
+        "signal/uid-a/speaker-activity.jsonl",
+        "signal/uid-b/botlog.txt",
+        "signal/uid-b/speaker-activity.jsonl",
+    ]
+    assert (
+        storage.get_bytes(EXPORT_BUCKET, BASE + "signal/uid-b/botlog.txt") == b"uid-b"
+    )

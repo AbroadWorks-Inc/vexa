@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import exporter.queue as queue_module  # noqa: E402
 from exporter.app import create_app  # noqa: E402
+from exporter.audio import join_webm  # noqa: E402
 from exporter.config import Settings  # noqa: E402
 from exporter.export_result import ExportReporter  # noqa: E402
 from exporter.job import Deps, ExportResult  # noqa: E402
@@ -144,6 +145,7 @@ def _deps(storage: Storage, settings: Settings) -> Deps:
         ),
         transcode=_fake_transcode,
         now=lambda: datetime(2026, 6, 18, 11, 0, 0, tzinfo=timezone.utc),
+        join_webm=join_webm,
     )
 
 

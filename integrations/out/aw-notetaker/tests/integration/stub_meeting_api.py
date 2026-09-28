@@ -15,7 +15,9 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request
 
 
-def create_app(recording: dict[str, Any], storage_path: str, api_key: str) -> FastAPI:
+def create_app(
+    recordings: list[dict[str, Any]], storage_paths: dict[int, str], api_key: str
+) -> FastAPI:
     app = FastAPI()
     app.state.reports = []
 
@@ -28,14 +30,14 @@ def create_app(recording: dict[str, Any], storage_path: str, api_key: str) -> Fa
         x_api_key: str | None = Header(default=None),
     ) -> dict[str, Any]:
         check(x_api_key)
-        return {"recordings": [recording]}
+        return {"recordings": recordings}
 
     @app.get("/recordings/{recording_id}/master")
     async def master(
         recording_id: int, x_api_key: str | None = Header(default=None)
     ) -> dict[str, Any]:
         check(x_api_key)
-        return {"storage_path": storage_path}
+        return {"storage_path": storage_paths[recording_id]}
 
     @app.post("/v2/meetings/{meeting_id}/export")
     async def export(

@@ -1,5 +1,6 @@
 """Synthetic speaker-activity builders for tests."""
 
+import io
 import json
 import wave
 from pathlib import Path
@@ -61,3 +62,28 @@ def write_silent_wav(path: Path, duration_s: float, rate: int = 100) -> None:
         wav.setsampwidth(2)
         wav.setframerate(rate)
         wav.writeframes(b"\x00\x00" * int(round(duration_s * rate)))
+
+
+def write_constant_wav(
+    path: Path, duration_s: float, value: int, rate: int = 100
+) -> None:
+    """A mono 16-bit wav whose every sample is `value`, so a joined file shows
+    which input each span came from."""
+    sample = value.to_bytes(2, "little", signed=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(sample * int(round(duration_s * rate)))
+
+
+def wav_samples(data: bytes) -> tuple[list[int], int]:
+    """(every sample, frame rate) of a mono 16-bit wav held as bytes."""
+    with wave.open(io.BytesIO(data), "rb") as wav:
+        frames = wav.readframes(wav.getnframes())
+        rate = wav.getframerate()
+    samples = [
+        int.from_bytes(frames[i : i + 2], "little", signed=True)
+        for i in range(0, len(frames), 2)
+    ]
+    return samples, rate

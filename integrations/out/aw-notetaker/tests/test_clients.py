@@ -13,9 +13,10 @@ from typing import Any
 import httpx
 import pytest
 
-from exporter.audio import webm_to_wav
+from exporter.audio import join_wavs, join_webm, webm_to_wav
 from exporter.notetaker import Notetaker, NotetakerError
 from exporter.vexa_client import MeetingApi, MeetingApiError
+from tests.builders import wav_samples, write_constant_wav
 
 
 KEY = "test-exporter-key"
@@ -265,3 +266,93 @@ def test_webm_to_wav(tmp_path: Path) -> None:
     with wave.open(str(dst), "rb") as w:
         assert w.getframerate() == 16000
         assert w.getnchannels() == 1
+
+
+def test_join_wavs_puts_each_part_after_its_silence(tmp_path: Path) -> None:
+    write_constant_wav(tmp_path / "a.wav", 0.5, 7)
+    write_constant_wav(tmp_path / "b.wav", 0.25, -3)
+    dst = tmp_path / "joined.wav"
+
+    join_wavs([(tmp_path / "a.wav", 0), (tmp_path / "b.wav", 30)], dst)
+
+    samples, rate = wav_samples(dst.read_bytes())
+    assert rate == 100
+    assert samples == [7] * 50 + [0] * 30 + [-3] * 25
+
+
+def test_join_wavs_refuses_parts_of_different_formats(tmp_path: Path) -> None:
+    write_constant_wav(tmp_path / "a.wav", 0.5, 1, rate=100)
+    write_constant_wav(tmp_path / "b.wav", 0.5, 1, rate=200)
+
+    with pytest.raises(ValueError, match="format"):
+        join_wavs(
+            [(tmp_path / "a.wav", 0), (tmp_path / "b.wav", 0)], tmp_path / "out.wav"
+        )
+
+
+def test_join_webm_decodes_every_part_with_the_dtx_filter_and_pads_the_gaps(
+    tmp_path: Path,
+) -> None:
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    parts = [(tmp_path / "a.webm", 0.0), (tmp_path / "b.webm", 2.5)]
+    join_webm(parts, tmp_path / "out.webm", run=fake_run)
+
+    cmd = captured[0]
+    assert cmd[0] == "ffmpeg" and cmd[-1] == str(tmp_path / "out.webm")
+    assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-i"] == [
+        str(tmp_path / "a.webm"),
+        str(tmp_path / "b.webm"),
+    ]
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert graph.count("aresample=async=1:first_pts=0") == 2
+    assert "atrim=duration=2.500000" in graph
+    assert "concat=n=3:v=0:a=1" in graph
+
+
+def test_join_webm_raises_runtimeerror_with_the_stderr_tail(tmp_path: Path) -> None:
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bad input")
+
+    with pytest.raises(RuntimeError, match="bad input"):
+        join_webm([(tmp_path / "a.webm", 0.0)], tmp_path / "out.webm", run=fake_run)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_join_webm_with_ffmpeg_keeps_the_gap_on_the_timeline(tmp_path: Path) -> None:
+    for name in ("a", "b"):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "libopus",
+                str(tmp_path / f"{name}.webm"),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    joined = tmp_path / "joined.webm"
+
+    join_webm([(tmp_path / "a.webm", 0.0), (tmp_path / "b.webm", 2.0)], joined)
+
+    wav_path = tmp_path / "joined.wav"
+    webm_to_wav(joined, wav_path)
+    samples, rate = wav_samples(wav_path.read_bytes())
+    assert abs(len(samples) / rate - 4.0) <= 0.1
+
+    def loud(start_s: float, end_s: float) -> float:
+        span = samples[int(start_s * rate) : int(end_s * rate)]
+        return max(abs(v) for v in span)
+
+    assert loud(0.2, 0.8) > 1000
+    assert loud(1.3, 2.7) == 0
+    assert loud(3.2, 3.8) > 1000
