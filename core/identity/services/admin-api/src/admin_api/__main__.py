@@ -142,7 +142,7 @@ def build_production_app():
         # SchemaInvariantError out of this ASGI-lifespan startup hook; uvicorn aborts startup and
         # exits(3), so the port never binds, /health never answers, and the compose healthcheck /
         # k8s startupProbe+readinessProbe never pass. Deliberate: the spawn path documents relying
-        # on uq_meeting_active_user_platform_native as its DB backstop, so a DB where that index is
+        # on uq_meeting_live_user_platform_native as its DB backstop, so a DB where that index is
         # absent must not be served by a process that assumes it. Not retried (see
         # _is_transient_connect_error) — it needs an operator, not a backoff.
         await _connect_with_retry(lambda: ensure_schema(app_db.get_engine(), Base))
