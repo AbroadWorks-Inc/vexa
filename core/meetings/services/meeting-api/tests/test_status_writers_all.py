@@ -1226,6 +1226,146 @@ async def test_pg_an_r5_stopped_meetings_terminal_event_carries_the_outcome(pg):
     assert terminal["meeting"]["outcome"]["detail"] == "deleted"
 
 
+# ── Postgres: R7's re-run after every finishing writer (I1) ─────────────────────────────────
+
+
+def _intake(pg: _Pg) -> tuple[Any, Any]:
+    from intake_builders import make_settings
+
+    from meeting_api.intake import IntakeService, PostgresIntakeStore
+    from meeting_api.intake.fakes import NoStop
+    from meeting_api.intake.sweeps import OutboxOnly
+
+    store = PostgresIntakeStore(pg.session_factory)
+    return store, IntakeService(
+        store, _NoSpawnPort(), NoStop(), OutboxOnly(), make_settings()
+    )
+
+
+async def _moved_while_live(
+    pg: _Pg, service: Any, *, reach_the_call: bool
+) -> tuple[int, dict]:
+    """A call that started 5 minutes ago gets its bot (claimed; with ``reach_the_call`` it goes
+    ``joining`` → ``active`` through the lifecycle callback); then its entry moves to tomorrow,
+    answered ``not_changed_live``. Returns the meeting id and the moved entry's body."""
+    from datetime import timedelta
+
+    from intake_builders import entry_body
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    reply = await service.put_entry(
+        USER,
+        entry_body(
+            start=_iso(now - timedelta(minutes=5)),
+            end=_iso(now + timedelta(minutes=55)),
+        ),
+    )
+    mid = int(
+        await pg.scalar(
+            "SELECT id FROM meetings WHERE uuid = CAST(:u AS uuid)",
+            u=reply["meeting"]["id"],
+        )
+    )
+    await pg.repo.create_meeting_guarded(
+        user_id=USER,
+        platform=PLAT,
+        native_meeting_id=NID,
+        data={},
+        claim_meeting_id=mid,
+    )
+    await pg.session(mid, "sess-cb")
+    if reach_the_call:
+        await _callback(pg.repo, _event("joining"), _event("active"))
+    tomorrow = now + timedelta(days=1)
+    moved = entry_body(start=_iso(tomorrow), end=_iso(tomorrow + timedelta(hours=1)))
+    held = await service.put_entry(USER, moved)
+    assert held["result"] == "not_changed_live"
+    return mid, moved
+
+
+async def _finish_by_callback(pg: _Pg, mid: int) -> None:
+    await _callback(
+        pg.repo, _event("completed", completion_reason="stopped", exit_code=0)
+    )
+
+
+async def _finish_by_runtime_destroy(pg: _Pg, mid: int) -> None:
+    from meeting_api import create_app
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    app = create_app(meeting_repo=pg.repo)
+    await app.state.apply_lifecycle_event(
+        {
+            "connection_id": "sess-cb",
+            "status": "completed",
+            "completion_reason": "stopped",
+        },
+        transition_source=TransitionSource.RUNTIME_DESTROY,
+        force_terminal_on_destroy=True,
+    )
+
+
+async def _finish_by_fail_meeting(pg: _Pg, mid: int) -> None:
+    from meeting_api.intake.status import Outcome
+
+    await pg.repo.fail_meeting(
+        meeting_id=mid,
+        reason="bot workload failed to start",
+        outcome=Outcome("not_sent", "spawn_error", "bot workload failed to start"),
+    )
+
+
+@pytest.mark.parametrize(
+    "finish, reach_the_call, finished",
+    [
+        (_finish_by_callback, True, "completed"),
+        (_finish_by_runtime_destroy, True, "completed"),
+        (_finish_by_fail_meeting, False, "failed"),
+    ],
+    ids=["lifecycle_callback", "runtime_destroy", "fail_meeting"],
+)
+async def test_pg_a_change_stored_while_live_reruns_after_every_finishing_writer(
+    pg, finish, reach_the_call, finished
+):
+    """R7 end to end: the entry moved while the bot was in the call; the meeting finishes through
+    a real writer; the not-sent sweep's next tick gives the entry a meeting of its own at the new
+    time (``meeting.scheduled``), and a later PUT with the same content is ``unchanged`` there.
+    """
+    from meeting_api.intake.sweeps import OutboxOnly, not_sent_tick
+
+    store, service = _intake(pg)
+    mid, moved = await _moved_while_live(pg, service, reach_the_call=reach_the_call)
+    await finish(pg, mid)
+    assert await pg.status(mid) == finished
+    assert (
+        await pg.scalar(
+            "SELECT state FROM meeting_entries WHERE meeting_id = :m", m=mid
+        )
+        == "active"
+    )
+
+    await not_sent_tick(
+        store,
+        service,
+        publisher=OutboxOnly(),
+        now=datetime.now(timezone.utc),
+        open_ended_s=3600,
+    )
+
+    new = int(await pg.scalar("SELECT meeting_id FROM meeting_entries"))
+    assert new != mid
+    assert await pg.status(new) == "scheduled"
+    assert [e["event_type"] for e in await pg.events(new)] == ["meeting.scheduled"]
+    scheduled = (await pg.events(new))[0]["payload"]["data"]["meeting"]
+    assert (scheduled["start"], scheduled["end"]) == (moved["start"], moved["end"])
+
+    again = await service.put_entry(USER, moved)
+    assert again["result"] == "unchanged"
+    assert again["meeting"]["id"] == str(
+        await pg.scalar("SELECT uuid FROM meetings WHERE id = :m", m=new)
+    )
+
+
 class _NoSpawnPort:
     async def spawn_exact(self, user_id: int, meeting_id: int) -> Any:
         raise AssertionError("no spawn in this test")

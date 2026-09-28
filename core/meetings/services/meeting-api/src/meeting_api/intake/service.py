@@ -40,8 +40,9 @@ one is stopped with that outcome (``bot_stopping``, R5). The status change is co
 meeting that went live meanwhile takes the live branch. When the meeting has already finished,
 only the entry goes (``entry_removed``) and the finished meeting is left as history.
 
-``merge_into_live`` is R2's exception and ``rerun_entries`` R7's re-run at finish; both are called
-by the scheduler and the status writer's callers, not by a route.
+``merge_into_live`` is R2's exception and ``rerun_entries`` R7's re-run after a finish; the scheduler
+calls both, never a route: the auto-join tick merges, and the not-sent sweep re-runs every entry a
+finished meeting kept active, whichever writer finished it (``sweeps.rerun_kept``).
 
 Events: ``meeting.scheduled`` for a meeting an entry created, ``meeting.updated`` when a
 meeting's time, link, title or entries change, ``meeting.removed`` (R8, R2), and

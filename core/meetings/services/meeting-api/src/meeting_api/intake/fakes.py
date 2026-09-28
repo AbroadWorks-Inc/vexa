@@ -9,7 +9,8 @@
     sequence, a finished status closes the active entries except the ones that re-run
     (``rules.is_rerun``, returned in ``rerun_entry_ids``), and every event is recorded in order in
     ``events`` with the meeting as projected at that moment. ``overdue_meetings`` applies
-    ``rules.is_overdue`` to the ``scheduled`` meetings that have an entry, as the Postgres read does.
+    ``rules.is_overdue`` to the ``scheduled`` meetings that have an entry, as the Postgres read does;
+    ``kept_entries`` returns the active entries of finished meetings.
   * ``FakeSpawn`` — ``SpawnPort``: claims a ``scheduled`` row (status ``requested``), answers
     ``already_live`` for any other row, or returns the failure it was given: before the claim by
     default, after it with ``after_claim=True`` (the row then ends ``failed``, outcome
@@ -194,6 +195,14 @@ class InMemoryIntakeStore:
             v
             for v in views
             if is_overdue(v.start, v.end, now=now, open_ended_s=open_ended_s)
+        ]
+
+    async def kept_entries(self) -> list[EntryView]:
+        return [
+            e
+            for _, e in sorted(self.entries.items())
+            if e.state == "active"
+            and self.meetings[e.meeting_id]["status"] in FINISHED_STATUSES
         ]
 
     def entries_of(self, meeting_id: int, state: str = "active") -> list[EntryView]:

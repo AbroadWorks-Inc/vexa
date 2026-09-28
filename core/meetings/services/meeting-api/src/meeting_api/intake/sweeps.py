@@ -1,5 +1,5 @@
-"""The scheduler's intake side (§1.5, R2, R6): the link check the auto-join tick makes before it
-sends a bot to an entry-managed meeting, and the not-sent sweep.
+"""The scheduler's intake side (§1.5, R2, R6, R7): the link check the auto-join tick makes before
+it sends a bot to an entry-managed meeting, and the not-sent sweep with R7's re-run.
 
 ``check_room(store, user_id, meeting_id, room, *, publisher)`` reads the meeting and its link again
 under the link lock and answers one of:
@@ -15,7 +15,7 @@ under the link lock and answers one of:
     out. Nothing else is written (no retry stamp), so the bot goes on the first tick after the link
     is free.
 
-``not_sent_tick(store, service, *, publisher, now, open_ended_s)`` is R6's backstop. Every
+``not_sent_tick(store, service, *, publisher, now, open_ended_s)`` is R6's backstop, then R7's. Every
 entry-managed meeting past its end without a bot (``IntakeStore.overdue_meetings``) is read again
 under its link lock and, still ``scheduled`` and overdue (``rules.is_overdue``), ends ``failed``
 with outcome ``not_sent`` through the status writer (``meeting.not_sent``). An open-ended meeting's
@@ -27,8 +27,15 @@ detail and message:
   * else ``room_busy`` when ``meeting.waiting_for_room`` went out;
   * else ``ended_before_sent``.
 
-Entries the finish kept active re-run (``IntakeService.rerun_entries``, R7). One meeting's failure
-is logged with its stack and the sweep goes on to the next.
+Then R7's re-run, ``rerun_kept(store, service)``: every entry a finished meeting kept active
+(``IntakeStore.kept_entries``: a future time that doesn't overlap the finished meeting, ``write_status``
+step 4) becomes a meeting of its own through ``IntakeService.rerun_entries``. It reads the kept
+entries themselves, not what a status write returned, so it covers every writer that finishes a
+meeting (the bot's lifecycle callback, the runtime's destroy, ``fail_meeting``, intake's own) and a
+finish whose process stopped before anything acted on it. A kept entry the sweep reaches after its
+own time has passed gets its meeting all the same, and a later tick ends that meeting ``not_sent``.
+
+One meeting's or entry's failure is logged with its stack and the sweep goes on to the next.
 
 ``OutboxOnly`` is the ``EventPublisher`` of the production ``IntakeService`` the scheduler merges
 and re-runs through (and the ``/v2`` routes use): events stay in ``webhook_outbox`` for the outbox
@@ -55,6 +62,7 @@ __all__ = [
     "check_room",
     "not_sent_cause",
     "not_sent_tick",
+    "rerun_kept",
 ]
 
 #: The exact message of each not-sent cause that isn't a spawn failure (§1.13).
@@ -145,12 +153,13 @@ async def not_sent_tick(
     now: datetime,
     open_ended_s: int,
 ) -> int:
-    """End every overdue entry-managed meeting ``not_sent`` (R6); returns how many ended."""
+    """End every overdue entry-managed meeting ``not_sent`` (R6), then re-run every kept entry
+    (R7, ``rerun_kept``); returns how many meetings ended."""
     ended = 0
     for view in await store.overdue_meetings(now, open_ended_s=open_ended_s):
         try:
             if await _end_not_sent(
-                store, service, publisher, view, now=now, open_ended_s=open_ended_s
+                store, publisher, view, now=now, open_ended_s=open_ended_s
             ):
                 ended += 1
         except Exception as exc:
@@ -168,12 +177,38 @@ async def not_sent_tick(
                     ),
                 },
             )
+    await rerun_kept(store, service)
     return ended
+
+
+async def rerun_kept(store: IntakeStore, service: IntakeService) -> int:
+    """R7: every entry a finished meeting kept active gets a meeting of its own; returns how many
+    entries were handed to ``IntakeService.rerun_entries``."""
+    kept = await store.kept_entries()
+    for entry in kept:
+        try:
+            await service.rerun_entries(entry.user_id, [entry.id])
+        except Exception as exc:
+            log_event(
+                "rerun_failed",
+                audience="operator",
+                level="error",
+                span="meetings.auto_join",
+                user_id=entry.user_id,
+                meeting_id=str(entry.meeting_id),
+                fields={
+                    "entry_id": entry.id,
+                    "error": type(exc).__name__,
+                    "traceback": "".join(
+                        traceback.format_exception(type(exc), exc, exc.__traceback__)
+                    ),
+                },
+            )
+    return len(kept)
 
 
 async def _end_not_sent(
     store: IntakeStore,
-    service: IntakeService,
     publisher: Optional[EventPublisher],
     view: MeetingView,
     *,
@@ -211,6 +246,4 @@ async def _end_not_sent(
         fields={"detail": detail, "message": message},
     )
     await _publish(publisher, [written.event_id])
-    if written.rerun_entry_ids:
-        await service.rerun_entries(user_id, written.rerun_entry_ids)
     return True

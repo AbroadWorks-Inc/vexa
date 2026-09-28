@@ -448,6 +448,100 @@ async def test_the_not_sent_sweep_reruns_a_kept_entry():
     assert h.store.meetings[moved.meeting_id]["status"] == "scheduled"
 
 
+async def _moved_while_live(h) -> str:
+    """A 09:00–10:00 call goes live; at 09:30 its entry moves to 15:00–16:00 (``not_changed_live``).
+    Returns the live meeting's uuid."""
+    reply = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    uuid = reply["meeting"]["id"]
+    h.clock.set("2026-09-29T09:00:00Z")
+    h.set_status(uuid, "active")
+    h.clock.set("2026-09-29T09:30:00Z")
+    held = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
+    assert held["result"] == "not_changed_live"
+    return uuid
+
+
+def _entry(h):
+    return h.store.find_entry(USER, "a@abroadworks.com", "google:3n5kq8example")
+
+
+async def test_the_sweep_reruns_an_entry_whichever_writer_finished_its_meeting():
+    """R7, I1: the bot's own finish (the lifecycle writer, not intake) keeps the moved entry
+    active; the sweep's next tick gives it a meeting of its own, and a later PUT with the same
+    content is ``unchanged`` on that meeting."""
+    h = make_harness()
+    uuid = await _moved_while_live(h)
+    h.clock.set("2026-09-29T09:55:00Z")
+    h.set_status(uuid, "completed")
+    assert (_entry(h).state, _entry(h).meeting_id) == ("active", h.meeting_id(uuid))
+
+    mark = h.mark()
+    assert await _sweep(h, "2026-09-29T09:55:30Z") == 0
+    new = h.store.view(_entry(h).meeting_id)
+    assert new.uuid != uuid
+    projected = new.project(lead_s=300)
+    assert (projected["status"], projected["start"], projected["end"]) == (
+        "scheduled",
+        "2026-09-29T15:00:00Z",
+        "2026-09-29T16:00:00Z",
+    )
+    assert h.events(mark) == [(new.uuid, "meeting.scheduled")]
+
+    again = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
+    assert (again["result"], again["meeting"]["id"]) == ("unchanged", new.uuid)
+    mark = h.mark()
+    assert await _sweep(h, "2026-09-29T09:56:00Z") == 0
+    assert h.events(mark) == []
+
+
+async def test_a_join_now_failure_after_the_claim_reruns_the_adopted_entry():
+    """A 09:45 paste adopts the 10:00 meeting and its spawn fails after the claim, which ends the
+    meeting ``not_sent`` (Ruling R17). The calendar entry, later than that finish, keeps its 10:00
+    meeting through the sweep."""
+    from meeting_api.intake.ports import SpawnOutcome
+
+    h = make_harness(
+        "2026-09-29T09:00:00Z",
+        spawn_failure=SpawnOutcome("failed", "spawn_error", "bot workload failed"),
+    )
+    h.spawn.after_claim = True
+    reply = await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T11:00:00Z")
+    adopted = reply["meeting"]["id"]
+    h.clock.set("2026-09-29T09:45:00Z")
+    pasted = await h.instant("manual:1", GMEET)
+    assert pasted["meeting"]["id"] == adopted
+    assert h.meeting(adopted).status == "failed"
+
+    await _sweep(h, "2026-09-29T09:45:30Z")
+    new = h.store.view(_entry(h).meeting_id)
+    assert new.uuid != adopted
+    projected = new.project(lead_s=300)
+    assert (projected["status"], projected["start"], projected["end"]) == (
+        "scheduled",
+        "2026-09-29T10:00:00Z",
+        "2026-09-29T11:00:00Z",
+    )
+
+
+async def test_a_rerun_the_sweep_reaches_after_its_time_ends_not_sent():
+    """R6 after R7: a kept entry whose own time has passed when the sweep reaches it gets its
+    meeting, which the next tick ends ``not_sent`` (``ended_before_sent``)."""
+    h = make_harness()
+    reply = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    uuid = reply["meeting"]["id"]
+    h.clock.set("2026-09-29T09:00:00Z")
+    h.set_status(uuid, "active")
+    await h.put(start="2026-09-29T10:30:00Z", end="2026-09-29T10:45:00Z")
+    h.clock.set("2026-09-29T09:55:00Z")
+    h.set_status(uuid, "completed")
+
+    await _sweep(h, "2026-09-29T11:00:00Z")
+    new = _entry(h).meeting_id
+    assert h.store.meetings[new]["status"] == "scheduled"
+    assert await _sweep(h, "2026-09-29T11:00:30Z") == 1
+    assert _outcome(h, new)[:3] == ("failed", "not_sent", "ended_before_sent")
+
+
 # ══ Postgres ════════════════════════════════════════════════════════════════════════════════
 
 pg_only = pytest.mark.skipif(

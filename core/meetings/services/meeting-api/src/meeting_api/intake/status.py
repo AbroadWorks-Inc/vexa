@@ -17,6 +17,7 @@ workload that never started and the auto-join retry rule reads.
   3. lock ``meeting_aw_state`` (created if missing), set the outcome if given, ``event_seq += 1``;
   4. on a finished status (``completed`` / ``failed``), close the active entries, except an entry
      that re-runs (R7, R10, below): it stays active and its id comes back in ``rerun_entry_ids``;
+     the not-sent sweep gives every such entry its meeting (``sweeps.rerun_kept``), whoever called;
   5. insert the event into ``webhook_outbox``: the §2.7 envelope around the one meeting projection
      (``project_meeting``), serialised once; the stored ``payload_text`` is the exact body sent.
 

@@ -27,7 +27,8 @@ cached generic plan still matches the index.
 row and whose ``scheduled_end_at`` has passed (an open-ended one: its start plus ``open_ended_s``).
 A meeting's end is never before its start, so the read also bounds the meeting time by ``now`` and
 walks the partial index ``ix_meeting_scheduled_due`` (``status = 'scheduled'`` is a literal for the
-same generic-plan reason).
+same generic-plan reason). ``kept_entries`` is its re-run read (R7): the active entries of finished
+meetings, its ``state = 'active'`` literal matching the partial index ``ix_meeting_entries_active_user``.
 
 ``link_rows(db, user_id, room)`` is the link resolver's read (§1.6): the account's rows on one link
 in the caller's session, narrow (no ``data`` beyond ``scheduled_at``), for ``resolver.resolve``.
@@ -204,6 +205,10 @@ class PostgresIntakeStore:
         async with self._reading() as tx:
             return await tx._overdue(now, open_ended_s=open_ended_s)
 
+    async def kept_entries(self) -> list[EntryView]:
+        async with self._reading() as tx:
+            return await tx._kept()
+
     @asynccontextmanager
     async def _reading(self) -> AsyncIterator[PostgresIntakeTx]:
         async with self._session_factory() as db:
@@ -336,6 +341,24 @@ class PostgresIntakeTx:
             .order_by(Meeting.id)
         )
         return await self._views(await self._scalars(stmt))
+
+    async def _kept(self) -> list[EntryView]:
+        """``PostgresIntakeStore.kept_entries``'s read: the ``state = 'active'`` literal lets the
+        planner use the partial index ``ix_meeting_entries_active_user``."""
+        from sqlalchemy import select, text
+
+        from ..sessions.models import Meeting, MeetingEntry
+
+        rows = await self._scalars(
+            select(MeetingEntry)
+            .join(Meeting, Meeting.id == MeetingEntry.meeting_id)
+            .where(
+                text("meeting_entries.state = 'active'"),
+                Meeting.status.in_(FINISHED_STATUSES),
+            )
+            .order_by(MeetingEntry.id)
+        )
+        return [_entry_view(row) for row in rows]
 
     async def meeting(self, meeting_id: int) -> MeetingView:
         from sqlalchemy import select

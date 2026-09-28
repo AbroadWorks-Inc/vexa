@@ -34,10 +34,10 @@ Public surface:
     booting keeps its stage and gets the flag and the outcome (``record_stop``, which R5 runs in the
     removal's own transaction); then ``leave`` (``stop_meeting_row``) sends the leave command and
     deletes a booting bot's workload.
-  * ``check_room`` / ``not_sent_tick`` — ``sweeps.py``. The scheduler's intake side (§1.5): the
-    link check under the link lock before a bot is sent to an entry-managed meeting (wait, or merge
-    into an open-ended live meeting, R2), and the not-sent sweep (R6). ``OutboxOnly`` is the
-    outbox-only publisher.
+  * ``check_room`` / ``not_sent_tick`` / ``rerun_kept`` — ``sweeps.py``. The scheduler's intake
+    side (§1.5): the link check under the link lock before a bot is sent to an entry-managed meeting
+    (wait, or merge into an open-ended live meeting, R2), the not-sent sweep (R6), and the re-run of
+    every entry a finished meeting kept active (R7). ``OutboxOnly`` is the outbox-only publisher.
   * ``PostgresIntakeStore(session_factory)`` — ``adapters.py``. The ``IntakeStore`` over Postgres:
     one transaction per ``room_lock`` holding the links' advisory locks (§1.4), status changes and
     events through ``write_status`` / ``write_event`` in that transaction.
@@ -89,6 +89,7 @@ from .sweeps import (
     check_room,
     not_sent_cause,
     not_sent_tick,
+    rerun_kept,
 )
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
@@ -101,6 +102,7 @@ __all__ = [
     "record_stop",
     "check_room",
     "not_sent_tick",
+    "rerun_kept",
     "not_sent_cause",
     "RoomCheck",
     "OutboxOnly",

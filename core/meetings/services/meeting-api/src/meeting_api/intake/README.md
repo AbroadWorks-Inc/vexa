@@ -70,7 +70,8 @@ time, removes a meeting that lost its last entry (R8) or stops its bot when live
 the active-entry quota only when a write adds an entry. Events are published after the commit;
 a `join_now` entry's meeting is then spawned on that exact row (a failure ends it `not_sent`,
 unless it was adopted with other entries on it: then only the pasted entry goes, Ruling R12). `merge_into_live` (R2's exception)
-and `rerun_entries` (R7) are for the scheduler and the status writer's callers. The service reaches
+and `rerun_entries` (R7) are for the scheduler: the auto-join tick merges, and the not-sent sweep
+re-runs every entry a finished meeting kept active, whichever writer finished it. The service reaches
 storage, spawn, stop and publishing only through `ports.py` (`IntakeStore`/`IntakeTx`,
 `SpawnPort`, `StopPort`, `EventPublisher`); `fakes.py` holds the in-memory implementations.
 `PostgresIntakeStore(session_factory)` (`adapters.py`) is the `IntakeStore` over Postgres: each
@@ -134,7 +135,7 @@ and its stop commit together, and the `/v2` stop opens a transaction for it. Aft
 `bot_commands:meeting:{id}` and deletes the workload of a bot still booting; when R5's leave fails,
 the removal still answers `bot_stopping` and the stale-stopping reconcile sweep ends the bot. A meeting with no live bot, or already stop-requested, is left as it is; a command bus
 that can't be reached is 503 `unavailable`, with the stop already recorded.
-`sweeps.py` is the scheduler's intake side (§1.5, R2, R6). `check_room` reads a due entry-managed
+`sweeps.py` is the scheduler's intake side (§1.5, R2, R6, R7). `check_room` reads a due entry-managed
 meeting and its link again under the link lock: `free`, `gone`, `merge` (the live meeting is an
 open-ended meeting with an active `join_now` entry whose bot isn't `stopping`, `is_merge_target`,
 the same predicate `merge_into_live` re-checks: `merge_into_live`), or `waiting` (any other live
@@ -145,7 +146,9 @@ single-flight) ends every `scheduled` entry-managed meeting past its end (`Intak
 `rules.is_overdue`; an open-ended one's end is its start plus `JOIN_NOW_ADOPT_AHEAD_S`) `failed`,
 outcome `not_sent`, under its link lock, with detail `last_error_code` (message `last_error_message`),
 else `room_busy` ("another bot was still on this meeting link when the meeting ended"), else
-`ended_before_sent` ("the meeting ended before a bot was sent"), and re-runs the entries it kept (R7).
+`ended_before_sent` ("the meeting ended before a bot was sent"); then `rerun_kept` gives every entry a
+finished meeting kept active (`IntakeStore.kept_entries`, R7) a meeting of its own, whichever writer
+finished that meeting (the lifecycle callback, the runtime's destroy, `fail_meeting`, intake's own).
 `IntakeSettings.from_env()` (`settings.py`) reads `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`,
 `AUTO_JOIN_LEAD_S`, `ENTRY_BLOCKED_HOSTS` and `INTAKE_MAX_ACTIVE_ENTRIES`, all declared in
 `config.v1.json`.
