@@ -105,6 +105,7 @@
   52. Owner decision (2026-09-28): only people on the meeting may stop its bot from the portal — the host and invitees who haven't declined. The portal allows stop only for a user who owns an active entry on the meeting; a declined guest, or an invitee without a connected calendar, can see the meeting but not stop it (Part 4).
   53. MIGRATION-0008 sets the `uuid` default before the backfill, so no row inserted in between is left NULL for `SET NOT NULL`; every locking step runs under `SET lock_timeout`; after step 3 the old unique index can't simply be recreated, because a link then holds several scheduled rows (§6.4 A1, Part 5).
   54. Every `helm upgrade` in Part 5 (steps 11, 14) uses the values file from aw-notetaker `feat/portal-aw-bots`; the runbook checks the rendered chart before upgrading (Part 5).
+  55. Owner follow-ups after the final review: §6.9 (F-A … F-K). F-K replaces R19; F-J replaces R8.
 
 ---
 
@@ -1570,6 +1571,24 @@ for g in readme docs-version dataflow isolation isolation-py exports graph graph
 for d in calendar-dispatcher notetaker-postgres; do (cd $N/$d && ../.venv/bin/python -m pytest -q -p no:cacheprovider | tail -1 && ../.venv/bin/black --check . && ../.venv/bin/ruff check . && ../.venv/bin/mypy .); done
 cd $N/portal && npx vitest run && npx tsc --noEmit && npx next lint
 ```
+
+## 6.9 Follow-ups after the final review (owner, 2026-09-28)
+
+The owner asked for all of these. Every limit is a setting (the service's `config.v1.json` and the chart) with the default shown, so a change needs no code. Nothing retries forever.
+
+| Task | Change | Settings (default) |
+|---|---|---|
+| F-A | Webhook retry schedule from a setting instead of a constant (`webhooks/sender.py`). | `WEBHOOK_RETRY_SCHEDULE_S` (`60,300,1800,7200`) |
+| F-C | A rotated secret takes effect at once: the sender reads the subscription's secrets when it signs, never from the 30 s cache. | — |
+| F-H | The sender's DNS checks run on the sender's own threads with a timeout, not the default pool that recording storage uses. A "lease short" skip is a failed attempt on the retry schedule, so it ends `dead` like any other failure. | `WEBHOOK_DNS_THREADS` (`4`), `WEBHOOK_DNS_TIMEOUT_S` (`5`) |
+| F-B | `aw_meetings_failed_total{reason,user_id}`: every meeting that ends `failed` after its bot was sent, counted once, by reason, at the one status writer. Alert when any occurs. | — |
+| F-D | A database constraint race is retried inside aw-bots a bounded number of times; if it still fails, the answer is 500 `internal_error` (logged, counted), not 503. | `INTAKE_CONFLICT_RETRIES` (`3`) |
+| F-I | The kept-entry re-run (R39) works in batches, is counted, and gives up on an entry after a bounded number of failures, telling the entry's owner by webhook. | `RERUN_BATCH_SIZE` (`200`), `RERUN_MAX_FAILURES` (`5`) |
+| F-K | Sending a bot for an entry-managed meeting (calendar or `join_now`) is tried a bounded number of times with a fixed gap; after the last failure the meeting ends `not_sent` with the last typed code (webhook, counter). The meeting's end stays the outer bound. `JOIN_NOW_ADOPT_AHEAD_S` is used only for the de-duplication look-ahead, never as a give-up time (replaces R19). | `BOT_SEND_MAX_ATTEMPTS` (`3`), `BOT_SEND_RETRY_BACKOFF_S` (`60`) |
+| F-E | The gateway signature also covers the query string and a SHA-256 of the body (a new signature version in the gateway-identity contract, re-sealed). Verifiers also accept an optional previous key, so the key can be rotated with no downtime. | `GATEWAY_IDENTITY_SECRET_PREVIOUS` (unset) |
+| F-J | Seal `core/flows/contracts/flows.v1` once, so `pnpm seal:contracts` needs no hand edit (replaces R8). | — |
+| F-F | A `/v2` API reference page on the docs site (`docs/docs/api/`), from Part 2, with request and reply examples for every route and webhook. | — |
+| F-G | The aw-bots rollout files (`deployment/base/aw-bots/values.yaml`, `alerts.yml`, `README.md`, `deployment/base/aw-exporter/`) move to their own aw-notetaker branch `feat/aw-bots-rollout` (from `feat/aw-bots-deployment`), with the settings and the alert above, so the aw-bots rollout doesn't wait on the calendar and portal review. | — |
 
 ---
 
