@@ -92,6 +92,7 @@ class EntryView:
     content_hash: str
     state: str
     removed_reason: Optional[str] = None
+    closed_at: Optional[datetime] = None
 
     @property
     def room(self) -> Room:
@@ -119,6 +120,7 @@ class EntryView:
             "content_hash": self.content_hash,
             "state": self.state,
             "removed_reason": self.removed_reason,
+            "closed_at": self.closed_at,
         }
 
     @classmethod
@@ -145,6 +147,7 @@ class EntryView:
             content_hash=row["content_hash"],
             state=row["state"],
             removed_reason=row["removed_reason"],
+            closed_at=row.get("closed_at"),
         )
 
     def as_entry_in(self) -> EntryIn:

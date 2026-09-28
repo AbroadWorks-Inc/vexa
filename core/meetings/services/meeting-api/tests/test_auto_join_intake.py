@@ -571,6 +571,33 @@ async def test_an_update_to_an_entry_waiting_to_rerun_decides_it():
     assert (len(h.store.meetings), h.events(mark)) == (meetings, [])
 
 
+async def test_a_kept_entry_put_back_then_moved_again_gets_its_meeting():
+    """N1: the kept entry (moved to 15:00 while live) is put back on the finished meeting's time
+    before the sweep: it is closed WITH that update's content (hash, time) and ``closed_at``.
+    When the organiser moves it to 15:00 again, that is a new future move: ``created``, a
+    ``scheduled`` 15:00 meeting, never ``unchanged``."""
+    h = make_harness()
+    uuid = await _moved_while_live(h)
+    h.clock.set("2026-09-29T09:55:00Z")
+    h.set_status(uuid, "completed")
+    back = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
+    assert back["result"] == "not_changed_finished"
+    closed = _entry(h)
+    assert (closed.state, closed.meeting_id) == ("closed", h.meeting_id(uuid))
+    assert closed.start == ts("2026-09-29T09:00:00Z")
+    assert closed.closed_at == ts("2026-09-29T09:55:00Z")
+
+    h.clock.set("2026-09-29T11:00:00Z")
+    again = await h.put(start="2026-09-29T15:00:00Z", end="2026-09-29T16:00:00Z")
+    assert (again["result"], again["previous_meeting_id"]) == ("created", uuid)
+    projected = again["meeting"]
+    assert (projected["status"], projected["start"], projected["end"]) == (
+        "scheduled",
+        "2026-09-29T15:00:00Z",
+        "2026-09-29T16:00:00Z",
+    )
+
+
 # ══ Postgres ════════════════════════════════════════════════════════════════════════════════
 
 pg_only = pytest.mark.skipif(

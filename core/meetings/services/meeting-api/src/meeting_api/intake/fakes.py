@@ -347,7 +347,9 @@ class InMemoryIntakeStore:
                 if is_rerun(entry.start, entry.end, window, finish=now):
                     rerun.append(entry.id)
                 else:
-                    self.entries[entry.id] = replace(entry, state="closed")
+                    self.entries[entry.id] = replace(
+                        entry, state="closed", closed_at=now.replace(microsecond=0)
+                    )
         change = {
             "from": from_status,
             "to": to_status,
@@ -448,7 +450,11 @@ class _FakeTx:
         )
 
     async def close_entry(self, entry_id: int) -> None:
-        self._s.entries[entry_id] = replace(self._s.entries[entry_id], state="closed")
+        self._s.entries[entry_id] = replace(
+            self._s.entries[entry_id],
+            state="closed",
+            closed_at=self._s._clock().replace(microsecond=0),
+        )
 
     async def active_entries(self, meeting_id: int) -> list[EntryView]:
         return self._s.entries_of(meeting_id)

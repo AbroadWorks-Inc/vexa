@@ -1405,6 +1405,39 @@ async def test_pg_an_update_back_to_the_finished_time_closes_the_kept_entry(pg):
     assert await pg.scalar("SELECT count(*) FROM meetings") == meetings
 
 
+async def test_pg_a_kept_entry_put_back_then_moved_again_gets_its_meeting(pg):
+    """N1 on Postgres: the put-back stores its content (time and hash) on the closed entry, so
+    the organiser's later move back to the kept time is ``created`` at that time."""
+    from datetime import timedelta
+
+    from intake_builders import entry_body
+
+    store, service = _intake(pg)
+    mid, moved = await _moved_while_live(pg, service, reach_the_call=True)
+    await _finish_by_callback(pg, mid)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    back_body = entry_body(
+        start=_iso(now - timedelta(minutes=10)),
+        end=_iso(now + timedelta(minutes=50)),
+    )
+    back = await service.put_entry(USER, back_body)
+    assert back["result"] == "not_changed_finished"
+    state, start_at, closed_at = (
+        await pg.exec("SELECT state, start_at, closed_at FROM meeting_entries")
+    ).one()
+    assert state == "closed" and closed_at is not None
+    assert _iso(start_at) == back_body["start"]
+
+    again = await service.put_entry(USER, moved)
+    assert again["result"] == "created"
+    new = int(await pg.scalar("SELECT meeting_id FROM meeting_entries"))
+    assert new != mid and await pg.status(new) == "scheduled"
+    assert (again["meeting"]["start"], again["meeting"]["end"]) == (
+        moved["start"],
+        moved["end"],
+    )
+
+
 class _NoSpawnPort:
     async def spawn_exact(self, user_id: int, meeting_id: int) -> Any:
         raise AssertionError("no spawn in this test")
