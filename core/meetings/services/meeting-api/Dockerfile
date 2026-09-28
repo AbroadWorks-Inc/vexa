@@ -5,7 +5,7 @@
 #
 # Build context: the v0.12 carve root (compose `context: ../..`). Wider than the other three
 # services because meeting_api validates AT THE SEAM (P8): it loads the sealed invocation.v1 /
-# lifecycle.v1 / webhook.v1 / runtime.v1 / schedule.v1 schemas, plus the DRAFT intake.v1 schema,
+# lifecycle.v1 / webhook.v1 / intake.v1 / runtime.v1 / schedule.v1 schemas
 # BY PATH at import (walking up from the module to find `meetings/contracts/...` and
 # `runtime/contracts/...`), so those contract files must be vendored into the image alongside src/.
 FROM python:3.12-slim
