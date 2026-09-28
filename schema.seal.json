@@ -79,6 +79,14 @@
       "updated_at": "Column(DateTime, server_default=func.now(), onupdate=func.now())",
       "value": "Column(JSONB, nullable=False, server_default=text(\"'{}'::jsonb\"), default=lambda: {})"
     },
+    "sweep_item_failures": {
+      "failures": "Column(Integer, nullable=False, server_default='0')",
+      "gave_up_at": "Column(DateTime(timezone=True), nullable=True)",
+      "item_id": "Column(String(80), primary_key=True)",
+      "last_error": "Column(Text, nullable=True)",
+      "sweep": "Column(String(64), primary_key=True)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())"
+    },
     "transcriptions": {
       "created_at": "Column(DateTime, default=datetime.utcnow)",
       "end_time": "Column(Float, nullable=False)",
@@ -214,6 +222,14 @@
       "updated_at": "Column(DateTime, server_default=func.now(), onupdate=func.now())",
       "user_id": "Column(Integer, nullable=False, index=True)",
       "uuid": "Column(UUID(as_uuid=True), nullable=False, unique=True, index=True, server_default=text('gen_random_uuid()'))"
+    },
+    "sweep_item_failures": {
+      "failures": "Column(Integer, nullable=False, server_default='0')",
+      "gave_up_at": "Column(DateTime(timezone=True), nullable=True)",
+      "item_id": "Column(String(80), primary_key=True)",
+      "last_error": "Column(Text, nullable=True)",
+      "sweep": "Column(String(64), primary_key=True)",
+      "updated_at": "Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())"
     },
     "transcriptions": {
       "created_at": "Column(DateTime, default=datetime.utcnow)",
