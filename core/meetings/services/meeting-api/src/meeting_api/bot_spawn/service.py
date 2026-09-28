@@ -444,6 +444,7 @@ async def request_bot(
     webhook_secret: Optional[str] = None,
     webhook_events: Optional[dict] = None,
     claim_meeting_id: Optional[int] = None,
+    claim_due: Optional[Any] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -458,7 +459,9 @@ async def request_bot(
 
     ``claim_meeting_id`` (§1.5): spawn on exactly that ``scheduled`` row (the scheduler and the
     intake instant join pass it); without it the planned row the R1 ``join_now`` rule picks is
-    claimed, else a new row is inserted (``MeetingRepo.create_meeting_guarded``).
+    claimed, else a new row is inserted (``MeetingRepo.create_meeting_guarded``). ``claim_due``
+    (the scheduler's ``auto_join.DueWindow``) makes the claim re-check under the lock that the row
+    is still due (``ClaimNotDue`` otherwise).
     """
     if claim_meeting_id is not None and continue_meeting:
         raise ValueError(
@@ -741,6 +744,7 @@ async def request_bot(
                 data=meeting_data,
                 max_concurrent=max_concurrent,
                 claim_meeting_id=claim_meeting_id,
+                claim_due=claim_due,
             )
         except MaxBotsExceeded:
             log_event(

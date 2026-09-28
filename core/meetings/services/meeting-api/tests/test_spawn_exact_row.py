@@ -29,10 +29,12 @@ from typing import Any, Optional
 import pytest
 
 from meeting_api.bot_spawn import request_bot
+from meeting_api.bot_spawn.auto_join import DueWindow
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.bot_spawn.ports import (
     AuthSessionBusy,
     AuthSessionNotConfigured,
+    ClaimNotDue,
     ClaimTargetMoved,
     DuplicateMeeting,
     MaxBotsExceeded,
@@ -267,6 +269,7 @@ async def _guarded(
     claim: Optional[int] = None,
     cap: Optional[int] = None,
     native: str = NID,
+    due: Optional[DueWindow] = None,
 ) -> dict:
     return await backend.repo.create_meeting_guarded(
         user_id=USER,
@@ -275,6 +278,7 @@ async def _guarded(
         data=dict(SPAWN_DATA),
         max_concurrent=cap,
         claim_meeting_id=claim,
+        claim_due=due,
     )
 
 
@@ -326,6 +330,45 @@ async def test_id_claim_of_a_row_no_longer_scheduled_is_meeting_stopped(
     with pytest.raises(MeetingStopped, match=f"meeting {target} is {status}"):
         await _guarded(backend, claim=target)
     assert (await backend.row(target))["status"] == status
+
+
+@pytest.mark.parametrize("managed", [True, False])
+async def test_id_claim_rechecks_under_the_lock_that_the_row_is_still_due(
+    backend, managed
+):
+    """M2 (§1.5): the scheduler read the row as due at ``now``; by the claim it starts tomorrow.
+    Under the lock the claim applies the scheduler's due rule again and refuses (``ClaimNotDue``,
+    nothing written); a row still due is claimed."""
+    now = _now()
+    due = DueWindow(now, lead_s=300, grace_s=600)
+    tomorrow = await backend.seed(
+        start=now + timedelta(days=1),
+        end=now + timedelta(days=1, minutes=30),
+        managed=managed,
+    )
+    with pytest.raises(ClaimNotDue):
+        await _guarded(backend, claim=tomorrow, due=due)
+    row = await backend.row(tomorrow)
+    assert row["status"] == "scheduled" and "k" not in row["data"]
+
+    today = await backend.seed(
+        start=now + timedelta(minutes=4),
+        end=now + timedelta(minutes=34),
+        managed=managed,
+    )
+    assert (await _guarded(backend, claim=today, due=due))["status"] == "requested"
+
+
+async def test_id_claim_of_an_entry_managed_row_past_its_end_is_not_due(backend):
+    now = _now()
+    ended = await backend.seed(
+        start=now - timedelta(minutes=40),
+        end=now - timedelta(minutes=10),
+        managed=True,
+    )
+    with pytest.raises(ClaimNotDue):
+        await _guarded(backend, claim=ended, due=DueWindow(now, 300, 600))
+    assert (await backend.row(ended))["status"] == "scheduled"
 
 
 async def test_id_claim_of_a_row_on_another_link_is_refused(backend):
@@ -618,6 +661,18 @@ async def test_spawn_exact_sends_the_bot_to_that_row(backend):
     row = await backend.row(target)
     assert row["status"] == "requested" and "auto_join_last_attempt" in row["data"]
     assert len(runtime.specs) == 1
+
+
+async def test_spawn_exact_of_a_row_no_longer_due_is_not_due(backend):
+    now = _now()
+    target = await backend.seed(start=now + timedelta(days=1))
+    runtime = FakeRuntimeClient()
+    outcome = await _port(backend.repo, runtime).spawn_exact(
+        USER, target, due=DueWindow(now, 300, 600)
+    )
+    assert outcome == SpawnOutcome("not_due")
+    assert (await backend.row(target))["status"] == "scheduled"
+    assert runtime.specs == []
 
 
 async def test_spawn_exact_on_a_live_row_is_already_live(backend):

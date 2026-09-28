@@ -32,7 +32,9 @@ the row. Any LIVE row on the link (`auto_join.LIVE_STATUSES`, `needs_help` and `
 is a 409. With `claim_meeting_id` (the scheduler and intake's instant join) exactly that
 `scheduled` row moves to `requested` through `intake.status.write_status` and gets
 `data.auto_join_last_attempt`; any other status is `MeetingStopped`, a row on another link
-`ClaimTargetMoved`. Without it (`POST /bots`): among entry-managed rows, the one the R1 `join_now`
+`ClaimTargetMoved`, and with the scheduler's `claim_due` (`auto_join.DueWindow`, the time part of
+`due_rows`) a `scheduled` row that is no longer due under the lock (moved or ended since the tick
+read it) `ClaimNotDue`, which the tick skips. Without it (`POST /bots`): among entry-managed rows, the one the R1 `join_now`
 rule picks (the earliest that hasn't ended and starts within `JOIN_NOW_ADOPT_AHEAD_S`); else among
 entry-less rows, upstream's rule, the newest, leaving out any starting after that window; else a new
 row is inserted. A future occurrence is never claimed.

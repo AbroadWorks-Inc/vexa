@@ -10,6 +10,9 @@ exception:
 
   * ``sent`` — the bot was spawned on the row;
   * ``already_live`` — a bot already owns the row's link (``DuplicateMeeting``);
+  * ``not_due`` — only with ``due`` (the scheduler's ``DueWindow``): under the lock the row is
+    still ``scheduled`` but no longer due, moved or ended since the scheduler read it
+    (``ClaimNotDue``); nothing was claimed;
   * ``failed`` — anything else, with ``spawn_failure``'s code and message.
 
 A failure after the claim (the token or invocation, the runtime, the post-spawn writes, a stop
@@ -43,11 +46,12 @@ from __future__ import annotations
 import traceback
 from typing import Any, Awaitable, Callable, Optional, Sequence, cast
 
-from ..bot_spawn.auto_join import _calendar_bot_name
+from ..bot_spawn.auto_join import DueWindow, _calendar_bot_name
 from ..bot_spawn.env_flags import resolve_spawn_flag
 from ..bot_spawn.ports import (
     AuthSessionBusy,
     AuthSessionNotConfigured,
+    ClaimNotDue,
     ClaimTargetMoved,
     DuplicateMeeting,
     MaxBotsExceeded,
@@ -200,15 +204,20 @@ class ExactRowSpawn:
         self._redis_url = redis_url
         self._allow_uncapped = allow_uncapped
 
-    async def spawn_exact(self, user_id: int, meeting_id: int) -> SpawnOutcome:
+    async def spawn_exact(
+        self, user_id: int, meeting_id: int, *, due: Optional[DueWindow] = None
+    ) -> SpawnOutcome:
         watch = _ClaimWatch(self._repo)
         try:
-            await self._spawn(watch, user_id, meeting_id)
+            await self._spawn(watch, user_id, meeting_id, due)
         except _Refused as exc:
             return self._failed(user_id, meeting_id, "internal_error", str(exc))
         except DuplicateMeeting:
             # Raised only by the guarded claim itself, so nothing was claimed.
             return SpawnOutcome("already_live")
+        except ClaimNotDue:
+            # Raised by the claim under the lock, before it writes anything.
+            return SpawnOutcome("not_due")
         except Exception as exc:
             code, message = spawn_failure(exc, user_id=user_id, meeting_id=meeting_id)
             if watch.claimed:
@@ -216,7 +225,13 @@ class ExactRowSpawn:
             return self._failed(user_id, meeting_id, code, message)
         return SpawnOutcome("sent")
 
-    async def _spawn(self, watch: _ClaimWatch, user_id: int, meeting_id: int) -> None:
+    async def _spawn(
+        self,
+        watch: _ClaimWatch,
+        user_id: int,
+        meeting_id: int,
+        due: Optional[DueWindow],
+    ) -> None:
         ctx = await self._context(user_id)
         for attempt in range(2):
             row = await self._repo.get_meeting(meeting_id)
@@ -247,6 +262,7 @@ class ExactRowSpawn:
                     token_secret=self._token_secret,
                     redis_url=self._redis_url,
                     claim_meeting_id=meeting_id,
+                    claim_due=due,
                 )
                 return
             except ClaimTargetMoved:

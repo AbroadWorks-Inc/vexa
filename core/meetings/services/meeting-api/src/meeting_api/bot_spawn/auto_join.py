@@ -7,7 +7,8 @@ through the partial index ``ix_meeting_scheduled_due``. An entry-less row is due
 from start - ``lead_s`` until its ``scheduled_end_at`` (R6: a late bot is better than none). Unless
 the per-meeting ``data.auto_join`` toggle is off, the tick spawns the bot on that exact row through
 ``intake.ExactRowSpawn`` — the SAME ``request_bot`` flow POST /bots runs, claiming the row by its id
-under the link lock — so the sweep is idempotent by construction: a claimed row leaves
+under the link lock, where the due window (``DueWindow``) is checked again — so the sweep is
+idempotent by construction and never sends a row a writer moved after the read: a claimed row leaves
 ``scheduled`` and drops out of the read, and a concurrent manual "Send bot now" surfaces here as
 ``already_live`` (someone already joined), counted, never error-stamped.
 
@@ -56,6 +57,7 @@ entrypoint (``__main__``) wraps it in the standard poll loop; tests drive single
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -82,6 +84,33 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _instant(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return _parse_iso(value)
+
+
+@dataclass(frozen=True)
+class DueWindow:
+    """The time part of the due rule at one tick (§1.5): a row is due from ``scheduled_at - lead_s``
+    until its ``scheduled_end_at`` when entries manage it (none: open-ended), else until
+    ``scheduled_at + grace_s``. ``due_rows`` filters with it, and the exact-row claim applies it
+    again under the link lock, so a row moved or ended after the tick's read is never sent."""
+
+    now: datetime
+    lead_s: float = DEFAULT_LEAD_S
+    grace_s: float = DEFAULT_GRACE_S
+
+    def holds(self, data: Any, *, managed: bool, scheduled_end_at: Any) -> bool:
+        at = _parse_iso(data.get("scheduled_at")) if isinstance(data, dict) else None
+        if at is None or self.now < at - timedelta(seconds=self.lead_s):
+            return False
+        if managed:
+            end = _instant(scheduled_end_at)
+            return end is None or self.now < end
+        return self.now <= at + timedelta(seconds=self.grace_s)
+
+
 def due_rows(rows: list[dict], *, now: datetime,
              lead_s: float = DEFAULT_LEAD_S, grace_s: float = DEFAULT_GRACE_S,
              retry_backoff_s: float = DEFAULT_RETRY_BACKOFF_S) -> list[dict]:
@@ -104,6 +133,7 @@ def due_rows(rows: list[dict], *, now: datetime,
     than its outcome, so it survives the outcome — and calendar sync carries it onto the sibling it
     creates for the same occurrence, which is how the backoff outlives the row it was earned on.
     """
+    window = DueWindow(now, lead_s, grace_s)
     due: list[dict] = []
     for row in rows:
         data = row.get("data") if isinstance(row.get("data"), dict) else {}
@@ -124,15 +154,8 @@ def due_rows(rows: list[dict], *, now: datetime,
             continue
         if not row.get("native_meeting_id") or row.get("platform") in (None, "", "unknown"):
             continue
-        at = _parse_iso(data.get("scheduled_at"))
-        if at is None:
-            continue
         managed = bool(row.get("has_entries"))
-        if managed:
-            end = _parse_iso(row.get("scheduled_end_at"))
-            if now < at - timedelta(seconds=lead_s) or (end is not None and now >= end):
-                continue
-        elif now < at - timedelta(seconds=lead_s) or now > at + timedelta(seconds=grace_s):
+        if not window.holds(data, managed=managed, scheduled_end_at=row.get("scheduled_end_at")):
             continue
         retry_at = _parse_iso(data.get("auto_join_next_retry"))
         if retry_at is not None and now < retry_at:
@@ -390,7 +413,15 @@ async def auto_join_tick(
         # sync both read to hold the next dispatch for one backoff interval; the claim restamps it
         # with the send time (Ruling R7).
         await repo.merge_meeting_data(row["id"], {"auto_join_last_attempt": now.isoformat()})
-        outcome = await spawn.spawn_exact(user_id, row["id"])
+        outcome = await spawn.spawn_exact(
+            user_id, row["id"], due=DueWindow(now, lead_s, grace_s)
+        )
+        if outcome.result == "not_due":
+            # A writer moved or ended the row after this tick read it; the claim saw it under the
+            # lock and sent nothing. The next tick decides it again.
+            log_event("auto_join_not_due", audience="system", span="meetings.auto_join",
+                      user_id=user_id, meeting_id=str(row["id"]))
+            continue
         if outcome.result == "already_live":
             # a manual "Send bot now" (or a racing sweep) already claimed it — success, not an error
             counters["already"] += 1

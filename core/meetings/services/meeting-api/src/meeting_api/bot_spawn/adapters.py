@@ -515,7 +515,7 @@ class SqlAlchemyMeetingRepo:
 
     async def create_meeting_guarded(
         self, *, user_id, platform, native_meeting_id, data, max_concurrent=None,
-        exclude_meeting_id=None, claim_meeting_id=None,
+        exclude_meeting_id=None, claim_meeting_id=None, claim_due=None,
     ) -> dict:
         """ATOMIC dedup + cap + claim-or-insert in ONE transaction (ROB1/ROB2, §1.5).
 
@@ -535,7 +535,7 @@ class SqlAlchemyMeetingRepo:
         backstop: a duplicate live row that slipped past the advisory locks (e.g. a different
         meeting-api process) raises ``IntegrityError`` at commit → mapped to ``DuplicateMeeting``.
         """
-        from sqlalchemy import bindparam, func, select, text
+        from sqlalchemy import bindparam, exists, func, select, text
         from sqlalchemy.exc import IntegrityError
 
         from ..intake.adapters import take_link_lock
@@ -543,7 +543,7 @@ class SqlAlchemyMeetingRepo:
         from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting, write_status
         from ..sessions.models import Meeting, MeetingAwState, MeetingEntry
         from .auto_join import LIVE_STATUSES
-        from .ports import ClaimTargetMoved, PlannedRow, planned_claim
+        from .ports import ClaimNotDue, ClaimTargetMoved, PlannedRow, planned_claim
 
         # 0. depleted — a cap <= 0 means NO bots allowed (0 is "depleted", never "unlimited");
         #    reject before touching the DB. Only ``None`` (no cap provided) skips the gate.
@@ -569,6 +569,20 @@ class SqlAlchemyMeetingRepo:
                     raise LookupError(f"meeting {claim_meeting_id} not found for user {user_id}")
                 if (target.platform, target.platform_specific_id) != (platform, native_meeting_id):
                     raise ClaimTargetMoved(claim_meeting_id)
+                # The scheduler's due rule again, under the lock: a row a writer moved or ended
+                # since the scheduler read it is not sent now.
+                if claim_due is not None and target.status == "scheduled":
+                    end = (await db.execute(
+                        select(MeetingAwState.scheduled_end_at)
+                        .where(MeetingAwState.meeting_id == target.id)
+                    )).scalar()
+                    managed = (await db.execute(
+                        select(exists().where(MeetingEntry.meeting_id == target.id))
+                    )).scalar()
+                    if not claim_due.holds(
+                        target.data, managed=bool(managed), scheduled_end_at=end
+                    ):
+                        raise ClaimNotDue(claim_meeting_id)
             # 1. dedup — under the locks, a LIVE row for (user, platform, native) blocks the spawn:
             #    whatever its status, a bot already owns the room.
             dup = (

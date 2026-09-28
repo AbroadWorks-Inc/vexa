@@ -360,9 +360,10 @@ class IntakeStore(Protocol):
 @dataclass(frozen=True)
 class SpawnOutcome:
     """The spawn path's answer for one exact row (§1.5): ``code`` and ``message`` are set on
-    ``failed`` (a §1.13 typed code and its exact message)."""
+    ``failed`` (a §1.13 typed code and its exact message). ``not_due`` answers only the scheduler,
+    whose claim re-checks its due rule under the lock; nothing was claimed."""
 
-    result: Literal["sent", "already_live", "failed"]
+    result: Literal["sent", "already_live", "not_due", "failed"]
     code: Optional[str] = None
     message: Optional[str] = None
 

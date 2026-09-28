@@ -1018,6 +1018,41 @@ async def test_pg_a_row_skipped_for_its_bot_limit_records_why(pg, context, messa
 
 
 @pg_only
+@pytest.mark.parametrize("change", ["moved", "removed"])
+async def test_pg_a_meeting_changed_between_the_due_read_and_the_claim_gets_no_bot(
+    pg, change
+):
+    """M2 (§1.5): the tick read the meeting as due; before its claim takes the link lock, a PUT
+    moves the meeting to tomorrow, or a remove ends it (R8). The claim re-checks under the lock:
+    no bot, and the meeting keeps the change."""
+    now = _now()
+    mid = await pg.put("e1", now, now + timedelta(minutes=30))
+    tomorrow = now + timedelta(days=1)
+
+    async def context_after_the_change(user_id: int) -> dict:
+        if change == "moved":
+            await pg.put("e1", tomorrow, tomorrow + timedelta(minutes=30))
+        else:
+            await pg.service.remove_entry(
+                USER,
+                {"external_id": "e1", "user": "a@abroadworks.com", "reason": "deleted"},
+            )
+        return await _ctx(user_id)
+
+    counters = await pg.tick(now, fetch_bot_context=context_after_the_change)
+    assert (counters["due"], counters["spawned"]) == (1, 0)
+    assert pg.runtime.specs == []
+    row = await pg.row(mid)
+    if change == "moved":
+        assert row["status"] == "scheduled"
+        assert row["data"]["scheduled_at"] == _iso(tomorrow)
+        assert "meeting.status_change" not in await pg.events(mid)
+    else:
+        assert row["status"] == "failed"
+        assert row["outcome_kind"] == "cancelled_by_calendar"
+
+
+@pg_only
 async def test_pg_a_spawn_failure_records_its_code_and_backs_off(pg):
     now = _now()
     for i in range(45):

@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from ..lifecycle.machine import dominant_completion_reason
 from .ports import (
+    ClaimNotDue,
     ClaimTargetMoved,
     DuplicateMeeting,
     MaxBotsExceeded,
@@ -110,7 +111,7 @@ class InMemoryMeetingRepo:
 
     async def create_meeting_guarded(
         self, *, user_id, platform, native_meeting_id, data, max_concurrent=None,
-        exclude_meeting_id=None, claim_meeting_id=None,
+        exclude_meeting_id=None, claim_meeting_id=None, claim_due=None,
     ) -> dict:
         """ATOMIC dedup + cap + claim-or-insert (ROB1/ROB2, §1.5). The check and the write run with
         NO ``await`` between them, so even ``SlowRepo`` (which adds ``await asyncio.sleep(0)`` inside
@@ -133,6 +134,11 @@ class InMemoryMeetingRepo:
                 raise LookupError(f"meeting {claim_meeting_id} not found for user {user_id}")
             if (target["platform"], target["native_meeting_id"]) != (platform, native_meeting_id):
                 raise ClaimTargetMoved(claim_meeting_id)
+            if (claim_due is not None and target["status"] == "scheduled"
+                    and not claim_due.holds(
+                        target["data"], managed=bool(target.get("has_entries")),
+                        scheduled_end_at=target.get("scheduled_end_at"))):
+                raise ClaimNotDue(claim_meeting_id)
         # 1. dedup — a LIVE row for (user, platform, native) blocks the spawn (409).
         for m in self._meetings.values():
             if (

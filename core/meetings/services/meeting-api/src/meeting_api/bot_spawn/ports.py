@@ -85,6 +85,7 @@ class MeetingRepo(Protocol):
         max_concurrent: Optional[int] = None,
         exclude_meeting_id: Optional[int] = None,
         claim_meeting_id: Optional[int] = None,
+        claim_due: Optional[Any] = None,
     ) -> dict:
         """ATOMIC dedup + cap-check + insert — the TOCTOU-safe spawn primitive (ROB1/ROB2).
 
@@ -95,7 +96,9 @@ class MeetingRepo(Protocol):
         Performs, in a SINGLE transaction with NO yield point between the checks and the insert:
           0. with ``claim_meeting_id``: lock that row and re-read it — another user's or a missing
              row raises ``LookupError``, a row no longer on ``(platform, native_meeting_id)`` raises
-             ``ClaimTargetMoved``;
+             ``ClaimTargetMoved``; with ``claim_due`` too (the scheduler's
+             ``auto_join.DueWindow``), a ``scheduled`` row the window no longer holds (moved or
+             ended since the scheduler read it) raises ``ClaimNotDue``;
           1. dedup — if the user already has a LIVE row (``auto_join.LIVE_STATUSES``) for
              ``(platform, native_meeting_id)``, raise ``DuplicateMeeting`` (→ HTTP 409);
           2. cap — if ``max_concurrent`` is set and the user already has ``>= max_concurrent`` ACTIVE
@@ -424,6 +427,16 @@ class MeetingStopped(Exception):
 
     A stopped meeting is not a broken one: a fresh ``POST /bots`` (without ``continue_meeting``)
     starts a new run on a new row, and that is the documented path. The detail string says so."""
+
+
+class ClaimNotDue(Exception):
+    """The ``scheduled`` row named by ``claim_meeting_id`` is no longer due by the scheduler's
+    window (``claim_due``): its time changed between the scheduler's read and the claim. Nothing
+    was written; the next tick decides the row again."""
+
+    def __init__(self, meeting_id: int):
+        self.meeting_id = meeting_id
+        super().__init__(f"meeting {meeting_id} is no longer due")
 
 
 class ClaimTargetMoved(Exception):
