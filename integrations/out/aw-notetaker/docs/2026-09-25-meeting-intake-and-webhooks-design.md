@@ -1590,7 +1590,7 @@ The owner asked for all of these. Every limit is a setting (the service's `confi
 | F-K | Sending a bot for an entry-managed meeting (calendar or `join_now`) is tried a bounded number of times with a fixed gap; after the last failure the meeting ends `not_sent` with the last typed code (webhook, counter). The meeting's end stays the outer bound. `JOIN_NOW_ADOPT_AHEAD_S` is used only for the de-duplication look-ahead, never as a give-up time (replaces R19). | `BOT_SEND_MAX_ATTEMPTS` (`3`), `BOT_SEND_RETRY_BACKOFF_S` (`60`) |
 | F-E | The gateway signature also covers the query string and a SHA-256 of the body (a new signature version in the gateway-identity contract, re-sealed). Verifiers also accept an optional previous key, so the key can be rotated with no downtime. | `GATEWAY_IDENTITY_SECRET_PREVIOUS` (unset) |
 | F-J | Seal `core/flows/contracts/flows.v1` once, so `pnpm seal:contracts` needs no hand edit (replaces R8). | — |
-| F-F | A `/v2` API reference page on the docs site (`docs/docs/api/`), from Part 2, with request and reply examples for every route and webhook. | — |
+| F-F | A `/v2` API reference for client developers, from Part 2, with request and reply examples for every route and webhook: `integrations/out/aw-notetaker/docs/2026-09-28-v2-api-reference.md`, linked from the root `README.md` (not upstream's docs site). | — |
 | F-G | The aw-bots rollout files (`deployment/base/aw-bots/values.yaml`, `alerts.yml`, `README.md`, `deployment/base/aw-exporter/`) move to their own aw-notetaker branch `feat/aw-bots-rollout` (from `feat/aw-bots-deployment`), with the settings and the alert above, so the aw-bots rollout doesn't wait on the calendar and portal review. | — |
 
 ---
