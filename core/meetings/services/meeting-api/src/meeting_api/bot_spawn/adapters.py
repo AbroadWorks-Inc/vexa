@@ -399,7 +399,9 @@ class SqlAlchemyMeetingRepo:
                     .limit(1)
                 )
             ).scalar()
-            if newest != session_uid:
+            if newest != session_uid or session_uid in retry.retired_sessions(m.data):
+                # A retired session (a new bot claimed the row, its session not written yet)
+                # is refused the same way.
                 log_event(
                     "lifecycle_stale_session_refused", audience="system", level="warning",
                     span="lifecycle.persist", meeting_id=str(m.id),
@@ -1226,7 +1228,7 @@ class SqlAlchemyMeetingRepo:
         workload ``workload_id`` (else the row's) recorded with ``workload_gone``. The last one on
         a meeting that already had a bot session is a failed bot, not a bot never sent: its
         ``not_sent`` outcome is dropped."""
-        from sqlalchemy import exists, select
+        from sqlalchemy import select
 
         from ..intake import retry
         from ..intake.adapters import PostgresIntakeTx, lock_meeting_on_its_link
@@ -1251,6 +1253,13 @@ class SqlAlchemyMeetingRepo:
                 completion_reason,
                 stop_requested=bool({**current, **merged}.get("stop_requested")),
             )
+            # The meeting's newest bot session, if it had one: retired once a new bot claims it.
+            newest = (await db.execute(
+                select(MeetingSession.session_uid)
+                .where(MeetingSession.meeting_id == m.id)
+                .order_by(MeetingSession.id.desc())
+                .limit(1)
+            )).scalar()
             written = await retry.retry(
                 PostgresIntakeTx(db),
                 m.id,
@@ -1259,6 +1268,7 @@ class SqlAlchemyMeetingRepo:
                     reason=merged["completion_reason"],
                     message=str(reason),
                     stage=failure_stage,
+                    session=newest,
                     workload=workload_id or m.bot_container_id,
                     proven_gone=workload_gone,
                     code=outcome.detail if outcome is not None and outcome.detail
@@ -1272,9 +1282,7 @@ class SqlAlchemyMeetingRepo:
                 await db.commit()
                 await db.refresh(m)
                 return _row_to_dict(m)
-            if outcome is not None and (await db.execute(
-                select(exists().where(MeetingSession.meeting_id == m.id))
-            )).scalar():
+            if outcome is not None and newest is not None:
                 outcome = None
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if m.end_time is None:

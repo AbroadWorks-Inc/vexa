@@ -69,6 +69,7 @@ __all__ = [
     "marker",
     "pending_from",
     "proven",
+    "retired_sessions",
     "retry",
 ]
 
@@ -123,7 +124,8 @@ def proven(data: Any) -> bool:
 def claimed(data: Any) -> dict[str, Any]:
     """The row's ``data`` once a new bot claims it: the marker's reason, stage and message moved
     into ``data.completion_history`` (``bot_spawn.ports._archive_completion``, as a reopened row's
-    are), the marker removed."""
+    are) with the failed session as ``after_session``, the marker removed. That session is retired:
+    it never writes the row again (``retired_sessions``)."""
     from ..bot_spawn.ports import _archive_completion
 
     out = dict(data) if isinstance(data, Mapping) else {}
@@ -131,8 +133,24 @@ def claimed(data: Any) -> dict[str, Any]:
     out.pop(MARKER, None)
     out["completion_reason"] = mark.get("reason")
     out["failure_stage"] = mark.get("stage")
-    out["failure_reason"] = mark.get("message")
-    return _archive_completion(out)
+    out["failure_reason"] = mark.get("message") or "the bot failed"
+    out = _archive_completion(out)
+    if mark.get("after_session"):
+        history = out["completion_history"]
+        history[-1] = {**history[-1], "after_session": mark["after_session"]}
+    return out
+
+
+def retired_sessions(data: Any) -> frozenset[str]:
+    """The sessions a new bot has replaced on this row (``claimed``): they write nothing."""
+    history = data.get("completion_history") if isinstance(data, Mapping) else None
+    if not isinstance(history, list):
+        return frozenset()
+    return frozenset(
+        str(h["after_session"])
+        for h in history
+        if isinstance(h, Mapping) and h.get("after_session")
+    )
 
 
 def is_bot_failure(failure: Failure) -> bool:

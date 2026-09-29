@@ -496,6 +496,7 @@ def _waiting_repo(*, proven: bool, status: str = "requested"):
                 "reason": "join_failure",
                 "stage": "joining",
                 "message": "no page",
+                "after_session": "sess-old",
                 "workload": "mtg-5-old",
                 "due_at": "2026-09-29T09:11:00Z",
                 "proven_gone": proven,
@@ -530,6 +531,7 @@ async def test_the_claim_takes_a_waiting_meeting_whose_workload_is_proven_gone()
         "joining",
     )
     assert archived["failure_reason"] == "no page"
+    assert archived["after_session"] == "sess-old"
     assert "completion_reason" not in data
 
 
@@ -862,3 +864,16 @@ def test_the_intake_retry_golden_is_the_projection_of_a_waiting_meeting():
     assert project_meeting(meeting, aw, entries, lead_s=300) == json.loads(
         path.read_text()
     )
+
+
+async def test_the_retired_session_of_a_claimed_meeting_writes_nothing():
+    repo = _waiting_repo(proven=True)
+    await repo.create_session(meeting_id=5, session_uid="sess-old")
+    await _claim(repo)
+    assert (
+        await repo.update_meeting_status(
+            session_uid="sess-old", status="failed", completion_reason="join_failure"
+        )
+        is None
+    )
+    assert repo._meetings[5]["status"] == "requested"

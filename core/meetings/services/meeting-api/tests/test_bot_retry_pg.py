@@ -993,3 +993,58 @@ async def test_pg_a_session_without_a_recorded_workload_names_its_own(pg):
     await _fail(pg, session, "failed", "join_failure", "bot_callback")
     marker = (await pg.row(mid))["data"]["bot_retry"]
     assert marker["workload"] == f"mtg-{mid}-{session[:8]}"
+
+
+async def test_pg_the_retired_session_cannot_write_between_the_claim_and_the_new_session(
+    pg,
+):
+    mid, old = await pg.sent(status="active")
+    workload = (await pg.row(mid))["bot_container_id"]
+    await _fail(pg, old, "completed", "left_alone", "runtime_destroy")
+    assert await pg.repo.prove_retry_gone(meeting_id=mid, workload=workload)
+    claimed = await pg.repo.create_meeting_guarded(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="kxo-misr-avz",
+        data={},
+        claim_meeting_id=mid,
+    )
+    assert claimed["data"]["completion_history"][-1]["after_session"] == old
+    events = len(await pg.events(mid))
+    # the failed bot's late terminal lands before the new session row exists
+    assert (
+        await pg.repo.update_meeting_status(
+            session_uid=old,
+            status="failed",
+            completion_reason="join_failure",
+            transition_source="runtime_destroy",
+        )
+        is None
+    )
+    row = await pg.row(mid)
+    assert (row["status"], row["data"].get("bot_retry")) == ("requested", None)
+    assert len(await pg.events(mid)) == events
+
+
+async def test_pg_a_failed_attempt_with_a_session_retires_it_at_the_next_claim(pg):
+    mid = await pg.calendar_meeting()
+
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class ContainerWriteFails(SqlAlchemyMeetingRepo):
+        async def set_bot_container(self, **kw):
+            raise RuntimeError("the database went away")
+
+    runtime = FakeRuntimeClient()
+    await pg.port(runtime, repo=ContainerWriteFails(pg.session_factory)).spawn_exact(
+        USER, mid
+    )
+    (session,) = await pg.sessions(mid)
+    assert (await pg.row(mid))["data"]["bot_retry"]["after_session"] == session
+    await pg.tick(_gone(), at=_later())
+    history = (await pg.row(mid))["data"]["completion_history"]
+    assert history[-1]["after_session"] == session
+    assert (
+        await pg.repo.update_meeting_status(session_uid=session, status="joining")
+        is None
+    )
