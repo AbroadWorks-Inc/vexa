@@ -25,14 +25,14 @@ secret.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import os
 from typing import Mapping, Optional
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from .. import key_ring
+from ..key_ring import KEY_BYTES, KeyRingError
 
 __all__ = [
     "AAD",
@@ -47,14 +47,9 @@ __all__ = [
 
 AAD = b"aw-webhook-secret"
 NONCE_BYTES = 12
-KEY_BYTES = 32
 MAX_KEY_ID = 64
 KEYS_ENV = "WEBHOOK_SECRET_ENC_KEYS"
 ACTIVE_KEY_ENV = "WEBHOOK_SECRET_ENC_ACTIVE_KEY"
-
-
-class KeyRingError(ValueError):
-    """The key ring settings are unusable. The message names the fault, never a key."""
 
 
 class SecretBoxError(Exception):
@@ -63,32 +58,12 @@ class SecretBoxError(Exception):
 
 
 def _parse_ring(keys_json: str) -> dict[str, bytes]:
-    try:
-        raw = json.loads(keys_json)
-    except ValueError as exc:
-        raise KeyRingError(f"{KEYS_ENV} is not valid JSON") from exc
-    if not isinstance(raw, dict) or not raw:
-        raise KeyRingError(f"{KEYS_ENV} must be a non-empty JSON object of id -> key")
-    ring: dict[str, bytes] = {}
-    for key_id, encoded in raw.items():
-        if not key_id or len(key_id) > MAX_KEY_ID:
-            raise KeyRingError(
-                f"{KEYS_ENV}: a key id must be 1-{MAX_KEY_ID} characters"
-            )
-        if not isinstance(encoded, str):
-            raise KeyRingError(f"{KEYS_ENV}: key {key_id!r} is not a base64 string")
-        try:
-            key = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise KeyRingError(
-                f"{KEYS_ENV}: key {key_id!r} is not valid base64"
-            ) from exc
-        if len(key) != KEY_BYTES:
-            raise KeyRingError(
-                f"{KEYS_ENV}: key {key_id!r} must be exactly {KEY_BYTES} bytes"
-            )
-        ring[key_id] = key
-    return ring
+    return key_ring.parse(
+        keys_json,
+        env_name=KEYS_ENV,
+        kid_ok=lambda key_id: 0 < len(key_id) <= MAX_KEY_ID,
+        kid_rule=f"1-{MAX_KEY_ID} characters",
+    )
 
 
 class SecretBox:
