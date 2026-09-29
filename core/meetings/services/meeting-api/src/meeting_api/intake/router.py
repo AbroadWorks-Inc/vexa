@@ -18,6 +18,8 @@ while the upstream routes keep FastAPI's 422. A database that can't be reached o
 arriving at once on two links) is run again by the service (§6.9 F-D); one that keeps losing is a
 500 ``internal_error``.
 
+A meeting id in the path that isn't a UUID is 400 ``invalid_request`` (§2.5), before any read.
+
 Visibility for ``user=``: a meeting is visible to a user when one of its entries, in any state,
 has that user as its ``user`` or among its ``attendees``. ``GET /v2/meetings/{id}`` without
 ``user=`` reads any meeting of the account; with it, a meeting the user can't see is
@@ -46,6 +48,7 @@ from __future__ import annotations
 import re
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -88,6 +91,7 @@ _PROGRAMMING_ERRORS = (TypeError, AttributeError, KeyError, AssertionError, Name
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _NO_LIVE_BOT = "no bot in this meeting; to cancel it, remove the entry"
+_NOT_A_UUID = "the meeting id in the path is not a UUID"
 
 ArtifactDeleter = Callable[[dict], Awaitable[list[str]]]
 
@@ -255,6 +259,10 @@ def build_intake_router(
     async def _meeting(
         user_id: int, meeting_id: str, user: Optional[str]
     ) -> MeetingView:
+        try:
+            uuid.UUID(meeting_id)
+        except ValueError:
+            raise IntakeError("invalid_request", _NOT_A_UUID) from None
         meeting = await reads.meeting_by_uuid(user_id, meeting_id)
         if meeting is None:
             raise IntakeError("meeting_not_found", NOT_FOUND)

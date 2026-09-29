@@ -40,6 +40,7 @@ C = "c@client.com"
 ACCOUNT = {"x-user-id": "1"}
 OTHER_ACCOUNT = {"x-user-id": "2"}
 NOT_A_UUID = "not-a-uuid"
+UNKNOWN_UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
 
 
 def _client(h: Any, **kwargs: Any):
@@ -390,8 +391,9 @@ async def test_single_read_visibility_owner_attendee_removed_stranger():
         conforms(ok.json(), "Meeting")
     assert owner.json()["id"] == ids["owned"]
     assert removed_entry.json()["status"] == "failed"
-    for missing in (stranger, removed_stranger, other_account, not_uuid):
+    for missing in (stranger, removed_stranger, other_account):
         _error(missing, 404, "meeting_not_found")
+    _error(not_uuid, 400, "invalid_request")
 
 
 async def test_meeting_list_visibility_order_and_filters():
@@ -483,6 +485,23 @@ async def test_meeting_list_cursor_pages_newest_first_without_gaps():
 # ── POST /v2/meetings/{id}/stop ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v2/meetings/{id}"),
+        ("POST", "/v2/meetings/{id}/stop"),
+        ("DELETE", "/v2/meetings/{id}"),
+    ],
+)
+async def test_a_meeting_id_that_is_not_a_uuid_is_400_invalid_request(method, path):
+    """§2.5: a bad id in the path is ``invalid_request``, before any read."""
+    h = make_harness()
+    client, _ = _client(h)
+    async with client:
+        r = await client.request(method, path.format(id=NOT_A_UUID), headers=ACCOUNT)
+    _error(r, 400, "invalid_request")
+
+
 async def test_stop_scheduled_or_finished_is_409_no_live_bot():
     h = make_harness()
     client, _ = _client(h)
@@ -539,7 +558,7 @@ async def test_storage_down_is_503_unavailable():
     async with client:
         h.store.on_lock = refuse
         put = await client.put("/v2/entries", json=entry_body(), headers=ACCOUNT)
-        read = await client.get(f"/v2/meetings/{NOT_A_UUID}", headers=ACCOUNT)
+        read = await client.get(f"/v2/meetings/{UNKNOWN_UUID}", headers=ACCOUNT)
         listing = await client.get("/v2/entries", params={"user": A}, headers=ACCOUNT)
     for response in (put, read, listing):
         _error(response, 503, "unavailable")
@@ -575,7 +594,7 @@ async def test_a_programming_error_is_not_dressed_up_as_unavailable():
     h = make_harness()
     client, _ = _client(h, reads=_Broken(h.store))
     async with client:
-        r = await client.get(f"/v2/meetings/{NOT_A_UUID}", headers=ACCOUNT)
+        r = await client.get(f"/v2/meetings/{UNKNOWN_UUID}", headers=ACCOUNT)
     assert r.status_code == 500
 
 
@@ -768,7 +787,7 @@ async def test_pg_reads_visibility_paging_and_entries(pg_routes):
     assert removed.status_code == 200
     conforms(removed.json(), "Meeting")
     _error(other, 404, "meeting_not_found")
-    _error(not_uuid, 404, "meeting_not_found")
+    _error(not_uuid, 400, "invalid_request")
     conforms(entries.json(), "EntryPage")
     conforms(entries_2.json(), "EntryPage")
     assert [e["external_id"] for e in entries.json()["entries"]] == [

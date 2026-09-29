@@ -337,9 +337,13 @@ async def test_erase_another_accounts_or_an_unknown_meeting_is_404():
     uuid = await world.setup("completed")
     async with world.client() as client:
         other = await client.delete(f"/v2/meetings/{uuid}", headers={"x-user-id": "2"})
-        unknown = await client.delete("/v2/meetings/not-a-uuid", headers=ACCOUNT)
+        unknown = await client.delete(
+            "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", headers=ACCOUNT
+        )
+        garbage = await client.delete("/v2/meetings/not-a-uuid", headers=ACCOUNT)
     _error(other, 404, "meeting_not_found")
     _error(unknown, 404, "meeting_not_found")
+    _error(garbage, 400, "invalid_request")
     assert len(world.storage.blobs) == 2
 
 

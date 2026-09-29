@@ -211,7 +211,7 @@ async def test_another_accounts_or_an_unknown_meeting_is_404():
         )
     _error(other, 404, "meeting_not_found")
     _error(unknown, 404, "meeting_not_found")
-    _error(garbage, 404, "meeting_not_found")
+    _error(garbage, 400, "invalid_request")
     assert world.aw() == aw_before
     assert world.export_events() == []
 
