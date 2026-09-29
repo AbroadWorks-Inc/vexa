@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from ..sweeps.item_failures import ItemFailures
 
 
-async def _teardown_verdict(
+async def teardown_verdict(
     runtime: Optional[Any], bot_container_id: Optional[str], *, meeting_id: Any, log: Any
 ) -> str:
     """Kill the workload and report the teardown verdict.
@@ -82,7 +82,7 @@ async def reconcile_stale_stopping_sweep(
         # 1. GUARANTEE teardown FIRST — and require confirmation. Completing before a confirmed
         #    kill is how the incident produced a `completed` meeting with a live ghost bot.
         #    (Untracked here is NOT escalated: the general sweep owns the bounded escalation.)
-        if await _teardown_verdict(
+        if await teardown_verdict(
             runtime, bot_container_id, meeting_id=meeting_id, log=log
         ) != "confirmed":
             continue  # stays `stopping` (truthful); retried next sweep, loud in the logs
@@ -174,7 +174,7 @@ async def prove_workload_gone(
     if probe == "gone":
         return "proven", ""
     if probe == "alive":
-        verdict = await _teardown_verdict(runtime, workload_id, meeting_id=meeting_id, log=log)
+        verdict = await teardown_verdict(runtime, workload_id, meeting_id=meeting_id, log=log)
         if verdict == "confirmed":
             return "proven", ""
         return "not_proven", f"delete of {workload_id} not confirmed ({verdict})"
@@ -434,7 +434,7 @@ async def reconcile_stale_nonterminal_sweep(
         # the meeting keeps its current status, loud in the logs, retried next sweep — except a
         # CONTINUOUSLY untracked workload (`stopping`/pre-active rows land here), which escalates
         # on the same bounded window instead of retrying the dead DELETE every sweep forever.
-        verdict = await _teardown_verdict(
+        verdict = await teardown_verdict(
             runtime, bot_container_id, meeting_id=meeting_id, log=log
         )
         if verdict != "confirmed":

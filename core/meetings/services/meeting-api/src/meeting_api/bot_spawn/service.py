@@ -805,9 +805,9 @@ async def request_bot(
         sweep to retry, bounded (§6.9 F-K2, F-I). Returns the verdict; never raises."""
         import logging
 
-        from ..lifecycle.reconcile import _teardown_verdict
+        from ..lifecycle.reconcile import teardown_verdict
 
-        verdict = await _teardown_verdict(
+        verdict = await teardown_verdict(
             runtime, workload_id, meeting_id=meeting_id,
             log=logging.getLogger("meeting_api.bot_spawn"),
         )
