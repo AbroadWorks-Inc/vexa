@@ -28,9 +28,10 @@ user_id}``
 ``aw_export_total{state,user_id}``                    the export route, per new result
 ``aw_sweep_last_run_timestamp_seconds{sweep}``        each background loop whose tick ran to its
                                                       end on this replica
-``aw_sweep_items_total{sweep,result}``                ``sweeps.item_failures.run_item``: an intake
-                                                      sweep's item that failed (``failed``) or was
-                                                      given up (``given_up``)
+``aw_sweep_items_total{sweep,result}``                ``sweeps.item_failures.run_item``: a sweep's
+                                                      item that failed (``failed``), was given up
+                                                      (``given_up``), or waited on a runtime that
+                                                      could not be reached (``runtime_unreachable``)
 ====================================================  ==============================================
 
 Three gauges are read from the database when Prometheus scrapes (``MetricsSource``), within
