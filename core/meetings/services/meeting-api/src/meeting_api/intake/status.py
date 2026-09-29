@@ -69,6 +69,7 @@ __all__ = [
     "check_event_data",
     "creation_change",
     "derive_event_id_v2",
+    "finish_owed",
     "insert_meeting",
     "lock_aw_state",
     "lock_meeting",
@@ -130,6 +131,23 @@ class Outcome:
 class WrittenEvent:
     event_id: str
     sequence: int
+
+
+def finish_owed(
+    claimed: bool, status: Optional[str], data: Optional[Mapping[str, Any]]
+) -> Optional[bool]:
+    """The meeting-level finish a failed send owes (§6.9 F-FIN): a send that had ``claimed`` the
+    row, whose spawn flow then finished the meeting (its last attempt, the stop interlock, a
+    write after the create), owes ``finish_meeting``. Returns ``None`` when it owes none (not
+    claimed, or the meeting isn't finished: someone else ended it and finished it), else whether
+    the user's stop drove it (``stopped``). The scheduler and the ``join_now`` send both ask it.
+    """
+    if not claimed or status not in FINISHED_STATUSES:
+        return None
+    ended = data or {}
+    return (
+        bool(ended.get("stop_requested")) or ended.get("completion_reason") == "stopped"
+    )
 
 
 def derive_event_id_v2(meeting_uuid: str, event_type: str, sequence: int) -> str:

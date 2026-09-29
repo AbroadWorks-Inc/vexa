@@ -2309,3 +2309,40 @@ async def test_pg_a_given_up_teardown_still_pending_is_kept_until_it_is_cleared(
         )
         == 0
     )
+
+
+# ── a join_now send ended after its claim gets the one finish (§6.9 F-FIN) ──────────────────
+
+
+async def test_pg_a_join_now_send_ended_after_its_claim_is_finished_like_any_end(pg):
+    """The instant join's own send, whose spawn ends the meeting after its claim (a stop that
+    raced its session write), runs the meeting-level finish through the one
+    ``finish_meeting``, as the user's stop."""
+    from intake_builders import instant_body
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+    from meeting_api.intake.fakes import FakePublisher, NoStop
+    from meeting_api.intake.service import IntakeService
+
+    class StopAfterTheContainer(SqlAlchemyMeetingRepo):
+        async def set_bot_container(self, **kw):
+            row = await super().set_bot_container(**kw)
+            await self.merge_meeting_data(kw["meeting_id"], {"stop_requested": True})
+            return row
+
+    app, sink, streams, finalized = await _finishing_app(pg)
+    service = IntakeService(
+        pg.store,
+        pg.port(FakeRuntimeClient(), repo=StopAfterTheContainer(pg.session_factory)),
+        NoStop(),
+        FakePublisher(),
+        make_settings(),
+    )
+    service.finish_meeting = app.state.finish_meeting
+    reply = await service.put_entry(USER, instant_body("paste:1", GMEET))
+    mid = await pg.id_of(reply["meeting"]["id"])
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
+    assert sink.events == ["bot.failed"]
+    assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
+    typed = app.state.typed_webhooks[-1]
+    assert typed["data"]["status_change"]["transition_source"] == "user_stop"

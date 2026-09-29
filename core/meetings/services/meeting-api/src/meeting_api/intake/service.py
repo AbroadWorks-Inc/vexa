@@ -96,7 +96,7 @@ from .rules import (
     recompute,
 )
 from .settings import IntakeSettings
-from .status import Outcome, StatusConflict, creation_change
+from .status import Outcome, StatusConflict, creation_change, finish_owed
 from .stop import record_stop
 from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
 
@@ -202,6 +202,9 @@ class IntakeService:
         self._settings = settings
         self._clock = clock
         self._sleep = sleep
+        #: The app's meeting-level finish (§6.9 F-FIN), set by the composition root once the app
+        #: exists: run for a meeting a ``join_now`` send ended after its claim.
+        self.finish_meeting: Optional[Callable[..., Awaitable[None]]] = None
 
     # ── routes ──────────────────────────────────────────────────────────────────────────────
 
@@ -551,9 +554,31 @@ class IntakeService:
             result = "joined_existing"
         elif outcome.result == "failed":
             result = await self._spawn_failed(user_id, done, entry, outcome)
-        return replace(
-            done, result=result, meeting=await self._read(user_id, done.meeting.id)
-        )
+        meeting = await self._read(user_id, done.meeting.id)
+        if outcome.result == "failed":
+            await self._finish(meeting.id, outcome.claimed, meeting)
+        return replace(done, result=result, meeting=meeting)
+
+    async def _finish(
+        self, meeting_id: int, claimed: bool, meeting: MeetingView
+    ) -> None:
+        """The meeting-level finish a send that ended the meeting after its claim owes
+        (``status.finish_owed``), through the one ``finish_meeting``. Best-effort: the meeting
+        has ended, and the reply stands."""
+        stopped = finish_owed(claimed, meeting.status, meeting.data)
+        if stopped is None or self.finish_meeting is None:
+            return
+        try:
+            await self.finish_meeting(meeting_id, stopped=stopped)
+        except Exception as exc:
+            log_event(
+                "intake_finish_failed",
+                audience="operator",
+                level="warning",
+                span="meetings.intake",
+                meeting_id=str(meeting_id),
+                fields={"error": type(exc).__name__},
+            )
 
     async def _spawn_failed(
         self, user_id: int, done: _Done, entry: EntryIn, outcome: SpawnOutcome

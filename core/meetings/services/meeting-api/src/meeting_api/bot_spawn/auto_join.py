@@ -325,7 +325,8 @@ async def auto_join_tick(
         ExactRowSpawn,
         spawn_failure,
     )
-    from ..intake.rules import FINISHED_STATUSES, is_overdue
+    from ..intake.rules import is_overdue
+    from ..intake.status import finish_owed
     from ..intake.sweeps import _publish as publish_events
     from ..intake.sweeps import check_room, end_given_up
     from ..sweeps.item_failures import run_pages, sweep_batch_size
@@ -533,14 +534,12 @@ async def auto_join_tick(
         interlock, a write after the create): the meeting-level finish, like every other end
         (§6.9 F-FIN). A meeting someone else ended first has had its finish. Returns whether it
         finished."""
-        if not outcome.claimed or (current or {}).get("status") not in FINISHED_STATUSES:
-            return False
-        ended = (current or {}).get("data") or {}
-        await _finish(
-            meeting_id,
-            stopped=bool(ended.get("stop_requested"))
-            or ended.get("completion_reason") == "stopped",
+        stopped = finish_owed(
+            outcome.claimed, (current or {}).get("status"), (current or {}).get("data")
         )
+        if stopped is None:
+            return False
+        await _finish(meeting_id, stopped=stopped)
         return True
 
     async def _end_waiting(

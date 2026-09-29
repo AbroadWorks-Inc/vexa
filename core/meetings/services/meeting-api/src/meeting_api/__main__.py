@@ -269,8 +269,10 @@ def build_production_app():
         metrics_source=PostgresMetricsSource(session_factory),
     )
 
-    # A waiting meeting a stop ends (§6.9 F-K2) gets the app's meeting-level finish.
+    # A waiting meeting a stop ends (§6.9 F-K2), and a meeting a join_now send ends after its
+    # claim (§6.9 F-FIN), get the app's meeting-level finish.
     intake.stop.finish_meeting = app.state.finish_meeting
+    intake.service.finish_meeting = app.state.finish_meeting
 
     _attach_background_loops(
         app, transcript_store, segment_bus, redis_client, meeting_repo, runtime_client,
