@@ -130,7 +130,7 @@
    "class": "defaulted",
    "default": "60",
    "description": "§1.10, §6.9 F-E: identity_guard.py refuses with 401 a gateway signature whose t is more than this many seconds before or after this service's clock (the replay window); the same setting on meeting-api and admin-api. Not a positive whole number, the guard is not built (a ValueError naming the setting) and no client request is served.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "DEFAULT_BOT_NAME",
@@ -447,21 +447,21 @@
    "class": "defaulted",
    "default": "10",
    "description": "webhooks (§1.8, §6.9 F-H): the most (s, above 0, decimals allowed) one subscription post may take in total; longer is a failed attempt (error 'timeout') on WEBHOOK_RETRY_SCHEDULE_S. Set but malformed, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_LEASE_S",
    "class": "defaulted",
    "default": "60",
    "description": "webhooks (§1.8): how long (whole s, at least 1) a sender's claim holds a delivery row before another replica may claim it again. It must be more than WEBHOOK_SEND_TIMEOUT_S + 5 s, so a claim can post and record inside it; a claim with less left sends nothing and records 'lease short'. Set but malformed, or too short, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "WEBHOOK_CLAIM_LIMIT",
    "class": "defaulted",
    "default": "50",
    "description": "webhooks (§1.8): the most delivery rows (whole, at least 1) one sender tick claims; the rest wait for the next tick. Set but malformed, meeting-api refuses to start.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SCHEDULER_TICK_INTERVAL",
@@ -718,21 +718,21 @@
    "class": "defaulted",
    "default": "0.01",
    "description": "entry service (§6.9 F-D): the least (s) of the random pause before an entry write that lost a constraint race runs again; the pause is a random point between this and INTAKE_CONFLICT_DELAY_MAX_S, times the try's number",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "INTAKE_CONFLICT_DELAY_MAX_S",
    "class": "defaulted",
    "default": "0.05",
    "description": "entry service (§6.9 F-D): the most (s) of that random pause, before it is multiplied by the try's number",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "INTAKE_STOP_LINK_RETRIES",
    "class": "defaulted",
    "default": "1",
    "description": "stop (§1.7): how many more times POST /v2/meetings/{id}/stop is run again when the meeting moved to another link between its read and its link lock; after the last, the stop answers 503 unavailable (retry)",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SWEEP_BATCH_SIZE",
@@ -753,14 +753,14 @@
    "class": "defaulted",
    "default": "21600",
    "description": "§6.9 F-K2/F-I: how long (s) a workload's teardown is chased while the runtime doesn't answer before it is given up: a pending teardown (data.unproven_teardown) from its since, a stale-stopping or stale-nonterminal reconcile row from its updated_at. A runtime that doesn't answer is never one of the item's failures, so this age is its only bound; a refused delete still counts toward SWEEP_MAX_ITEM_FAILURES. Longer than any meeting (6 h)",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "SWEEP_ITEM_FAILURES_RETENTION_S",
    "class": "defaulted",
    "default": "604800",
    "description": "§6.9 F-I: how long (s) a sweep_item_failures record untouched is kept; each reconcile pass deletes the older ones, SWEEP_BATCH_SIZE at a time (7 days). A given-up item's record is touched whenever its sweep still lists it, so only given-up items no longer pending go (their meeting gone or finished, their work cleared)",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "CALENDAR_SYNC_INTERVAL_S",

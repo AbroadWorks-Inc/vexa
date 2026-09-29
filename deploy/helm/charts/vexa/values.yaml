@@ -193,8 +193,11 @@ adminApi:
   # Webhook subscriptions (admin-api side).
   webhookMaxSubscriptions: "20"         # WEBHOOK_MAX_SUBSCRIPTIONS — per-account quota
   webhookDeliveryRetentionDays: "30"    # WEBHOOK_DELIVERY_RETENTION_DAYS — daily sweep of final deliveries
+  webhookDeliveryRetentionBatchSize: "1000"  # WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE — rows per delete batch, each its own transaction
+  webhookDeliveryRetentionMaxBatches: "100"  # WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES — per-run cap of batches of each delete; the rest waits for the next run
   webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — comma-separated private hosts a
                                         # subscription URL may name; empty ⇒ every private target refused
+  gatewayIdentityMaxSkewSeconds: "60"   # GATEWAY_IDENTITY_MAX_SKEW_S — a gateway signature's freshness window; set meetingApi's the same
   # Merged over global.podAnnotations for admin-api's pods; a key set here wins.
   podAnnotations: {}
   resources:
@@ -252,6 +255,9 @@ meetingApi:
   entryBlockedHosts: ""                 # ENTRY_BLOCKED_HOSTS — comma-separated link hosts refused; empty ⇒ none
   intakeMaxActiveEntries: "100000"      # INTAKE_MAX_ACTIVE_ENTRIES — per-account quota of active entries
   intakeConflictRetries: "3"            # INTAKE_CONFLICT_RETRIES — retries for an entry write that lost a database-constraint race
+  intakeConflictDelayMinSeconds: "0.01" # INTAKE_CONFLICT_DELAY_MIN_S — least random pause before that retry (times the try's number)
+  intakeConflictDelayMaxSeconds: "0.05" # INTAKE_CONFLICT_DELAY_MAX_S — most random pause before that retry (times the try's number)
+  intakeStopLinkRetries: "1"            # INTAKE_STOP_LINK_RETRIES — reruns of a stop whose meeting moved link before it answers 503
   autoJoinLeadSeconds: "120"            # AUTO_JOIN_LEAD_S — the bot is sent this long before the meeting starts
   notSentSweepIntervalSeconds: "30"     # NOT_SENT_SWEEP_INTERVAL_S — cadence of the not-sent sweep
   botSendMaxAttempts: "3"               # BOT_SEND_MAX_ATTEMPTS — entry-managed bot-send retry budget
@@ -259,7 +265,10 @@ meetingApi:
   sweepBatchSize: "200"                 # SWEEP_BATCH_SIZE — paging size shared by the auto-join tick, not-sent sweep and outbox publisher
   sweepMaxItemFailures: "5"             # SWEEP_MAX_ITEM_FAILURES — give-up threshold shared by those same sweeps
   meetingUntrackedGraceSeconds: "600"   # MEETING_UNTRACKED_GRACE_SEC — a runtime 404's proof-of-gone wait; a waiting meeting's/unproven spawn's grace past due_at
+  unprovenTeardownMaxAgeSeconds: "21600"  # UNPROVEN_TEARDOWN_MAX_AGE_S — how long a teardown is chased while the runtime doesn't answer (pending teardowns and stale reconcile rows)
+  sweepItemFailuresRetentionSeconds: "604800"  # SWEEP_ITEM_FAILURES_RETENTION_S — an untouched sweep_item_failures record is pruned after this
   jitsiHosts: ""                        # VEXA_JITSI_HOSTS — comma-separated self-hosted Jitsi hostnames
+  gatewayIdentityMaxSkewSeconds: "60"   # GATEWAY_IDENTITY_MAX_SKEW_S — a gateway signature's freshness window; set adminApi's the same
   # Webhook subscriptions (meeting-api side: the outbox publisher and the sender).
   webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — same list as adminApi's, applied on send
   webhookPublishIntervalSeconds: "1"    # WEBHOOK_PUBLISH_INTERVAL_S
@@ -267,6 +276,9 @@ meetingApi:
   webhookRetryScheduleSeconds: "60,300,1800,7200"  # WEBHOOK_RETRY_SCHEDULE_S — comma-separated sender retry waits
   webhookDnsThreads: "4"                # WEBHOOK_DNS_THREADS — threads in the sender's own DNS pool
   webhookDnsTimeoutSeconds: "5"         # WEBHOOK_DNS_TIMEOUT_S — max seconds for one send-time DNS lookup
+  webhookSendTimeoutSeconds: "10"       # WEBHOOK_SEND_TIMEOUT_S — max seconds one subscription post takes in total
+  webhookLeaseSeconds: "60"             # WEBHOOK_LEASE_S — a sender claim's hold on a delivery row; must exceed the send timeout + 5 s
+  webhookClaimLimit: "50"               # WEBHOOK_CLAIM_LIMIT — most delivery rows one sender tick claims
   # Merged over global.podAnnotations for meeting-api's pods; a key set here wins.
   podAnnotations: {}
   resources:

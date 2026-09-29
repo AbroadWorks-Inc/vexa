@@ -110,6 +110,9 @@ spec:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: WEBHOOK_SECRET_ENC_ACTIVE_KEY
                   optional: true
+            # The gateway signature's freshness window (the replay window); the same on admin-api.
+            - name: GATEWAY_IDENTITY_MAX_SKEW_S
+              value: {{ .Values.meetingApi.gatewayIdentityMaxSkewSeconds | default "60" | quote }}
             - name: DEFAULT_BOT_NAME
               value: {{ .Values.meetingApi.defaultBotName | default "" | quote }}
             - name: TRANSCRIPTION_SERVICE_URL
@@ -177,6 +180,12 @@ spec:
               value: {{ .Values.meetingApi.intakeMaxActiveEntries | default "100000" | quote }}
             - name: INTAKE_CONFLICT_RETRIES
               value: {{ .Values.meetingApi.intakeConflictRetries | default "3" | quote }}
+            - name: INTAKE_CONFLICT_DELAY_MIN_S
+              value: {{ .Values.meetingApi.intakeConflictDelayMinSeconds | default "0.01" | quote }}
+            - name: INTAKE_CONFLICT_DELAY_MAX_S
+              value: {{ .Values.meetingApi.intakeConflictDelayMaxSeconds | default "0.05" | quote }}
+            - name: INTAKE_STOP_LINK_RETRIES
+              value: {{ .Values.meetingApi.intakeStopLinkRetries | default "1" | quote }}
             - name: AUTO_JOIN_LEAD_S
               value: {{ .Values.meetingApi.autoJoinLeadSeconds | default "120" | quote }}
             - name: NOT_SENT_SWEEP_INTERVAL_S
@@ -191,6 +200,10 @@ spec:
               value: {{ .Values.meetingApi.sweepMaxItemFailures | default "5" | quote }}
             - name: MEETING_UNTRACKED_GRACE_SEC
               value: {{ .Values.meetingApi.meetingUntrackedGraceSeconds | default "600" | quote }}
+            - name: UNPROVEN_TEARDOWN_MAX_AGE_S
+              value: {{ .Values.meetingApi.unprovenTeardownMaxAgeSeconds | default "21600" | quote }}
+            - name: SWEEP_ITEM_FAILURES_RETENTION_S
+              value: {{ .Values.meetingApi.sweepItemFailuresRetentionSeconds | default "604800" | quote }}
             - name: VEXA_JITSI_HOSTS
               value: {{ .Values.meetingApi.jitsiHosts | default "" | quote }}
             # Webhook subscriptions: the outbox publisher and the sender.
@@ -206,6 +219,12 @@ spec:
               value: {{ .Values.meetingApi.webhookDnsThreads | default "4" | quote }}
             - name: WEBHOOK_DNS_TIMEOUT_S
               value: {{ .Values.meetingApi.webhookDnsTimeoutSeconds | default "5" | quote }}
+            - name: WEBHOOK_SEND_TIMEOUT_S
+              value: {{ .Values.meetingApi.webhookSendTimeoutSeconds | default "10" | quote }}
+            - name: WEBHOOK_LEASE_S
+              value: {{ .Values.meetingApi.webhookLeaseSeconds | default "60" | quote }}
+            - name: WEBHOOK_CLAIM_LIMIT
+              value: {{ .Values.meetingApi.webhookClaimLimit | default "50" | quote }}
             {{- with .Values.meetingApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

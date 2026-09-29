@@ -85,6 +85,9 @@ spec:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: WEBHOOK_SECRET_ENC_ACTIVE_KEY
                   optional: true
+            # The gateway signature's freshness window (the replay window); the same on meeting-api.
+            - name: GATEWAY_IDENTITY_MAX_SKEW_S
+              value: {{ .Values.adminApi.gatewayIdentityMaxSkewSeconds | default "60" | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.adminApi.logLevel | default "info" | quote }}
             # POST /v2/webhooks/{id}/test hands the send to meeting-api's internal edge.
@@ -94,6 +97,10 @@ spec:
               value: {{ .Values.adminApi.webhookMaxSubscriptions | default "20" | quote }}
             - name: WEBHOOK_DELIVERY_RETENTION_DAYS
               value: {{ .Values.adminApi.webhookDeliveryRetentionDays | default "30" | quote }}
+            - name: WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE
+              value: {{ .Values.adminApi.webhookDeliveryRetentionBatchSize | default "1000" | quote }}
+            - name: WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES
+              value: {{ .Values.adminApi.webhookDeliveryRetentionMaxBatches | default "100" | quote }}
             - name: WEBHOOK_PRIVATE_HOST_ALLOWLIST
               value: {{ .Values.adminApi.webhookPrivateHostAllowlist | default "" | quote }}
             {{- with .Values.adminApi.extraEnv }}

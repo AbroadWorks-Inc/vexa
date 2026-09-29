@@ -553,6 +553,10 @@ for kv in \
   'ENTRY_BLOCKED_HOSTS|value: ""' \
   'INTAKE_MAX_ACTIVE_ENTRIES|value: "100000"' \
   'INTAKE_CONFLICT_RETRIES|value: "3"' \
+  'INTAKE_CONFLICT_DELAY_MIN_S|value: "0.01"' \
+  'INTAKE_CONFLICT_DELAY_MAX_S|value: "0.05"' \
+  'INTAKE_STOP_LINK_RETRIES|value: "1"' \
+  'GATEWAY_IDENTITY_MAX_SKEW_S|value: "60"' \
   'AUTO_JOIN_LEAD_S|value: "120"' \
   'NOT_SENT_SWEEP_INTERVAL_S|value: "30"' \
   'BOT_SEND_MAX_ATTEMPTS|value: "3"' \
@@ -560,19 +564,27 @@ for kv in \
   'SWEEP_BATCH_SIZE|value: "200"' \
   'SWEEP_MAX_ITEM_FAILURES|value: "5"' \
   'MEETING_UNTRACKED_GRACE_SEC|value: "600"' \
+  'UNPROVEN_TEARDOWN_MAX_AGE_S|value: "21600"' \
+  'SWEEP_ITEM_FAILURES_RETENTION_S|value: "604800"' \
   'VEXA_JITSI_HOSTS|value: ""' \
   'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' \
   'WEBHOOK_PUBLISH_INTERVAL_S|value: "1"' \
   'WEBHOOK_SEND_INTERVAL_S|value: "1"' \
   'WEBHOOK_RETRY_SCHEDULE_S|value: "60,300,1800,7200"' \
   'WEBHOOK_DNS_THREADS|value: "4"' \
-  'WEBHOOK_DNS_TIMEOUT_S|value: "5"' ; do
+  'WEBHOOK_DNS_TIMEOUT_S|value: "5"' \
+  'WEBHOOK_SEND_TIMEOUT_S|value: "10"' \
+  'WEBHOOK_LEASE_S|value: "60"' \
+  'WEBHOOK_CLAIM_LIMIT|value: "50"' ; do
   env_is "$RENDER" meeting-api "${kv%%|*}" "${kv##*|}"
 done
 for kv in \
   'MEETING_API_URL|value: "http://vexa-vexa-meeting-api:8080"' \
   'WEBHOOK_MAX_SUBSCRIPTIONS|value: "20"' \
   'WEBHOOK_DELIVERY_RETENTION_DAYS|value: "30"' \
+  'WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE|value: "1000"' \
+  'WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES|value: "100"' \
+  'GATEWAY_IDENTITY_MAX_SKEW_S|value: "60"' \
   'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' ; do
   env_is "$RENDER" admin-api "${kv%%|*}" "${kv##*|}"
 done
@@ -589,7 +601,15 @@ RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml
   --set meetingApi.meetingUntrackedGraceSeconds=900 \
   --set meetingApi.webhookRetryScheduleSeconds=30\\,120 --set meetingApi.webhookDnsThreads=8 \
   --set meetingApi.webhookDnsTimeoutSeconds=2 \
+  --set meetingApi.intakeConflictDelayMinSeconds=0.02 --set meetingApi.intakeConflictDelayMaxSeconds=0.2 \
+  --set meetingApi.intakeStopLinkRetries=3 --set meetingApi.gatewayIdentityMaxSkewSeconds=30 \
+  --set meetingApi.unprovenTeardownMaxAgeSeconds=7200 \
+  --set meetingApi.sweepItemFailuresRetentionSeconds=86400 \
+  --set meetingApi.webhookSendTimeoutSeconds=5 --set meetingApi.webhookLeaseSeconds=30 \
+  --set meetingApi.webhookClaimLimit=20 \
   --set adminApi.webhookPrivateHostAllowlist=portal.example.svc.cluster.local \
+  --set adminApi.webhookDeliveryRetentionBatchSize=500 \
+  --set adminApi.webhookDeliveryRetentionMaxBatches=10 --set adminApi.gatewayIdentityMaxSkewSeconds=30 \
   --set gateway.intakeRateLimitPerMin=900 \
   --set gateway.rateLimitBurst=240 --set gateway.rateLimitRps=80)"
 env_is "$RENDER_INTAKE" meeting-api ENTRY_BLOCKED_HOSTS 'value: "meet.example.org"'
@@ -604,7 +624,19 @@ env_is "$RENDER_INTAKE" meeting-api MEETING_UNTRACKED_GRACE_SEC 'value: "900"'
 env_is "$RENDER_INTAKE" meeting-api WEBHOOK_RETRY_SCHEDULE_S 'value: "30,120"'
 env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_THREADS 'value: "8"'
 env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_TIMEOUT_S 'value: "2"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_DELAY_MIN_S 'value: "0.02"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_DELAY_MAX_S 'value: "0.2"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_STOP_LINK_RETRIES 'value: "3"'
+env_is "$RENDER_INTAKE" meeting-api GATEWAY_IDENTITY_MAX_SKEW_S 'value: "30"'
+env_is "$RENDER_INTAKE" meeting-api UNPROVEN_TEARDOWN_MAX_AGE_S 'value: "7200"'
+env_is "$RENDER_INTAKE" meeting-api SWEEP_ITEM_FAILURES_RETENTION_S 'value: "86400"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_SEND_TIMEOUT_S 'value: "5"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_LEASE_S 'value: "30"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_CLAIM_LIMIT 'value: "20"'
 env_is "$RENDER_INTAKE" admin-api WEBHOOK_PRIVATE_HOST_ALLOWLIST 'value: "portal.example.svc.cluster.local"'
+env_is "$RENDER_INTAKE" admin-api WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE 'value: "500"'
+env_is "$RENDER_INTAKE" admin-api WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES 'value: "10"'
+env_is "$RENDER_INTAKE" admin-api GATEWAY_IDENTITY_MAX_SKEW_S 'value: "30"'
 env_is "$RENDER_INTAKE" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "900"'
 env_is "$RENDER_INTAKE" gateway GATEWAY_RATE_LIMIT_BURST 'value: "240"'
 env_is "$RENDER_INTAKE" gateway GATEWAY_RATE_LIMIT_RPS 'value: "80"'
