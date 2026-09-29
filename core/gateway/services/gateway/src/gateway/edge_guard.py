@@ -176,7 +176,9 @@ _REQUEST_PATH: ContextVar[str] = ContextVar("edge_guard_request_path", default="
 class EdgeGuardMiddleware(SecurityMiddleware):
     """fastapi-guard's ``SecurityMiddleware``, with its own refusals on a ``/v2/`` path in the
     §2.5 body ``{"error": {"code", "message"}}`` (429 ``rate_limited``, 403 ``forbidden``), as
-    every other refusal the gateway itself answers there. Any other path keeps the guard's body.
+    every other refusal the gateway itself answers there. A 429 there carries ``Retry-After``: the
+    guard's rate-limit window in seconds (``GUARD_RATE_LIMIT_WINDOW``). Any other path keeps the
+    guard's body.
 
     Only the guard's refusals are reshaped: every check builds its refusal through
     ``create_error_response``; the responses it passes through from the routes never are.
@@ -199,7 +201,10 @@ class EdgeGuardMiddleware(SecurityMiddleware):
         if not path.startswith(_V2_PREFIX) or status_code not in _V2_ERROR_CODES:
             return response
         message = (response.body or b"").decode("utf-8", "replace") or default_message
-        return StarletteGuardResponse(_refusal(path, status_code, message))
+        headers = None
+        if status_code == 429:
+            headers = {"Retry-After": str(int(self.config.rate_limit_window))}
+        return StarletteGuardResponse(_refusal(path, status_code, message, headers))
 
 
 def apply_guard(app: FastAPI, config: SecurityConfig | None = None) -> None:

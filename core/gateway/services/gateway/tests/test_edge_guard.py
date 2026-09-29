@@ -278,6 +278,42 @@ class TestGuardV2Shape:
         }
 
     @pytest.mark.asyncio
+    async def test_a_per_ip_429_on_v2_retries_after_the_guard_window(self) -> None:
+        """§2.5: ``rate_limited`` sets ``Retry-After``: the guard's own window, in seconds."""
+        app = _make_v2_app(
+            _enforcing_config(
+                rate_limit=1, rate_limit_window=45, trusted_proxies=["127.0.0.1"]
+            )
+        )
+        headers = {"X-Forwarded-For": "10.0.0.74"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            assert (await ac.get("/v2/meetings", headers=headers)).status_code == 200
+            resp = await ac.get("/v2/meetings", headers=headers)
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "45"
+
+    @pytest.mark.asyncio
+    async def test_the_retry_after_is_the_window_the_gateway_configures(
+        self, monkeypatch
+    ) -> None:
+        """The window comes from ``GUARD_RATE_LIMIT_WINDOW`` through ``build_guard_config``."""
+        monkeypatch.setenv("GUARD_ENABLE_REDIS", "false")
+        monkeypatch.setenv("GUARD_RATE_LIMIT_RPM", "1")
+        monkeypatch.setenv("GUARD_RATE_LIMIT_WINDOW", "37")
+        monkeypatch.setenv("GUARD_TRUSTED_PROXIES", "127.0.0.1")
+        app = _make_v2_app(build_guard_config())
+        headers = {"X-Forwarded-For": "10.0.0.75"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            assert (await ac.get("/v2/meetings", headers=headers)).status_code == 200
+            resp = await ac.get("/v2/meetings", headers=headers)
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "37"
+
+    @pytest.mark.asyncio
     async def test_a_blocked_address_on_v2_has_the_error_shape(self) -> None:
         app = _make_v2_app(
             _enforcing_config(
