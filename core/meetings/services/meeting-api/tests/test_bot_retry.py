@@ -513,6 +513,41 @@ async def test_a_meeting_ended_outside_the_lifecycle_runs_every_finish_step(
     assert sinks.reaped == [f"tc:meeting:{meeting['id']}"]
 
 
+async def test_a_meeting_end_is_finished_once_however_often_the_finish_is_asked():
+    """M7: a second finish of the same meeting end is a no-op: one system-hook post, one
+    reap. A continued meeting's next end is a new end, finished again."""
+    from meeting_api import create_app
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    sinks = _Sinks()
+    repo = InMemoryMeetingRepo()
+    meeting = await repo.create_meeting(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="kxo-misr-avz",
+        data={},
+    )
+    mid = meeting["id"]
+    await repo.create_session(meeting_id=mid, session_uid="sess-1")
+    repo._meetings[mid]["status"] = "failed"
+    app = create_app(
+        meeting_repo=repo,
+        system_webhook_sink=sinks,
+        transcript_finalizer=sinks.finalize,
+        redis=sinks,
+    )
+    await app.state.finish_meeting(mid)
+    await app.state.finish_meeting(mid, stopped=True)
+    assert sinks.system == ["bot.failed"]
+    assert sinks.finalized == [mid] and sinks.reaped == [f"tc:meeting:{mid}"]
+    await repo.create_session(
+        meeting_id=mid, session_uid="sess-2"
+    )  # continued, ended again
+    await app.state.finish_meeting(mid)
+    assert sinks.system == ["bot.failed", "bot.failed"]
+    assert len(sinks.reaped) == 2
+
+
 # ── the newest session speaks for the meeting ───────────────────────────────────────────────
 
 

@@ -421,6 +421,19 @@ class InMemoryMeetingRepo:
             return None
         return dict(row)
 
+    async def claim_finish(self, *, meeting_id, session_uid) -> Optional[dict]:
+        """The real adapter's at-most-once claim of a finished meeting end's finish."""
+        from .ports import FINISHED_END, finished_end
+
+        row = self._meetings.get(meeting_id)
+        if row is None or row["status"] not in _TERMINAL_STATUSES:
+            return None
+        end = finished_end(row["status"], session_uid)
+        if (row.get("data") or {}).get(FINISHED_END) == end:
+            return None
+        row["data"] = {**(row.get("data") or {}), FINISHED_END: end}
+        return dict(row)
+
     async def list_unproven_teardowns(self, *, after=None, limit=None) -> list:
         """The real adapter's read of the rows carrying pending teardowns, any status: a page of
         ``limit`` rows after ``after``, one item per pending workload."""

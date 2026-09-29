@@ -326,6 +326,36 @@ class SqlAlchemyMeetingRepo:
                 return None
             return _row_to_dict(m)
 
+    async def claim_finish(self, *, meeting_id, session_uid) -> Optional[dict]:
+        """§6.9 F-FIN: take the meeting-level finish of a finished meeting's end at most once.
+        Under the row lock, a ``completed``/``failed`` row whose ``data.finished_end`` isn't this
+        end (its status and ``session_uid``, the newest session) gets it in the same transaction;
+        the row, or ``None`` when it isn't finished or this end already had its finish."""
+        from sqlalchemy import select
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from ..intake.status import FINISHED_STATUSES
+        from ..sessions.models import Meeting
+        from .ports import FINISHED_END, finished_end
+
+        async with self._session_factory() as db:
+            m = (
+                await db.execute(
+                    select(Meeting).where(Meeting.id == meeting_id).with_for_update()
+                )
+            ).scalars().first()
+            if m is None or m.status not in FINISHED_STATUSES:
+                return None
+            end = finished_end(m.status, session_uid)
+            data = dict(m.data) if isinstance(m.data, dict) else {}
+            if data.get(FINISHED_END) == end:
+                return None
+            m.data = {**data, FINISHED_END: end}
+            flag_modified(m, "data")
+            row = _row_to_dict(m)
+            await db.commit()
+            return row
+
     async def list_unproven_teardowns(self, *, after=None, limit=None) -> list[dict]:
         """The meetings, whatever their status, holding workloads that still wait for their
         delete (``data.unproven_teardown``, §6.9 F-K2), by id, one page of ``limit`` meetings

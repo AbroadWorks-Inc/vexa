@@ -432,6 +432,17 @@ def teardown_done(data: Any, workload: Optional[str]) -> dict:
     return {UNPROVEN_TEARDOWN: rest or None}
 
 
+#: ``meetings.data`` key: the meeting end whose meeting-level finish has been taken, ``{status,
+#: session}`` (the finished status and the newest session), written with the claim so each end
+#: is finished at most once (§6.9 F-FIN, ``MeetingRepo.claim_finish``).
+FINISHED_END = "finished_end"
+
+
+def finished_end(status: str, session_uid: str) -> dict:
+    """The ``FINISHED_END`` value of the end a finished meeting's newest session names."""
+    return {"status": status, "session": session_uid}
+
+
 #: ``meetings.data`` key: the session a spawn will write, and when it claimed, inserted or reopened
 #: the row: ``{session, at}``. Written in that same transaction, before the workload create.
 SPAWN_SESSION = "spawn_session"

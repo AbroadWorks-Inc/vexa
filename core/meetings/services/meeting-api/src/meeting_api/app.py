@@ -770,17 +770,19 @@ def _mount_lifecycle(
         """§6.9 F-K2: the finish of a meeting the retry ended outside the lifecycle
         (``intake.retry.end``: its planned end, a stop, its deadline, its last send): the same
         ``_finish`` as a lifecycle end, keyed by its last bot session. A meeting that never had a
-        session had no bot: nothing to finish.
+        session had no bot: nothing to finish. Each end is finished once
+        (``repo.claim_finish``: the finished status and that session, marked in the claim's own
+        transaction), so a second call for the same end is a no-op.
         ``stopped``: the user's stop drove it (``user_stop``), else the scheduler did."""
         from .lifecycle.machine import BotStatus, MeetingRecord, StatusChange
 
         repo: Any = meeting_repo  # the finish reads use the repo's own row reads
-        row = await repo.get_finished_meeting(meeting_id)
-        if not isinstance(row, dict):
-            return
         sessions = await meeting_repo.list_sessions(meeting_id=meeting_id)
         if not sessions:
             return
+        row = await repo.claim_finish(meeting_id=meeting_id, session_uid=sessions[-1])
+        if not isinstance(row, dict):
+            return  # not finished, or this end already had its finish
 
         async def _persist(delta: dict) -> Any:
             await repo.merge_meeting_data(meeting_id, delta)

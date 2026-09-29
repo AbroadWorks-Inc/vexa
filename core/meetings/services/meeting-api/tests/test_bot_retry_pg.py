@@ -2180,3 +2180,25 @@ async def test_pg_a_first_send_a_stop_raced_after_its_session_is_finished_as_a_s
     assert sink.events == ["bot.failed"] and finalized == [mid]
     typed = app.state.typed_webhooks[-1]
     assert typed["data"]["status_change"]["transition_source"] == "user_stop"
+
+
+# ── a meeting end is finished once (§6.9 F-FIN) ─────────────────────────────────────────────
+
+
+async def test_pg_two_finishes_of_one_end_run_its_steps_once(pg):
+    """M7: two finishes of the same end racing (a stop and the driver) post the system hook
+    and reap once; the marker is written with the claim, under the row lock."""
+    import asyncio
+
+    mid, session = await pg.sent(status="active")
+    app, sink, streams, finalized = await _finishing_app(pg)
+    await pg.execute("UPDATE meetings SET status = 'failed' WHERE id = :m", m=mid)
+    await asyncio.gather(
+        app.state.finish_meeting(mid), app.state.finish_meeting(mid, stopped=True)
+    )
+    assert sink.events == ["bot.failed"]
+    assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
+    assert (await pg.row(mid))["data"]["finished_end"] == {
+        "status": "failed",
+        "session": session,
+    }
