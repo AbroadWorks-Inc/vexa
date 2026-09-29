@@ -1545,9 +1545,13 @@ class _SilentLog:
 
 
 class _DeleteFails(FakeRuntimeClient):
+    """A runtime that refuses every delete (a definite answer: one of the item's failures)."""
+
     async def delete_workload(self, workload_id):
+        from meeting_api.bot_spawn.ports import SpawnFailed
+
         self.deleted.append(f"failed:{workload_id}")
-        raise RuntimeError("the kernel is down")
+        raise SpawnFailed("runtime kernel delete_workload returned 409", refused=True)
 
 
 async def _ended_with_a_pending_teardown(pg: Pg) -> tuple[int, str]:

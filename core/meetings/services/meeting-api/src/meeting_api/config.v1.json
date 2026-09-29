@@ -700,6 +700,13 @@
    "targets": ["helm"]
   },
   {
+   "key": "UNPROVEN_TEARDOWN_MAX_AGE_S",
+   "class": "defaulted",
+   "default": "21600",
+   "description": "§6.9 F-K2/F-I: how long (s) after its since a pending teardown (data.unproven_teardown) is retried before it is given up; a runtime that doesn't answer is never one of the item's failures, so this age is its only bound. Longer than any meeting (6 h)",
+   "targets": []
+  },
+  {
    "key": "CALENDAR_SYNC_INTERVAL_S",
    "class": "defaulted",
    "default": "300",

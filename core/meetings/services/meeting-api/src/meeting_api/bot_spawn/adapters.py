@@ -1471,7 +1471,7 @@ class HttpRuntimeClient:
         real container even across a runtime restart). A 404 raises ``WorkloadUnknown``: the kernel
         does not know the workload, so termination is UNCONFIRMED — a container may still be live
         (the orphaned-live-bot incident treated exactly this 404 as success). Any other error
-        raises ``SpawnFailed``. Callers log loud and retry/backstop; they must never report a stop
+        raises ``SpawnFailed``, a refusal for a 4xx. Callers log loud and retry/backstop; they must never report a stop
         as done on these."""
         resp = await self._client.delete(
             f"{self._url}/workloads/{workload_id}",
@@ -1480,7 +1480,10 @@ class HttpRuntimeClient:
         if resp.status_code == 404:
             raise WorkloadUnknown(workload_id)
         if resp.status_code >= 400:
-            raise SpawnFailed(f"runtime kernel delete_workload returned {resp.status_code}")
+            raise SpawnFailed(
+                f"runtime kernel delete_workload returned {resp.status_code}",
+                refused=resp.status_code < 500,
+            )
 
     async def get_workload(self, workload_id: str) -> Optional[dict]:
         """Liveness probe (``GET /workloads/{id}``). 404 → the kernel does not TRACK the workload →

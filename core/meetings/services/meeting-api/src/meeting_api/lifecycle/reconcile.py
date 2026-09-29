@@ -24,11 +24,13 @@ port (prod = HttpRuntimeClient; tests = FakeRuntimeClient). Best-effort per meet
 """
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
-from ..bot_spawn.ports import WorkloadUnknown
+from ..bot_spawn.ports import SpawnFailed, WorkloadUnknown
+from ..sweeps.item_failures import ItemDeferred, ItemExpired
 from .machine import dominant_completion_reason
 
 if TYPE_CHECKING:
@@ -47,7 +49,10 @@ async def teardown_verdict(
                           Logged LOUD; the caller must NOT advance the meeting to a terminal state
                           on this alone — the next sweep retries (bounded by the untracked
                           escalation window, see ``reconcile_stale_nonterminal_sweep``).
-      * ``"failed"``    — the delete errored (transient runtime trouble): retry on the next sweep.
+      * ``"refused"``   — the kernel answered and refused the delete (a 4xx): retry on the next
+                          sweep.
+      * ``"failed"``    — the delete got no answer (the runtime unreachable, a 5xx): retry on the
+                          next sweep.
     """
     if runtime is None or not bot_container_id:
         return "confirmed"
@@ -64,7 +69,7 @@ async def teardown_verdict(
         return "untracked"
     except Exception as e:  # noqa: BLE001 — transient runtime error: retry on the next sweep
         _log_orphan_kill_failed(meeting_id, bot_container_id, e)
-        return "failed"
+        return "refused" if isinstance(e, SpawnFailed) and e.refused else "failed"
 
 
 def session_workload(
@@ -184,9 +189,12 @@ async def prove_workload_gone(
     reports it terminal) is proof; an ``alive`` workload is torn down and proof only once the
     kernel confirms the delete; a 404 (``untracked``) counts only once ``untracked_grace``
     (``MEETING_UNTRACKED_GRACE_SEC``) has passed ``since`` the workload was recorded, and waits
-    inside it; anything else (no runtime, a probe error, no workload id to ask about, a 404 with
-    no ``since``) is not proof. Returns ``("proven", "")``, ``("wait", "")`` or
-    ``("not_proven", why)``."""
+    inside it. A runtime that doesn't answer (the probe errors, or the delete gets no answer) is
+    ``unreachable``: no answer at all. Anything else (no runtime, no workload id to ask about, a
+    delete the runtime refuses or 404s, a 404 with no ``since``) is not proof. Returns
+    ``("proven", "")``, ``("wait", "")``, ``("unreachable", why)`` or ``("not_proven", why)``."""
+    if runtime is None or not workload_id or not hasattr(runtime, "get_workload"):
+        return "not_proven", f"no runtime to ask about {workload_id}"
     probe, _info = await _probe_bot_workload(runtime, workload_id, log=log)
     if probe == "gone":
         return "proven", ""
@@ -194,14 +202,15 @@ async def prove_workload_gone(
         verdict = await teardown_verdict(runtime, workload_id, meeting_id=meeting_id, log=log)
         if verdict == "confirmed":
             return "proven", ""
-        return "not_proven", f"delete of {workload_id} not confirmed ({verdict})"
+        why = f"delete of {workload_id} not confirmed ({verdict})"
+        return ("unreachable" if verdict == "failed" else "not_proven"), why
     if probe == "untracked":
         if since is None:
             return "not_proven", f"no since recorded for {workload_id}: grace unknown"
         if (now - since).total_seconds() <= untracked_grace:
             return "wait", ""  # the kernel doesn't know it yet: not evidence, not a failure
         return "proven", ""
-    return "not_proven", f"no runtime answer about {workload_id} ({probe})"
+    return "unreachable", f"no runtime answer about {workload_id} ({probe})"
 
 
 def _workload_evidence(bot_container_id: Optional[str], info: Optional[dict]) -> str:
@@ -526,6 +535,17 @@ class UnprovenTeardownFailed(Exception):
     """An unproven workload's delete was not confirmed this pass (one of its bounded tries)."""
 
 
+class UnprovenTeardownExpired(ItemExpired):
+    """An unproven workload still not deleted ``UNPROVEN_TEARDOWN_MAX_AGE_S`` after its
+    ``since``: given up."""
+
+
+def unproven_teardown_max_age_s() -> float:
+    """``UNPROVEN_TEARDOWN_MAX_AGE_S``: how long after its ``since`` a pending teardown is tried
+    before it is given up (6 h, longer than any meeting)."""
+    return float(os.getenv("UNPROVEN_TEARDOWN_MAX_AGE_S", "21600"))
+
+
 async def retry_unproven_teardowns(
     repo: Any,
     runtime: Optional[Any],
@@ -543,10 +563,14 @@ async def retry_unproven_teardowns(
     evidence clears it: the runtime reports the workload terminal, a delete it confirms, or a 404
     that has lasted past ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) since it was
     recorded; a 404 inside the grace waits, and counts nothing (a missing or unreadable ``since``
-    counts, so it never waits forever). Anything else is one failure; the
-    ``SWEEP_MAX_ITEM_FAILURES``-th gives the item up, logged at error level with both ids and
-    counted (``aw_sweep_items_total{sweep="unproven-teardown",result="given_up"}``). Never
-    raises. Returns how many were cleared."""
+    counts, so it never waits forever). A runtime that doesn't answer is not the item's failure:
+    logged at warning level, counted (``aw_sweep_items_total{sweep="unproven-teardown",
+    result="runtime_unreachable"}``) and tried again next pass, until the teardown is
+    ``UNPROVEN_TEARDOWN_MAX_AGE_S`` past its ``since``. Anything else, a delete the runtime
+    refuses among them, is one failure, and the ``SWEEP_MAX_ITEM_FAILURES``-th gives the item up.
+    Past its max age, an item not cleared is given up at once. Either way the give-up is logged at
+    error level with both ids and counted (``result="given_up"``). Never raises. Returns how many
+    were cleared."""
     if not hasattr(repo, "list_unproven_teardowns") or not hasattr(repo, "merge_meeting_data"):
         return 0
     from datetime import timezone
@@ -556,6 +580,7 @@ async def retry_unproven_teardowns(
     from ..sweeps.item_failures import run_pages, sweep_batch_size
 
     limit = batch_size or sweep_batch_size()
+    max_age = unproven_teardown_max_age_s()
     now = datetime.now(timezone.utc)
     cleared = 0
 
@@ -572,6 +597,13 @@ async def retry_unproven_teardowns(
         if verdict == "wait":
             return
         if verdict != "proven":
+            if since is not None and (now - since).total_seconds() > max_age:
+                raise UnprovenTeardownExpired(
+                    f"{why}; pending since {since.isoformat()}, past "
+                    f"UNPROVEN_TEARDOWN_MAX_AGE_S ({max_age:g} s)"
+                )
+            if verdict == "unreachable" and since is not None:
+                raise ItemDeferred("runtime_unreachable", why)
             raise UnprovenTeardownFailed(why)
         await repo.merge_meeting_data(
             row["id"], lambda data: teardown_done(data, row.get("workload"))

@@ -15,6 +15,8 @@ import pytest
 
 from meeting_api.sweeps.item_failures import (
     InMemoryItemFailures,
+    ItemDeferred,
+    ItemExpired,
     run_item,
     sweep_batch_size,
     sweep_max_item_failures,
@@ -102,6 +104,42 @@ async def test_a_failure_that_cannot_be_recorded_is_logged_and_not_raised(capsys
     assert events == ["sweep_item_failure_unrecorded"]
 
 
+async def test_a_deferred_item_is_logged_and_counted_and_records_nothing(capsys):
+    failures = InMemoryItemFailures(max_failures=1)
+
+    async def no_answer() -> None:
+        raise ItemDeferred("runtime_unreachable", "no runtime answer about w")
+
+    before = _count("probe", "runtime_unreachable")
+    for _ in range(3):
+        assert await run_item(failures, "probe", "8", no_answer) is False
+    assert failures.counts == {} and await failures.given_up("probe", ["8"]) == set()
+    assert _count("probe", "runtime_unreachable") == before + 3
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(e["event"], e["level"]) for e in lines] == [
+        ("sweep_item_runtime_unreachable", "warning")
+    ] * 3
+    assert lines[0]["fields"] == {
+        "sweep": "probe",
+        "item_id": "8",
+        "reason": "no runtime answer about w",
+    }
+
+
+async def test_an_expired_item_is_given_up_at_once(capsys):
+    failures = InMemoryItemFailures(max_failures=5)
+
+    async def too_old() -> None:
+        raise ItemExpired("pending past its max age")
+
+    given_up = _count("probe", "given_up")
+    assert await run_item(failures, "probe", "3", too_old) is False
+    assert await failures.given_up("probe", ["3"]) == {"3"}
+    assert _count("probe", "given_up") == given_up + 1
+    (line,) = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    assert (line["event"], line["level"]) == ("sweep_item_given_up", "error")
+
+
 # ── Postgres ─────────────────────────────────────────────────────────────────────────────────
 
 pg_only = pytest.mark.skipif(
@@ -140,3 +178,18 @@ async def test_pg_the_count_survives_a_second_replica_and_gives_up_once(
             )
         ).one()
     assert tuple(row) == (4, "RuntimeError", True)
+
+
+@pg_only
+async def test_pg_give_up_gives_the_item_up_on_its_first_call_once(link_pg_engine):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    factory = async_sessionmaker(link_pg_engine, expire_on_commit=False)
+    failures = PostgresItemFailures(factory, max_failures=5)
+    error = ItemExpired("too old")
+    assert await failures.failed("unproven-teardown", "5:w", RuntimeError("x")) is False
+    assert await failures.give_up("unproven-teardown", "5:w", error) is True
+    assert await failures.give_up("unproven-teardown", "5:w", error) is False
+    assert await failures.given_up("unproven-teardown", ["5:w"]) == {"5:w"}

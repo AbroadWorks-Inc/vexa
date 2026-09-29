@@ -1127,6 +1127,156 @@ async def test_a_pending_teardown_without_a_readable_since_is_bounded(since):
     }
 
 
+def _teardown_items(result: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_sweep_items_total", {"sweep": "unproven-teardown", "result": result}
+    )
+    return value or 0.0
+
+
+def _pending_since(seconds_ago: float):
+    repo = _waiting_repo(proven=True, status="failed")
+    since = datetime.now(UTC) - timedelta(seconds=seconds_ago)
+    repo._meetings[5]["data"]["unproven_teardown"] = [
+        {"workload": "mtg-5-old", "since": since.isoformat()}
+    ]
+    return repo
+
+
+class _Unreachable:
+    """A runtime that doesn't answer while ``down``, then a live workload it deletes."""
+
+    def __init__(self) -> None:
+        from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+        self.down = True
+        self.real = FakeRuntimeClient(workloads={"mtg-5-old": {"state": "running"}})
+
+    async def get_workload(self, workload_id):
+        if self.down:
+            raise OSError("connection refused")
+        return await self.real.get_workload(workload_id)
+
+    async def delete_workload(self, workload_id):
+        if self.down:
+            raise OSError("connection refused")
+        await self.real.delete_workload(workload_id)
+
+
+async def test_a_runtime_outage_never_gives_a_pending_teardown_up():
+    """I1: a runtime that can't be reached is not the item's failure. Two minutes of outage
+    (eight passes at 15 s) count nothing, and the delete goes once the runtime answers.
+    """
+    from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
+
+    repo = _pending_since(30)
+    failures = InMemoryItemFailures(max_failures=5)
+    runtime = _Unreachable()
+    before = _teardown_items("runtime_unreachable")
+    for _ in range(8):
+        await retry_unproven_teardowns(
+            repo, runtime, untracked_grace=600, log=_Log(), failures=failures
+        )
+    assert failures.counts == {} and failures.gave_up == set()
+    assert _teardown_items("runtime_unreachable") == before + 8
+    runtime.down = False
+    assert (
+        await retry_unproven_teardowns(
+            repo, runtime, untracked_grace=600, log=_Log(), failures=failures
+        )
+        == 1
+    )
+    assert runtime.real.deleted == ["mtg-5-old"]
+    assert repo._meetings[5]["data"].get("unproven_teardown") is None
+
+
+async def test_a_pending_teardown_past_its_max_age_is_given_up_logged_and_counted(
+    monkeypatch, capsys
+):
+    """I1: the one bound on a runtime that doesn't answer is the teardown's age:
+    ``UNPROVEN_TEARDOWN_MAX_AGE_S`` past its ``since`` it is given up at once, at error level
+    with both ids, and counted."""
+    import json
+
+    from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
+
+    monkeypatch.setenv("UNPROVEN_TEARDOWN_MAX_AGE_S", "3600")
+    repo = _pending_since(3601)
+    failures = InMemoryItemFailures(max_failures=5)
+    before = _teardown_items("given_up")
+    await retry_unproven_teardowns(
+        repo, _Unreachable(), untracked_grace=600, log=_Log(), failures=failures
+    )
+    assert failures.gave_up == {("unproven-teardown", "5:mtg-5-old")}
+    assert _teardown_items("given_up") == before + 1
+    lines = [
+        json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")
+    ]
+    given = [x for x in lines if x["event"] == "sweep_item_given_up"]
+    assert len(given) == 1 and given[0]["level"] == "error"
+    assert given[0]["fields"]["item_id"] == "5:mtg-5-old"
+    assert given[0]["fields"]["error"] == "UnprovenTeardownExpired"
+
+
+async def test_the_max_age_defaults_to_six_hours(monkeypatch):
+    from meeting_api.lifecycle.reconcile import unproven_teardown_max_age_s
+
+    monkeypatch.delenv("UNPROVEN_TEARDOWN_MAX_AGE_S", raising=False)
+    assert unproven_teardown_max_age_s() == 21600.0
+
+
+async def test_a_delete_the_runtime_refuses_counts_toward_the_max_failures():
+    """I1: a definite answer that isn't a proof (the runtime refuses the delete) is one of the
+    item's bounded failures."""
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.bot_spawn.ports import SpawnFailed
+    from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
+
+    class Refuses(FakeRuntimeClient):
+        async def delete_workload(self, workload_id):
+            raise SpawnFailed(
+                "runtime kernel delete_workload returned 409", refused=True
+            )
+
+    repo = _pending_since(30)
+    failures = InMemoryItemFailures(max_failures=2)
+    runtime = Refuses(workloads={"mtg-5-old": {"state": "running"}})
+    for _ in range(2):
+        await retry_unproven_teardowns(
+            repo, runtime, untracked_grace=600, log=_Log(), failures=failures
+        )
+    assert failures.gave_up == {("unproven-teardown", "5:mtg-5-old")}
+
+
+class _DeleteResp:
+    def __init__(self, code: int) -> None:
+        self.status_code = code
+
+
+class _DeleteHttp:
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+    async def delete(self, url, timeout=None):
+        return _DeleteResp(self.code)
+
+
+@pytest.mark.parametrize(
+    "code,refused", [(400, True), (409, True), (500, False), (503, False)]
+)
+async def test_a_runtime_5xx_on_a_delete_is_not_a_refusal(code, refused):
+    from meeting_api.bot_spawn.adapters import HttpRuntimeClient
+    from meeting_api.bot_spawn.ports import SpawnFailed
+
+    with pytest.raises(SpawnFailed) as caught:
+        await HttpRuntimeClient(_DeleteHttp(code), "http://runtime").delete_workload(
+            "w"
+        )
+    assert caught.value.refused is refused
+
+
 async def test_the_sweep_reads_the_waiting_meetings_in_pages(monkeypatch):
     import copy
 

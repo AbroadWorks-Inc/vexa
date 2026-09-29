@@ -5,9 +5,14 @@ order (``run_pages``, the one paged loop), and runs each item through ``run_item
 (``ItemFailures.failed``), logged with its id, error and stack, and counted in
 ``aw_sweep_items_total{sweep,result}`` (``failed``); the ``SWEEP_MAX_ITEM_FAILURES``-th (5) failure
 gives it up (``given_up``, logged at error level), and the sweep skips it from then on
-(``ItemFailures.given_up``). One item's failure never stops the rest of its page. ``run_item``
-never raises: a failure that can't even be recorded (the database is down) is logged and the item
-is tried again on the next tick, since nothing was counted.
+(``ItemFailures.given_up``). An action bounded by the age of its item instead raises
+``ItemExpired`` past that age, which gives the item up at once (``ItemFailures.give_up``). An
+action that couldn't get an answer for a reason that isn't the item's failure (a dependency that
+didn't answer) raises ``ItemDeferred``: logged at warning level and counted under its own
+``result``, it records nothing, and the item runs again on the next pass. One item's failure never
+stops the rest of its page. ``run_item`` never raises: a failure that can't even be recorded (the
+database is down) is logged and the item is tried again on the next tick, since nothing was
+counted.
 
 ``PostgresItemFailures`` keeps the counts in ``sweep_item_failures`` (one row per sweep and item),
 so every replica and every tick shares them; ``InMemoryItemFailures`` is its fake. The row stores
@@ -28,6 +33,8 @@ from ..obs import log_event
 
 __all__ = [
     "InMemoryItemFailures",
+    "ItemDeferred",
+    "ItemExpired",
     "ItemFailures",
     "PostgresItemFailures",
     "run_item",
@@ -47,9 +54,26 @@ def sweep_max_item_failures() -> int:
     return int(os.getenv("SWEEP_MAX_ITEM_FAILURES", "5"))
 
 
+class ItemDeferred(Exception):
+    """An item's action got no answer, for a reason that isn't the item's failure: ``run_item``
+    logs it at warning level and counts it as ``result``; nothing is recorded."""
+
+    def __init__(self, result: str, message: str) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+class ItemExpired(Exception):
+    """An item past its sweep's age bound: ``run_item`` gives it up at once."""
+
+
 class ItemFailures(Protocol):
     async def failed(self, sweep: str, item_id: str, error: BaseException) -> bool:
         """Record one failure of the item; ``True`` when this one gives it up."""
+        ...
+
+    async def give_up(self, sweep: str, item_id: str, error: BaseException) -> bool:
+        """Record one failure of the item and give it up; ``True`` unless it was already."""
         ...
 
     async def given_up(self, sweep: str, item_ids: Collection[str]) -> set[str]:
@@ -69,6 +93,17 @@ async def run_item(
     try:
         await action()
         return True
+    except ItemDeferred as exc:
+        log_event(
+            f"sweep_item_{exc.result}",
+            audience="operator",
+            level="warning",
+            span="sweeps",
+            user_id=user_id,
+            fields={"sweep": sweep, "item_id": item_id, "reason": str(exc)},
+        )
+        sweep_item(sweep, exc.result)
+        return False
     except Exception as exc:
         fields = {
             "sweep": sweep,
@@ -78,8 +113,9 @@ async def run_item(
                 traceback.format_exception(type(exc), exc, exc.__traceback__)
             ),
         }
+        record = failures.give_up if isinstance(exc, ItemExpired) else failures.failed
         try:
-            gave_up = await failures.failed(sweep, item_id, exc)
+            gave_up = await record(sweep, item_id, exc)
         except Exception as record:
             fields["record_error"] = type(record).__name__
             log_event(
@@ -165,19 +201,37 @@ class InMemoryItemFailures:
         self.gave_up.add(key)
         return True
 
+    async def give_up(self, sweep: str, item_id: str, error: BaseException) -> bool:
+        key = (sweep, item_id)
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if key in self.gave_up:
+            return False
+        self.gave_up.add(key)
+        return True
+
     async def given_up(self, sweep: str, item_ids: Collection[str]) -> set[str]:
         return {i for i in item_ids if (sweep, i) in self.gave_up}
 
 
 class PostgresItemFailures:
     """``ItemFailures`` over ``sweep_item_failures``: one upsert per failure, which stamps
-    ``gave_up_at`` on the ``max_failures``-th and reports that one alone."""
+    ``gave_up_at`` on the ``max_failures``-th (on the first, for ``give_up``) and reports that one
+    alone."""
 
     def __init__(self, session_factory: Any, *, max_failures: int) -> None:
         self._session_factory = session_factory
         self._max = max_failures
 
     async def failed(self, sweep: str, item_id: str, error: BaseException) -> bool:
+        return await self._record(sweep, item_id, error, self._max)
+
+    async def give_up(self, sweep: str, item_id: str, error: BaseException) -> bool:
+        return await self._record(sweep, item_id, error, 1)
+
+    async def _record(
+        self, sweep: str, item_id: str, error: BaseException, give_up_at: int
+    ) -> bool:
+        """One failure; the item is given up once its count reaches ``give_up_at``."""
         from sqlalchemy import text
 
         stmt = text(
@@ -199,7 +253,7 @@ class PostgresItemFailures:
                     "sweep": sweep,
                     "item": item_id,
                     "error": type(error).__name__,
-                    "max": self._max,
+                    "max": give_up_at,
                 },
             )
             return bool(result.scalar_one())
