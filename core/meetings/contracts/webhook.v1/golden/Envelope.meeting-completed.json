@@ -6,7 +6,6 @@
   "data": {
     "meeting": {
       "id": 11367,
-      "uuid": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
       "user_id": 7,
       "platform": "google_meet",
       "native_meeting_id": "abc-defg-hij",
@@ -14,22 +13,6 @@
       "status": "completed",
       "completion_reason": "stopped",
       "failure_stage": null,
-      "outcome": null,
-      "entries": [
-        {
-          "external_id": "google:3n5kq8example",
-          "user": "a@abroadworks.com",
-          "attendees": [
-            "a@abroadworks.com",
-            "b@example.com"
-          ],
-          "series_id": "google:series-weekly",
-          "metadata": {
-            "crm_id": "42"
-          }
-        }
-      ],
-      "sequence": 9,
       "service_provenance": {
         "bot_admitted_at": "2026-06-18T10:00:00.000Z",
         "bot_departed_at": "2026-06-18T10:42:00.000Z",

@@ -10,8 +10,7 @@ is exactly the stored body, so the headers verify against it.
 
 Legacy deliveries (``Envelope.meeting-completed`` and ``Envelope.bot-failed``): what the lifecycle
 callback sends the legacy system and per-user URLs: ``lifecycle.webhook.build_typed_envelope``
-around ``app.legacy_meeting_projection`` of the row the repo's status write returns (the row plus
-the meeting's ``uuid``, ``entries``, ``outcome`` and ``sequence`` from the one meeting projection).
+around ``app.legacy_meeting_projection`` of the meeting row, upstream's meeting block.
 
 Each test builds its payload from fixed inputs and compares it with the golden file, so an emitter
 change shows up here. The goldens are never edited by hand: to regenerate them after an intended
@@ -180,12 +179,29 @@ def test_the_golden_is_the_builders_output(name, build):
     assert json.loads(path.read_text()) == built
 
 
-def test_the_legacy_meeting_block_carries_the_meetings_uuid_entries_outcome_and_sequence():
-    meeting = _completed()["data"]["meeting"]
-    assert meeting["uuid"] == UUID
-    assert meeting["sequence"] == 9
-    assert meeting["outcome"] is None
-    assert [e["external_id"] for e in meeting["entries"]] == ["google:3n5kq8example"]
+# Upstream's meeting block (the parent's ``_build_meeting_event_data``): the §2.4 meeting's own
+# keys are the subscription deliveries', never the legacy URLs'.
+LEGACY_MEETING_KEYS = [
+    "id",
+    "user_id",
+    "platform",
+    "native_meeting_id",
+    "constructed_meeting_url",
+    "status",
+    "completion_reason",
+    "failure_stage",
+    "service_provenance",
+    "start_time",
+    "end_time",
+    "data",
+    "created_at",
+    "updated_at",
+]
+
+
+@pytest.mark.parametrize("build", [_completed, _bot_failed])
+def test_the_legacy_meeting_block_is_upstreams(build):
+    assert list(build()["data"]["meeting"]) == LEGACY_MEETING_KEYS
 
 
 # ── subscription deliveries (§2.7) ───────────────────────────────────────────────────────────

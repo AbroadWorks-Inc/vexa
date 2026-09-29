@@ -1505,7 +1505,9 @@ class _SystemCapture:
         self.calls.append(envelope)
 
 
-async def test_pg_the_system_url_still_receives_meeting_completed_now_with_uuid(pg):
+async def test_pg_the_system_url_still_receives_meeting_completed(pg):
+    """Upstream's system hook keeps working with upstream's meeting block; the §2.4 meeting's
+    own keys go to ``/v2/webhooks`` subscribers only (§6.9 F-X)."""
     mid = await pg.seed("requested", session_uid="sess-cb")
     sink = _SystemCapture()
     await _callback(
@@ -1518,14 +1520,11 @@ async def test_pg_the_system_url_still_receives_meeting_completed_now_with_uuid(
     assert [e["event_type"] for e in sink.calls] == ["meeting.completed"]
     meeting = sink.calls[0]["data"]["meeting"]
     assert meeting["id"] == mid
-    assert meeting["uuid"] == str(
-        await pg.scalar("SELECT uuid FROM meetings WHERE id = :m", m=mid)
-    )
     assert meeting["status"] == "completed"
     assert meeting["completion_reason"] == "stopped"
-    assert meeting["sequence"] == await pg.seq(mid) == 3
-    assert meeting["entries"] == []
-    assert meeting["outcome"] is None
+    assert meeting["start_time"] is not None and meeting["end_time"] is not None
+    assert not {"uuid", "entries", "outcome", "sequence"} & set(meeting)
+    assert await pg.seq(mid) == 3  # the subscription events are still written
 
 
 # ── Postgres: aw_meetings_failed_total, once per failed bot (§6.9 F-B) ──────────────────────

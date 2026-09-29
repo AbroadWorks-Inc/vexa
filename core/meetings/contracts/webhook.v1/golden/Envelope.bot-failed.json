@@ -6,7 +6,6 @@
   "data": {
     "meeting": {
       "id": 11368,
-      "uuid": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
       "user_id": 7,
       "platform": "zoom",
       "native_meeting_id": "98765432101",
@@ -14,9 +13,6 @@
       "status": "failed",
       "completion_reason": "awaiting_admission_rejected",
       "failure_stage": "awaiting_admission",
-      "outcome": null,
-      "entries": [],
-      "sequence": 4,
       "service_provenance": null,
       "start_time": null,
       "end_time": "2026-06-18T10:03:12.000Z",

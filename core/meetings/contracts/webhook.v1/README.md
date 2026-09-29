@@ -103,8 +103,10 @@ the same bytes.
 
 ## Legacy deliveries (system hook, per-user `webhook_url`)
 - **Envelope.** `api_version` `2026-03-01`. `data` is `{ meeting, status_change? }`. `meeting` is
-  the legacy meeting block: the integer `id`, `user_id` and the cleaned `data`, plus `uuid`,
-  `entries`, `outcome` and `sequence` from the one meeting projection. Every event except
+  upstream's meeting block: the integer `id`, `user_id`, `native_meeting_id`, `start_time`,
+  `end_time` and the cleaned `data` (meeting-api's own bookkeeping keys stripped). It is not the
+  §2.4 meeting: a receiver that wants that (the UUID, `entries`, `outcome`, `sequence`) subscribes
+  on `/v2/webhooks`, as the AW exporter and the portal do. Every event except
   `meeting.completed` also carries the `status_change` block (`from`, `to`, `reason`, `timestamp`,
   `transition_source`).
 - **Two events per FSM advance.** One advance (e.g. → `active`) emits both `meeting.status_change`
