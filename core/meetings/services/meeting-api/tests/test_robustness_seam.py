@@ -401,10 +401,12 @@ async def test_stop_reconcile_kills_orphan_workload():
 
 
 async def test_stop_reconcile_no_container_id_does_not_crash():
-    """A stale `stopping` meeting whose bot_container_id was never written still completes — the sweep
-    skips the kill (nothing to target) and never raises."""
+    """A stale `stopping` meeting whose bot_container_id was never written still completes: the sweep
+    deletes the workload its session's spawn asked for (``workload_id_for``, §6.9 F-K2) first, and
+    never raises."""
     import logging
 
+    from meeting_api.bot_spawn.ports import workload_id_for
     from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
 
     repo = _StaleStoppingRepo([(7, "sess-7", None)])
@@ -417,7 +419,7 @@ async def test_stop_reconcile_no_container_id_does_not_crash():
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
     )
     assert n == 1
-    assert runtime.deleted == [], "no container id → no kill, no crash"
+    assert runtime.deleted == [workload_id_for(7, "sess-7")]
 
 
 async def test_stop_reconcile_kill_failure_never_completes_the_row():

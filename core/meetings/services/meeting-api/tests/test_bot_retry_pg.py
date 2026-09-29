@@ -1574,6 +1574,54 @@ async def test_pg_a_post_spawn_failure_on_the_last_attempt_records_the_unproven_
     assert row["data"]["unproven_teardown"]["workload"] == workload
 
 
+def _container_write_cancelled(pg: Pg):
+    import asyncio
+
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class Repo(SqlAlchemyMeetingRepo):
+        async def set_bot_container(self, **kw):
+            raise asyncio.CancelledError()
+
+    return Repo(pg.session_factory)
+
+
+async def test_pg_a_cancel_after_the_session_write_deletes_the_workload_and_bounds_it(
+    pg,
+):
+    import asyncio
+
+    mid = await pg.calendar_meeting()
+    runtime = FakeRuntimeClient()
+    with pytest.raises(asyncio.CancelledError):
+        await pg.port(runtime, repo=_container_write_cancelled(pg)).spawn_exact(
+            USER, mid
+        )
+    workload = runtime.specs[0]["workloadId"]
+    assert runtime.deleted == [workload]
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (workload, True)
+
+
+async def test_pg_a_cancel_after_the_session_write_on_the_last_attempt_records_it(pg):
+    import asyncio
+
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+    runtime = _DeleteFails()
+    with pytest.raises(asyncio.CancelledError):
+        await pg.port(runtime, repo=_container_write_cancelled(pg)).spawn_exact(
+            USER, mid
+        )
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert (
+        row["data"]["unproven_teardown"]["workload"] == runtime.specs[0]["workloadId"]
+    )
+
+
 async def _unproven_waiting(pg: Pg, **kw: Any) -> tuple[int, str]:
     """A meeting waiting for its next bot after a create that went unanswered."""
     import httpx

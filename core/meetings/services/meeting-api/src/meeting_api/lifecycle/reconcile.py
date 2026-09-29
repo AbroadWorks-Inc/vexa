@@ -67,6 +67,22 @@ async def teardown_verdict(
         return "failed"
 
 
+def session_workload(
+    runtime: Optional[Any], meeting_id: Any, session_uid: Optional[str],
+    bot_container_id: Optional[str],
+) -> Optional[str]:
+    """The workload a sweep proves gone or deletes for a meeting's newest session: the recorded
+    ``bot_container_id``, else, with a runtime to ask, the id the session's spawn asked for
+    (``bot_spawn.ports.workload_id_for``): a spawn cancelled between its session write and its
+    container write left a workload with no record on the row (§6.9 F-K2). Without a runtime
+    nothing could be orphaned."""
+    if bot_container_id or runtime is None or not session_uid:
+        return bot_container_id
+    from ..bot_spawn.ports import workload_id_for
+
+    return workload_id_for(meeting_id, session_uid)
+
+
 async def reconcile_stale_stopping_sweep(
     repo: Any,
     runtime: Optional[Any],
@@ -79,6 +95,7 @@ async def reconcile_stale_stopping_sweep(
     stale = await repo.list_stale_stopping(older_than_seconds=stop_grace)
     reconciled = 0
     for meeting_id, session_uid, bot_container_id in stale:
+        bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         # 1. GUARANTEE teardown FIRST — and require confirmation. Completing before a confirmed
         #    kill is how the incident produced a `completed` meeting with a live ghost bot.
         #    (Untracked here is NOT escalated: the general sweep owns the bounded escalation.)
@@ -388,6 +405,7 @@ async def reconcile_stale_nonterminal_sweep(
     seen_untracked: set = set()
     now = time.monotonic()
     for meeting_id, status, session_uid, bot_container_id, stop_requested in stale:
+        bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         probe, probe_info = "unknown", None
         # LIVENESS GATE (the correctness fix): for a status where a bot may be alive and legitimately
         # QUIET — in the meeting (`active`/`needs_help`) or on its way in (`requested`/`joining`/

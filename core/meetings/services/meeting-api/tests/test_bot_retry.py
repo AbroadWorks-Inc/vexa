@@ -1157,3 +1157,99 @@ async def test_a_waiting_meeting_the_sweep_cannot_end_is_given_up():
         await end_overdue_retries(repo, untracked_grace=600, log=_Log(), failures=failures)
     assert tries == [5, 5]
     assert await failures.given_up(OVERDUE_RETRY_SWEEP, ["5"]) == {"5"}
+
+
+# ── a session with no recorded workload: the sweeps reach the workload it was sent as ─────────
+
+
+class _QuietLog:
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+def _containerless(status: str):
+    """A stale row with a session and no ``bot_container_id`` (a cancel between the session
+    write and the container write); returns the repo, the meeting id and that workload's id."""
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+    from meeting_api.bot_spawn.ports import workload_id_for
+
+    repo = InMemoryMeetingRepo()
+    repo._meetings[5] = {
+        "id": 5,
+        "user_id": USER,
+        "platform": "google_meet",
+        "native_meeting_id": "kxo-misr-avz",
+        "platform_specific_id": "kxo-misr-avz",
+        "status": status,
+        "bot_container_id": None,
+        "start_time": None,
+        "end_time": None,
+        "created_at": "2026-09-01T09:00:00Z",
+        "updated_at": "2026-09-01T09:00:00Z",
+        "data": {},
+    }
+    repo.sessions.append({"meeting_id": 5, "session_uid": "sess-abcdef12-9"})
+    return repo, 5, workload_id_for(5, "sess-abcdef12-9")
+
+
+async def _general_sweep(repo, runtime):
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    posted: list[dict] = []
+
+    async def post(body):
+        posted.append(body)
+
+    await reconcile_stale_nonterminal_sweep(
+        repo, runtime, post, stop_grace=0, active_grace=0, log=_QuietLog(),
+        untracked_grace=600, untracked_since={},
+        item_failures=InMemoryItemFailures(max_failures=5),
+    )
+    return posted
+
+
+async def test_a_containerless_session_whose_workload_is_gone_is_deleted_then_reaped():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    repo, _, workload = _containerless("joining")
+    runtime = FakeRuntimeClient(workloads={workload: {"state": "destroyed"}})
+    posted = await _general_sweep(repo, runtime)
+    assert runtime.deleted == [workload]
+    assert [p["status"] for p in posted] == ["failed"]
+
+
+async def test_a_containerless_session_whose_workload_runs_is_not_reaped():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    repo, _, workload = _containerless("joining")
+    runtime = FakeRuntimeClient(workloads={workload: {"state": "running"}})
+    assert await _general_sweep(repo, runtime) == []
+    assert runtime.deleted == []
+
+
+async def test_a_containerless_session_the_runtime_never_heard_of_waits_for_the_grace():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    repo, _, _ = _containerless("joining")
+    assert await _general_sweep(repo, FakeRuntimeClient(workloads={})) == []
+
+
+async def test_a_containerless_stopping_row_has_its_workload_deleted_before_it_completes():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
+
+    repo, mid, workload = _containerless("stopping")
+
+    async def stale(**kw):
+        return [(mid, "sess-abcdef12-9", None)]
+
+    repo.list_stale_stopping = stale
+    runtime = FakeRuntimeClient(workloads={workload: {"state": "running"}})
+    posted: list[dict] = []
+
+    async def post(body):
+        posted.append(body)
+
+    await reconcile_stale_stopping_sweep(repo, runtime, post, stop_grace=0, log=_QuietLog())
+    assert runtime.deleted == [workload]
+    assert [p["status"] for p in posted] == ["completed"]

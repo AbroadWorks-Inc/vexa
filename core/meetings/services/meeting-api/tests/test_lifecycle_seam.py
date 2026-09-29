@@ -1550,21 +1550,25 @@ def test_stopping_row_still_reaps_on_its_short_grace():
 
 
 def test_pre_active_row_with_no_workload_at_all_still_reconciles():
-    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with NO recorded workload has
-    nothing that could be alive — the gate does not apply, so it still converges on the time window,
-    with a note that says so instead of claiming a bot went missing. (`joining`, not `requested`:
-    the FSM's only legal first edge is `<new>` → `joining`, so a never-reported row's convergence
-    rides the runtime-destroy force path, not this callback — unchanged by #862.)"""
+    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with a session and NO recorded
+    workload may still have the workload its spawn asked for (``workload_id_for``: a cancel between
+    the session write and the container write, §6.9 F-K2), so the sweep asks the runtime about that
+    id. A 404 is not evidence: the row converges on the bounded untracked window, with the
+    stage-derived reason. (`joining`, not `requested`: the FSM's only legal first edge is `<new>` →
+    `joining`.)"""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="joining")
     runtime = FakeRuntimeClient(workloads={})
     client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
 
-    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "joining"  # window opened only
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 1
     row = repo._meetings[m["id"]]
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "join_failure"
-    assert "no workload recorded" in _terminal_reason(repo, m["id"])
+    assert "presumed lost" in _terminal_reason(repo, m["id"])
 
 
 def test_pre_active_untracked_workload_still_escalates_on_the_bounded_window():

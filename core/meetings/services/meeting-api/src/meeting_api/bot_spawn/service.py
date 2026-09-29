@@ -979,7 +979,8 @@ async def request_bot(
         # For a continued meeting this APPENDS a session to the reused row — N sessions per meeting (P3c).
         await repo.create_session(meeting_id=meeting_id, session_uid=connection_id)
         row = await repo.set_bot_container(meeting_id=meeting_id, bot_container_id=workload_id)
-    except Exception as e:  # noqa: BLE001 — any post-spawn DB failure must trigger compensation
+    except (Exception, asyncio.CancelledError) as e:
+        # Any post-spawn DB failure, or a cancel between the two writes, must trigger compensation.
         torn_down = False
         try:
             await runtime.delete_workload(workload_id)
@@ -1004,6 +1005,8 @@ async def request_bot(
             await _fail_row(str(failed), failed, gone=True)
         else:
             await _fail_unproven(str(failed), failed)
+        if isinstance(e, asyncio.CancelledError):
+            raise
         raise failed from e
 
     # THE INTERLOCK — the half of the fence that has no TOCTOU hole (F2).
