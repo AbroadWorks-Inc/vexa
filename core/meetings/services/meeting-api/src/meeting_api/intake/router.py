@@ -70,7 +70,7 @@ from .reads import (
 )
 from .rules import FINISHED_STATUSES, is_live
 from .service import IntakeService
-from .validation import IntakeError
+from .validation import IntakeError, error_body
 
 __all__ = ["build_intake_router", "MAX_LIMIT", "DEFAULT_LIMIT", "MEETING_STATUSES"]
 
@@ -99,7 +99,7 @@ def _error(exc: IntakeError) -> JSONResponse:
         else None
     )
     return JSONResponse(
-        {"error": {"code": exc.code, "message": exc.message}},
+        error_body(exc.code, exc.message),
         status_code=exc.http_status,
         headers=headers,
     )

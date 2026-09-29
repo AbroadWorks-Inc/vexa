@@ -41,7 +41,14 @@ from referencing import Registry, Resource
 
 from .projection import iso_utc
 
-__all__ = ["EntryIn", "RemoveIn", "IntakeError", "parse_entry", "parse_remove"]
+__all__ = [
+    "EntryIn",
+    "RemoveIn",
+    "IntakeError",
+    "error_body",
+    "parse_entry",
+    "parse_remove",
+]
 
 #: §2.2 — "metadata | object <= 16 KB". A wire-contract limit, not a per-deployment setting, so it
 #: is not in config.v1.json (mirrors how the schema itself bakes in maxLength/maxItems).
@@ -116,6 +123,11 @@ class RemoveIn:
     external_id: str
     user: str
     reason: Optional[str]
+
+
+def error_body(code: str, message: str) -> dict[str, Any]:
+    """The §2.5 error body: ``{"error": {"code", "message"}}``."""
+    return {"error": {"code": code, "message": message}}
 
 
 class IntakeError(Exception):

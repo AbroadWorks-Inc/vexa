@@ -48,6 +48,7 @@ import time
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from . import key_ring
+from .intake import error_body
 from .key_ring import KeyRingError
 from .obs import log_event
 
@@ -200,9 +201,7 @@ def _at_most_one(headers: list, name: bytes) -> Optional[str]:
 def _unauthorized(path: str) -> bytes:
     message = "the caller's identity must come from the gateway"
     if path.startswith("/v2/"):
-        return json.dumps(
-            {"error": {"code": "unauthorized", "message": message}}
-        ).encode()
+        return json.dumps(error_body("unauthorized", message)).encode()
     return json.dumps({"detail": message}).encode()
 
 

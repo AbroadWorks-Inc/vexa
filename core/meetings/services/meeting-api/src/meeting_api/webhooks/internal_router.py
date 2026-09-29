@@ -15,15 +15,14 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..callback_auth import INTERNAL_SECRET_HEADER, internal_secret, secret_matches
+from ..intake import error_body
 from ..intake.outbox import SubscriptionNotFound, WebhookTests
 
 __all__ = ["build_webhook_test_router"]
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(
-        {"error": {"code": code, "message": message}}, status_code=status
-    )
+    return JSONResponse(error_body(code, message), status_code=status)
 
 
 def build_webhook_test_router(tests: Optional[WebhookTests]) -> APIRouter:

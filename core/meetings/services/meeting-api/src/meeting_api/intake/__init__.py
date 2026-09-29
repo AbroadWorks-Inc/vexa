@@ -90,7 +90,14 @@ from .sweeps import (
     not_sent_cause,
     not_sent_tick,
 )
-from .validation import EntryIn, IntakeError, RemoveIn, parse_entry, parse_remove
+from .validation import (
+    EntryIn,
+    IntakeError,
+    RemoveIn,
+    error_body,
+    parse_entry,
+    parse_remove,
+)
 
 __all__ = [
     "IntakeService",
@@ -125,6 +132,7 @@ __all__ = [
     "EntryIn",
     "RemoveIn",
     "IntakeError",
+    "error_body",
     "parse_entry",
     "parse_remove",
     "write_status",
