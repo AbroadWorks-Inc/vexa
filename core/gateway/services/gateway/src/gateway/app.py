@@ -482,8 +482,8 @@ def create_app(
             if user_data.get("webhook_events"):
                 headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
         headers[TRACE_HEADER] = get_trace_id() or ""
-        # §1.10: meeting-api and admin-api believe x-user-id only with a fresh signature, which
-        # _sign adds once the exact query and body to forward are known. Without a usable key ring
+        # §1.10: meeting-api and admin-api believe these x-user-* headers only with a fresh
+        # signature, which _sign adds once the exact query and body to forward are known. Without a usable key ring
         # there is no identity to vouch for; the fault names a setting, never a key.
         try:
             signing_key()
@@ -500,9 +500,8 @@ def create_app(
         return headers, None
 
     # §1.10, §6.9 F-E: signed with the ring's active key, named by kid, over the forwarded
-    # x-user-id, x-user-scopes and
-    # x-user-limits, the method, the path and query of the URL httpx sends, and the SHA-256 of the
-    # exact body bytes forwarded.
+    # x-user-id and every other identity header (identity_signature.IDENTITY_HEADERS), the method,
+    # the path and query of the URL httpx sends, and the SHA-256 of the exact body bytes forwarded.
     def _sign(headers: dict, method: str, url: str, params: Optional[dict], content: bytes) -> None:
         headers[SIGNATURE_HEADER] = sign_now(signing_key(), headers, method, url, params, content)
 

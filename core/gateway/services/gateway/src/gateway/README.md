@@ -16,7 +16,9 @@ The production edge logic, injectable. Modules:
 - **`identity_signature.py`** — §1.10, §6.9 F-E: the `x-gateway-signature` (v2) put on every
   forwarded request carrying `x-user-id`: HMAC-SHA256 with the active key of the
   `GATEWAY_IDENTITY_KEYS` ring (`GATEWAY_IDENTITY_ACTIVE_KEY`, named in the header as `kid`) over
-  the version, the kid, `t`, the user, the forwarded `x-user-scopes` and `x-user-limits`, the method, the SHA-256 of the exact body forwarded, the raw query and the
+  the version, the kid, `t`, the user, every other identity header forwarded (`IDENTITY_HEADERS`:
+  `x-user-email`, `-scopes`, `-limits`, `-workspaces`, `-webhook-url`, `-webhook-secret`,
+  `-webhook-events`), the method, the SHA-256 of the exact body forwarded, the raw query and the
   decoded path of the URL httpx sends. meeting-api and admin-api verify it with the ring key its
   `kid` names, so a key rotates by adding it to the ring, switching the active kid and later
   dropping the old key (`core/gateway/contracts/gateway-identity/README.md`); the rule is pinned by

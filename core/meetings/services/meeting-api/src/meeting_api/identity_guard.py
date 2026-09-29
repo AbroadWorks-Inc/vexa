@@ -1,21 +1,22 @@
 """Only the gateway can say who is calling (design §1.10).
 
-Client routes take the caller from ``x-user-id``. The gateway sets that header after it has
-checked the caller's key, and signs it with the active key of the ``GATEWAY_IDENTITY_KEYS`` ring,
-naming that key's id (§6.9 F-E)::
+Client routes take the caller from ``x-user-id`` and the other identity headers
+(``IDENTITY_HEADERS``). The gateway sets them after it has checked the caller's key, and signs them
+with the active key of the ``GATEWAY_IDENTITY_KEYS`` ring, naming that key's id (§6.9 F-E)::
 
     x-gateway-signature: kid=<key id>,t=<unix seconds>,v2=<hex HMAC-SHA256(key, message)>
-    message = "v2\n<kid>\n<t>\n<user_id>\n<scopes>\n<limits>\n<METHOD>\n<body_sha256>\n<query>\n<path>"
+    message = "v2\n<kid>\n<t>\n<user_id>\n<email>\n<scopes>\n<limits>\n<workspaces>
+               \n<webhook_url>\n<webhook_secret>\n<webhook_events>\n<METHOD>\n<body_sha256>
+               \n<query>\n<path>"
 
 ``IdentityGuard`` answers 401 before any client route runs unless the request carries exactly one
-``x-user-id``, at most one ``x-user-scopes`` and one ``x-user-limits``, and exactly one signature
-that
+``x-user-id``, at most one of each of ``IDENTITY_HEADERS``, and exactly one signature that
 
 - parses as ``kid=<1-64 of A-Z a-z 0-9 . _ ->,t=<digits>,v2=<64 lower-case hex digits>``,
 - names a ``kid`` in this service's ring,
 - was made at most ``MAX_SKEW_S`` seconds before or after this service's clock, and
 - matches, in constant time, the HMAC under that kid's key over the kid, that ``t``, that
-  ``x-user-id``, the ``x-user-scopes`` and ``x-user-limits`` values (empty when absent), the
+  ``x-user-id``, the value of each of ``IDENTITY_HEADERS`` in order (empty when absent), the
   request's method, the SHA-256 of its body, its raw query (``scope["query_string"]``) and its
   path (``scope["path"]``: percent-decoded).
 
@@ -54,8 +55,16 @@ from .obs import log_event
 
 SIGNATURE_HEADER = "x-gateway-signature"
 USER_HEADER = "x-user-id"
-SCOPES_HEADER = "x-user-scopes"
-LIMITS_HEADER = "x-user-limits"
+#: The identity headers besides ``x-user-id`` the signature covers, in message order.
+IDENTITY_HEADERS = (
+    "x-user-email",
+    "x-user-scopes",
+    "x-user-limits",
+    "x-user-workspaces",
+    "x-user-webhook-url",
+    "x-user-webhook-secret",
+    "x-user-webhook-events",
+)
 MAX_SKEW_S = 60
 KEYS_ENV = "GATEWAY_IDENTITY_KEYS"
 KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -119,8 +128,7 @@ def precheck(
 def verify_signature(
     ring: Mapping[str, bytes],
     user_id: Optional[str],
-    scopes: str,
-    limits: str,
+    identity: Mapping[str, str],
     header: Optional[str],
     method: str,
     path: str,
@@ -128,7 +136,9 @@ def verify_signature(
     body: bytes,
     now: float,
 ) -> Optional[str]:
-    """``None`` when ``header`` vouches for ``user_id`` on this request, else why it doesn't."""
+    """``None`` when ``header`` vouches for ``user_id`` and ``identity`` (each of
+    ``IDENTITY_HEADERS`` → its value, ``""`` when absent) on this request, else why it doesn't.
+    """
     reason = precheck(ring, user_id, header, now)
     if reason is not None:
         return reason
@@ -141,8 +151,7 @@ def verify_signature(
         kid,
         match.group(2),
         user_id,
-        scopes,
-        limits,
+        *[identity.get(name, "") for name in IDENTITY_HEADERS],
         method.upper(),
         hashlib.sha256(body).hexdigest(),
         query,
@@ -224,22 +233,23 @@ class IdentityGuard:
         except KeyRingError as e:
             ring, fault = {}, str(e)
         user_id = _single(headers, USER_HEADER.encode())
-        scopes = _at_most_one(headers, SCOPES_HEADER.encode())
-        limits = _at_most_one(headers, LIMITS_HEADER.encode())
+        found = {
+            name: _at_most_one(headers, name.encode()) for name in IDENTITY_HEADERS
+        }
+        identity = {name: value for name, value in found.items() if value is not None}
         header = _single(headers, SIGNATURE_HEADER.encode())
         now = self.clock()
         reason = "ring_invalid" if fault else precheck(ring, user_id, header, now)
-        if reason is None and (scopes is None or limits is None):
+        if reason is None and len(identity) < len(found):
             reason = "duplicated"
-        if reason is None and scopes is not None and limits is not None:
+        if reason is None:
             body = await _read_body(receive)
             if body is None:
                 return
             reason = verify_signature(
                 ring,
                 user_id,
-                scopes,
-                limits,
+                identity,
                 header,
                 scope["method"],
                 path,

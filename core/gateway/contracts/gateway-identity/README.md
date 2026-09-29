@@ -9,16 +9,21 @@ pinned here as data that all three test suites read.
 ```
 x-gateway-signature: kid=<key id>,t=<unix seconds>,v2=<64 lower-case hex digits>
 v2 = hex HMAC-SHA256(key, message), message UTF-8
-message = "v2" LF <kid> LF <t> LF <user_id> LF <scopes> LF <limits> LF <METHOD> LF <body_sha256> LF <query> LF <path>
+message = "v2" LF <kid> LF <t> LF <user_id> LF <email> LF <scopes> LF <limits> LF <workspaces>
+          LF <webhook_url> LF <webhook_secret> LF <webhook_events>
+          LF <METHOD> LF <body_sha256> LF <query> LF <path>
 ```
 
 - `kid` names the ring key the signature is made with. The HMAC key is that key's 32 raw bytes
   (the base64 decoded, not its text). The kid is in the header, so a verifier knows which key to
   use, and in the message, so it can't be relabelled.
 - `user_id` is the exact `x-user-id` value; `METHOD` is upper-case.
-- `scopes` and `limits` are the exact `x-user-scopes` and `x-user-limits` values as forwarded;
-  an absent header is an empty field. A request that carries either header more than once is
-  refused.
+- `email` … `webhook_events` are the exact values of the identity headers as forwarded, in this
+  order: `x-user-email`, `x-user-scopes`, `x-user-limits`, `x-user-workspaces`,
+  `x-user-webhook-url`, `x-user-webhook-secret`, `x-user-webhook-events` (`identity_headers` in the
+  vectors). An absent header is an empty field. With `x-user-id` they are every `x-user-*` header
+  the gateway forwards, so a verifier believes none of them unsigned. A request that carries any
+  of them more than once is refused.
 - `body_sha256` is the lower-case hex SHA-256 of the exact request body bytes: the bytes the
   gateway forwards, and the bytes the verifier receives before any handler reads them. An empty
   body hashes the empty string.
@@ -64,7 +69,7 @@ key its `kid` names; a kid not in its ring is refused. No message ever carries k
   - `keys` / `active_key`: a test ring.
   - `vectors` pin the signer (`gateway/identity_signature.py`), under the active key and an older one.
   - `verify_cases` pin the verifiers (`meeting_api/identity_guard.py`, `admin_api/app/identity_guard.py`). Each case names the kids its verifier holds (`verifier_kids`). The cases cover:
-    - changed scopes, limits, query and body;
+    - each identity header changed, dropped or added, and a query and body changed;
     - the active key, and an older key still in the ring;
     - a key dropped from the ring, and a kid not in the ring;
     - a relabelled kid, and the header format.

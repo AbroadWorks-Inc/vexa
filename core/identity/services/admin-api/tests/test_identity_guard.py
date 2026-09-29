@@ -2,8 +2,8 @@
 
 A client route believes ``x-user-id`` only with a fresh ``x-gateway-signature`` (version ``v2``)
 made with a key of the ``GATEWAY_IDENTITY_KEYS`` ring, named by its ``kid``, over the request's
-user, ``x-user-scopes``, ``x-user-limits``, method, path, raw query and body (§6.9 F-E).
-Unsigned, forged, stale, future, wrong-user, wrong-scopes, wrong-limits, wrong-query, wrong-body,
+user, every other identity header (``IDENTITY_HEADERS``), method, path, raw query and body (§6.9
+F-E). Unsigned, forged, stale, future, wrong-user, wrong-identity-header, wrong-query, wrong-body,
 unknown-kid, v1 and duplicated identities answer 401 before any route runs; so does every client
 request when the ring is unset or malformed, and the rejection says why. The operator's
 ``/admin/*`` surface, ``/internal/*`` and ``/health`` are exempt, and every route of the app is
@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Route
 
 from admin_api.app.identity_guard import (
+    IDENTITY_HEADERS,
     MAX_SKEW_S,
     IdentityGuard,
     KeyRingError,
@@ -36,6 +37,7 @@ from admin_api.app.identity_guard import (
 )
 from admin_api.app.main import create_app
 from gateway_identity import (
+    IDENTITY_HEADERS as SIGNED_BY_THE_STAND_IN,
     KEY,
     KID,
     load_vectors,
@@ -80,8 +82,7 @@ def test_the_verifier_agrees_with_the_shared_vectors(case):
     reason = verify_signature(
         ring,
         case["user_id"],
-        case["scopes"],
-        case["limits"],
+        {name: case["headers"].get(name, "") for name in IDENTITY_HEADERS},
         case["header"],
         case["method"],
         case["path"],
@@ -90,6 +91,11 @@ def test_the_verifier_agrees_with_the_shared_vectors(case):
         case["now"],
     )
     assert (reason is None) is case["valid"], reason
+
+
+def test_the_identity_headers_are_the_shared_ones():
+    assert list(IDENTITY_HEADERS) == VECTORS["identity_headers"]
+    assert SIGNED_BY_THE_STAND_IN == IDENTITY_HEADERS
 
 
 def test_the_shared_skew_is_the_guards():
@@ -188,37 +194,48 @@ def test_signed_scopes_and_limits_pass(client):
     assert client.get("/", headers=headers).status_code == 200
 
 
-@pytest.mark.parametrize(
-    "header,value",
-    [
-        ("x-user-scopes", "bot,tx,export"),
-        ("x-user-scopes", ""),
-        ("x-user-limits", "45"),
-        ("x-user-limits", ""),
-    ],
-    ids=["scopes-changed", "scopes-emptied", "limits-changed", "limits-emptied"],
-)
-def test_a_replay_with_another_scopes_or_limits_header_is_401(client, header, value):
-    headers = signed_headers(7, "GET", "/", scopes="bot,tx", limits="3")
-    assert client.get("/", headers={**headers, header: value}).status_code == 401
+#: Every identity header the gateway forwards, as it forwards them for one user.
+FULL = {
+    "x-user-email": "u@example.com",
+    "x-user-scopes": "bot,tx",
+    "x-user-limits": "3",
+    "x-user-workspaces": "ws-1,ws-2",
+    "x-user-webhook-url": "https://hooks.example.com/aw",
+    "x-user-webhook-secret": "whsec-test-only",
+    "x-user-webhook-events": '{"meeting.completed": true}',
+}
 
 
-@pytest.mark.parametrize("header", ["x-user-scopes", "x-user-limits"])
-def test_a_dropped_scopes_or_limits_header_is_401(client, header):
-    headers = signed_headers(7, "GET", "/", scopes="bot,tx", limits="3")
+def _full() -> dict[str, str]:
+    return signed_headers(7, "GET", "/", **FULL)
+
+
+def test_every_identity_header_signed_passes(client):
+    assert client.get("/", headers=_full()).status_code == 200
+
+
+@pytest.mark.parametrize("header", IDENTITY_HEADERS)
+@pytest.mark.parametrize("value", ["changed", ""], ids=["changed", "emptied"])
+def test_a_replay_with_another_identity_header_is_401(client, header, value):
+    assert client.get("/", headers={**_full(), header: value}).status_code == 401
+
+
+@pytest.mark.parametrize("header", IDENTITY_HEADERS)
+def test_a_dropped_identity_header_is_401(client, header):
+    headers = _full()
     del headers[header]
     assert client.get("/", headers=headers).status_code == 401
 
 
-@pytest.mark.parametrize("header", ["x-user-scopes", "x-user-limits"])
-def test_an_added_scopes_or_limits_header_is_401(client, header):
+@pytest.mark.parametrize("header", IDENTITY_HEADERS)
+def test_an_added_identity_header_is_401(client, header):
     headers = signed_headers(7, "GET", "/")
-    assert client.get("/", headers={**headers, header: "bot"}).status_code == 401
+    assert client.get("/", headers={**headers, header: FULL[header]}).status_code == 401
 
 
-@pytest.mark.parametrize("header", ["x-user-scopes", "x-user-limits"])
-def test_a_duplicated_scopes_or_limits_header_is_401(client, header):
-    signed = signed_headers(7, "GET", "/", scopes="bot,tx", limits="3")
+@pytest.mark.parametrize("header", IDENTITY_HEADERS)
+def test_a_duplicated_identity_header_is_401(client, header):
+    signed = _full()
     pairs = [*signed.items(), (header, signed[header])]
     assert client.get("/", headers=httpx.Headers(pairs)).status_code == 401
 

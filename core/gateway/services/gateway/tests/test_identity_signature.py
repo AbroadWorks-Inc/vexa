@@ -2,8 +2,8 @@
 
 Every forwarded request that carries ``x-user-id`` also carries ``x-gateway-signature`` (version
 ``v2``), made with the active key of the ``GATEWAY_IDENTITY_KEYS`` ring and naming it (``kid``),
-over the forwarded user, ``x-user-scopes`` and ``x-user-limits`` values, method, path, raw query
-string and the SHA-256 of the exact body bytes forwarded. A signature a client sends is never
+over the forwarded user, every other identity header it forwards (``IDENTITY_HEADERS``), method,
+path, raw query string and the SHA-256 of the exact body bytes forwarded. A signature a client sends is never
 forwarded. Without a usable ring the gateway refuses to start (preflight and the ring check) and
 refuses to forward. The signing rule is pinned by the shared vectors meeting-api and admin-api
 verify with.
@@ -17,7 +17,7 @@ import hmac
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import httpx
 import pytest
@@ -27,6 +27,7 @@ from gateway import config_preflight as cp
 from gateway import create_app
 from gateway.adapters import AdminApiAuthorizer
 from gateway.identity_signature import (
+    IDENTITY_HEADERS,
     SIGNATURE_HEADER,
     KeyRingError,
     SigningKey,
@@ -46,6 +47,20 @@ RING = json.dumps({KID: base64.b64encode(KEY).decode()})
 #: The x-user-scopes and x-user-limits the gateway forwards for ``VALID_USER``.
 SCOPES = ",".join(VALID_USER["scopes"])
 LIMITS = str(VALID_USER["max_concurrent"])
+#: Every identity header besides x-user-id the gateway forwards for ``VALID_USER``.
+FORWARDED = {
+    "x-user-email": VALID_USER["email"],
+    "x-user-scopes": SCOPES,
+    "x-user-limits": LIMITS,
+}
+#: A user with every piece of identity the gateway forwards.
+FULL_USER = {
+    **VALID_USER,
+    "workspaces": ["ws-1", "ws-2"],
+    "webhook_url": "https://hooks.example.com/aw",
+    "webhook_secret": "whsec-test-only",
+    "webhook_events": {"meeting.completed": True},
+}
 
 
 def _vectors() -> dict:
@@ -68,8 +83,7 @@ def _verify(
     query: str = "",
     body: bytes = b"",
     *,
-    scopes: str = SCOPES,
-    limits: str = LIMITS,
+    identity: Mapping[str, str] = FORWARDED,
     kid: str = KID,
 ) -> int:
     """Check ``header`` the way the receiving services do; returns its ``t``."""
@@ -82,8 +96,7 @@ def _verify(
         kid,
         str(t),
         user_id,
-        scopes,
-        limits,
+        *[identity.get(name, "") for name in VECTORS["identity_headers"]],
         method,
         hashlib.sha256(body).hexdigest(),
         query,
@@ -116,8 +129,7 @@ def _verify_as_sent(last: dict[str, Any], user_id: str = "7") -> int:
         sent.url.path,
         sent.url.query.decode("ascii"),
         sent.content,
-        scopes=last["headers"].get("x-user-scopes", ""),
-        limits=last["headers"].get("x-user-limits", ""),
+        identity=last["headers"],
     )
 
 
@@ -152,8 +164,7 @@ def test_signer_reproduces_the_shared_vectors(vector):
             vector["kid"],
             str(vector["t"]),
             vector["user_id"],
-            vector["scopes"],
-            vector["limits"],
+            *[vector["headers"].get(h, "") for h in VECTORS["identity_headers"]],
             vector["method"],
             vector["body_sha256"],
             vector["query"],
@@ -164,8 +175,7 @@ def test_signer_reproduces_the_shared_vectors(vector):
     got = sign(
         key,
         vector["user_id"],
-        vector["scopes"],
-        vector["limits"],
+        vector["headers"],
         vector["method"],
         vector["path"],
         vector["query"],
@@ -175,12 +185,17 @@ def test_signer_reproduces_the_shared_vectors(vector):
     assert got == vector["header"]
 
 
+def test_the_identity_headers_signed_are_the_shared_ones():
+    assert list(IDENTITY_HEADERS) == VECTORS["identity_headers"]
+
+
 def test_the_vectors_cover_query_body_and_rotation():
     vectors = VECTORS["vectors"]
     assert any(v["query"] for v in vectors) and any(not v["query"] for v in vectors)
     assert any(v["body"] for v in vectors) and any(not v["body"] for v in vectors)
-    for field in ("scopes", "limits"):
-        assert any(v[field] for v in vectors) and any(not v[field] for v in vectors)
+    for name in VECTORS["identity_headers"]:
+        assert any(name in v["headers"] for v in vectors)
+        assert any(name not in v["headers"] for v in vectors)
     assert {v["kid"] for v in vectors} == set(VECTORS["keys"])
     assert VECTORS["active_key"] in VECTORS["keys"]
     cases = VECTORS["verify_cases"]
@@ -328,17 +343,56 @@ def test_the_scopes_and_limits_signed_are_those_forwarded(signing):
     assert headers["x-user-scopes"] == SCOPES
     assert headers["x-user-limits"] == LIMITS
     _verify(headers[SIGNATURE_HEADER], KEY, "7", "GET", "/meetings")
+    for name, value in (("x-user-scopes", "bot,tx,export"), ("x-user-limits", "45")):
+        with pytest.raises(AssertionError):
+            _verify(
+                headers[SIGNATURE_HEADER],
+                KEY,
+                "7",
+                "GET",
+                "/meetings",
+                identity={**FORWARDED, name: value},
+            )
+
+
+def _forward_as(user: dict) -> dict[str, Any]:
+    downstream = FakeDownstream(status_code=200, body={"ok": True})
+    client = TestClient(create_app(FakeAuthorizer(user=user), downstream, FakeRedis()))
+    raw = b'{"platform":"google_meet","native_meeting_id":"abc-defg-hij"}'
+    r = client.post(
+        "/bots", headers={**AUTH, "content-type": "application/json"}, content=raw
+    )
+    assert r.status_code == 200
+    return downstream.last
+
+
+def test_every_identity_header_the_gateway_forwards_is_signed(signing):
+    last = _forward_as(FULL_USER)
+    forwarded = {h for h in last["headers"] if h.startswith("x-user-")}
+    assert forwarded == {"x-user-id", *IDENTITY_HEADERS}
+    _verify_as_sent(last)
+
+
+@pytest.mark.parametrize("name", IDENTITY_HEADERS)
+def test_a_changed_identity_header_breaks_the_signature(signing, name):
+    last = _forward_as(FULL_USER)
+    _verify_as_sent(last)
+    for changed in (
+        {**last["headers"], name: "changed"},
+        {k: v for k, v in last["headers"].items() if k != name},
+    ):
+        with pytest.raises(AssertionError):
+            _verify_as_sent({**last, "headers": changed})
+
+
+def test_an_identity_header_not_forwarded_is_signed_empty(signing):
+    last = _forward_as(VALID_USER)
+    assert "x-user-workspaces" not in last["headers"]
+    _verify_as_sent(last)
     with pytest.raises(AssertionError):
-        _verify(
-            headers[SIGNATURE_HEADER],
-            KEY,
-            "7",
-            "GET",
-            "/meetings",
-            scopes="bot,tx,export",
+        _verify_as_sent(
+            {**last, "headers": {**last["headers"], "x-user-workspaces": "ws-1"}}
         )
-    with pytest.raises(AssertionError):
-        _verify(headers[SIGNATURE_HEADER], KEY, "7", "GET", "/meetings", limits="45")
 
 
 def test_a_forward_to_admin_api_is_signed_over_the_admin_api_path(signing):
@@ -387,7 +441,7 @@ def test_the_streamed_leg_is_signed_over_its_query(signing):
 def test_a_client_supplied_signature_is_never_forwarded(signing):
     client, downstream = _client()
     forged = sign(
-        SigningKey(KID, KEY), "1", "", "", "GET", "/meetings", "", b"", int(time.time())
+        SigningKey(KID, KEY), "1", {}, "GET", "/meetings", "", b"", int(time.time())
     )
     r = client.get(
         "/meetings", headers={**AUTH, SIGNATURE_HEADER: forged, "x-user-id": "1"}
@@ -535,8 +589,7 @@ async def test_the_ws_subscribe_hop_is_signed_over_the_body_it_posts(signing):
         "POST",
         "/ws/authorize-subscribe",
         body=hop["content"],
-        scopes="tx",
-        limits="3",
+        identity={"x-user-scopes": "tx", "x-user-limits": "3"},
     )
     assert hop["headers"]["x-user-scopes"] == "tx"
     assert hop["headers"]["x-user-limits"] == "3"

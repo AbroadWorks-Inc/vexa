@@ -1,17 +1,21 @@
 """The identity signature the gateway puts on every request it forwards (design §1.10, §6.9 F-E).
 
-The gateway resolves the caller's key to a user and forwards ``x-user-id``. meeting-api and
-admin-api believe that header only when it arrives with a fresh signature made with a key of the
-``GATEWAY_IDENTITY_KEYS`` ring, which only the gateway and they hold::
+The gateway resolves the caller's key to a user and forwards ``x-user-id`` with the rest of the
+caller's identity (``IDENTITY_HEADERS``). meeting-api and admin-api believe those headers only when
+they arrive with a fresh signature made with a key of the ``GATEWAY_IDENTITY_KEYS`` ring, which
+only the gateway and they hold::
 
     x-gateway-signature: kid=<key id>,t=<unix seconds>,v2=<hex HMAC-SHA256(key, message)>
-    message = "v2\\n<kid>\\n<t>\\n<user_id>\\n<scopes>\\n<limits>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>"
+    message = "v2\\n<kid>\\n<t>\\n<user_id>\\n<email>\\n<scopes>\\n<limits>\\n<workspaces>
+               \\n<webhook_url>\\n<webhook_secret>\\n<webhook_events>\\n<METHOD>\\n<body_sha256>
+               \\n<query>\\n<path>"
 
 - ``kid`` names the ring key the signature is made with: ``GATEWAY_IDENTITY_ACTIVE_KEY``. The HMAC
   key is that key's 32 raw bytes.
 - ``user_id`` is the exact ``x-user-id`` value forwarded.
-- ``scopes`` and ``limits`` are the exact ``x-user-scopes`` and ``x-user-limits`` values forwarded,
-  empty when the header isn't forwarded.
+- ``email`` … ``webhook_events`` are the exact values of the ``IDENTITY_HEADERS`` forwarded, in that
+  order, each empty when the header isn't forwarded. With ``x-user-id`` they are every ``x-user-*``
+  header the gateway forwards.
 - ``METHOD`` is the forwarded method, upper-case.
 - ``body_sha256`` is the lower-case hex SHA-256 of the exact body bytes forwarded (the empty
   string's digest for an empty body).
@@ -21,8 +25,8 @@ admin-api believe that header only when it arrives with a fresh signature made w
 - ``path`` is the path of that URL, percent-decoded (``httpx.URL.path``); the receiving service
   reads it as ``scope["path"]``. It is the last field because it is the only one that can contain
   a line feed.
-- The verifiers look ``kid`` up in their own ring and accept a signature made at most 60 s before
-  or after their own clock.
+- The verifiers look ``kid`` up in their own ring and accept a signature made at most their
+  ``GATEWAY_IDENTITY_MAX_SKEW_S`` before or after their own clock.
 
 The ring has the webhook secret encryption ring's format: ``GATEWAY_IDENTITY_KEYS`` is a JSON object
 ``{"<kid>": "<exactly 32 bytes, standard base64>"}``. A kid is 1-64 characters of ``A-Z a-z 0-9 .
@@ -53,6 +57,16 @@ KEYS_ENV = "GATEWAY_IDENTITY_KEYS"
 ACTIVE_KEY_ENV = "GATEWAY_IDENTITY_ACTIVE_KEY"
 KEY_BYTES = 32
 KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+#: The identity headers besides ``x-user-id`` the signature covers, in message order.
+IDENTITY_HEADERS = (
+    "x-user-email",
+    "x-user-scopes",
+    "x-user-limits",
+    "x-user-workspaces",
+    "x-user-webhook-url",
+    "x-user-webhook-secret",
+    "x-user-webhook-events",
+)
 
 
 class KeyRingError(ValueError):
@@ -132,22 +146,23 @@ def signed_target(
 def sign(
     key: SigningKey,
     user_id: str,
-    scopes: str,
-    limits: str,
+    identity: Mapping[str, str],
     method: str,
     path: str,
     query: str,
     body: bytes,
     t: int,
 ) -> str:
-    """The ``x-gateway-signature`` value for one forwarded request made at unix time ``t``."""
+    """The ``x-gateway-signature`` value for one forwarded request made at unix time ``t``.
+
+    ``identity`` holds the lower-case identity headers forwarded; the signature covers each of
+    ``IDENTITY_HEADERS``, empty when absent."""
     fields = [
         VERSION,
         key.kid,
         str(t),
         user_id,
-        scopes,
-        limits,
+        *[identity.get(name, "") for name in IDENTITY_HEADERS],
         method.upper(),
         hashlib.sha256(body).hexdigest(),
         query,
@@ -168,14 +183,13 @@ def sign_now(
 ) -> str:
     """Sign a request forwarded now to ``url`` with ``headers``, ``params`` and ``body``.
 
-    ``headers`` are the lower-case headers forwarded; the signature covers their ``x-user-id``,
-    ``x-user-scopes`` and ``x-user-limits``."""
+    ``headers`` are the lower-case headers forwarded; the signature covers their ``x-user-id`` and
+    ``IDENTITY_HEADERS``."""
     path, query = signed_target(url, params)
     return sign(
         key,
         headers["x-user-id"],
-        headers.get("x-user-scopes", ""),
-        headers.get("x-user-limits", ""),
+        headers,
         method,
         path,
         query,
