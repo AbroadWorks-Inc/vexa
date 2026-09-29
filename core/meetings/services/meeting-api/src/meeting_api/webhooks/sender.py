@@ -71,7 +71,6 @@ the guard validated with the Host header and TLS SNI of the real host).
 from __future__ import annotations
 
 import asyncio
-import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +81,7 @@ from typing import Any, Callable, Collection, List, Mapping, Optional, Protocol
 
 from ..metrics import webhook_delivery
 from ..obs import log_event
+from ..settings import SettingsError, seconds, whole
 from .secret_box import SecretBox, SecretBoxError
 from .signing import signed_headers
 from .ssrf import (
@@ -107,7 +107,6 @@ __all__ = [
     "Poster",
     "PostgresDeliveryStore",
     "SenderSettings",
-    "SenderSettingsError",
     "SigningSecrets",
     "TransportError",
     "WebhookSender",
@@ -126,49 +125,16 @@ SENDER_ERROR = "sender error"
 _SPAN = "webhooks.delivery"
 
 
-class SenderSettingsError(ValueError):
-    """A sender setting is set but malformed; meeting-api refuses to start. The message names the
-    setting and what it must be."""
-
-
 def _retry_schedule(raw: str) -> tuple[int, ...]:
     parts = [part.strip() for part in raw.split(",")]
     if 1 <= len(parts) <= MAX_RETRIES and all(
         p.isascii() and p.isdigit() and int(p) >= 1 for p in parts
     ):
         return tuple(int(p) for p in parts)
-    raise SenderSettingsError(
+    raise SettingsError(
         "WEBHOOK_RETRY_SCHEDULE_S must be a comma-separated list of 1 to "
         f"{MAX_RETRIES} positive whole seconds"
     )
-
-
-def _dns_threads(raw: str) -> int:
-    if raw.isascii() and raw.isdigit() and int(raw) >= 1:
-        return int(raw)
-    raise SenderSettingsError(
-        "WEBHOOK_DNS_THREADS must be a whole number of at least 1"
-    )
-
-
-def _dns_timeout_s(raw: str) -> float:
-    return _seconds(raw, "WEBHOOK_DNS_TIMEOUT_S")
-
-
-def _seconds(raw: str, key: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError:
-        value = math.nan
-    if math.isfinite(value) and value > 0:
-        return value
-    raise SenderSettingsError(f"{key} must be a number of seconds above 0")
-
-
-def _whole(raw: str, key: str, what: str) -> int:
-    if raw.isascii() and raw.isdigit() and int(raw) >= 1:
-        return int(raw)
-    raise SenderSettingsError(f"{key} must be a whole number of {what} of at least 1")
 
 
 @dataclass(frozen=True)
@@ -188,31 +154,26 @@ class SenderSettings:
 
     @classmethod
     def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> SenderSettings:
-        """The settings from the environment; an unset or empty key takes its default, and a
-        malformed one raises ``SenderSettingsError``."""
+        """The settings from the environment (``meeting_api.settings``); an unset or empty key
+        takes its default, and a malformed one raises ``SettingsError``."""
         env = os.environ if environ is None else environ
         schedule = (env.get("WEBHOOK_RETRY_SCHEDULE_S") or "").strip()
-        threads = (env.get("WEBHOOK_DNS_THREADS") or "").strip()
-        timeout = (env.get("WEBHOOK_DNS_TIMEOUT_S") or "").strip()
-        send = (env.get("WEBHOOK_SEND_TIMEOUT_S") or "").strip()
-        lease = (env.get("WEBHOOK_LEASE_S") or "").strip()
-        claims = (env.get("WEBHOOK_CLAIM_LIMIT") or "").strip()
         settings = cls(
             retry_schedule_s=(
                 _retry_schedule(schedule) if schedule else DEFAULT_RETRY_SCHEDULE_S
             ),
-            dns_threads=_dns_threads(threads) if threads else DEFAULT_DNS_THREADS,
-            dns_timeout_s=_dns_timeout_s(timeout) if timeout else DEFAULT_DNS_TIMEOUT_S,
-            send_timeout_s=(
-                _seconds(send, "WEBHOOK_SEND_TIMEOUT_S") if send else SEND_TIMEOUT_S
+            dns_threads=whole("WEBHOOK_DNS_THREADS", str(DEFAULT_DNS_THREADS), env=env),
+            dns_timeout_s=seconds(
+                "WEBHOOK_DNS_TIMEOUT_S", str(DEFAULT_DNS_TIMEOUT_S), env=env
             ),
-            lease_s=_whole(lease, "WEBHOOK_LEASE_S", "seconds") if lease else LEASE_S,
-            claim_limit=(
-                _whole(claims, "WEBHOOK_CLAIM_LIMIT", "rows") if claims else CLAIM_LIMIT
+            send_timeout_s=seconds(
+                "WEBHOOK_SEND_TIMEOUT_S", str(SEND_TIMEOUT_S), env=env
             ),
+            lease_s=whole("WEBHOOK_LEASE_S", str(LEASE_S), env=env),
+            claim_limit=whole("WEBHOOK_CLAIM_LIMIT", str(CLAIM_LIMIT), env=env),
         )
         if settings.lease_s <= settings.send_timeout_s + LEASE_MARGIN_S:
-            raise SenderSettingsError(
+            raise SettingsError(
                 "WEBHOOK_LEASE_S must be more than WEBHOOK_SEND_TIMEOUT_S + "
                 f"{LEASE_MARGIN_S:g} s, or no claim can post inside its lease"
             )

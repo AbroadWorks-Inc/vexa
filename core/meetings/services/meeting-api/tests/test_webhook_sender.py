@@ -48,11 +48,11 @@ from meeting_api.webhooks.sender import (
     HttpxPoster,
     PostgresDeliveryStore,
     SenderSettings,
-    SenderSettingsError,
     SigningSecrets,
     TransportError,
     WebhookSender,
 )
+from meeting_api.settings import SettingsError
 from meeting_api.webhooks.ssrf import (
     DEFAULT_PRIVATE_HOST_ALLOWLIST,
     PinnedURL,
@@ -681,7 +681,7 @@ def test_a_retry_schedule_setting_is_read(raw, parsed):
     ],
 )
 def test_a_malformed_retry_schedule_is_refused(raw):
-    with pytest.raises(SenderSettingsError) as err:
+    with pytest.raises(SettingsError) as err:
         SenderSettings.from_env({"WEBHOOK_RETRY_SCHEDULE_S": raw})
     assert "WEBHOOK_RETRY_SCHEDULE_S" in str(err.value)
 
@@ -1322,13 +1322,13 @@ def test_the_default_send_bounds():
     ],
 )
 def test_a_malformed_send_bound_is_refused(key, raw):
-    with pytest.raises(SenderSettingsError) as err:
+    with pytest.raises(SettingsError) as err:
         SenderSettings.from_env({key: raw})
     assert key in str(err.value)
 
 
 def test_a_lease_too_short_to_post_inside_is_refused():
-    with pytest.raises(SenderSettingsError) as err:
+    with pytest.raises(SettingsError) as err:
         SenderSettings.from_env(
             {"WEBHOOK_SEND_TIMEOUT_S": "10", "WEBHOOK_LEASE_S": "15"}
         )
@@ -1382,7 +1382,7 @@ def test_the_default_dns_settings():
     ],
 )
 def test_a_malformed_dns_setting_is_refused(key, raw):
-    with pytest.raises(SenderSettingsError) as err:
+    with pytest.raises(SettingsError) as err:
         SenderSettings.from_env({key: raw})
     assert key in str(err.value)
 
@@ -1900,7 +1900,7 @@ def test_a_malformed_sender_setting_refuses_to_boot(monkeypatch, key, raw):
 
     _production_env(monkeypatch)
     monkeypatch.setenv(key, raw)
-    with pytest.raises(SenderSettingsError, match=key):
+    with pytest.raises(SettingsError, match=key):
         main_mod.build_production_app()
 
 

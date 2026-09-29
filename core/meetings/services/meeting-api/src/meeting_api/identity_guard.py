@@ -53,6 +53,7 @@ from . import key_ring
 from .intake import error_body
 from .key_ring import KeyRingError
 from .obs import log_event
+from .settings import whole
 
 SIGNATURE_HEADER = "x-gateway-signature"
 USER_HEADER = "x-user-id"
@@ -107,16 +108,10 @@ def identity_ring() -> Mapping[str, bytes]:
 
 def max_skew_s() -> int:
     """``GATEWAY_IDENTITY_MAX_SKEW_S`` (default 60): the most seconds a signature's ``t`` may be
-    before or after this service's clock; ``ValueError`` unless a positive whole number.
+    before or after this service's clock; ``settings.SettingsError`` unless a whole number of at
+    least 1.
     """
-    raw = os.getenv("GATEWAY_IDENTITY_MAX_SKEW_S", "60")
-    try:
-        skew = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{MAX_SKEW_ENV} must be a whole number of seconds") from exc
-    if skew < 1:
-        raise ValueError(f"{MAX_SKEW_ENV} must be at least 1")
-    return skew
+    return whole(MAX_SKEW_ENV, "60")
 
 
 def precheck(

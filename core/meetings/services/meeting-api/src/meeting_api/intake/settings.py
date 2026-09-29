@@ -38,7 +38,7 @@ def auto_join_lead_s() -> int:
     # Imported at call time so bot_spawn can import the intake package without an import cycle.
     from ..bot_spawn.auto_join import DEFAULT_LEAD_S
 
-    return int(float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))))
+    return int(seconds("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S), zero=True))
 
 
 def auto_join_grace_s() -> float:
@@ -46,13 +46,13 @@ def auto_join_grace_s() -> float:
     seconds after its start."""
     from ..bot_spawn.auto_join import DEFAULT_GRACE_S
 
-    return float(os.getenv("AUTO_JOIN_GRACE_S", str(DEFAULT_GRACE_S)))
+    return seconds("AUTO_JOIN_GRACE_S", str(DEFAULT_GRACE_S), zero=True)
 
 
 def join_now_adopt_ahead_s() -> int:
     """``JOIN_NOW_ADOPT_AHEAD_S``: a pasted link adopts a meeting starting within this many
     seconds."""
-    return int(os.getenv("JOIN_NOW_ADOPT_AHEAD_S", "3600"))
+    return whole("JOIN_NOW_ADOPT_AHEAD_S", "3600")
 
 
 @dataclass(frozen=True)
@@ -81,13 +81,13 @@ class IntakeSettings:
                 "INTAKE_CONFLICT_DELAY_MIN_S must not be more than INTAKE_CONFLICT_DELAY_MAX_S"
             )
         return cls(
-            max_days_ahead=int(os.getenv("ENTRY_MAX_DAYS_AHEAD", "30")),
+            max_days_ahead=whole("ENTRY_MAX_DAYS_AHEAD", "30"),
             join_now_adopt_ahead_s=join_now_adopt_ahead_s(),
             lead_s=auto_join_lead_s(),
             blocked_hosts=frozenset(
                 h.strip().lower() for h in blocked.split(",") if h.strip()
             ),
-            max_active_entries=int(os.getenv("INTAKE_MAX_ACTIVE_ENTRIES", "100000")),
+            max_active_entries=whole("INTAKE_MAX_ACTIVE_ENTRIES", "100000"),
             send_max_attempts=whole("BOT_SEND_MAX_ATTEMPTS", "3"),
             send_retry_backoff_s=whole("BOT_SEND_RETRY_BACKOFF_S", "60"),
             conflict_retries=whole("INTAKE_CONFLICT_RETRIES", "3", zero=True),

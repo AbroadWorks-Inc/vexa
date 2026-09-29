@@ -69,8 +69,11 @@ def _check_settings() -> None:
     """Read every number setting a sweep, an item or a request reads after boot (§1.11, §6.9),
     so a value meeting-api can't run on refuses to start (``settings.SettingsError``, naming the
     key) instead of failing each item that reads it. The settings read at boot itself go through
-    the same reader where they are read (``MEETING_UNTRACKED_GRACE_SEC``)."""
-    from .intake.settings import IntakeSettings
+    the same reader where they are read (``MEETING_UNTRACKED_GRACE_SEC``, the sweep intervals
+    this work adds, the webhook sender's). ``GATEWAY_IDENTITY_MAX_SKEW_S`` is read when the
+    middleware stack is built, on the first request, so it is read here too."""
+    from .identity_guard import max_skew_s
+    from .intake.settings import IntakeSettings, auto_join_grace_s
     from .lifecycle.reconcile import unproven_teardown_max_age_s
     from .sweeps.item_failures import (
         sweep_batch_size,
@@ -78,7 +81,9 @@ def _check_settings() -> None:
         sweep_max_item_failures,
     )
 
+    max_skew_s()
     IntakeSettings.from_env()
+    auto_join_grace_s()
     unproven_teardown_max_age_s()
     sweep_batch_size()
     sweep_max_item_failures()
@@ -699,7 +704,7 @@ def _attach_background_loops(
     # Not-sent sweep (§1.5, R6): a meeting entries manage that reaches its end without a bot ends
     # `failed`, outcome `not_sent`, with its cause. An open-ended meeting has no end to pass: its
     # bounded bot sends end it (BOT_SEND_MAX_ATTEMPTS).
-    not_sent_interval = float(os.getenv("NOT_SENT_SWEEP_INTERVAL_S", "30"))
+    not_sent_interval = seconds("NOT_SENT_SWEEP_INTERVAL_S", "30")
 
     async def _not_sent_loop() -> None:
         if intake_store is None:
@@ -734,12 +739,12 @@ def _attach_background_loops(
     from .webhooks.ssrf import DEFAULT_PRIVATE_HOST_ALLOWLIST, parse_allowlist
     from .webhooks.subscriptions import AdminSubscriptions
 
-    webhook_send_interval = float(os.getenv("WEBHOOK_SEND_INTERVAL_S", "1"))
+    webhook_send_interval = seconds("WEBHOOK_SEND_INTERVAL_S", "1")
     webhook_allowlist = parse_allowlist(
         os.getenv("WEBHOOK_PRIVATE_HOST_ALLOWLIST", DEFAULT_PRIVATE_HOST_ALLOWLIST)
     )
     webhook_subscriptions = AdminSubscriptions(admin_api_url, internal_secret)
-    # Read at boot: a malformed sender setting refuses to start (SenderSettingsError).
+    # Read at boot: a malformed sender setting refuses to start (settings.SettingsError).
     from .webhooks.sender import SenderSettings
 
     webhook_sender_settings = SenderSettings.from_env()
@@ -747,7 +752,7 @@ def _attach_background_loops(
     # The publisher is single-flight, every WEBHOOK_PUBLISH_INTERVAL_S: one replica fans the outbox
     # out per tick (a second one would only find the rows already published). It needs Postgres and
     # the admin edge; without the edge the rows stay unpublished (and alert), never published empty.
-    webhook_publish_interval = float(os.getenv("WEBHOOK_PUBLISH_INTERVAL_S", "1"))
+    webhook_publish_interval = seconds("WEBHOOK_PUBLISH_INTERVAL_S", "1")
 
     async def _webhook_publish_loop() -> None:
         if session_factory is None:

@@ -1,5 +1,5 @@
-"""§1.11, §6.9 — every setting a sweep or an item reads after boot is checked when meeting-api
-boots: a value it can't run on refuses to start (``SettingsError``, naming the key), and the
+"""§1.11, §6.9 — every number setting meeting-api reads, at boot or later in a sweep, an item or a
+request, goes through ``meeting_api.settings`` and is checked when meeting-api boots: a value it can't run on refuses to start (``SettingsError``, naming the key), and the
 defaults start. ``build_production_app`` is built for real, with the config.v1 preflight skipped
 and dummy connection settings (nothing connects at build time).
 """
@@ -22,6 +22,20 @@ KEYS = (
     "INTAKE_CONFLICT_DELAY_MAX_S",
     "INTAKE_STOP_LINK_RETRIES",
     "MEETING_UNTRACKED_GRACE_SEC",
+    "AUTO_JOIN_LEAD_S",
+    "AUTO_JOIN_GRACE_S",
+    "JOIN_NOW_ADOPT_AHEAD_S",
+    "ENTRY_MAX_DAYS_AHEAD",
+    "INTAKE_MAX_ACTIVE_ENTRIES",
+    "NOT_SENT_SWEEP_INTERVAL_S",
+    "WEBHOOK_SEND_INTERVAL_S",
+    "WEBHOOK_PUBLISH_INTERVAL_S",
+    "GATEWAY_IDENTITY_MAX_SKEW_S",
+    "WEBHOOK_DNS_THREADS",
+    "WEBHOOK_DNS_TIMEOUT_S",
+    "WEBHOOK_SEND_TIMEOUT_S",
+    "WEBHOOK_LEASE_S",
+    "WEBHOOK_CLAIM_LIMIT",
 )
 
 
@@ -69,6 +83,29 @@ def _production_env(monkeypatch: pytest.MonkeyPatch) -> None:
         ("INTAKE_STOP_LINK_RETRIES", "-1"),
         ("MEETING_UNTRACKED_GRACE_SEC", "ten minutes"),
         ("MEETING_UNTRACKED_GRACE_SEC", "0"),
+        ("AUTO_JOIN_LEAD_S", "2m"),
+        ("AUTO_JOIN_LEAD_S", "-1"),
+        ("AUTO_JOIN_GRACE_S", "later"),
+        ("AUTO_JOIN_GRACE_S", "-600"),
+        ("JOIN_NOW_ADOPT_AHEAD_S", "an hour"),
+        ("JOIN_NOW_ADOPT_AHEAD_S", "0"),
+        ("ENTRY_MAX_DAYS_AHEAD", "a month"),
+        ("ENTRY_MAX_DAYS_AHEAD", "0"),
+        ("INTAKE_MAX_ACTIVE_ENTRIES", "lots"),
+        ("INTAKE_MAX_ACTIVE_ENTRIES", "0"),
+        ("NOT_SENT_SWEEP_INTERVAL_S", "often"),
+        ("NOT_SENT_SWEEP_INTERVAL_S", "0"),
+        ("WEBHOOK_SEND_INTERVAL_S", "fast"),
+        ("WEBHOOK_SEND_INTERVAL_S", "0"),
+        ("WEBHOOK_PUBLISH_INTERVAL_S", "fast"),
+        ("WEBHOOK_PUBLISH_INTERVAL_S", "0"),
+        ("GATEWAY_IDENTITY_MAX_SKEW_S", "a minute"),
+        ("GATEWAY_IDENTITY_MAX_SKEW_S", "0"),
+        ("WEBHOOK_DNS_THREADS", "0"),
+        ("WEBHOOK_DNS_TIMEOUT_S", "0"),
+        ("WEBHOOK_SEND_TIMEOUT_S", "0"),
+        ("WEBHOOK_LEASE_S", "0"),
+        ("WEBHOOK_CLAIM_LIMIT", "0"),
     ],
 )
 def test_a_setting_it_cannot_run_on_refuses_to_boot(monkeypatch, key, raw):
@@ -109,6 +146,25 @@ def test_no_more_runs_and_no_least_pause_boot(monkeypatch):
     monkeypatch.setenv("INTAKE_STOP_LINK_RETRIES", "0")
     monkeypatch.setenv("INTAKE_CONFLICT_DELAY_MIN_S", "0")
     main_mod.build_production_app()
+
+
+def test_no_lead_and_no_grace_boot(monkeypatch):
+    """A lead of 0 sends the bot at the start and a grace of 0 never sends it late: both are
+    meaningful, so both start."""
+    import meeting_api.__main__ as main_mod
+
+    _production_env(monkeypatch)
+    monkeypatch.setenv("AUTO_JOIN_LEAD_S", "0")
+    monkeypatch.setenv("AUTO_JOIN_GRACE_S", "0")
+    main_mod.build_production_app()
+
+
+def test_the_sender_settings_raise_the_one_settings_error():
+    from meeting_api.webhooks.sender import SenderSettings
+
+    with pytest.raises(SettingsError, match="WEBHOOK_CLAIM_LIMIT"):
+        SenderSettings.from_env({"WEBHOOK_CLAIM_LIMIT": "0"})
+    assert SenderSettings.from_env({}) == SenderSettings()
 
 
 def test_an_empty_setting_takes_its_default(monkeypatch):
