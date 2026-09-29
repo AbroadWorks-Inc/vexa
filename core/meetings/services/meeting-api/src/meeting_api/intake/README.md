@@ -159,7 +159,10 @@ the outcome, and sends no leave command; a removal of its last entry answers `re
 meeting is bounded: at `due_at` + `MEETING_UNTRACKED_GRACE_SEC` (`retry.deadline`) one still
 unproven, or still without its new bot, ends `failed` (`workload_not_proven` / `retry_not_sent`),
 by the retry driver or, if the driver gave the item up, by the reconcile sweep
-(`end_overdue_retries`, `repo.end_retry`). Every
+(`end_overdue_retries`, `repo.end_retry`). A meeting the retry ends this way (its planned end, a
+stop, its deadline, its last send) gets the same meeting-level finish as a lifecycle end: the app's
+`finish_meeting` (transcript finalized, service provenance, `bot.failed` to the system hook, the
+copilot reap), keyed by its last bot session. Every
 `bot.retry` moves `aw_bot_retries_total{reason,user_id}` once its transaction commits.
 `IntakeStop` (`stop.py`) is the production `StopPort` (§1.7), behind `POST /v2/meetings/{id}/stop`
 (no outcome: the meeting ends with upstream's `stopped`) and R5 (outcome `cancelled_by_calendar`

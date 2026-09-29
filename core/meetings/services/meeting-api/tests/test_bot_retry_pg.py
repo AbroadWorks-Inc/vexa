@@ -181,6 +181,7 @@ class Pg:
         *,
         at: datetime,
         untracked_grace: float = 600.0,
+        finish_meeting: Any = None,
     ) -> dict:
         """One auto-join tick at ``at``: the due rows and the meetings waiting for a new bot."""
         from meeting_api.bot_spawn.auto_join import auto_join_tick
@@ -196,6 +197,7 @@ class Pg:
             token_secret="s",
             redis_url="redis://r",
             untracked_grace=untracked_grace,
+            finish_meeting=finish_meeting,
         )
 
     async def sent(self, *, status: str = "active", **kw: Any) -> tuple[int, str]:
@@ -1123,3 +1125,111 @@ async def test_pg_the_reconcile_sweep_ends_a_waiting_meeting_the_driver_gave_up(
         "join_failure",
     )
     assert (await pg.types(mid))[-1] == "bot.failed"
+
+
+# ── a meeting the retry ends gets the same meeting-level finish ─────────────────────────────
+
+
+class _Streams:
+    def __init__(self) -> None:
+        self.reaped: list[str] = []
+
+    async def publish(self, channel: str, data: str):
+        return 1
+
+    async def xadd(self, stream: str, payload: dict):
+        self.reaped.append(stream)
+        return "1-0"
+
+
+async def _finishing_app(pg: Pg):
+    from meeting_api import create_app
+
+    sink, streams, finalized = _SystemSink(), _Streams(), []
+
+    async def finalize(meeting_id: int) -> int:
+        finalized.append(meeting_id)
+        return 3
+
+    app = create_app(
+        meeting_repo=pg.repo,
+        system_webhook_sink=sink,
+        transcript_finalizer=finalize,
+        redis=streams,
+    )
+    return app, sink, streams, finalized
+
+
+async def test_pg_a_waiting_meeting_ended_at_its_planned_end_is_finished_like_any_end(
+    pg,
+):
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    mid, session = await pg.sent(status="active", end_in=timedelta(minutes=3))
+    app, sink, streams, finalized = await _finishing_app(pg)
+    await app.state.apply_lifecycle_event(
+        {
+            "connection_id": session,
+            "status": "completed",
+            "completion_reason": "left_alone",
+        },
+        transition_source=TransitionSource.RUNTIME_DESTROY,
+        force_terminal_on_destroy=True,
+    )
+    assert (sink.events, finalized, streams.reaped) == ([], [], [])
+    await pg.tick(_gone(), at=_later(181), finish_meeting=app.state.finish_meeting)
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert sink.events == ["bot.failed"]
+    assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
+    assert app.state.typed_webhooks[-1]["data"]["meeting"]["status"] == "failed"
+
+
+async def test_pg_a_stopped_waiting_meeting_is_finished_like_any_end(pg):
+    from meeting_api.intake.stop import IntakeStop
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    mid, session = await pg.sent(status="joining")
+    await _fail(pg, session, "failed", "join_failure", "bot_callback")
+    app, sink, streams, finalized = await _finishing_app(pg)
+    commands = InMemoryCommandPublisher()
+    stop = IntakeStop(pg.store, commands, FakeRuntimeClient())
+    stop.finish_meeting = app.state.finish_meeting
+    await stop.stop_live(USER, mid, outcome=None)
+    assert (await pg.row(mid))["status"] == "failed"
+    assert commands.published == []
+    assert sink.events == ["bot.failed"] and finalized == [mid]
+    assert streams.reaped == [f"tc:meeting:{mid}"]
+
+
+async def test_pg_a_waiting_meeting_the_sweep_ends_is_finished_like_any_end(pg):
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    class Log:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    mid, session = await pg.sent(status="joining")
+    await _fail(pg, session, "failed", "join_failure", "bot_callback")
+    await pg.execute(
+        "UPDATE meetings SET data = jsonb_set(data, '{bot_retry,due_at}', "
+        "'\"2026-01-01T00:00:00Z\"') WHERE id = :m",
+        m=mid,
+    )
+    app, sink, streams, finalized = await _finishing_app(pg)
+
+    async def post(body):
+        raise AssertionError("not through the lifecycle")
+
+    await reconcile_stale_nonterminal_sweep(
+        pg.repo,
+        _Unknown(),
+        post,
+        stop_grace=45,
+        active_grace=300,
+        log=Log(),
+        untracked_grace=600,
+        finish_meeting=app.state.finish_meeting,
+    )
+    assert (await pg.row(mid))["status"] == "failed"
+    assert sink.events == ["bot.failed"] and finalized == [mid]

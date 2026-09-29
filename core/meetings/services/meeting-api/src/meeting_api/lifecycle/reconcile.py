@@ -336,6 +336,7 @@ async def reconcile_stale_nonterminal_sweep(
     preactive_grace: Optional[float] = None,
     untracked_grace: float = 600.0,
     untracked_since: Optional[dict] = None,
+    finish_meeting: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> int:
     """The GENERAL backstop: any meeting hung in a non-terminal status whose bot is GONE (its row has
     been quiet — no status change, no segment/heartbeat — past the grace window) converges to a
@@ -357,7 +358,9 @@ async def reconcile_stale_nonterminal_sweep(
     Returns the number of meetings reconciled."""
     if repo is None or not hasattr(repo, "list_stale_nonterminal"):
         return 0
-    ended = await end_overdue_retries(repo, untracked_grace=untracked_grace, log=log)
+    ended = await end_overdue_retries(
+        repo, untracked_grace=untracked_grace, log=log, finish_meeting=finish_meeting
+    )
     try:
         stale = await repo.list_stale_nonterminal(
             stop_grace=stop_grace, active_grace=active_grace,
@@ -483,11 +486,18 @@ async def reconcile_stale_nonterminal_sweep(
     return reconciled + ended
 
 
-async def end_overdue_retries(repo: Any, *, untracked_grace: float, log: Any) -> int:
+async def end_overdue_retries(
+    repo: Any,
+    *,
+    untracked_grace: float,
+    log: Any,
+    finish_meeting: Optional[Callable[..., Awaitable[Any]]] = None,
+) -> int:
     """§6.9 F-K2's backstop: every meeting waiting for its next bot past its deadline
     (``intake.retry.deadline``: ``due_at`` + ``untracked_grace``) ends ``failed`` through
     ``repo.end_retry``, whatever the retry driver did (it may have given the item up). Before its
     deadline a waiting meeting is left to the driver: ``list_stale_nonterminal`` never lists one.
+    Each one ended gets the meeting-level finish ``finish_meeting(meeting_id)`` (the app's).
     Best-effort: never raises. Returns how many ended."""
     if not hasattr(repo, "list_retry_meetings") or not hasattr(repo, "end_retry"):
         return 0
@@ -512,6 +522,8 @@ async def end_overdue_retries(repo: Any, *, untracked_grace: float, log: Any) ->
             await repo.end_retry(meeting_id=row["id"], change_reason=code, message=message)
             ended += 1
             log.warning("nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message)
+            if finish_meeting is not None:
+                await finish_meeting(row["id"])
         except Exception:  # noqa: BLE001 — best-effort; retried next sweep
             log.exception("nonterminal-reconcile: end_retry failed for meeting %s", row["id"])
     return ended

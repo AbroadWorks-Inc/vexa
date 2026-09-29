@@ -335,6 +335,24 @@ class SqlAlchemyMeetingRepo:
             await db.commit()
             return True
 
+    async def get_finished_meeting(self, meeting_id) -> Optional[dict]:
+        """One FINISHED meeting row (``completed``/``failed``) with its ``uuid``, ``entries``,
+        ``outcome`` and event ``sequence`` (``_with_projection``), as the lifecycle write returns
+        a row: the meeting-level finish of a meeting ended outside the lifecycle (§6.9 F-K2)
+        reads it. ``None`` for a missing or unfinished one."""
+        from sqlalchemy import select
+
+        from ..intake.status import FINISHED_STATUSES, project_stored
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            m = (
+                await db.execute(select(Meeting).where(Meeting.id == meeting_id))
+            ).scalars().first()
+            if m is None or m.status not in FINISHED_STATUSES:
+                return None
+            return _with_projection(_row_to_dict(m), await project_stored(db, m.id))
+
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
         """§6.9 F-K2: end a meeting waiting for its next bot ``failed`` (``intake.retry.end``)
         under the link lock and the row lock; the event's id, or ``None`` when it isn't waiting."""

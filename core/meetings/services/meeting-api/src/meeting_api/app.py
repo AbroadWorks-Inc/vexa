@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -479,6 +479,171 @@ def _mount_lifecycle(
     app.state.status_change_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
     app.state.typed_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
 
+    async def _finish_row(meeting_row: dict, persist: Any) -> dict:
+        """The meeting-level finish of a row that has just finished, whatever ended it (the bot's
+        lifecycle, or the §6.9 F-K2 retry ending a meeting that waited for a new bot).
+
+        COMPLETION FINALIZATION — flush the meeting's remaining live redis segments to the durable
+        store (threshold 0: the mutable tail included, no more updates are coming) and persist the
+        processed doc into meeting.data, via the injected finalizer (prod:
+        collector/db_writer.finalize_meeting). This guarantees a finished meeting's transcript is
+        durable even if the periodic db-writer never gets another tick (crash/restart right after
+        completion). Then the SERVICE PROVENANCE: the event projection can truthfully carry the
+        producer facts even if its best-effort persistence fails, matching the callback's
+        established availability contract; the next reconciliation pass owns that exception.
+        ``persist(delta)`` merges a ``data`` delta into the row and returns it (or ``None``).
+        Best-effort: the periodic loop retries anything this misses; never raises."""
+        terminal_meeting_id = meeting_row["id"]
+        if transcript_finalizer is not None:
+            try:
+                finalized_segments = await transcript_finalizer(terminal_meeting_id)
+                if isinstance(finalized_segments, int) and finalized_segments >= 0:
+                    updated_row = await persist({"segments_captured": finalized_segments})
+                    if isinstance(updated_row, dict):
+                        meeting_row = updated_row
+            except Exception as e:  # noqa: BLE001 — the db-writer loop is the retry path
+                try:
+                    updated_row = await persist({"transcript_finalize_failed": True})
+                    if isinstance(updated_row, dict):
+                        meeting_row = updated_row
+                except Exception:  # noqa: BLE001 — original finalization failure is the signal
+                    pass
+                log_event("transcript_finalize_failed", audience="system", level="warning",
+                          span="lifecycle.callback",
+                          fields={"meeting_id": terminal_meeting_id, "error": str(e)})
+        data = dict(meeting_row.get("data") or {})
+        provenance = build_service_provenance({**meeting_row, "data": data})
+        if provenance is not None:
+            data["service_provenance"] = provenance
+            projection_row = {**meeting_row, "data": data}
+            try:
+                updated_row = await persist({"service_provenance": provenance})
+                meeting_row = updated_row if isinstance(updated_row, dict) else projection_row
+            except Exception as e:  # noqa: BLE001 — callback availability is pre-existing
+                meeting_row = projection_row
+                log_event(
+                    "service_provenance_persist_failed",
+                    audience="system",
+                    level="warning",
+                    span="lifecycle.callback",
+                    fields={"meeting_id": meeting_row.get("id"), "error": str(e)},
+                )
+        return meeting_row
+
+    async def _deliver_system(typed_envelope: dict, meeting_row: dict) -> None:
+        """The operator callback is a separate trust boundary from a customer's webhook. It
+        receives terminal service facts only (``meeting.completed``, ``bot.failed``) of a finished
+        row, through a destination frozen by deployment config. A transient failure is retained
+        by the sink's dedicated retry queue; it never falls back to a user URL."""
+        if system_webhook_sink is None or typed_envelope.get("event_type") not in {
+            "meeting.completed",
+            "bot.failed",
+        }:
+            return
+        try:
+            result = await system_webhook_sink.deliver(
+                typed_envelope, label=f"meeting:{meeting_row.get('id')}"
+            )
+            if result is not None:
+                log_event(
+                    "system_webhook_delivery",
+                    audience="system",
+                    level="info" if result.status == "delivered" else "warning",
+                    span="lifecycle.callback",
+                    meeting_id=meeting_row.get("id"),
+                    fields={
+                        "outcome": result.status,
+                        "event_type": typed_envelope.get("event_type"),
+                        "status_code": result.status_code,
+                    },
+                )
+        except Exception as e:  # noqa: BLE001 — terminal fact stays in meeting storage
+            log_event(
+                "system_webhook_delivery_failed",
+                audience="system",
+                level="warning",
+                span="lifecycle.callback",
+                meeting_id=meeting_row.get("id"),
+                fields={"error_type": type(e).__name__},
+            )
+
+    async def _reap_copilot(meeting_row: dict, *, session_uid: str) -> None:
+        """COPILOT REAP (Bug 3): the moment a meeting lands TERMINAL, emit the `session_end` marker
+        onto the meeting copilot transcript feed — the EXACT stream the meeting copilot worker
+        (agent worker/meeting.py, via VEXA_TRANSCRIPT_STREAM) blocks on. The worker reaps
+        immediately on that marker (exit 0 → container reaped), instead of sitting idle for its
+        VEXA_IDLE_TIMEOUT_SEC (default 4h) when the bot never emitted its own `session_end` — e.g.
+        it was SIGKILLed, or stopped in the waiting room (Bug 2) before it could. Idempotent: a
+        redundant session_end (the bot already sent one via the collector) just reasserts the
+        reap. Best-effort; never raises.
+
+        KEYING (P0 fix/transcript-cross-tenant-leak, now merged): the carrier is ROW-scoped
+        `tc:meeting:{meeting_row_id}` — the numeric meetings-domain ROW id, NOT the native id
+        (which collides across tenants/rows and is never a data key post-P0). The collector
+        (collector/ingest.py `_transcript_stream`) writes its session_end on the same row key and
+        the worker tails the row key (agent dispatch.py sets
+        VEXA_TRANSCRIPT_STREAM=tc:meeting:{row_id}), so this reap must key by the row id to land
+        on the live stream the worker blocks on."""
+        if redis is None or not hasattr(redis, "xadd"):
+            return
+        meeting_row_id = meeting_row.get("id")
+        native = meeting_row.get("native_meeting_id") or session_uid
+        if meeting_row_id is None:
+            return
+        try:
+            await redis.xadd(
+                f"tc:meeting:{meeting_row_id}",
+                {"type": "session_end", "uid": str(native or meeting_row_id)},
+            )
+            log_event(
+                "meeting_copilot_reap_signalled", audience="system", span="lifecycle.callback",
+                meeting_id=session_uid,
+                fields={"meeting_row_id": meeting_row_id, "native": native,
+                        "meeting_status": meeting_row.get("status")},
+            )
+        except Exception as e:  # noqa: BLE001 — the worker's idle timeout is the backstop
+            log_event("meeting_copilot_reap_failed", audience="system", level="warning",
+                      span="lifecycle.callback",
+                      fields={"meeting_row_id": meeting_row_id, "error": str(e)})
+
+    async def finish_meeting(meeting_id: int, *, stopped: bool = False) -> None:
+        """§6.9 F-K2: the meeting-level finish of a meeting the retry ended outside the lifecycle
+        (``intake.retry.end``: its planned end, a stop, its deadline, its last send): the same
+        ``_finish_row``, then its ``bot.failed`` to the system hook and the copilot reap, keyed by
+        its last bot session. A meeting that never had a session had no bot: nothing to finish.
+        ``stopped``: the user's stop drove it (``user_stop``), else the scheduler did."""
+        from .lifecycle.machine import BotStatus, MeetingRecord, StatusChange
+
+        repo: Any = meeting_repo  # the finish reads use the repo's own row reads
+        row = await repo.get_finished_meeting(meeting_id)
+        if not isinstance(row, dict):
+            return
+        sessions = await meeting_repo.list_sessions(meeting_id=meeting_id)
+        if not sessions:
+            return
+
+        async def _persist(delta: dict) -> Any:
+            await repo.merge_meeting_data(meeting_id, delta)
+            return await repo.get_finished_meeting(meeting_id)
+
+        row = await _finish_row(row, _persist)
+        change = StatusChange(
+            record=MeetingRecord(connection_id=sessions[-1]),
+            old_status=None,
+            new_status=BotStatus(row["status"]),
+            reason=(row.get("data") or {}).get("failure_reason"),
+            transition_source=(
+                TransitionSource.USER_STOP if stopped else TransitionSource.SCHEDULER_TIMEOUT
+            ),
+        )
+        typed_envelope = build_typed_envelope(change, meeting=legacy_meeting_projection(row))
+        if typed_envelope is not None:
+            app.state.typed_webhooks.append(typed_envelope)
+            await _deliver_system(typed_envelope, row)
+        await _reap_copilot(row, session_uid=sessions[-1])
+
+    app.state.finish_meeting = finish_meeting
+
     async def _apply_lifecycle_event(
         body: dict,
         *,
@@ -641,13 +806,8 @@ def _mount_lifecycle(
         retry_pending = isinstance(meeting_row, dict) and (
             _retry.marker(meeting_row.get("data")) is not None
         )
-        # COMPLETION FINALIZATION — the moment the FSM lands on a terminal status, flush the
-        # meeting's remaining live redis segments to the durable store (threshold 0: the mutable
-        # tail included, no more updates are coming) and persist the processed doc into
-        # meeting.data, via the injected finalizer (prod: collector/db_writer.finalize_meeting).
-        # This guarantees a completed meeting's transcript is durable even if the periodic
-        # db-writer never gets another tick (crash/restart right after completion). Best-effort:
-        # the periodic loop retries anything this misses; never fail the bot's callback.
+        # The meeting-level finish (``_finish_row``: the transcript finalized, the service
+        # provenance persisted) the moment the FSM lands the row on a finished status.
         terminal_advanced = (
             not change.no_op
             and rec.status is not None
@@ -656,78 +816,21 @@ def _mount_lifecycle(
             and meeting_row.get("id") is not None
             and row_finished
         )
-        if (
-            transcript_finalizer is not None
-            and terminal_advanced
-        ):
-            terminal_meeting_id = meeting_row["id"]
-            try:
-                finalized_segments = await transcript_finalizer(terminal_meeting_id)
-                if isinstance(finalized_segments, int) and finalized_segments >= 0:
-                    rec_data = rec.data
-                    rec_data["segments_captured"] = finalized_segments
-                    updated_row = await meeting_repo.update_meeting_status(
-                        session_uid=rec.connection_id,
-                        status=persisted_status,
-                        completion_reason=(
-                            rec.completion_reason.value if rec.completion_reason else None
-                        ),
-                        failure_stage=rec.failure_stage.value if rec.failure_stage else None,
-                        data=rec_data,
-                    )
-                    if isinstance(updated_row, dict):
-                        meeting_row = updated_row
-            except Exception as e:  # noqa: BLE001 — the db-writer loop is the retry path
-                rec_data = rec.data
-                rec_data["transcript_finalize_failed"] = True
-                try:
-                    updated_row = await meeting_repo.update_meeting_status(
-                        session_uid=rec.connection_id,
-                        status=persisted_status,
-                        completion_reason=(
-                            rec.completion_reason.value if rec.completion_reason else None
-                        ),
-                        failure_stage=rec.failure_stage.value if rec.failure_stage else None,
-                        data=rec_data,
-                    )
-                    if isinstance(updated_row, dict):
-                        meeting_row = updated_row
-                except Exception:  # noqa: BLE001 — original finalization failure is the signal
-                    pass
-                log_event("transcript_finalize_failed", audience="system", level="warning",
-                          span="lifecycle.callback",
-                          fields={"meeting_id": terminal_meeting_id, "error": str(e)})
         if terminal_advanced and isinstance(meeting_row, dict):
-            data = dict(meeting_row.get("data") or {})
-            provenance = build_service_provenance({**meeting_row, "data": data})
-            if provenance is not None:
-                data["service_provenance"] = provenance
-                # The event projection can truthfully carry the producer facts even if this
-                # best-effort persistence attempt fails, matching the callback's established
-                # availability contract. The next reconciliation pass owns that exception.
-                projection_row = {**meeting_row, "data": data}
-                try:
-                    updated_row = await meeting_repo.update_meeting_status(
-                        session_uid=rec.connection_id,
-                        status=persisted_status,
-                        completion_reason=(
-                            rec.completion_reason.value if rec.completion_reason else None
-                        ),
-                        failure_stage=rec.failure_stage.value if rec.failure_stage else None,
-                        data=data,
-                    )
-                    meeting_row = (
-                        updated_row if isinstance(updated_row, dict) else projection_row
-                    )
-                except Exception as e:  # noqa: BLE001 — callback availability is pre-existing
-                    meeting_row = projection_row
-                    log_event(
-                        "service_provenance_persist_failed",
-                        audience="system",
-                        level="warning",
-                        span="lifecycle.callback",
-                        fields={"meeting_id": meeting_row.get("id"), "error": str(e)},
-                    )
+            finished_status = str(persisted_status)
+
+            async def _persist(delta: dict) -> Any:
+                return await meeting_repo.update_meeting_status(
+                    session_uid=rec.connection_id,
+                    status=finished_status,
+                    completion_reason=(
+                        rec.completion_reason.value if rec.completion_reason else None
+                    ),
+                    failure_stage=rec.failure_stage.value if rec.failure_stage else None,
+                    data=delta,
+                )
+
+            meeting_row = await _finish_row(meeting_row, _persist)
         # Build the TYPED event the transition maps to (meeting.started on active,
         # meeting.completed with the post-meeting envelope on completion, bot.failed on terminal
         # failure) — additive alongside meeting.status_change, never instead of it. Built AFTER the
@@ -797,60 +900,9 @@ def _mount_lifecycle(
                         )
                     except Exception:  # noqa: BLE001 — a publish edge is not a dependency
                         pass
-        # The operator callback is a separate trust boundary from a customer's
-        # webhook. It receives terminal service facts only, through a destination
-        # frozen by deployment config. A transient failure is retained by the
-        # sink's dedicated retry queue; it never falls back to a user URL.
-        if (
-            system_webhook_sink is not None
-            and typed_envelope is not None
-            and row_finished
-            and typed_envelope.get("event_type") in {
-                "meeting.completed",
-                "bot.failed",
-            }
-        ):
-            try:
-                result = await system_webhook_sink.deliver(
-                    typed_envelope,
-                    label=f"meeting:{meeting_row.get('id')}"
-                    if isinstance(meeting_row, dict)
-                    else f"session:{rec.connection_id}",
-                )
-                if result is not None:
-                    log_event(
-                        "system_webhook_delivery",
-                        audience="system",
-                        level=(
-                            "info"
-                            if result.status == "delivered"
-                            else "warning"
-                        ),
-                        span="lifecycle.callback",
-                        meeting_id=(
-                            meeting_row.get("id")
-                            if isinstance(meeting_row, dict)
-                            else None
-                        ),
-                        fields={
-                            "outcome": result.status,
-                            "event_type": typed_envelope.get("event_type"),
-                            "status_code": result.status_code,
-                        },
-                    )
-            except Exception as e:  # noqa: BLE001 — terminal fact stays in meeting storage
-                log_event(
-                    "system_webhook_delivery_failed",
-                    audience="system",
-                    level="warning",
-                    span="lifecycle.callback",
-                    meeting_id=(
-                        meeting_row.get("id")
-                        if isinstance(meeting_row, dict)
-                        else None
-                    ),
-                    fields={"error_type": type(e).__name__},
-                )
+        # The operator callback: terminal service facts of a finished row (``_deliver_system``).
+        if typed_envelope is not None and row_finished and isinstance(meeting_row, dict):
+            await _deliver_system(typed_envelope, meeting_row)
         # Deliver the sealed webhook.v1 envelopes (meeting.status_change + the typed event, if any)
         # to the user's configured endpoint (per-user config rides on meeting.data — set at spawn
         # from identity via the gateway; NO users-table read). The sink's per-user event filter
@@ -967,48 +1019,15 @@ def _mount_lifecycle(
                         log_event("user_meeting_status_publish_failed", audience="system",
                                   level="warning", span="lifecycle.callback",
                                   fields={"error": str(e)})
-        # COPILOT REAP (Bug 3): the moment a meeting lands TERMINAL, emit the `session_end` marker onto
-        # the meeting copilot transcript feed — the EXACT stream the meeting copilot worker
-        # (agent worker/meeting.py, via VEXA_TRANSCRIPT_STREAM) blocks on. The worker reaps immediately
-        # on that marker (exit 0 → container reaped), instead of sitting idle for its
-        # VEXA_IDLE_TIMEOUT_SEC (default 4h) when the bot never emitted its own `session_end` — e.g. it
-        # was SIGKILLed, or stopped in the waiting room (Bug 2) before it could. Idempotent: a redundant
-        # session_end (the bot already sent one via the collector) just reasserts the reap. Best-effort;
-        # never fails the lifecycle callback.
-        #
-        # KEYING (P0 fix/transcript-cross-tenant-leak, now merged): the carrier is ROW-scoped
-        # `tc:meeting:{meeting_row_id}` — the numeric meetings-domain ROW id, NOT the native id (which
-        # collides across tenants/rows and is never a data key post-P0). The collector
-        # (collector/ingest.py `_transcript_stream`) writes its session_end on the same row key and the
-        # worker tails the row key (agent dispatch.py sets VEXA_TRANSCRIPT_STREAM=tc:meeting:{row_id}),
-        # so this lifecycle reap must key by the row id to land on the live stream the worker blocks on.
+        # COPILOT REAP the moment the meeting lands finished (``_reap_copilot``).
         if (
-            redis is not None
-            and not change.no_op
+            not change.no_op
             and rec.status is not None
             and rec.status.value in ("completed", "failed")
             and isinstance(meeting_row, dict)
             and row_finished
-            and hasattr(redis, "xadd")
         ):
-            meeting_row_id = meeting_row.get("id")
-            native = meeting_row.get("native_meeting_id") or rec.connection_id
-            if meeting_row_id is not None:
-                try:
-                    await redis.xadd(
-                        f"tc:meeting:{meeting_row_id}",
-                        {"type": "session_end", "uid": str(native or meeting_row_id)},
-                    )
-                    log_event(
-                        "meeting_copilot_reap_signalled", audience="system", span="lifecycle.callback",
-                        meeting_id=rec.connection_id,
-                        fields={"meeting_row_id": meeting_row_id, "native": native,
-                                "meeting_status": rec.status.value},
-                    )
-                except Exception as e:  # noqa: BLE001 — the worker's idle timeout is the backstop
-                    log_event("meeting_copilot_reap_failed", audience="system", level="warning",
-                              span="lifecycle.callback",
-                              fields={"meeting_row_id": meeting_row_id, "error": str(e)})
+            await _reap_copilot(meeting_row, session_uid=rec.connection_id)
         log_event(
             "meeting_lifecycle_advanced", audience="user", span="lifecycle.callback",
             meeting_id=rec.connection_id,

@@ -36,7 +36,7 @@ when one is given; the outbox holds them either way.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from ..lifecycle.stop_router import (
     BOOTING_STATUSES,
@@ -123,6 +123,9 @@ class IntakeStop:
         self._commands = commands
         self._runtime = runtime
         self._publisher = publisher
+        #: The app's meeting-level finish (§6.9 F-K2), set by the composition root once the app
+        #: exists: run for a waiting meeting a stop ended.
+        self.finish_meeting: Optional[Callable[..., Awaitable[None]]] = None
 
     async def stop_live(
         self, user_id: int, meeting_id: int, *, outcome: Optional[Outcome]
@@ -135,7 +138,11 @@ class IntakeStop:
 
     async def leave(self, user_id: int, stop: RecordedStop) -> None:
         if retry.marker(stop.row.get("data")) is not None:
-            return  # a meeting waiting for its next bot had no bot to tell, and has ended
+            # A meeting waiting for its next bot had no bot to tell: it has ended, and gets the
+            # meeting-level finish instead.
+            if self.finish_meeting is not None:
+                await self.finish_meeting(stop.meeting_id, stopped=True)
+            return
         try:
             await stop_meeting_row(
                 _StoreRows(self._store, user_id),

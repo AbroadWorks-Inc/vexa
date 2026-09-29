@@ -413,6 +413,12 @@ class InMemoryMeetingRepo:
         row["data"][retry.MARKER] = {**mark, "proven_gone": True}
         return True
 
+    async def get_finished_meeting(self, meeting_id) -> Optional[dict]:
+        row = self._meetings.get(meeting_id)
+        if row is None or row["status"] not in _TERMINAL_STATUSES:
+            return None
+        return dict(row)
+
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
         """The real adapter's ``retry.end`` on a waiting row (no outbox here)."""
         from ..intake import retry

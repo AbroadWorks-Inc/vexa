@@ -258,6 +258,7 @@ async def auto_join_tick(
     item_failures=None,
     batch_size: Optional[int] = None,
     untracked_grace: float = 600.0,
+    finish_meeting: Optional[Callable[..., Awaitable[None]]] = None,
 ) -> dict:
     """One sweep: spawn every due scheduled meeting. Returns counters for observability:
     ``{"due": n, "spawned": n, "already": n, "errors": n, "skipped_uncapped": n,
@@ -305,7 +306,8 @@ async def auto_join_tick(
     and a new bot session is spawned on the row through ``ExactRowSpawn`` (counted in
     ``spawned``). A failure after the claim goes back through ``retry``; one before it (the claim
     never ran) is one more of the meeting's bounded sends, and the last one ends it ``failed``
-    (counted in ``errors``)."""
+    (counted in ``errors``). Every meeting the driver ends gets the meeting-level finish
+    ``finish_meeting(meeting_id, stopped=…)`` (the app's, the same as a lifecycle end)."""
     from ..intake.ports import Room
     from ..intake.spawn import (
         IDENTITY_UNAVAILABLE,
@@ -504,6 +506,17 @@ async def auto_join_tick(
                   user_id=user_id, meeting_id=str(row["id"]),
                   fields={"platform": row["platform"], "native": row["native_meeting_id"]})
 
+    async def _finish(meeting_id: int, *, stopped: bool) -> None:
+        """The meeting-level finish of a meeting the driver ended (best-effort)."""
+        if finish_meeting is None:
+            return
+        try:
+            await finish_meeting(meeting_id, stopped=stopped)
+        except Exception as exc:  # noqa: BLE001 — the meeting is ended; its finish is best-effort
+            log_event("auto_join_retry_finish_failed", audience="system", level="warning",
+                      span="meetings.auto_join", meeting_id=str(meeting_id),
+                      fields={"error": type(exc).__name__})
+
     async def _end_waiting(
         row: dict, *, stopped: bool, change_reason: Optional[str] = None,
         message: Optional[str] = None,
@@ -521,6 +534,7 @@ async def auto_join_tick(
             )
         if written is not None:
             await publish_events(publisher, [written.event_id])
+            await _finish(row["id"], stopped=stopped)
         log_event("auto_join_retry_ended", audience="user", level="warning",
                   span="meetings.auto_join", user_id=row["user_id"],
                   meeting_id=str(row["id"]), fields={"stopped": stopped})
@@ -541,10 +555,13 @@ async def auto_join_tick(
             written = await retry.retry(
                 tx, row["id"], failure, now=now, settings=IntakeSettings.from_env()
             )
+            ended = None
             if written is None:
-                written = await retry.end(tx, row["id"], change_reason=code)
+                written = ended = await retry.end(tx, row["id"], change_reason=code)
         if written is not None:
             await publish_events(publisher, [written.event_id])
+        if ended is not None:
+            await _finish(row["id"], stopped=False)
 
     async def _retry_one(row: dict) -> None:
         """One meeting waiting for its next bot (§6.9 F-K2)."""

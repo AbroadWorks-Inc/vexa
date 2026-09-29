@@ -269,6 +269,9 @@ def build_production_app():
         metrics_source=PostgresMetricsSource(session_factory),
     )
 
+    # A waiting meeting a stop ends (§6.9 F-K2) gets the app's meeting-level finish.
+    intake.stop.finish_meeting = app.state.finish_meeting
+
     _attach_background_loops(
         app, transcript_store, segment_bus, redis_client, meeting_repo, runtime_client,
         service_authority=service_authority,
@@ -518,6 +521,7 @@ def _attach_background_loops(
                     meeting_repo, runtime, _post_lifecycle,
                     stop_grace=stop_grace, active_grace=active_grace, log=log,
                     preactive_grace=preactive_grace, untracked_grace=untracked_grace,
+                    finish_meeting=getattr(app.state, "finish_meeting", None),
                 )
             await reconcile_stale_stopping_sweep(
                 meeting_repo, runtime, _post_lifecycle, stop_grace=stop_grace, log=log,
@@ -650,6 +654,7 @@ def _attach_background_loops(
                 item_failures=item_failures,
                 batch_size=sweep_batch,
                 untracked_grace=untracked_grace,
+                finish_meeting=getattr(app.state, "finish_meeting", None),
             )
 
         while True:
