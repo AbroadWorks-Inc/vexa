@@ -90,7 +90,9 @@ replica; per-meeting jobs are independent.
 ### 4.1 Intake — `POST /hooks/vexa`
 - Verify `X-Webhook-Signature: sha256=HMAC(secret, "<X-Webhook-Timestamp>." + raw_body)` with
   `hmac.compare_digest`; reject timestamps older than 300 s; fail closed if the secret is unset.
-- `meeting.completed` → enqueue; any other event → 200 no-op (logged).
+- `meeting.completed` → enqueue; `bot.failed` → enqueue too (a failed meeting that has a recording
+  is exported, intake design §6.9 F-K2; see `README.md` "Which meetings are exported"); any other
+  event → 200 no-op (logged).
 - Durable enqueue: `PUT s3://aw-bots/aw-exporter/pending/<meeting_id>.json` (the envelope), then
   **202**. Enqueue failure → 503 so Vexa's retry queue redelivers.
 - Worker loop (`EXPORT_CONCURRENCY`, default 4) drains the pending prefix; on startup and every

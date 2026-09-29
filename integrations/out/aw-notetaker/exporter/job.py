@@ -6,9 +6,14 @@ in the `/process` hand-off; the integer Vexa id is kept in `_export.json` and
 used only to read the meeting's recordings and transcript. A webhook without
 a UUID raises `MissingMeetingUuid` before anything is read or written.
 
+The meeting is `meeting.completed`, or `bot.failed` after its bot recorded
+part of the call (§6.9 F-K2); a `bot.failed` meeting with no recording is
+skipped (logged; nothing written, nothing reported).
+
 The outcome is reported through the gateway (`export_result.py`) after it is
-recorded in `_export.json`: `handed_off` after `/process`, `failed` when the
-meeting has no audio or more recordings than `EXPORT_MAX_RECORDINGS`. A re-run of a handed-off folder only reports again.
+recorded in `_export.json`: `handed_off` after `/process`, `failed` when a
+completed meeting has no audio or a meeting has more recordings than
+`EXPORT_MAX_RECORDINGS`. A re-run of a handed-off folder only reports again.
 
 A meeting can have several bot sessions (a bot failed and a new one joined,
 §6.9 F-K2); each session with audio has its own recording. They make ONE
@@ -53,7 +58,9 @@ EMPTY_ACTIVITY_AUDIO_S = 180.0
 
 ACTIVITY_FILE = "speaker-activity.jsonl"
 
-State = Literal["handed_off", "no_audio", "too_many_recordings", "already_done"]
+State = Literal[
+    "handed_off", "no_audio", "too_many_recordings", "skipped", "already_done"
+]
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 # A meeting's `speaker_activity` is its worst session's, in this order.
 _ACTIVITY_SEVERITY: tuple[ActivityState, ...] = ("ok", "capped", "invalid", "missing")
@@ -342,6 +349,15 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         deps.export_result.report(meeting_uuid, "failed", s3_path, error)
         return ExportResult("too_many_recordings", folder)
     audio_recs = _audio_recordings(recs, vexa_meeting_id)
+    if not audio_recs and envelope.get("event_type") == "bot.failed":
+        # The meeting failed before its bot recorded anything: there is no
+        # export to report on, and the meeting's own `bot.failed` says why.
+        logger.info(
+            "bot_failed_skipped vexa_meeting_id=%s reason=no_recording; "
+            "nothing exported",
+            vexa_meeting_id,
+        )
+        return ExportResult("skipped", folder)
     if not audio_recs:
         storage.put_json(
             settings.export_bucket,

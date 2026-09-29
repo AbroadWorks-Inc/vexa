@@ -1582,3 +1582,126 @@ def test_a_meeting_at_the_recordings_cap_is_exported(storage: Storage) -> None:
     )
 
     assert export_meeting(_envelope(), deps).state == "handed_off"
+
+
+# ---------------------------------------------------------------------------
+# A meeting that ended `failed` after its bot recorded (§6.9 F-K2, item 60)
+# ---------------------------------------------------------------------------
+
+
+def _failed_envelope(**meeting_overrides: Any) -> dict[str, Any]:
+    envelope = _envelope(
+        status="failed", completion_reason="bot_crashed", **meeting_overrides
+    )
+    envelope["event_type"] = "bot.failed"
+    return envelope
+
+
+def test_a_failed_meeting_with_recordings_is_exported_like_a_completed_one(
+    storage: Storage,
+) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    _put_activity(storage, "uid-a", two_speaker_gmeet_lines(SESSION_A.origin_ms))
+    _put_activity(
+        storage, "uid-b", [header()] + _speaks(SESSION_B.origin_ms, "Speaker Gamma", 0)
+    )
+    notetaker = FakeNotetaker()
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage,
+        meeting_api,
+        notetaker,
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+        export_result=export_result,
+    )
+
+    assert export_meeting(_failed_envelope(), deps) == ExportResult(
+        "handed_off", FOLDER
+    )
+
+    assert set(storage.list_keys(EXPORT_BUCKET, BASE)) == EXPECTED_KEYS
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    assert export_result.calls == [(MEETING_UUID, "handed_off", S3_PATH, None)]
+    samples, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav"))
+    assert len(samples) / rate == 130.0
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert _intervals(timeline) == [
+        ("Speaker Alpha", 0.0, 0.768),
+        ("Speaker Beta", 1.5, 2.268),
+        ("Speaker Gamma", 90.0, 90.768),
+    ]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "meeting.json")["status"] == "failed"
+
+
+def test_a_failed_meeting_without_a_recording_is_skipped_with_a_log_line(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    failed = {
+        "id": 80,
+        "status": "failed",
+        "created_at": RECORDING_CREATED_AT,
+        "media_files": [],
+    }
+    notetaker = FakeNotetaker()
+    export_result = FakeExportResult()
+    meeting_api = FakeMeetingApi(recordings=[failed])
+    deps = _deps(storage, meeting_api, notetaker, export_result=export_result)
+
+    with caplog.at_level(logging.INFO, logger="exporter"):
+        result = export_meeting(_failed_envelope(), deps)
+
+    assert result == ExportResult("skipped", FOLDER)
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
+    assert notetaker.calls == []
+    assert export_result.calls == []
+    assert meeting_api.master_calls == []
+    assert any(
+        r.getMessage()
+        == "bot_failed_skipped vexa_meeting_id=11367 reason=no_recording; "
+        "nothing exported"
+        for r in caplog.records
+    )
+
+
+def test_a_completed_meeting_without_audio_still_reports_a_failed_export(
+    storage: Storage,
+) -> None:
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage, FakeMeetingApi(), FakeNotetaker(), export_result=export_result
+    )
+
+    assert export_meeting(_envelope(), deps).state == "no_audio"
+    assert export_result.calls == [
+        (MEETING_UUID, "failed", S3_PATH, "no audio recording")
+    ]
+
+
+def test_duplicate_and_crossed_events_for_one_meeting_export_once(
+    storage: Storage,
+) -> None:
+    """bot.failed twice and a meeting.completed for the same meeting, through
+    the durable queue: one folder, one /process."""
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A])
+    _put_activity(storage, "uid-a", two_speaker_gmeet_lines(SESSION_A.origin_ms))
+    notetaker = FakeNotetaker()
+    deps = _deps(
+        storage, meeting_api, notetaker, transcode=transcode, join_webm=FakeJoinWebm()
+    )
+    queue = PendingQueue(storage, VEXA_BUCKET)
+
+    queue.enqueue(_failed_envelope())
+    queue.enqueue(_failed_envelope())
+    assert queue.pending_ids() == ["11367"]
+    asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
+    queue.enqueue(_envelope())
+    asyncio.run(sweep_once(queue, deps, now=lambda: 2000.0))
+    queue.enqueue(_failed_envelope())
+    asyncio.run(sweep_once(queue, deps, now=lambda: 3000.0))
+
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    assert meeting_api.master_calls == [70]
+    assert queue.pending_ids() == []
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["state"] == "handed_off"

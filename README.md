@@ -27,7 +27,7 @@ end up with the same kind of transcript.
    │                                                   writes speaker-activity.jsonl
    │  stores recordings + speaker activity in  s3://aw-bots/
    │  every status change: signed webhook to each subscriber (e.g. the portal)
-   │  when the meeting ends: signed webhook  "meeting.completed" to the exporter
+   │  when the meeting ends: signed webhook  "meeting.completed" (or "bot.failed") to the exporter
    ▼
  exporter (our addition, integrations/out/aw-notetaker/)
    │  reads the meeting through the gateway (its own key)
@@ -132,7 +132,7 @@ Everything else is upstream Vexa, unchanged.
 | Change | Where | Why |
 |---|---|---|
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
-| **Exporter.** A new small service. It reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting into the folder the AW notetaker pipeline reads, and hands it over. |
+| **Exporter.** A new small service. It reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
 | **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |

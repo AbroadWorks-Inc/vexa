@@ -2,9 +2,15 @@
 
 Verifies Vexa's webhook signature on the raw body before touching JSON,
 validates the meeting fields the export job needs before anything is
-durably enqueued, hands `meeting.completed` events to the worker in
-`queue.py`, and no-ops (200) on any other event type. Enqueue failure is a
-503 so Vexa's own delivery retries redeliver it.
+durably enqueued, hands finished meetings to the worker in `queue.py`, and
+no-ops (200) on any other event type. Enqueue failure is a 503 so Vexa's own
+delivery retries redeliver it.
+
+A finished meeting is `meeting.completed`, or `bot.failed`: a meeting whose
+bot recorded part of the call and then failed is still exported (§6.9 F-K2);
+the job skips one that has no recording. A `bot.failed` without a
+`start_time` never had its bot in the meeting, so it is skipped here, and a
+`not_sent` meeting (no bot was ever sent) is never exported.
 """
 
 from __future__ import annotations
@@ -37,6 +43,14 @@ _REQUIRED_MEETING_FIELDS = (
     "native_meeting_id",
     "start_time",
 )
+
+
+_EXPORTED_EVENTS = frozenset({"meeting.completed", "bot.failed"})
+
+
+def _not_sent(meeting: Mapping[str, Any]) -> bool:
+    outcome = meeting.get("outcome")
+    return isinstance(outcome, dict) and outcome.get("kind") == "not_sent"
 
 
 def _meeting_is_valid(meeting: Mapping[str, Any]) -> bool:
@@ -88,10 +102,29 @@ def create_app(
         if not isinstance(envelope, dict):
             logger.warning("webhook rejected: envelope is not an object")
             raise HTTPException(status_code=400, detail="invalid envelope")
-        if envelope.get("event_type") != "meeting.completed":
+        event_type = envelope.get("event_type")
+        if event_type not in _EXPORTED_EVENTS:
             return JSONResponse({"status": "ignored"})
         data = envelope.get("data")
         meeting = data.get("meeting") if isinstance(data, dict) else None
+        if isinstance(meeting, dict) and _not_sent(meeting):
+            logger.info(
+                "not_sent_ignored meeting_id=%s event_type=%s; no bot was sent",
+                meeting.get("id"),
+                event_type,
+            )
+            return JSONResponse({"status": "ignored"})
+        if (
+            event_type == "bot.failed"
+            and isinstance(meeting, dict)
+            and not meeting.get("start_time")
+        ):
+            logger.info(
+                "bot_failed_skipped meeting_id=%s reason=no_start_time; "
+                "nothing recorded",
+                meeting.get("id"),
+            )
+            return JSONResponse({"status": "ignored"})
         if not isinstance(meeting, dict) or not _meeting_is_valid(meeting):
             logger.warning("webhook rejected: invalid or incomplete data.meeting")
             raise HTTPException(status_code=400, detail="invalid data.meeting")

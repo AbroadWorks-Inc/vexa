@@ -1,6 +1,6 @@
 # exporter — Vexa meeting → AbroadWorks notetaker hand-off
 
-On Vexa's `meeting.completed` webhook, builds the per-meeting AbroadWorks notetaker folder in
+On a finished meeting that has a recording, builds the per-meeting AbroadWorks notetaker folder in
 `aw-chatworks-transcribe` (audio, speaker-activity-derived speaker attribution, meeting metadata)
 and hands it off to `notetaker-worker` via `POST /process`. The meeting's UUID is its id in every
 file and in the hand-off. It reads meeting-api and reports the export result
@@ -11,6 +11,22 @@ never with `X-User-Id` or the internal secret (design
 Spec: [`docs/2026-09-23-aw-rearchitecture-design.md`](docs/2026-09-23-aw-rearchitecture-design.md)
 (§4), [`docs/2026-09-23-speaker-activity-design.md`](docs/2026-09-23-speaker-activity-design.md).
 Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.md).
+
+## Which meetings are exported (design §6.9 F-K2)
+The system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) carries two events, and both are exported:
+- **`meeting.completed`**, as before. One with no audio recording is a failed export (`no_audio`).
+- **`bot.failed`**: the meeting ended `failed`, for example because its bot recorded part of the call,
+  failed, and could not be replaced in time. It is exported and transcribed like a completed one,
+  every session into the one folder. When it has no audio recording, it is skipped with the log line
+  `bot_failed_skipped … reason=no_recording`: nothing is written, `/process` isn't called, and **no
+  export result is reported** (nothing was exported, and the meeting's own `bot.failed` already says
+  why). A `bot.failed` without a `start_time` never had its bot in the meeting, so intake answers
+  200 and skips it (`reason=no_start_time`).
+- **Never exported:** any other event, and a `not_sent` meeting (`outcome.kind == "not_sent"`, no bot
+  was ever sent), whatever event carries it.
+- **One export per meeting.** The queue is keyed by the meeting id and the folder's `_export.json`
+  `handed_off` ends it, so repeated or crossed events (`bot.failed` twice, or `bot.failed` then
+  `meeting.completed`) export once.
 
 ## Through the gateway (design §1.9, §1.10)
 - **Reads.** `GET /recordings`, `GET /recordings/{id}/master` and `GET /transcripts/by-id/{id}` go to

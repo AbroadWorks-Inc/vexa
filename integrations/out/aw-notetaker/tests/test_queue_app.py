@@ -173,7 +173,7 @@ def test_wrong_event_type_ignored_and_not_queued(storage: Storage) -> None:
         clock=_fixed_clock,
         start_worker=False,
     )
-    body = b'{"event_type":"bot.failed","data":{}}'
+    body = b'{"event_type":"meeting.started","data":{}}'
     headers = _sign(body)
     with TestClient(app) as client:
         resp = client.post("/hooks/vexa", content=body, headers=headers)
@@ -203,6 +203,84 @@ def test_meeting_completed_enqueues_and_returns_202(storage: Storage) -> None:
     assert stored is not None
     assert stored["envelope"] == envelope
     assert stored["attempts"] == 0
+
+
+def _post(storage: Storage, envelope: Any) -> tuple[Any, PendingQueue]:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    app = create_app(
+        settings,
+        queue,
+        _deps(storage, settings),
+        clock=_fixed_clock,
+        start_worker=False,
+    )
+    body = json.dumps(envelope).encode()
+    with TestClient(app) as client:
+        resp = client.post("/hooks/vexa", content=body, headers=_sign(body))
+    return resp, queue
+
+
+def test_bot_failed_is_queued_like_a_completed_meeting(storage: Storage) -> None:
+    envelope = _envelope("bot.failed", status="failed")
+
+    resp, queue = _post(storage, envelope)
+
+    assert resp.status_code == 202
+    assert resp.json() == {"status": "queued"}
+    stored = storage.get_json(VEXA_BUCKET, "aw-exporter/pending/11367.json")
+    assert stored is not None and stored["envelope"] == envelope
+
+
+def test_bot_failed_without_a_start_time_is_skipped_not_rejected(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bot never got into the meeting (webhook.v1 golden: start_time
+    null), so nothing was recorded; a 400 would only make Vexa redeliver."""
+    with caplog.at_level(logging.INFO, logger="exporter"):
+        resp, queue = _post(
+            storage, _envelope("bot.failed", status="failed", start_time=None)
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored"}
+    assert queue.pending_ids() == []
+    assert any(
+        r.getMessage()
+        == "bot_failed_skipped meeting_id=11367 reason=no_start_time; nothing recorded"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("event_type", ["meeting.completed", "bot.failed"])
+def test_a_not_sent_meeting_is_never_queued(storage: Storage, event_type: str) -> None:
+    outcome = {"kind": "not_sent", "detail": "account_limit", "message": "limit"}
+
+    resp, queue = _post(
+        storage, _envelope(event_type, status="failed", outcome=outcome)
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored"}
+    assert queue.pending_ids() == []
+
+
+def test_meeting_not_sent_event_is_ignored(storage: Storage) -> None:
+    resp, queue = _post(storage, _envelope("meeting.not_sent", status="failed"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored"}
+    assert queue.pending_ids() == []
+
+
+def test_bot_failed_with_an_incomplete_meeting_returns_400(storage: Storage) -> None:
+    envelope = _envelope("bot.failed", status="failed")
+    del envelope["data"]["meeting"]["platform"]
+
+    resp, queue = _post(storage, envelope)
+
+    assert resp.status_code == 400
+    assert queue.pending_ids() == []
 
 
 def test_enqueue_failure_returns_503(

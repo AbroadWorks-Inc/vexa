@@ -4,7 +4,7 @@ One module per job; the flow is `app` → `queue` → `job`.
 
 | Module | What it does |
 |---|---|
-| `app.py` | `POST /hooks/vexa` (verifies Vexa's webhook signature, validates, queues) and `GET /healthz` |
+| `app.py` | `POST /hooks/vexa` (verifies Vexa's webhook signature, validates, queues `meeting.completed` and `bot.failed`, never a `not_sent` meeting) and `GET /healthz` |
 | `queue.py` | Durable queue in S3 (`aw-exporter/pending/`, `failed/`), retry with backoff, the worker loop |
 | `job.py` | Exports one meeting: every bot session's master audio → one `audio.wav`/`master.webm` on one clock, speaker timeline, JSON files, `/process` call |
 | `activity.py` | Reads the bot's `speaker-activity.jsonl` (who-spoke-when, no audio) into speaker start/end events — no fallback to the debug capture tape |
