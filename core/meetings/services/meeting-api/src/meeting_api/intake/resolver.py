@@ -32,7 +32,7 @@ Started rows go by start, then id.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional, Sequence
 
@@ -137,12 +137,16 @@ def _most_recent_started(rows: Sequence[LinkRow], now: datetime) -> list[LinkRow
 
 
 def _stale(row: LinkRow, now: datetime, grace_s: float) -> bool:
-    """A timed, entry-less ``scheduled`` plan past its ``scheduled_at`` plus the grace."""
+    """A timed, entry-less ``scheduled`` plan the sweep will never send: past its
+    ``scheduled_at`` plus the grace (the sweep's own ``DueWindow.past_grace``)."""
+    # Imported at call time so bot_spawn can import the intake package without an import cycle.
+    from ..bot_spawn.auto_join import DueWindow
+
     return (
         row.status == "scheduled"
         and not row.managed
         and row.planned_at is not None
-        and row.planned_at + timedelta(seconds=grace_s) < now
+        and DueWindow(now, grace_s=grace_s).past_grace(row.planned_at)
     )
 
 

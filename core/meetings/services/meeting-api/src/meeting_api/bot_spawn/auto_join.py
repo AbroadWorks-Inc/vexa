@@ -105,7 +105,8 @@ class DueWindow:
     """The time part of the due rule at one tick (§1.5): a row is due from ``scheduled_at - lead_s``
     until its ``scheduled_end_at`` when entries manage it (none: open-ended), else until
     ``scheduled_at + grace_s``. ``due_rows`` filters with it, and the exact-row claim applies it
-    again under the link lock, so a row moved or ended after the tick's read is never sent."""
+    again under the link lock, so a row moved or ended after the tick's read is never sent. The
+    link resolver reads ``past_grace`` for the entry-less plans the sweep will never send."""
 
     now: datetime
     lead_s: float = DEFAULT_LEAD_S
@@ -118,7 +119,11 @@ class DueWindow:
         if managed:
             end = _instant(scheduled_end_at)
             return end is None or self.now < end
-        return self.now <= at + timedelta(seconds=self.grace_s)
+        return not self.past_grace(at)
+
+    def past_grace(self, at: datetime) -> bool:
+        """An entry-less plan at ``at`` is past its last send time, ``at + grace_s``."""
+        return self.now > at + timedelta(seconds=self.grace_s)
 
 
 def due_rows(rows: list[dict], *, now: datetime,
