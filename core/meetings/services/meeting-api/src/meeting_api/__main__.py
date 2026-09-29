@@ -607,10 +607,12 @@ def _attach_background_loops(
         intake_store, intake_service = intake.store, intake.service
         scheduler_publisher = intake.publisher
 
-    # §6.9 F-I: the intake sweeps read in pages of SWEEP_BATCH_SIZE, and an item that fails
+    # §6.9 F-I: the sweeps read in pages of SWEEP_BATCH_SIZE, and an item that fails
     # SWEEP_MAX_ITEM_FAILURES times (counted in sweep_item_failures, shared by the replicas) is
-    # given up. Postgres only, like the sweeps that use it.
+    # given up. Without Postgres (Lite) the counts live in one in-memory record for the process,
+    # so the bound holds there too.
     from .sweeps.item_failures import (
+        InMemoryItemFailures,
         PostgresItemFailures,
         sweep_batch_size,
         sweep_max_item_failures,
@@ -620,7 +622,7 @@ def _attach_background_loops(
     item_failures = (
         PostgresItemFailures(session_factory, max_failures=sweep_max_item_failures())
         if session_factory is not None
-        else None
+        else InMemoryItemFailures(max_failures=sweep_max_item_failures())
     )
 
     async def _auto_join_loop() -> None:

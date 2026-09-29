@@ -308,3 +308,39 @@ async def test_without_postgres_neither_sweep_runs(monkeypatch):
     monkeypatch.setattr(sweeps_mod, "not_sent_tick", _stub_not_sent)
     await _run_loops(monkeypatch, session_factory=None)
     assert calls == []
+
+
+async def test_without_postgres_the_reconcile_sweep_keeps_one_failure_record(monkeypatch):
+    """§6.9 F-I in Lite: the failure counts that bound a sweep's items live in one in-memory
+    record per process, not a fresh one per pass, so SWEEP_MAX_ITEM_FAILURES still gives up."""
+    from meeting_api.lifecycle import reconcile as reconcile_mod
+    from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
+    captured: list = []
+
+    async def _stub_nonterminal(*args, **kwargs):
+        captured.append(kwargs.get("item_failures"))
+        return 0
+
+    async def _stub_stopping(*args, **kwargs):
+        return 0
+
+    async def _none(*args, **kwargs):  # pragma: no cover - the sweeps are stubbed
+        return []
+
+    monkeypatch.setattr(_FakeMeetingRepo, "list_stale_stopping", _none, raising=False)
+    monkeypatch.setattr(_FakeMeetingRepo, "list_stale_nonterminal", _none, raising=False)
+    monkeypatch.setattr(reconcile_mod, "reconcile_stale_nonterminal_sweep", _stub_nonterminal)
+    monkeypatch.setattr(reconcile_mod, "reconcile_stale_stopping_sweep", _stub_stopping)
+
+    plain_app = _fake_app
+
+    def _app_with_the_lifecycle():
+        app = plain_app()
+        app.state.apply_lifecycle_event = _none
+        return app
+
+    monkeypatch.setattr(sys.modules[__name__], "_fake_app", _app_with_the_lifecycle)
+    await _run_loops(monkeypatch, session_factory=None, env={"SWEEP_MAX_ITEM_FAILURES": "3"})
+    (failures,) = captured
+    assert isinstance(failures, InMemoryItemFailures) and failures._max == 3
