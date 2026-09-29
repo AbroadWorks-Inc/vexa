@@ -594,7 +594,7 @@ async def test_pg_every_lifecycle_step_records_one_event(pg):
         )
         payload = await _one_change(pg, mid, before, status, frm=prev)
         assert payload["data"]["change"]["reason"] == f"to {status}"
-        assert row is not None and row["sequence"] == before.seq + 1
+        assert row is not None and row["status"] == status  # its sequence: _one_change
         prev = status
     before = await _before(pg, mid)
     row = await pg.repo.update_meeting_status(

@@ -78,21 +78,6 @@ def _row_to_dict(m) -> dict:
     }
 
 
-def _with_projection(row: dict, projected: Optional[dict]) -> dict:
-    """The row dict plus the meeting's ``uuid``, ``entries``, ``outcome`` and event ``sequence``
-    from the one meeting projection (``intake.status.project_stored``): what the legacy system and
-    per-user webhooks add to their meeting block (§1.8)."""
-    if projected is None:
-        return row
-    return {
-        **row,
-        "uuid": projected["id"],
-        "entries": projected["entries"],
-        "outcome": projected["outcome"],
-        "sequence": projected["sequence"],
-    }
-
-
 class SqlAlchemyMeetingRepo:
     """``MeetingRepo`` over a SQLAlchemy-async ``session_factory`` (``meetings`` /
     ``meeting_sessions`` tables). Carve of the parent ``meetings.request_bot`` DB ops."""
@@ -325,13 +310,12 @@ class SqlAlchemyMeetingRepo:
             return True
 
     async def get_finished_meeting(self, meeting_id) -> Optional[dict]:
-        """One FINISHED meeting row (``completed``/``failed``) with its ``uuid``, ``entries``,
-        ``outcome`` and event ``sequence`` (``_with_projection``), as the lifecycle write returns
-        a row: the meeting-level finish of a meeting ended outside the lifecycle (§6.9 F-K2)
-        reads it. ``None`` for a missing or unfinished one."""
+        """One FINISHED meeting row (``completed``/``failed``), as the lifecycle write returns a
+        row: the meeting-level finish of a meeting ended outside the lifecycle (§6.9 F-K2) reads
+        it. ``None`` for a missing or unfinished one."""
         from sqlalchemy import select
 
-        from ..intake.status import FINISHED_STATUSES, project_stored
+        from ..intake.status import FINISHED_STATUSES
         from ..sessions.models import Meeting
 
         async with self._session_factory() as db:
@@ -340,7 +324,7 @@ class SqlAlchemyMeetingRepo:
             ).scalars().first()
             if m is None or m.status not in FINISHED_STATUSES:
                 return None
-            return _with_projection(_row_to_dict(m), await project_stored(db, m.id))
+            return _row_to_dict(m)
 
     async def list_unproven_teardowns(self, *, after=None, limit=None) -> list[dict]:
         """The meetings, whatever their status, holding workloads that still wait for their
@@ -511,7 +495,7 @@ class SqlAlchemyMeetingRepo:
         from ..intake import retry
         from ..intake.adapters import PostgresIntakeTx, lock_meeting_on_its_link
         from ..intake.settings import IntakeSettings
-        from ..intake.status import FINISHED_STATUSES, project_stored, write_status
+        from ..intake.status import FINISHED_STATUSES, write_status
         from ..obs import log_event
         from ..sessions.models import MeetingSession
         from .auto_join import LIVE_STATUSES
@@ -608,10 +592,9 @@ class SqlAlchemyMeetingRepo:
                     settings=IntakeSettings.from_env(), data_patch=merged,
                 )
                 if written is not None:
-                    projected = await project_stored(db, m.id)
                     await db.commit()
                     await db.refresh(m)
-                    return _with_projection(_row_to_dict(m), projected)
+                    return _row_to_dict(m)
                 if failure.lost and retry.is_last(await tx.meeting(m.id), failure):
                     # The last attempt's lost bot ends the meeting `failed`, not `completed`.
                     status = "failed"
@@ -632,16 +615,14 @@ class SqlAlchemyMeetingRepo:
             else:
                 m.data = {**(m.data if isinstance(m.data, dict) else {}), **merged}
                 flag_modified(m, "data")
-            projected = await project_stored(db, m.id)
             await db.commit()
             # Refresh BEFORE _row_to_dict: `updated_at` has a server-side onupdate, so it is expired
             # post-commit; reading it in _row_to_dict would trigger implicit async IO (MissingGreenlet).
             # The other write adapters (create_meeting/set_bot_container/reopen) follow the same pattern.
             await db.refresh(m)
             # Return the updated row so the lifecycle callback can deliver the per-user webhook from
-            # meeting.data (and the stop route gets a clean dict) without a second query; it carries
-            # the meeting's uuid, entries, outcome and event sequence for the legacy webhooks (§1.8).
-            return _with_projection(_row_to_dict(m), projected)
+            # meeting.data (and the stop route gets a clean dict) without a second query.
+            return _row_to_dict(m)
 
     async def count_active_bots(self, *, user_id, exclude_meeting_id=None) -> int:
         from sqlalchemy import func, select

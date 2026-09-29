@@ -31,8 +31,6 @@ import pytest
 from referencing import Registry, Resource
 
 from meeting_api.app import legacy_meeting_projection
-from meeting_api.bot_spawn.adapters import _with_projection
-from meeting_api.intake.projection import project_meeting
 from meeting_api.lifecycle.machine import LifecycleSink, MeetingStore, TransitionSource
 from meeting_api.lifecycle.webhook import build_typed_envelope
 
@@ -58,16 +56,6 @@ def _change(connection_id: str, *events: dict[str, Any]) -> Any:
     return change
 
 
-def _row(meeting: dict[str, Any], aw: dict[str, Any], entries: list[dict]) -> dict:
-    """The row as ``SqlAlchemyMeetingRepo.update_meeting_status`` returns it."""
-    stored = {
-        **meeting,
-        "uuid": UUID,
-        "platform_specific_id": meeting["native_meeting_id"],
-    }
-    return _with_projection(meeting, project_meeting(stored, aw, entries, lead_s=300))
-
-
 def _completed() -> dict:
     change = _change(
         "sess-golden-completed",
@@ -79,43 +67,31 @@ def _completed() -> dict:
             "timestamp": "2026-06-18T10:42:00.000Z",
         },
     )
-    row = _row(
-        {
-            "id": 11367,
-            "user_id": 7,
-            "platform": "google_meet",
-            "native_meeting_id": "abc-defg-hij",
-            "constructed_meeting_url": "https://meet.google.com/abc-defg-hij",
-            "status": "completed",
-            "start_time": "2026-06-18T10:00:00.000Z",
-            "end_time": "2026-06-18T10:42:00.000Z",
-            "data": {
-                "name": "Weekly sync",
-                "completion_reason": "stopped",
-                "service_provenance": {
-                    "bot_admitted_at": "2026-06-18T10:00:00.000Z",
-                    "bot_departed_at": "2026-06-18T10:42:00.000Z",
-                    "bot_outcome": "served",
-                    "transcription_provider": "customer",
-                    "transcription_outcome": "served",
-                    "lifecycle_contract_version": "2026-07-28",
-                },
+    # The row as ``SqlAlchemyMeetingRepo.update_meeting_status`` returns it.
+    row = {
+        "id": 11367,
+        "user_id": 7,
+        "platform": "google_meet",
+        "native_meeting_id": "abc-defg-hij",
+        "constructed_meeting_url": "https://meet.google.com/abc-defg-hij",
+        "status": "completed",
+        "start_time": "2026-06-18T10:00:00.000Z",
+        "end_time": "2026-06-18T10:42:00.000Z",
+        "data": {
+            "name": "Weekly sync",
+            "completion_reason": "stopped",
+            "service_provenance": {
+                "bot_admitted_at": "2026-06-18T10:00:00.000Z",
+                "bot_departed_at": "2026-06-18T10:42:00.000Z",
+                "bot_outcome": "served",
+                "transcription_provider": "customer",
+                "transcription_outcome": "served",
+                "lifecycle_contract_version": "2026-07-28",
             },
-            "created_at": "2026-06-18T09:59:30.000Z",
-            "updated_at": "2026-06-18T10:42:00.000Z",
         },
-        {"event_seq": 9, "outcome_kind": None},
-        [
-            {
-                "external_id": "google:3n5kq8example",
-                "source_user": "a@abroadworks.com",
-                "attendees": ["a@abroadworks.com", "b@example.com"],
-                "series_id": "google:series-weekly",
-                "metadata": {"crm_id": "42"},
-                "state": "closed",
-            }
-        ],
-    )
+        "created_at": "2026-06-18T09:59:30.000Z",
+        "updated_at": "2026-06-18T10:42:00.000Z",
+    }
     envelope = build_typed_envelope(
         change,
         meeting=legacy_meeting_projection(row),
@@ -138,26 +114,23 @@ def _bot_failed() -> dict:
             "timestamp": "2026-06-18T10:03:12.000Z",
         },
     )
-    row = _row(
-        {
-            "id": 11368,
-            "user_id": 7,
-            "platform": "zoom",
-            "native_meeting_id": "98765432101",
-            "constructed_meeting_url": "https://zoom.us/j/98765432101",
-            "status": "failed",
-            "start_time": None,
-            "end_time": "2026-06-18T10:03:12.000Z",
-            "data": {
-                "completion_reason": "awaiting_admission_rejected",
-                "failure_stage": "awaiting_admission",
-            },
-            "created_at": "2026-06-18T10:02:00.000Z",
-            "updated_at": "2026-06-18T10:03:12.000Z",
+    # The row as ``SqlAlchemyMeetingRepo.update_meeting_status`` returns it.
+    row = {
+        "id": 11368,
+        "user_id": 7,
+        "platform": "zoom",
+        "native_meeting_id": "98765432101",
+        "constructed_meeting_url": "https://zoom.us/j/98765432101",
+        "status": "failed",
+        "start_time": None,
+        "end_time": "2026-06-18T10:03:12.000Z",
+        "data": {
+            "completion_reason": "awaiting_admission_rejected",
+            "failure_stage": "awaiting_admission",
         },
-        {"event_seq": 4, "outcome_kind": None},
-        [],
-    )
+        "created_at": "2026-06-18T10:02:00.000Z",
+        "updated_at": "2026-06-18T10:03:12.000Z",
+    }
     envelope = build_typed_envelope(
         change,
         meeting=legacy_meeting_projection(row),
