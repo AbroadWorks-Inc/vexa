@@ -13,11 +13,11 @@
 
 The gateway checks the ``webhooks`` scope and sets ``x-user-id`` (the account). Every failure is
 the §2.5 body ``{"error": {"code", "message"}}``: a request that fails validation is 400
-``invalid_request``, an id that isn't one of the account's subscriptions is 404
-``webhook_not_found``, an account with no ``users`` row adding one is 404 ``account_not_found``,
-the 21st subscription is 429 ``quota_exceeded`` (no ``Retry-After``), and a database that can't be
-reached, a missing secret key ring or a failed test hand-off is 503 ``unavailable``. A constraint
-violation is a bug and stays a 500.
+``invalid_request`` (so is an id in the path that isn't a UUID), a UUID that isn't one of the
+account's subscriptions is 404 ``webhook_not_found``, an account with no ``users`` row adding one
+is 404 ``account_not_found``, the 21st subscription is 429 ``quota_exceeded`` (no
+``Retry-After``), and a database that can't be reached, a missing secret key ring or a failed test
+hand-off is 503 ``unavailable``. A constraint violation is a bug and stays a 500.
 
 - A secret the caller omits is generated and returned once, in that response only. A secret the
   caller supplies is never echoed. Secrets are stored sealed by ``SecretBox``; responses and logs
@@ -444,7 +444,7 @@ def build_webhook_router(
         try:
             sid = uuid.UUID(subscription_id)
         except ValueError as exc:
-            raise WebhookError("webhook_not_found", _NOT_FOUND) from exc
+            raise WebhookError("invalid_request", "subscription_id: not a UUID") from exc
         stmt = select(WebhookSubscription).where(
             WebhookSubscription.id == sid, WebhookSubscription.user_id == user_id
         )

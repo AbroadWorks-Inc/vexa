@@ -258,6 +258,51 @@ def test_the_test_hand_off_fails_without_the_internal_secret():
         asyncio.run(sender.send_test(7, "sub-1"))
 
 
+class _NoReads:
+    """A session that fails the test on any read: a bad id is refused before the database."""
+
+    async def execute(self, *args, **kwargs):
+        raise AssertionError("a non-UUID webhook id reached the database")
+
+    async def rollback(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("PATCH", "/v2/webhooks/not-a-uuid", {"active": False}),
+        ("DELETE", "/v2/webhooks/not-a-uuid", None),
+        ("POST", "/v2/webhooks/not-a-uuid/rotate-secret", {}),
+        ("POST", "/v2/webhooks/not-a-uuid/test", None),
+        ("GET", "/v2/webhooks/not-a-uuid/deliveries", None),
+    ],
+)
+def test_a_webhook_id_that_is_not_a_uuid_is_400_invalid_request(method, path, body):
+    """§2.5: a bad id in the path is 400 ``invalid_request``, not 404."""
+    from fastapi.testclient import TestClient
+
+    from admin_api.app.db import get_db
+    from admin_api.app.main import create_app
+
+    app = create_app(
+        webhooks=WebhookDeps(
+            secret_box=_box("k1"),
+            test_sender=FakeTestSender(),
+            settings=WebhookSettings(),
+        )
+    )
+    app.dependency_overrides[get_db] = lambda: _NoReads()
+    client = TestClient(via_gateway(app))
+
+    r = client.request(method, path, json=body, headers=_as(1))
+
+    assert r.status_code == 400, r.text
+    assert r.json() == {
+        "error": {"code": "invalid_request", "message": "subscription_id: not a UUID"}
+    }
+
+
 # ── real Postgres: the routes ────────────────────────────────────────────────────────────────
 
 needs_pg = pytest.mark.skipif(
@@ -698,7 +743,6 @@ def test_another_accounts_subscription_is_not_found(env):
         client.post(f"/v2/webhooks/{sid}/rotate-secret", json={}, headers=_as(2)),
         client.post(f"/v2/webhooks/{sid}/test", headers=_as(2)),
         client.get(f"/v2/webhooks/{sid}/deliveries", headers=_as(2)),
-        client.get("/v2/webhooks/not-a-uuid/deliveries", headers=_as(1)),
     ):
         assert r.status_code == 404, r.text
         assert r.json()["error"]["code"] == "webhook_not_found"
