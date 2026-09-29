@@ -1076,6 +1076,46 @@ async def test_pg_a_runtime_spawn_failure_has_one_terminal_event(pg):
     )
 
 
+async def test_pg_the_recovery_records_the_planned_workload_when_it_frees_the_link(pg):
+    """M4: the spawn flow could neither fail the row nor record its unproven workload (the
+    database flapped), so the port's recovery ends it: the workload ``data.spawn_session``
+    names is recorded through the one builder for the teardown sweep."""
+    import httpx
+
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.bot_spawn.ports import pending_teardowns, workload_id_for
+    from meeting_api.intake import PostgresIntakeStore
+
+    class Flapping(SqlAlchemyMeetingRepo):
+        async def fail_meeting(self, **kw):
+            raise RuntimeError("database went away")
+
+        async def merge_meeting_data(self, meeting_id, patch):
+            raise RuntimeError("database went away")
+
+    class NoAnswer(FakeRuntimeClient):
+        async def create_workload(self, spec):
+            self.specs.append(spec)
+            raise httpx.ReadError("connection reset")
+
+        async def delete_workload(self, workload_id):
+            raise RuntimeError("the kernel is down")
+
+    mid = await _seed_due(pg)
+    runtime = NoAnswer()
+    port = _spawn_port(
+        Flapping(pg.session_factory), runtime, PostgresIntakeStore(pg.session_factory)
+    )
+    outcome = await port.spawn_exact(USER, mid)
+    assert outcome.result == "failed"
+    assert await pg.status(mid) == "failed"
+    data = (await pg.repo.get_meeting(mid))["data"]
+    planned = workload_id_for(mid, data["spawn_session"]["session"])
+    assert planned == runtime.specs[0]["workloadId"]
+    assert [t["workload"] for t in pending_teardowns(data)] == [planned]
+
+
 async def test_pg_the_recovery_never_writes_over_a_live_workload(pg, capsys):
     """A failure after the workload id was recorded (here: the interlock read) leaves the row
     ``requested`` with its bot: the recovery skips the terminal write and logs it."""

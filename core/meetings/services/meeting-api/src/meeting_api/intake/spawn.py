@@ -65,9 +65,12 @@ from ..bot_spawn.ports import (
     MeetingRepo,
     MeetingStopped,
     QuotaExceeded,
+    SPAWN_SESSION,
     RuntimeClient,
     SpawnFailed,
     TranscriptionNotConfigured,
+    unproven_teardown,
+    workload_id_for,
 )
 from ..bot_spawn.service import request_bot
 from ..obs import log_event
@@ -297,8 +300,11 @@ class ExactRowSpawn:
     ) -> None:
         """§1.5: the claimed row ends ``not_sent`` with the code and message, or, while the
         meeting is on, goes back to ``requested`` for another bot (§6.9 F-K2, ``retry.retry``). The
-        spawn flow fails the row itself wherever a workload may exist, so a row that reaches here
-        names no workload, and it is never recorded as gone. The last failure of a meeting
+        spawn flow fails the row itself wherever a workload may exist; a row that reaches here
+        anyway (failing it and recording its workload both failed) names only the workload its
+        spawn planned (``data.spawn_session``, ``workload_id_for``), never recorded as gone: the
+        retry proves it gone before the next bot, and an end that frees the link records it
+        through the one builder (``unproven_teardown``). The last failure of a meeting
         entries manage that already had a bot session ends ``failed`` without the ``not_sent``
         outcome. A row the spawn flow already sent back (``data.bot_retry``) is left alone. Best
         effort: a failure here is logged with its stack, and the spawn's answer stands.
@@ -327,13 +333,20 @@ class ExactRowSpawn:
                         fields={"code": code},
                     )
                 elif current.status == "requested":
-                    # Nothing says whether a workload was started: never recorded gone.
+                    # Nothing says whether the planned workload was started: never recorded gone.
+                    plan = current.data.get(SPAWN_SESSION)
+                    planned = (
+                        workload_id_for(meeting_id, str(plan["session"]))
+                        if isinstance(plan, dict) and plan.get("session")
+                        else None
+                    )
                     failure = retry.Failure(
                         "failed",
                         None,
                         message,
                         stage="requested",
                         code=code,
+                        workload=planned,
                         proven_gone=False,
                     )
                     written = await retry.retry(
@@ -354,6 +367,11 @@ class ExactRowSpawn:
                             meeting_id,
                             "failed",
                             expected_from={"requested"},
+                            data_patch=(
+                                None
+                                if planned is None
+                                else unproven_teardown(current.data, planned)
+                            ),
                             outcome=outcome,
                             change_reason=code,
                             event_type=None if outcome is None else "meeting.not_sent",
