@@ -914,7 +914,8 @@ async def request_bot(
         )
     except MeetingStopped:
         raise
-    except Exception as e:
+    except (Exception, asyncio.CancelledError) as e:
+        # A cancel here is bounded the same way: no pod can exist before the create.
         if claim_meeting_id is not None:
             await _fail_row(
                 f"the bot could not be prepared ({type(e).__name__})", e, gone=True, created=False

@@ -1705,3 +1705,29 @@ async def test_pg_the_driver_finishes_a_stop_its_spawn_hit_as_a_user_stop(pg):
     assert sink.events == ["bot.failed"]
     typed = app.state.typed_webhooks[-1]
     assert typed["data"]["status_change"]["transition_source"] == "user_stop"
+
+
+async def test_pg_a_cancel_before_the_create_is_proven_gone_and_bounded(pg):
+    import asyncio
+
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class CancelledAtTheFence(SqlAlchemyMeetingRepo):
+        reads = 0
+
+        async def get_meeting(self, meeting_id):
+            self.reads += 1
+            if self.reads == 2:  # the spawn fence, after the claim, before the create
+                raise asyncio.CancelledError()
+            return await super().get_meeting(meeting_id)
+
+    mid = await pg.calendar_meeting()
+    runtime = FakeRuntimeClient()
+    with pytest.raises(asyncio.CancelledError):
+        await pg.port(
+            runtime, repo=CancelledAtTheFence(pg.session_factory)
+        ).spawn_exact(USER, mid)
+    assert runtime.specs == []  # the create never ran
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (None, True)
+    assert (await pg.tick(_gone(), at=_later()))["spawned"] == 1
