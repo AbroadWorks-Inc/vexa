@@ -973,8 +973,10 @@ def _mount_lifecycle(
         # Publish each persisted FSM advance to bm:meeting:{id}:status in the canonical 0.10.6 WS
         # contract shape (the source of truth; api-gateway forwards the redis payload verbatim):
         #   {type:"meeting.status", meeting:{id,platform,native_id}, payload:{status}, user_id, ts}
-        # `status` is the raw BotStatus value (e.g. 'needs_help'); clients translate to their own
-        # vocabulary on THEIR side (the core emits the contract, never a client's naming). Skipped on
+        # `status` is the row's persisted status (a session whose failure sent the meeting back for
+        # another bot shows `requested`, §6.9 F-K2), the raw value (e.g. 'needs_help'); clients
+        # translate to their own vocabulary on THEIR side (the core emits the contract, never a
+        # client's naming). Skipped on
         # a no-op advance (idempotent replay) / unknown session. Best-effort: never fail the callback.
         if redis is not None and not change.no_op and isinstance(meeting_row, dict) and rec.status is not None:
             meeting_id = meeting_row.get("id")
@@ -989,7 +991,7 @@ def _mount_lifecycle(
                         "platform": meeting_row.get("platform"),
                         "native_id": meeting_row.get("native_meeting_id"),
                     },
-                    "payload": {"status": rec.status.value},
+                    "payload": {"status": persisted_status or rec.status.value},
                     "user_id": meeting_row.get("user_id"),
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
@@ -1008,7 +1010,7 @@ def _mount_lifecycle(
                         "type": "meeting.status",
                         "meeting_id": meeting_id,
                         "native": meeting_row.get("native_meeting_id"),
-                        "status": rec.status.value,
+                        "status": persisted_status or rec.status.value,
                         "when": frame["ts"],
                     }
                     try:

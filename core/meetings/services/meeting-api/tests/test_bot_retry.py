@@ -323,6 +323,7 @@ class _Sinks:
         self.finalized: list[int] = []
         self.reaped: list[str] = []
         self.published: list[str] = []
+        self.frames: list[tuple[str, dict]] = []
 
     async def deliver(self, *args, **kwargs):  # the system sink: (envelope, label=)
         from types import SimpleNamespace
@@ -338,6 +339,9 @@ class _Sinks:
         return 0
 
     async def publish(self, channel: str, data: str):
+        import json
+
+        self.frames.append((channel, json.loads(data)))
         return 1
 
     async def xadd(self, stream: str, payload: dict):
@@ -411,6 +415,23 @@ async def test_a_retried_session_sends_bot_retry_and_no_meeting_level_side_effec
     assert sinks.user[-2:] == ["meeting.status_change", "bot.retry"]
     assert sinks.system == []
     assert sinks.finalized == [] and sinks.reaped == [] and sinks.published == []
+
+
+async def test_the_ws_frames_carry_the_rows_status_not_the_sessions(monkeypatch):
+    failed = ({"status": "failed", "completion_reason": "join_failure"}, False)
+    _, sinks, row = await _drive("retry", [JOINING, failed], monkeypatch)
+    meeting, user = sinks.frames[-2], sinks.frames[-1]
+    assert meeting[0] == f"bm:meeting:{row['id']}:status"
+    assert meeting[1]["payload"]["status"] == "requested"
+    assert (user[0], user[1]["status"]) == ("u:1:meetings", "requested")
+    lost = ({"status": "completed", "completion_reason": "left_alone"}, True)
+    _, sinks, row = await _drive("last_lost", [JOINING, ACTIVE, lost], monkeypatch)
+    assert [
+        f[1].get("status") or f[1]["payload"]["status"] for f in sinks.frames[-2:]
+    ] == [
+        "failed",
+        "failed",
+    ]
 
 
 async def test_a_lost_bot_on_its_last_attempt_is_bot_failed_everywhere(monkeypatch):
