@@ -1307,3 +1307,59 @@ async def test_pg_an_entry_less_meetings_last_failure_keeps_not_sent(pg, monkeyp
     await port.spawn_exact(USER, unsent)
     assert (await pg.aw(unsent))["outcome_kind"] == "not_sent"
     assert (await pg.types(unsent))[-1] == "meeting.not_sent"
+
+
+# ── an unproven workload of a meeting that ends is deleted ──────────────────────────────────
+
+
+class _NoAnswer(FakeRuntimeClient):
+    """A runtime whose create raises ``error`` (the workload may have been started)."""
+
+    def __init__(self, error: BaseException, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.error = error
+
+    async def create_workload(self, spec):
+        self.specs.append(spec)
+        raise self.error
+
+
+async def test_pg_an_unproven_create_on_the_last_attempt_deletes_the_workload(pg):
+    import httpx
+
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+    runtime = _NoAnswer(httpx.ReadError("connection reset"))
+    await pg.port(runtime).spawn_exact(USER, mid)
+    assert (await pg.row(mid))["status"] == "failed"
+    assert runtime.deleted == [runtime.specs[0]["workloadId"]]
+
+
+async def test_pg_an_unproven_create_on_an_entry_less_meeting_deletes_the_workload(pg):
+    from meeting_api.bot_spawn.ports import SpawnFailed
+
+    await pg.execute(
+        "INSERT INTO meetings (user_id, platform, platform_specific_id, status, data) "
+        "VALUES (:u, 'google_meet', 'abc-defg-hij', 'scheduled', CAST(:d AS jsonb))",
+        u=USER,
+        d=json.dumps({"scheduled_at": _iso(_now()), "auto_join": True}),
+    )
+    mid = int(await pg.scalar("SELECT max(id) FROM meetings"))
+    runtime = _NoAnswer(SpawnFailed("runtime kernel returned 503: busy", refused=False))
+    await pg.port(runtime).spawn_exact(USER, mid)
+    assert (await pg.row(mid))["status"] == "failed"
+    assert runtime.deleted == [runtime.specs[0]["workloadId"]]
+
+
+async def test_pg_an_unproven_create_that_is_retried_leaves_the_workload_to_the_proof(
+    pg,
+):
+    import httpx
+
+    mid = await pg.calendar_meeting()
+    runtime = _NoAnswer(httpx.ReadError("connection reset"))
+    await pg.port(runtime).spawn_exact(USER, mid)
+    assert (await pg.row(mid))["data"]["bot_retry"]["proven_gone"] is False
+    assert runtime.deleted == []

@@ -837,21 +837,48 @@ async def request_bot(
             f"{meeting_api_url}/runtime/callback", workload_id, internal_secret or ""
         ),
     )
-    async def _fail_row(reason: str, exc: BaseException, *, gone: bool) -> None:
+    async def _fail_row(reason: str, exc: BaseException, *, gone: bool) -> Optional[dict]:
         """Fail the claimed row BY ID (the ``MeetingSession`` may not exist yet), naming the
         workload and whether it is proven gone (§6.9 F-K2: a meeting that is on retries, and a
-        new bot goes only once that workload is proven gone). Best-effort: never masks the spawn
-        error the caller re-raises."""
+        new bot goes only once that workload is proven gone). Returns the row as it stands, or
+        ``None`` when failing it failed. Best-effort: never masks the spawn error the caller
+        re-raises."""
         try:
-            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
-                                    outcome=_not_sent(exc), workload_id=workload_id,
-                                    workload_gone=gone)
+            return await repo.fail_meeting(
+                meeting_id=meeting_id, reason=reason, failure_stage="requested",
+                outcome=_not_sent(exc), workload_id=workload_id, workload_gone=gone,
+            )
         except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
             log_event(
                 "bot_spawn_fail_row_error", audience="system", level="error",
                 span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
                 fields={"error": str(fail_err)},
             )
+            return None
+
+    async def _fail_unproven(reason: str, exc: BaseException) -> None:
+        """A create the runtime did not refuse: the workload may exist. A meeting that retries
+        proves it gone before its next bot (§6.9 F-K2); one that ends instead (its last attempt,
+        its planned end too close, no entries) frees its link, so the workload is deleted now,
+        best-effort, through the reconcile sweeps' teardown, and the verdict logged."""
+        import logging
+
+        from ..intake import retry
+        from ..lifecycle.reconcile import _teardown_verdict
+
+        failed_row = await _fail_row(reason, exc, gone=False)
+        if failed_row is not None and retry.marker(failed_row.get("data")) is not None:
+            return
+        verdict = await _teardown_verdict(
+            runtime, workload_id, meeting_id=meeting_id,
+            log=logging.getLogger("meeting_api.bot_spawn"),
+        )
+        log_event(
+            "bot_spawn_unproven_workload_teardown", audience="system",
+            level="info" if verdict == "confirmed" else "error",
+            span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+            fields={"workload_id": workload_id, "verdict": verdict},
+        )
 
     try:
         result = await runtime.create_workload(spec)
@@ -878,7 +905,10 @@ async def request_bot(
         # session-keyed update_meeting_status cannot reach it yet. Only an explicit refusal proves
         # the workload gone; a 5xx does not (``SpawnFailed.refused``).
         reason = str(e) or "bot workload failed to start"
-        await _fail_row(reason, e, gone=e.refused)
+        if e.refused:
+            await _fail_row(reason, e, gone=True)
+        else:
+            await _fail_unproven(reason, e)
         log_event(
             "bot_spawn_failed", audience="system", level="error",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
@@ -889,8 +919,8 @@ async def request_bot(
         # No answer from the kernel (a timeout, a dropped connection, a protocol error): it may
         # have started the workload, so the row is failed with the workload named and NOT proven
         # gone (§6.9 F-K2).
-        await _fail_row(
-            f"the runtime did not answer the workload create ({type(e).__name__})", e, gone=False
+        await _fail_unproven(
+            f"the runtime did not answer the workload create ({type(e).__name__})", e
         )
         raise
 
