@@ -34,11 +34,11 @@ the full meeting (`data.meeting`); `webhook.test` carries none.
 | `meeting.started` | the step to `active` |
 | `meeting.completed` | the step to `completed` |
 | `bot.failed` | the step to `failed` (`meeting.not_sent` instead when the outcome is `not_sent`) |
+| `bot.retry` | a bot failed while the meeting is on and a new bot will be sent on the same meeting: the step back to `requested`; `data.change.reason` carries the failure reason and `data.meeting.bot_joins_at` when the new bot goes |
 | `export.handed_off` / `export.failed` | the exporter's result (`data.meeting.export`) |
 | `webhook.test` | a test send (`POST /v2/webhooks/{id}/test`) |
 
-`bot.retry`, `recording.ready` and `transcription.ready` are in `EventType` but are not sent to
-subscribers.
+`recording.ready` and `transcription.ready` are in `EventType` but are not sent to subscribers.
 
 ### Envelope (`MeetingEvent`)
 ```json
@@ -138,8 +138,10 @@ the same bytes.
 - **`EventType`** — the delivered event vocabulary (`meeting.started · meeting.status_change ·
   meeting.completed · meeting.scheduled · meeting.updated · meeting.removed ·
   meeting.waiting_for_room · meeting.not_sent · bot.failed · bot.retry · recording.ready ·
-  transcription.ready · export.handed_off · export.failed · webhook.test`). `bot.retry` is
-  reserved for the lobby-timeout retry and not yet emitted by any producer.
+  transcription.ready · export.handed_off · export.failed · webhook.test`). `bot.retry` is sent
+  when a bot fails while its meeting is on and a new bot will be sent on the same meeting; the
+  legacy deliveries (system hook, per-user `webhook_url`) get it too, with the `status_change`
+  block of the failed bot's session.
 - **`SignatureHeaders`** — the headers a verifier recomputes: `sha256=<hmac_sha256(secret,
   "<X-Webhook-Timestamp>." + raw_body)>`, timestamp-then-payload, bounding replay. `Authorization`
   appears on legacy deliveries only; `X-Webhook-Signature-Previous` on subscription deliveries

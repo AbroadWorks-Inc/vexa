@@ -1,0 +1,45 @@
+{
+  "api_version": "2026-09-25",
+  "created_at": "2026-09-29T05:12:41Z",
+  "data": {
+    "change": {
+      "at": "2026-09-29T05:12:41Z",
+      "from": "active",
+      "reason": "left_alone",
+      "to": "requested"
+    },
+    "meeting": {
+      "bot_joins_at": "2026-09-29T05:13:41Z",
+      "completion_reason": null,
+      "end": "2026-09-29T06:00:00Z",
+      "entries": [
+        {
+          "attendees": [
+            "a@abroadworks.com",
+            "b@example.com"
+          ],
+          "external_id": "google:3n5kq8example",
+          "metadata": {
+            "crm_id": "42"
+          },
+          "series_id": "google:series-weekly",
+          "user": "a@abroadworks.com"
+        }
+      ],
+      "export": null,
+      "failure_stage": null,
+      "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+      "meeting_url": "https://meet.google.com/abc-defg-hij",
+      "outcome": null,
+      "platform": "google_meet",
+      "room": "abc-defg-hij",
+      "sequence": 6,
+      "start": "2026-09-29T04:30:00Z",
+      "status": "requested",
+      "time_zone": "Asia/Kolkata",
+      "title": "Weekly sync"
+    }
+  },
+  "event_id": "evt_05ed09810a57c6eb2b56862dafc23b59e4198433cc2636bbac4fe854e9590075",
+  "event_type": "bot.retry"
+}

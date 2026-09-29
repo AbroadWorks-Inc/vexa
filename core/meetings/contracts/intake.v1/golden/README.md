@@ -8,6 +8,9 @@ by `meeting-api/tests/test_intake_contract.py` through the Python `jsonschema` p
   and an instant-join body with neither.
 - `Remove.with-reason.json` / `Remove.no-reason.json` — a `POST /v2/entries/remove` body.
 - `Meeting.scheduled.json` — the §2.4 meeting object.
+- `Meeting.retry-pending.json` — a meeting waiting for a new bot after one failed (§6.9 F-K2):
+  `requested`, `bot_joins_at` the new bot's time, no `completion_reason` yet (checked against
+  `project_meeting` by meeting-api's `tests/test_bot_retry.py`).
 - `EntryState.active.json` — a `GET /v2/entries` row.
 - `EntryPage.first-page.json` — a `GET /v2/entries` page with a `next_cursor`.
 - `MeetingPage.last-page.json` — the last page of `GET /v2/meetings` (`next_cursor: null`).

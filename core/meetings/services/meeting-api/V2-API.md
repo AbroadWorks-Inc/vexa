@@ -778,13 +778,14 @@ deployment's secret key ring not configured, or the test couldn't be queued; ret
 | `meeting.started` | The bot reached `active`. |
 | `meeting.completed` | The meeting reached `completed`. |
 | `bot.failed` | The meeting reached `failed` (except `not_sent`, which is `meeting.not_sent`). |
+| `bot.retry` | A bot failed while the meeting is on; a new bot will be sent to the same meeting. The meeting is back to `requested`, `change.reason` is the failure reason and `bot_joins_at` is when the new bot goes. |
 | `export.handed_off` / `export.failed` | The exporter's result (`meeting.export`). |
 | `webhook.test` | A test send. |
 
 A status change is **exactly one event**, never two: the typed one when there is one, else
 `meeting.status_change`. A receiver that follows every step listens to the typed events as well as
-`meeting.status_change`. `bot.retry`, `recording.ready` and `transcription.ready` are accepted in
-`events` but not sent to subscribers. Erasing a meeting sends nothing. aw-bots' part ends at
+`meeting.status_change`. `recording.ready` and `transcription.ready` are accepted in `events` but
+not sent to subscribers. Erasing a meeting sends nothing. aw-bots' part ends at
 `export.handed_off`: transcription is not an aw-bots event.
 
 #### The envelope

@@ -30,7 +30,10 @@ responses against the same shapes.
   start, end, time_zone, bot_joins_at, entries, export, sequence`. `status` /
   `completion_reason` / `failure_stage` / `outcome.kind` / `export.state` are left as open strings
   here (not enumerated): `status` mirrors the sealed `lifecycle.v1` FSM plus intake's own
-  pre-lifecycle `scheduled`, which this draft does not own or duplicate.
+  pre-lifecycle `scheduled`, which this draft does not own or duplicate. A meeting waiting for a
+  new bot after one failed (§6.9 F-K2, the `bot.retry` webhook) reads `requested` with
+  `bot_joins_at` the new bot's time and no `completion_reason` yet
+  (`golden/Meeting.retry-pending.json`).
 - **`MeetingEntryRef`** — one item of `Meeting.entries`: a finished meeting lists its closed
   entries, any other meeting its active entries; removed entries are never listed.
 - **`Outcome`** / **`Export`** — `Meeting.outcome` / `Meeting.export`, each `null` until set.

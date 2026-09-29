@@ -2,11 +2,11 @@
 
 Subscription deliveries (``MeetingEvent.*``, ``TestEvent.*``, ``SignatureHeaders.subscription`` and
 ``SignatureHeaders.rotated``): the envelopes are the outbox rows the status writer
-(``intake.status.write_status`` / ``write_event``) and the test writer
-(``intake.outbox.PostgresWebhookTests.queue_test``) store, run over an in-memory session at a fixed
-instant; the headers are ``webhooks.signing.signed_headers`` over the stored body of
-``MeetingEvent.meeting-completed``. A golden re-serialised compactly with sorted keys is exactly the
-stored body, so the headers verify against it.
+(``intake.status.write_status`` / ``write_event``), the retry writer (``intake.retry.retry``, §6.9
+F-K2) and the test writer (``intake.outbox.PostgresWebhookTests.queue_test``) store, run over an
+in-memory session at a fixed instant; the headers are ``webhooks.signing.signed_headers`` over the
+stored body of ``MeetingEvent.meeting-completed``. A golden re-serialised compactly with sorted keys
+is exactly the stored body, so the headers verify against it.
 
 Legacy deliveries (``Envelope.meeting-completed`` and ``Envelope.bot-failed``): what the lifecycle
 callback sends the legacy system and per-user URLs: ``lifecycle.webhook.build_typed_envelope``
@@ -250,6 +250,9 @@ class _Session:
         entity = stmt.column_descriptions[0]["entity"]
         if entity is self._orm.MeetingEntry:
             return _Rows(self._entries)
+        if entity in (self._orm.Meeting, self._orm.MeetingAwState):
+            row = self._rows.get(entity)
+            return _Rows([] if row is None else [row])
         if entity is self._orm.WebhookSubscription:
             return _Rows([] if self._subscription is None else [self._subscription])
         raise AssertionError(f"unexpected statement: {stmt}")
@@ -318,6 +321,10 @@ def _entries(orm) -> list:
             metadata_={"crm_id": "42"},
             content_hash="h" * 64,
             state="active",
+            title="Weekly sync",
+            time_zone="Asia/Kolkata",
+            join_now=False,
+            removed_reason=None,
         )
     ]
 
@@ -378,6 +385,48 @@ async def _subscription_bot_failed(orm) -> str:
     return db.body()
 
 
+async def _subscription_bot_retry(orm) -> str:
+    from meeting_api.intake import retry
+    from meeting_api.intake.adapters import PostgresIntakeTx
+    from meeting_api.intake.settings import IntakeSettings
+
+    aw = _aw(orm, 5)
+    aw.scheduled_end_at = datetime(2026, 9, 29, 6, 0, tzinfo=timezone.utc)
+    aw.send_attempts = 0
+    db = _Session(
+        orm,
+        meeting=_meeting(orm, "active", auto_join_last_attempt="2026-09-29T04:25:00Z"),
+        aw=aw,
+        entries=_entries(orm),
+    )
+    written = await retry.retry(
+        PostgresIntakeTx(db),  # type: ignore[arg-type]
+        MEETING_ID,
+        retry.Failure(
+            "completed",
+            "left_alone",
+            "stopped (workload destroyed, confirmed by runtime)",
+            lost=True,
+            session="sess-golden-retry",
+            workload="mtg-11367-5c1d2e3f",
+            proven_gone=True,
+        ),
+        now=NOW.replace(microsecond=0),
+        settings=IntakeSettings(
+            max_days_ahead=30,
+            join_now_adopt_ahead_s=3600,
+            lead_s=300,
+            blocked_hosts=frozenset(),
+            max_active_entries=100_000,
+            send_max_attempts=3,
+            send_retry_backoff_s=60,
+            conflict_retries=3,
+        ),
+    )
+    assert written is not None
+    return db.body()
+
+
 async def _subscription_updated(orm) -> str:
     from meeting_api.intake.status import write_event
 
@@ -401,6 +450,7 @@ async def _subscription_test(orm) -> str:
 SUBSCRIPTION_GOLDENS = [
     ("MeetingEvent.meeting-completed", _subscription_completed),
     ("MeetingEvent.bot-failed", _subscription_bot_failed),
+    ("MeetingEvent.bot-retry", _subscription_bot_retry),
     ("MeetingEvent.meeting-updated", _subscription_updated),
     ("TestEvent.webhook-test", _subscription_test),
 ]
@@ -501,6 +551,24 @@ def test_the_subscription_event_is_one_typed_event_with_the_change_and_the_v2_id
     assert completed["data"]["meeting"]["id"] == UUID
     assert completed["data"]["meeting"]["sequence"] == 9
     assert "status_change" not in completed["data"]
+
+
+def test_the_retry_event_sends_the_meeting_back_to_requested_with_the_reason():
+    retried = json.loads(_golden_path("MeetingEvent.bot-retry").read_text())
+    assert retried["event_type"] == "bot.retry"
+    assert retried["data"]["change"] == {
+        "from": "active",
+        "to": "requested",
+        "reason": "left_alone",
+        "at": "2026-09-29T05:12:41Z",
+    }
+    meeting = retried["data"]["meeting"]
+    assert (meeting["status"], meeting["completion_reason"], meeting["outcome"]) == (
+        "requested",
+        None,
+        None,
+    )
+    assert meeting["bot_joins_at"] == "2026-09-29T05:13:41Z"
 
 
 def test_the_legacy_goldens_do_not_satisfy_the_subscription_shape():

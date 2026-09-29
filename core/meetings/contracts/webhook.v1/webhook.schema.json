@@ -5,7 +5,7 @@
   "description": "The outbound webhook wire shape: the delivery envelope POSTed to a subscriber's URL, plus the signed-header scheme that authenticates it. Two producers share it. Subscription deliveries (the /v2/webhooks subscribers, §2.7) are MeetingEvent and TestEvent envelopes: meeting-api's status writer stores each event in webhook_outbox (intake/status.py, intake/outbox.py) and webhooks/sender.py posts the stored body, signed under the subscriber's secret. Legacy deliveries (the system hook and a meeting's per-user webhook_url) are built by lifecycle/webhook.py and posted by webhooks/delivery.py. Every delivery of either producer is an Envelope.",
   "$defs": {
     "EventType": {
-      "description": "The webhook event types this contract delivers. meeting.* mirror the meeting FSM (lifecycle.v1) plus the intake.v1 entry lifecycle (scheduled/updated/removed/waiting_for_room/not_sent); recording.* / transcription.* are post-meeting artifacts; export.* is the exporter's handoff result; webhook.test is an on-demand subscriber test send; bot.retry is reserved for the lobby-timeout retry, not yet emitted.",
+      "description": "The webhook event types this contract delivers. meeting.* mirror the meeting FSM (lifecycle.v1) plus the intake.v1 entry lifecycle (scheduled/updated/removed/waiting_for_room/not_sent); recording.* / transcription.* are post-meeting artifacts; export.* is the exporter's handoff result; webhook.test is an on-demand subscriber test send; bot.retry is sent when a bot fails while its meeting is on and a new bot will be sent on the same meeting (data.change.reason carries the failure reason).",
       "enum": [
         "meeting.started",
         "meeting.status_change",

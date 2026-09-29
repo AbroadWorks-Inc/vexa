@@ -10,7 +10,8 @@ Offline, on the in-memory fakes:
     workload-gone proof (``reconcile.prove_workload_gone``) and the runtime callback marking a
     waiting meeting's workload gone instead of driving a terminal;
   * a waiting meeting stopped or losing its last entry ends at once, with no leave command; its
-    ``bot_joins_at`` is the retry's ``due_at``; the reconcile sweep leaves it to the retry.
+    ``bot_joins_at`` is the retry's ``due_at`` (the ``intake.v1`` golden
+    ``Meeting.retry-pending``); the reconcile sweep leaves it to the retry.
 
 The Postgres wiring (the lifecycle write, ``fail_meeting``, the spawn port) is in
 ``test_bot_retry_pg.py``.
@@ -769,3 +770,64 @@ async def test_the_reconcile_sweep_leaves_a_waiting_meeting_to_the_retry():
         repo, runtime, post, stop_grace=0, active_grace=0, log=_Log()
     )
     assert posted == [] and runtime.deleted == []
+
+
+def test_the_intake_retry_golden_is_the_projection_of_a_waiting_meeting():
+    import json
+    from pathlib import Path
+
+    from meeting_api.intake.projection import project_meeting
+
+    rel = (
+        Path("meetings")
+        / "contracts"
+        / "intake.v1"
+        / "golden"
+        / "Meeting.retry-pending.json"
+    )
+    path = next(
+        p / rel for p in Path(__file__).resolve().parents if (p / rel).is_file()
+    )
+    meeting = {
+        "uuid": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+        "status": "requested",
+        "platform": "google_meet",
+        "platform_specific_id": "kxo-misr-avz",
+        "start_time": datetime(2026, 9, 29, 9, 1, 5),
+        "data": {
+            "title": "Weekly sync",
+            "constructed_meeting_url": GMEET,
+            "scheduled_at": "2026-09-29T09:00:00Z",
+            "auto_join_last_attempt": "2026-09-29T08:55:00Z",
+            "bot_retry": {
+                "reason": "left_alone",
+                "stage": None,
+                "message": "stopped (workload destroyed, confirmed by runtime)",
+                "after_session": "sess-1",
+                "workload": "mtg-11367-5c1d2e3f",
+                "at": "2026-09-29T09:12:00Z",
+                "due_at": "2026-09-29T09:13:00Z",
+                "proven_gone": True,
+            },
+        },
+    }
+    aw = {
+        "scheduled_end_at": datetime(2026, 9, 29, 9, 30, tzinfo=UTC),
+        "time_zone": "Asia/Kolkata",
+        "event_seq": 6,
+        "outcome_kind": None,
+        "export_state": None,
+    }
+    entries = [
+        {
+            "external_id": "google:3n5kq8example",
+            "source_user": "a@abroadworks.com",
+            "attendees": ["a@abroadworks.com", "b@abroadworks.com", "c@client.com"],
+            "series_id": None,
+            "metadata": None,
+            "state": "active",
+        }
+    ]
+    assert project_meeting(meeting, aw, entries, lead_s=300) == json.loads(
+        path.read_text()
+    )
