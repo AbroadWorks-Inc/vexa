@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from ..bot_spawn.ports import WorkloadUnknown
 from .machine import dominant_completion_reason
+
+if TYPE_CHECKING:
+    from ..sweeps.item_failures import ItemFailures
 
 
 async def _teardown_verdict(
@@ -337,7 +340,7 @@ async def reconcile_stale_nonterminal_sweep(
     untracked_grace: float = 600.0,
     untracked_since: Optional[dict] = None,
     finish_meeting: Optional[Callable[..., Awaitable[Any]]] = None,
-    item_failures: Optional[Any] = None,
+    item_failures: "ItemFailures",
 ) -> int:
     """The GENERAL backstop: any meeting hung in a non-terminal status whose bot is GONE (its row has
     been quiet — no status change, no segment/heartbeat — past the grace window) converges to a
@@ -360,7 +363,8 @@ async def reconcile_stale_nonterminal_sweep(
     if repo is None or not hasattr(repo, "list_stale_nonterminal"):
         return 0
     ended = await end_overdue_retries(
-        repo, untracked_grace=untracked_grace, log=log, finish_meeting=finish_meeting
+        repo, untracked_grace=untracked_grace, log=log, finish_meeting=finish_meeting,
+        failures=item_failures,
     )
     await retry_unproven_teardowns(
         repo, runtime, untracked_grace=untracked_grace, log=log, failures=item_failures
@@ -504,13 +508,13 @@ async def retry_unproven_teardowns(
     *,
     untracked_grace: float,
     log: Any,
-    failures: Optional[Any] = None,
+    failures: "ItemFailures",
     batch_size: Optional[int] = None,
 ) -> int:
     """§6.9 F-K2 with F-I's bound: every finished meeting whose unproven workload's delete wasn't
     confirmed (``data.unproven_teardown``, written by ``bot_spawn.request_bot``) is tried again,
-    a page of ``SWEEP_BATCH_SIZE`` at a time by meeting id, each through
-    ``sweeps.item_failures.run_item`` (item ``<meeting id>:<workload>``). The reap gate's own
+    a page of ``SWEEP_BATCH_SIZE`` at a time by meeting id (``sweeps.item_failures.run_pages``),
+    each through ``run_item`` (item ``<meeting id>:<workload>``). The reap gate's own
     evidence clears it: the runtime reports the workload terminal, a delete it confirms, or a 404
     that has lasted past ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) since it was
     recorded; a 404 inside the grace waits, and counts nothing (a missing or unreadable ``since``
@@ -521,18 +525,11 @@ async def retry_unproven_teardowns(
     if not hasattr(repo, "list_unproven_teardowns") or not hasattr(repo, "merge_meeting_data"):
         return 0
     from datetime import timezone
-    from functools import partial
 
     from ..bot_spawn.ports import UNPROVEN_TEARDOWN
     from ..intake.rules import as_utc
-    from ..sweeps.item_failures import (
-        InMemoryItemFailures,
-        run_item,
-        sweep_batch_size,
-        sweep_max_item_failures,
-    )
+    from ..sweeps.item_failures import run_pages, sweep_batch_size
 
-    tracker = failures or InMemoryItemFailures(max_failures=sweep_max_item_failures())
     limit = batch_size or sweep_batch_size()
     now = datetime.now(timezone.utc)
     cleared = 0
@@ -556,22 +553,21 @@ async def retry_unproven_teardowns(
         await repo.merge_meeting_data(row["id"], {UNPROVEN_TEARDOWN: None})
         cleared += 1
 
-    after: Optional[int] = None
     try:
-        while True:
-            page = await repo.list_unproven_teardowns(after=after, limit=limit)
-            items = {f"{row['id']}:{row.get('workload')}": row for row in page}
-            skip = await tracker.given_up(UNPROVEN_TEARDOWN_SWEEP, list(items))
-            for item_id, row in items.items():
-                if item_id not in skip:
-                    await run_item(tracker, UNPROVEN_TEARDOWN_SWEEP, item_id,
-                                   partial(one, row), user_id=row.get("user_id"))
-            if len(page) < limit:
-                break
-            after = page[-1]["id"]
+        await run_pages(
+            failures, UNPROVEN_TEARDOWN_SWEEP,
+            lambda after: repo.list_unproven_teardowns(after=after, limit=limit),
+            limit=limit, after_of=lambda row: row["id"],
+            item_id_of=lambda row: f"{row['id']}:{row.get('workload')}",
+            user_id_of=lambda row: row.get("user_id"), action=one,
+        )
     except Exception:  # noqa: BLE001 — best-effort; retried next sweep
         log.exception("nonterminal-reconcile: list_unproven_teardowns failed")
     return cleared
+
+
+#: The overdue-retry backstop's name in ``sweep_item_failures`` and ``aw_sweep_items_total``.
+OVERDUE_RETRY_SWEEP = "retry-overdue"
 
 
 async def end_overdue_retries(
@@ -579,54 +575,61 @@ async def end_overdue_retries(
     *,
     untracked_grace: float,
     log: Any,
+    failures: "ItemFailures",
     finish_meeting: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> int:
     """§6.9 F-K2's backstop: every meeting waiting for its next bot past its deadline
     (``intake.retry.deadline``: ``due_at`` + ``untracked_grace``) ends ``failed`` through
     ``repo.end_retry``, whatever the retry driver did (it may have given the item up), read a page
-    of ``SWEEP_BATCH_SIZE`` at a time by meeting id (§6.9 F-I). Before its
-    deadline a waiting meeting is left to the driver: ``list_stale_nonterminal`` never lists one.
-    Each one ended gets the meeting-level finish ``finish_meeting(meeting_id)`` (the app's).
-    Best-effort: never raises. Returns how many ended."""
+    of ``SWEEP_BATCH_SIZE`` at a time by meeting id, each through ``run_item`` under its own sweep
+    name (§6.9 F-I, ``sweeps.item_failures.run_pages``). Before its deadline a waiting meeting is
+    left to the driver: ``list_stale_nonterminal`` never lists one. Each one ended gets the
+    meeting-level finish ``finish_meeting(meeting_id)`` (the app's). Best-effort: never raises.
+    Returns how many ended."""
     if not hasattr(repo, "list_retry_meetings") or not hasattr(repo, "end_retry"):
         return 0
     from datetime import timezone
 
     from ..intake import retry
-    from ..sweeps.item_failures import sweep_batch_size
+    from ..sweeps.item_failures import run_pages, sweep_batch_size
 
     now = datetime.now(timezone.utc)
     page_size = sweep_batch_size()
     ended = 0
-    after: Optional[int] = None
-    while True:
-        try:
-            waiting = await repo.list_retry_meetings(after=after, limit=page_size)
-        except Exception:  # noqa: BLE001 — best-effort; retried next sweep
-            log.exception("nonterminal-reconcile: list_retry_meetings failed")
-            return ended
-        for row in waiting:
+
+    def overdue(rows: Any) -> list:
+        out = []
+        for row in rows:
             mark = retry.marker(row.get("data"))
             limit = None if mark is None else retry.deadline(mark, untracked_grace)
-            if mark is None or limit is None or now < limit:
-                continue
-            code, message = retry.overdue(mark, limit)
-            try:
-                if await repo.end_retry(
-                    meeting_id=row["id"], change_reason=code, message=message
-                ) is None:
-                    continue  # the driver or a stop ended it between the listing and the lock
-                ended += 1
-                log.warning(
-                    "nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message
-                )
-                if finish_meeting is not None:
-                    await finish_meeting(row["id"])
-            except Exception:  # noqa: BLE001 — best-effort; retried next sweep
-                log.exception("nonterminal-reconcile: end_retry failed for meeting %s", row["id"])
-        if len(waiting) < page_size:
-            return ended
-        after = waiting[-1]["id"]
+            if mark is not None and limit is not None and now >= limit:
+                out.append(row)
+        return out
+
+    async def end(row: dict) -> None:
+        nonlocal ended
+        mark = retry.marker(row.get("data")) or {}
+        code, message = retry.overdue(mark, retry.deadline(mark, untracked_grace) or now)
+        if await repo.end_retry(
+            meeting_id=row["id"], change_reason=code, message=message
+        ) is None:
+            return  # the driver or a stop ended it between the listing and the lock
+        ended += 1
+        log.warning("nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message)
+        if finish_meeting is not None:
+            await finish_meeting(row["id"])
+
+    try:
+        await run_pages(
+            failures, OVERDUE_RETRY_SWEEP,
+            lambda after: repo.list_retry_meetings(after=after, limit=page_size),
+            limit=page_size, after_of=lambda row: row["id"],
+            item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row.get("user_id"),
+            action=end, select=overdue,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; retried next sweep
+        log.exception("nonterminal-reconcile: list_retry_meetings failed")
+    return ended
 
 
 def _log_orphan_kill_failed(meeting_id, workload_id, err, *, unconfirmed: bool = False) -> None:

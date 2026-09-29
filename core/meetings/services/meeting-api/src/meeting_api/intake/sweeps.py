@@ -27,10 +27,10 @@ detail and message:
   * else ``room_busy`` when ``meeting.waiting_for_room`` went out;
   * else ``ended_before_sent``.
 
-The overdue read is paged (``SWEEP_BATCH_SIZE``, id order) and every page is worked in the tick.
-Each meeting runs through ``sweeps.item_failures.run_item`` (§6.9 F-I): one meeting's failure is
-logged with its id and stack, counted, and never stops the rest; after ``SWEEP_MAX_ITEM_FAILURES``
-the sweep gives it up and skips it.
+The overdue read is paged (``SWEEP_BATCH_SIZE``, id order) and every page is worked in the tick
+(``sweeps.item_failures.run_pages``). Each meeting runs through ``run_item`` (§6.9 F-I): one
+meeting's failure is logged with its id and stack, counted, and never stops the rest; after
+``SWEEP_MAX_ITEM_FAILURES`` the sweep gives it up and skips it.
 
 ``OutboxOnly`` is the ``EventPublisher`` of the production ``IntakeService`` the scheduler merges
 through (and the ``/v2`` routes use): events stay in ``webhook_outbox`` for the outbox
@@ -44,7 +44,7 @@ from datetime import datetime
 from typing import Literal, Mapping, Optional, Sequence
 
 from ..obs import log_event
-from ..sweeps.item_failures import ItemFailures, run_item, sweep_batch_size
+from ..sweeps.item_failures import ItemFailures, run_pages, sweep_batch_size
 from .ports import EventPublisher, IntakeStore, MeetingView, Room
 from .rules import is_live, is_overdue
 from .service import is_merge_target
@@ -154,24 +154,21 @@ async def not_sent_tick(
     many ended."""
     limit = batch_size or sweep_batch_size()
     ended: list[int] = []
-    after: Optional[int] = None
-    while True:
-        page = await store.overdue_meetings(now, after=after, limit=limit)
-        if not page:
-            break
-        after = page[-1].id
-        skip = await failures.given_up(NOT_SENT, [str(v.id) for v in page])
-        for view in page:
-            if str(view.id) in skip:
-                continue
 
-            async def end(view: MeetingView = view) -> None:
-                if await _end_not_sent(store, publisher, view, now=now):
-                    ended.append(view.id)
+    async def end(view: MeetingView) -> None:
+        if await _end_not_sent(store, publisher, view, now=now):
+            ended.append(view.id)
 
-            await run_item(failures, NOT_SENT, str(view.id), end, user_id=view.user_id)
-        if len(page) < limit:
-            break
+    await run_pages(
+        failures,
+        NOT_SENT,
+        lambda after: store.overdue_meetings(now, after=after, limit=limit),
+        limit=limit,
+        after_of=lambda view: view.id,
+        item_id_of=lambda view: str(view.id),
+        user_id_of=lambda view: view.user_id,
+        action=end,
+    )
     return len(ended)
 
 

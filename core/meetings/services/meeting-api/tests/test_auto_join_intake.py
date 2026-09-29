@@ -674,7 +674,10 @@ class Pg:
     async def tick(self, now: datetime, **kw: Any) -> dict:
         from meeting_api.bot_spawn.auto_join import auto_join_tick
 
+        from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
         kw.setdefault("fetch_bot_context", _ctx)
+        kw.setdefault("item_failures", InMemoryItemFailures(max_failures=5))
         return await auto_join_tick(
             self.repo,
             kw.pop("runtime", self.runtime),

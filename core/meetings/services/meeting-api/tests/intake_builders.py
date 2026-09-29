@@ -222,8 +222,15 @@ def make_harness(
 def sweep_intake(**tick_kw: Any) -> dict[str, Any]:
     """``auto_join_tick``'s intake arguments over a fresh in-memory harness, for a test that only
     exercises entry-less rows (the harness never holds them)."""
+    from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
     h = make_harness()
-    return {"store": h.store, "intake": h.service, **tick_kw}
+    return {
+        "store": h.store,
+        "intake": h.service,
+        "item_failures": InMemoryItemFailures(max_failures=5),
+        **tick_kw,
+    }
 
 
 def send_clock(at: datetime) -> Any:

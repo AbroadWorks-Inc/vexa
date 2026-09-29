@@ -66,11 +66,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import partial
-from typing import Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from ..metrics import autojoin_lag
 from ..obs import log_event
+
+if TYPE_CHECKING:
+    from ..sweeps.item_failures import ItemFailures
 
 # Sweep cadence/window env vocabulary (config.v1: all optional, sane defaults).
 # 120s (#1208): the bot must be STANDING IN THE LOBBY when the meeting starts, not setting out then
@@ -255,7 +257,7 @@ async def auto_join_tick(
     token_secret: Optional[str] = None,
     redis_url: Optional[str] = None,
     allow_uncapped: bool = False,
-    item_failures=None,
+    item_failures: "ItemFailures",
     batch_size: Optional[int] = None,
     untracked_grace: float = 600.0,
     finish_meeting: Optional[Callable[..., Awaitable[None]]] = None,
@@ -289,8 +291,8 @@ async def auto_join_tick(
     row's frame to ``u:{user}:meetings`` after an error stamp so the terminal refreshes.
 
     §6.9 F-I: the due read is paged (``batch_size``, else ``SWEEP_BATCH_SIZE``; meeting time then
-    id) and every page is worked in the tick. Each row runs through
-    ``sweeps.item_failures.run_item`` over ``item_failures`` (the entrypoint's Postgres one): a row
+    id) and every page is worked in the tick (``sweeps.item_failures.run_pages``). Each row runs
+    through ``run_item`` over ``item_failures`` (the entrypoint's, shared by every sweep): a row
     that raises fails alone, logged with its id and stack and counted, and after
     ``SWEEP_MAX_ITEM_FAILURES`` it is given up and skipped.
 
@@ -318,12 +320,7 @@ async def auto_join_tick(
     )
     from ..intake.sweeps import _publish as publish_events
     from ..intake.sweeps import check_room
-    from ..sweeps.item_failures import (
-        InMemoryItemFailures,
-        run_item,
-        sweep_batch_size,
-        sweep_max_item_failures,
-    )
+    from ..sweeps.item_failures import run_pages, sweep_batch_size
     from .ports import TranscriptionNotConfigured
 
     now = now or datetime.now(timezone.utc)
@@ -633,33 +630,26 @@ async def auto_join_tick(
                                        outcome.message or "the bot was not sent")
 
     limit = batch_size or sweep_batch_size()
-    failures = item_failures or InMemoryItemFailures(max_failures=sweep_max_item_failures())
-    after = None
-    while True:
-        rows = await repo.list_due_meetings(now, lead_s, after=after, limit=limit)
+
+    def _due(rows):
         due = due_rows(rows, now=now, lead_s=lead_s, grace_s=grace_s,
                        retry_backoff_s=retry_backoff_s)
         counters["due"] += len(due)
-        skip = await failures.given_up(AUTO_JOIN, [str(row["id"]) for row in due])
-        for row in due:
-            if str(row["id"]) not in skip:
-                await run_item(failures, AUTO_JOIN, str(row["id"]),
-                               partial(_one, row), user_id=row["user_id"])
-        if len(rows) < limit:
-            break
-        after = (rows[-1]["event_time"], rows[-1]["id"])
+        return due
 
+    await run_pages(
+        item_failures, AUTO_JOIN,
+        lambda after: repo.list_due_meetings(now, lead_s, after=after, limit=limit),
+        limit=limit, after_of=lambda row: (row["event_time"], row["id"]),
+        item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row["user_id"],
+        action=_one, select=_due,
+    )
     if hasattr(repo, "list_retry_meetings"):
-        retry_after: Optional[int] = None
-        while True:
-            waiting = await repo.list_retry_meetings(after=retry_after, limit=limit)
-            skip = await failures.given_up(AUTO_JOIN, [str(row["id"]) for row in waiting])
-            for row in waiting:
-                if str(row["id"]) not in skip:
-                    await run_item(failures, AUTO_JOIN, str(row["id"]),
-                                   partial(_retry_one, row), user_id=row["user_id"])
-            if len(waiting) < limit:
-                break
-            retry_after = waiting[-1]["id"]
-
+        await run_pages(
+            item_failures, AUTO_JOIN,
+            lambda after: repo.list_retry_meetings(after=after, limit=limit),
+            limit=limit, after_of=lambda row: row["id"],
+            item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row["user_id"],
+            action=_retry_one,
+        )
     return counters

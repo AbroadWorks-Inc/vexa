@@ -670,6 +670,7 @@ from meeting_api.lifecycle.reconcile import (  # noqa: E402
     reconcile_stale_nonterminal_sweep,
     synthesize_terminal_for_dead_workload,
 )
+from meeting_api.sweeps.item_failures import InMemoryItemFailures  # noqa: E402
 
 
 def _run_sweep(client: TestClient, repo: InMemoryMeetingRepo):
@@ -681,6 +682,7 @@ def _run_sweep(client: TestClient, repo: InMemoryMeetingRepo):
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, None, _post, stop_grace=45.0, active_grace=300.0,
         log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     ))
 
 

@@ -42,6 +42,7 @@ from meeting_api.intake.outbox import (
     SubscriptionNotFound,
     fan_out,
 )
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
 from meeting_api.webhooks.secret_box import SecretBox
 from meeting_api.webhooks.sender import PostgresDeliveryStore, WebhookSender
 from meeting_api.webhooks.subscriptions import Subscription, SubscriptionsUnavailable
@@ -165,6 +166,12 @@ async def pg():
     await eng.dispose()
 
 
+def _publisher(session_factory: Any, source: Any, **kw: Any) -> OutboxPublisher:
+    """An ``OutboxPublisher`` with its own in-memory give-up record unless ``failures`` is given."""
+    kw.setdefault("failures", InMemoryItemFailures(max_failures=5))
+    return OutboxPublisher(session_factory, source, **kw)
+
+
 def sessions(engine: Any) -> Any:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -284,7 +291,7 @@ async def test_the_publisher_fans_out_to_matching_active_subscribers(pg):
     completed = await seed_event(pg, m1, "meeting.completed")
     theirs = await seed_event(pg, m2, "meeting.completed")
 
-    result = await OutboxPublisher(sessions(pg), source, clock=Clock()).run_once()
+    result = await _publisher(sessions(pg), source, clock=Clock()).run_once()
 
     assert await deliveries(pg) == {
         (status_change, everything.id, 1, "pending"),
@@ -302,7 +309,7 @@ async def test_the_publisher_fans_out_to_matching_active_subscribers(pg):
     assert due == T0
     # published rows are never read again
     assert (
-        await OutboxPublisher(sessions(pg), source, clock=Clock()).run_once()
+        await _publisher(sessions(pg), source, clock=Clock()).run_once()
     ).published == 0
 
 
@@ -341,7 +348,7 @@ async def test_a_crash_before_commit_then_a_redo_creates_no_duplicates(pg):
 
     # the page's one transaction and each row's own fail: all rolled back, nothing published
     crashing = CrashingSessions(pg, fail=4)
-    assert (await OutboxPublisher(crashing, source).run_once()).published == 0
+    assert (await _publisher(crashing, source).run_once()).published == 0
     assert await deliveries(pg) == set()
     assert await unpublished(pg) == set(events)
 
@@ -354,14 +361,14 @@ async def test_a_crash_before_commit_then_a_redo_creates_no_duplicates(pg):
         s=a.id,
         t=T0,
     )
-    result = await OutboxPublisher(crashing, source).run_once()
+    result = await _publisher(crashing, source).run_once()
     assert result.published == 3
     got = await deliveries(pg)
     assert len(got) == 6
     assert (events[0], a.id, 1, "delivered") in got
     assert {(e, s.id) for e in events for s in (a, b)} == {(d[0], d[1]) for d in got}
     assert await unpublished(pg) == set()
-    assert (await OutboxPublisher(crashing, source).run_once()).published == 0
+    assert (await _publisher(crashing, source).run_once()).published == 0
     assert len(await deliveries(pg)) == 6
 
 
@@ -397,7 +404,7 @@ async def test_the_rows_are_read_in_pages_oldest_first_and_all_published(pg):
 
     event.listen(pg.sync_engine, "before_cursor_execute", grab)
     try:
-        result = await OutboxPublisher(sessions(pg), source, batch_size=200).run_once()
+        result = await _publisher(sessions(pg), source, batch_size=200).run_once()
     finally:
         event.remove(pg.sync_engine, "before_cursor_execute", grab)
     assert result.published == 501
@@ -409,8 +416,6 @@ async def test_the_rows_are_read_in_pages_oldest_first_and_all_published(pg):
 async def test_a_poison_row_is_given_up_and_never_holds_back_the_rest(pg, monkeypatch):
     """A row whose publish keeps failing fails alone (its page is published row by row); after
     ``SWEEP_MAX_ITEM_FAILURES`` it is read past."""
-    from meeting_api.sweeps.item_failures import InMemoryItemFailures
-
     source = StaticSubscriptions()
     await seed_subscription(pg, source, 1)
     meeting = await seed_meeting(pg, 1)
@@ -426,7 +431,7 @@ async def test_a_poison_row_is_given_up_and_never_holds_back_the_rest(pg, monkey
 
     monkeypatch.setattr(OutboxPublisher, "_publish", publish)
     failures = InMemoryItemFailures(max_failures=2)
-    publisher = OutboxPublisher(sessions(pg), source, failures=failures)
+    publisher = _publisher(sessions(pg), source, failures=failures)
     assert (await publisher.run_once()).published == 1
     assert await unpublished(pg) == {poison}
     await publisher.run_once()
@@ -465,7 +470,7 @@ async def test_a_full_batch_to_nine_subscribers_publishes_in_one_tick(pg):
     subs = [await seed_subscription(pg, source, 1) for _ in range(9)]
     events = await seed_many(pg, await seed_meeting(pg, 1), 500)
 
-    result = await OutboxPublisher(sessions(pg), source, batch_size=500).run_once()
+    result = await _publisher(sessions(pg), source, batch_size=500).run_once()
 
     assert (result.published, result.deliveries) == (500, 4500)
     assert await unpublished(pg) == set()
@@ -475,7 +480,7 @@ async def test_a_full_batch_to_nine_subscribers_publishes_in_one_tick(pg):
 
     # a redo of the same batch (a crash after the inserts, before the publish) adds nothing
     await execute(pg, "UPDATE webhook_outbox SET published_at = NULL")
-    again = await OutboxPublisher(sessions(pg), source, batch_size=500).run_once()
+    again = await _publisher(sessions(pg), source, batch_size=500).run_once()
     assert (again.published, again.deliveries) == (500, 0)
     assert len(await deliveries(pg)) == 4500
 
@@ -489,13 +494,13 @@ async def test_an_account_whose_subscriptions_cannot_be_read_waits(pg):
     going = await seed_event(pg, m2, "meeting.updated")
     source.unavailable.add(1)
 
-    result = await OutboxPublisher(sessions(pg), source).run_once()
+    result = await _publisher(sessions(pg), source).run_once()
 
     assert (result.published, result.deferred) == (1, 1)
     assert await unpublished(pg) == {waiting}
     assert await deliveries(pg) == {(going, theirs.id, 2, "pending")}
     source.unavailable.clear()
-    assert (await OutboxPublisher(sessions(pg), source).run_once()).published == 1
+    assert (await _publisher(sessions(pg), source).run_once()).published == 1
     assert await unpublished(pg) == set()
 
 
@@ -513,7 +518,7 @@ async def test_one_accounts_failing_read_never_stalls_the_others(pg):
     ]
     source.unavailable.add(1)
     clock = Mono()
-    publisher = OutboxPublisher(sessions(pg), source, monotonic=clock)
+    publisher = _publisher(sessions(pg), source, monotonic=clock)
 
     result = await publisher.run_once()
 
@@ -552,7 +557,7 @@ async def test_a_pause_committed_first_blocks_new_deliveries(pg):
         ),
         {"id": s.id},
     )
-    publishing = asyncio.create_task(OutboxPublisher(sessions(pg), source).run_once())
+    publishing = asyncio.create_task(_publisher(sessions(pg), source).run_once())
     await asyncio.sleep(0.3)
     assert not publishing.done(), "the publisher must wait for the pause's row lock"
     await conn.execute(
@@ -583,7 +588,7 @@ async def test_a_pause_that_waits_for_the_publisher_cancels_what_it_inserted(pg)
 
     held = CrashingSessions(pg)
     held.gate = asyncio.Event()
-    publishing = asyncio.create_task(OutboxPublisher(held, source).run_once())
+    publishing = asyncio.create_task(_publisher(held, source).run_once())
     await asyncio.wait_for(held.reached.wait(), 5)  # inserted, not yet committed
 
     async def pause() -> None:
@@ -625,7 +630,7 @@ async def test_status_writer_events_reach_the_subscriber_byte_for_byte(pg, monke
         )
         await db.commit()
 
-    await OutboxPublisher(sessions(pg), source).run_once()
+    await _publisher(sessions(pg), source).run_once()
     posted: list[bytes] = []
 
     class Receiver:
@@ -701,7 +706,7 @@ async def test_webhook_test_goes_to_one_subscriber_and_is_never_replayed(
     assert envelope["data"] == {"subscription_id": target.id}
     assert await deliveries(pg) == {(event_id, target.id, 1, "pending")}
 
-    assert (await OutboxPublisher(sessions(pg), source).run_once()).published == 0
+    assert (await _publisher(sessions(pg), source).run_once()).published == 0
     assert await deliveries(pg) == {(event_id, target.id, 1, "pending")}
 
     posted: list[tuple[str, bytes]] = []
@@ -835,7 +840,7 @@ async def test_the_publisher_never_touches_redis(pg, monkeypatch):
     source = StaticSubscriptions()
     await seed_subscription(pg, source, 1)
     await seed_event(pg, await seed_meeting(pg, 1), "meeting.updated")
-    assert (await OutboxPublisher(sessions(pg), source).run_once()).deliveries == 1
+    assert (await _publisher(sessions(pg), source).run_once()).deliveries == 1
     await PostgresWebhookTests(sessions(pg)).queue_test(1, source.by_user[1][0].id)
 
 

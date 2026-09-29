@@ -624,6 +624,7 @@ def test_sink_history_only_grows_on_real_advance():
 # persist → webhook → ws publish path is exercised end-to-end, no while/sleep wrapper.
 
 from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep  # noqa: E402
+from meeting_api.sweeps.item_failures import InMemoryItemFailures  # noqa: E402
 
 
 def _set_updated_now(repo: InMemoryMeetingRepo, meeting_id: int) -> None:
@@ -643,7 +644,8 @@ def _run_general_sweep(client: TestClient, repo: InMemoryMeetingRepo, *, stop_gr
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, None, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"), **extra,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
 
 
@@ -738,7 +740,8 @@ def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grac
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, runtime, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"), **extra,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
 
 
@@ -889,6 +892,7 @@ def _run_general_sweep_esc(client, repo, runtime, tracker, *, untracked_grace,
         repo, runtime, _post_cb, stop_grace=stop_grace, active_grace=active_grace,
         log=logging.getLogger("test.reconcile"),
         untracked_grace=untracked_grace, untracked_since=tracker,
+        item_failures=InMemoryItemFailures(max_failures=5),
     ))
 
 

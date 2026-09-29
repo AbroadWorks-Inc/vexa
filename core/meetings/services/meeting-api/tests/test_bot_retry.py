@@ -31,6 +31,7 @@ from meeting_api.intake.ports import Room
 from meeting_api.intake.rules import Plan
 from meeting_api.intake.status import Outcome
 from meeting_api.intake.validation import parse_entry
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
 
 UTC = timezone.utc
 USER = 1
@@ -888,7 +889,8 @@ async def test_the_reconcile_sweep_leaves_a_waiting_meeting_to_the_retry():
 
     runtime = FakeRuntimeClient(workloads={"mtg-5-old": {"state": "destroyed"}})
     await reconcile_stale_nonterminal_sweep(
-        repo, runtime, post, stop_grace=0, active_grace=0, log=_Log()
+        repo, runtime, post, stop_grace=0, active_grace=0, log=_Log(),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert posted == [] and runtime.deleted == []
     assert repo._meetings[5]["status"] == "requested"
@@ -916,6 +918,7 @@ async def test_the_reconcile_sweep_ends_a_waiting_meeting_past_its_deadline():
         active_grace=0,
         log=_Log(),
         untracked_grace=600,
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     row = repo._meetings[5]
     assert (row["status"], row["data"]["completion_reason"]) == (
@@ -1017,7 +1020,8 @@ async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
     repo = overdue_repo()
     assert (
         await end_overdue_retries(
-            repo, untracked_grace=600, log=_Log(), finish_meeting=finish
+            repo, untracked_grace=600, log=_Log(), finish_meeting=finish,
+            failures=InMemoryItemFailures(max_failures=5),
         )
         == 1
     )
@@ -1032,7 +1036,8 @@ async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
     finished.clear()
     assert (
         await end_overdue_retries(
-            raced, untracked_grace=600, log=_Log(), finish_meeting=finish
+            raced, untracked_grace=600, log=_Log(), finish_meeting=finish,
+            failures=InMemoryItemFailures(max_failures=5),
         )
         == 0
     )
@@ -1077,7 +1082,6 @@ async def test_a_pending_teardown_without_a_readable_since_is_bounded(since):
     given up, rather than waiting forever."""
     from meeting_api.bot_spawn.fakes import FakeRuntimeClient
     from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
-    from meeting_api.sweeps.item_failures import InMemoryItemFailures
 
     repo = _waiting_repo(proven=True, status="failed")
     pending = (
@@ -1115,6 +1119,32 @@ async def test_the_sweep_reads_the_waiting_meetings_in_pages(monkeypatch):
         return await real(**kw)
 
     repo.list_retry_meetings = paged
-    assert await end_overdue_retries(repo, untracked_grace=600, log=_Log()) == 2
+    assert await end_overdue_retries(
+        repo, untracked_grace=600, log=_Log(), failures=InMemoryItemFailures(max_failures=5)
+    ) == 2
     assert reads[0] == (None, 1) and all(limit == 1 for _, limit in reads)
     assert [repo._meetings[i]["status"] for i in (5, 6)] == ["failed", "failed"]
+
+
+async def test_a_waiting_meeting_the_sweep_cannot_end_is_given_up():
+    """§6.9 F-I: the backstop's item that keeps failing is counted and given up under its own
+    sweep name, never retried forever; the retry driver's give-ups don't reach it."""
+    from meeting_api.lifecycle.reconcile import OVERDUE_RETRY_SWEEP, end_overdue_retries
+
+    repo = _waiting_repo(proven=False)
+    late = datetime.now(UTC) - timedelta(seconds=601)
+    repo._meetings[5]["data"]["bot_retry"]["due_at"] = late.isoformat()
+    tries: list[int] = []
+
+    async def broken(**kw):
+        tries.append(kw["meeting_id"])
+        raise RuntimeError("the database went away")
+
+    repo.end_retry = broken
+    failures = InMemoryItemFailures(max_failures=2)
+    await failures.failed("auto-join", "5", RuntimeError("the driver gave it up"))
+    await failures.failed("auto-join", "5", RuntimeError("the driver gave it up"))
+    for _ in range(3):
+        await end_overdue_retries(repo, untracked_grace=600, log=_Log(), failures=failures)
+    assert tries == [5, 5]
+    assert await failures.given_up(OVERDUE_RETRY_SWEEP, ["5"]) == {"5"}

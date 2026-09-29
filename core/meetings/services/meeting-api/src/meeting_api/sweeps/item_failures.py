@@ -1,7 +1,7 @@
 """Bounded work for the intake sweeps (§6.9 F-I): pages, and a bounded retry per item.
 
 Every intake sweep reads its work in pages of at most ``SWEEP_BATCH_SIZE`` (200) items, in a stable
-order, and runs each item through ``run_item``. An item that raises is recorded against its sweep
+order (``run_pages``, the one paged loop), and runs each item through ``run_item``. An item that raises is recorded against its sweep
 (``ItemFailures.failed``), logged with its id, error and stack, and counted in
 ``aw_sweep_items_total{sweep,result}`` (``failed``); the ``SWEEP_MAX_ITEM_FAILURES``-th (5) failure
 gives it up (``given_up``, logged at error level), and the sweep skips it from then on
@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import os
 import traceback
-from typing import Any, Awaitable, Callable, Collection, Protocol
+from functools import partial
+from typing import Any, Awaitable, Callable, Collection, Protocol, Sequence, TypeVar
 
 from ..metrics import sweep_item
 from ..obs import log_event
@@ -30,6 +31,7 @@ __all__ = [
     "ItemFailures",
     "PostgresItemFailures",
     "run_item",
+    "run_pages",
     "sweep_batch_size",
     "sweep_max_item_failures",
 ]
@@ -100,6 +102,50 @@ async def run_item(
         )
         sweep_item(sweep, result)
         return False
+
+
+T = TypeVar("T")
+
+
+def _every(page: Sequence[T]) -> Sequence[T]:
+    return page
+
+
+async def run_pages(
+    failures: ItemFailures,
+    sweep: str,
+    read_page: Callable[[Any], Awaitable[Sequence[T]]],
+    *,
+    limit: int,
+    after_of: Callable[[T], Any],
+    item_id_of: Callable[[T], str],
+    user_id_of: Callable[[T], Any],
+    action: Callable[[T], Awaitable[Any]],
+    select: Callable[[Sequence[T]], Sequence[T]] = _every,
+) -> None:
+    """Run ``sweep`` over all its work, a page at a time: ``read_page(after)`` reads at most
+    ``limit`` items in a stable order after the cursor ``after`` (``None`` first, then
+    ``after_of`` of the page's last item), until a short page. Each item of ``select(page)`` the
+    sweep hasn't given up runs ``action(item)`` through ``run_item`` as ``item_id_of(item)``. A
+    failing read raises."""
+    after: Any = None
+    while True:
+        page = await read_page(after)
+        work = select(page)
+        skip = await failures.given_up(sweep, [item_id_of(item) for item in work])
+        for item in work:
+            item_id = item_id_of(item)
+            if item_id not in skip:
+                await run_item(
+                    failures,
+                    sweep,
+                    item_id,
+                    partial(action, item),
+                    user_id=user_id_of(item),
+                )
+        if len(page) < limit:
+            return
+        after = after_of(page[-1])
 
 
 class InMemoryItemFailures:

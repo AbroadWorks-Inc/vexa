@@ -55,13 +55,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence
 
 from ..obs import log_event
-from ..sweeps.item_failures import (
-    InMemoryItemFailures,
-    ItemFailures,
-    run_item,
-    sweep_batch_size,
-    sweep_max_item_failures,
-)
+from ..sweeps.item_failures import ItemFailures, run_item, sweep_batch_size
 from ..webhooks.subscriptions import (
     Subscription,
     SubscriptionSource,
@@ -156,17 +150,15 @@ class OutboxPublisher:
         session_factory: Any,
         subscriptions: SubscriptionSource,
         *,
+        failures: ItemFailures,
         batch_size: Optional[int] = None,
-        failures: Optional[ItemFailures] = None,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session_factory = session_factory
         self._subscriptions = subscriptions
         self._batch_size = batch_size or sweep_batch_size()
-        self._failures = failures or InMemoryItemFailures(
-            max_failures=sweep_max_item_failures()
-        )
+        self._failures = failures
         self._clock = clock
         self._monotonic = monotonic
         self._reads = asyncio.Semaphore(READ_CONCURRENCY)

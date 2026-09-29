@@ -35,6 +35,7 @@ import pytest
 
 from intake_builders import GMEET, ZOOM, entry_body, instant_body, make_settings
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEETING_API_TEST_DATABASE_URL"),
@@ -200,6 +201,7 @@ class Pg:
             redis_url="redis://r",
             untracked_grace=untracked_grace,
             finish_meeting=finish_meeting,
+            item_failures=InMemoryItemFailures(max_failures=5),
         )
 
     async def sent(self, *, status: str = "active", **kw: Any) -> tuple[int, str]:
@@ -1108,6 +1110,7 @@ async def test_pg_the_reconcile_sweep_ends_a_waiting_meeting_the_driver_gave_up(
         active_grace=300,
         log=Log(),
         untracked_grace=600,
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert (await pg.row(mid))["status"] == "requested"  # before its deadline
     await pg.execute(
@@ -1123,6 +1126,7 @@ async def test_pg_the_reconcile_sweep_ends_a_waiting_meeting_the_driver_gave_up(
         active_grace=300,
         log=Log(),
         untracked_grace=600,
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     row = await pg.row(mid)
     assert (row["status"], row["data"]["completion_reason"]) == (
@@ -1235,6 +1239,7 @@ async def test_pg_a_waiting_meeting_the_sweep_ends_is_finished_like_any_end(pg):
         log=Log(),
         untracked_grace=600,
         finish_meeting=app.state.finish_meeting,
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert (await pg.row(mid))["status"] == "failed"
     assert sink.events == ["bot.failed"] and finalized == [mid]
