@@ -665,15 +665,16 @@ class _Log:
 async def _proven(runtime, workload="w-1", *, failed_s_ago=60.0, grace=600.0) -> bool:
     from meeting_api.lifecycle.reconcile import prove_workload_gone
 
-    return await prove_workload_gone(
+    verdict, _why = await prove_workload_gone(
         runtime,
         workload,
         meeting_id=5,
-        failed_at=NOW - timedelta(seconds=failed_s_ago),
+        since=NOW - timedelta(seconds=failed_s_ago),
         now=NOW,
         untracked_grace=grace,
         log=_Log(),
     )
+    return verdict == "proven"
 
 
 async def test_a_workload_the_kernel_reports_terminal_is_gone():

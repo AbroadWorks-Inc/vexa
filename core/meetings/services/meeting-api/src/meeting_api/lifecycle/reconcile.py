@@ -157,28 +157,34 @@ async def prove_workload_gone(
     workload_id: Optional[str],
     *,
     meeting_id: Any,
-    failed_at: Optional[datetime],
+    since: Optional[datetime],
     now: datetime,
     untracked_grace: float,
     log: Any,
-) -> bool:
+) -> tuple[str, str]:
     """§6.9 F-K2: whether a failed bot's workload is proven gone, so a new bot may go to its
-    meeting. The reap gate's own evidence: ``gone`` (the kernel reports it terminal) is proof; an
-    ``alive`` workload is torn down and proof only once the kernel confirms the delete; a 404
-    (``untracked``) counts only once ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) has
-    passed since the failure (``failed_at``); anything else (no runtime, a probe error, no workload
-    id to ask about) is not proof."""
-    if not workload_id:
-        return False
+    meeting or its pending teardown is done. The reap gate's own evidence: ``gone`` (the kernel
+    reports it terminal) is proof; an ``alive`` workload is torn down and proof only once the
+    kernel confirms the delete; a 404 (``untracked``) counts only once ``untracked_grace``
+    (``MEETING_UNTRACKED_GRACE_SEC``) has passed ``since`` the workload was recorded, and waits
+    inside it; anything else (no runtime, a probe error, no workload id to ask about, a 404 with
+    no ``since``) is not proof. Returns ``("proven", "")``, ``("wait", "")`` or
+    ``("not_proven", why)``."""
     probe, _info = await _probe_bot_workload(runtime, workload_id, log=log)
     if probe == "gone":
-        return True
+        return "proven", ""
     if probe == "alive":
         verdict = await _teardown_verdict(runtime, workload_id, meeting_id=meeting_id, log=log)
-        return verdict == "confirmed"
+        if verdict == "confirmed":
+            return "proven", ""
+        return "not_proven", f"delete of {workload_id} not confirmed ({verdict})"
     if probe == "untracked":
-        return failed_at is not None and (now - failed_at).total_seconds() > untracked_grace
-    return False
+        if since is None:
+            return "not_proven", f"no since recorded for {workload_id}: grace unknown"
+        if (now - since).total_seconds() <= untracked_grace:
+            return "wait", ""  # the kernel doesn't know it yet: not evidence, not a failure
+        return "proven", ""
+    return "not_proven", f"no runtime answer about {workload_id} ({probe})"
 
 
 def _workload_evidence(bot_container_id: Optional[str], info: Optional[dict]) -> str:
@@ -536,20 +542,18 @@ async def retry_unproven_teardowns(
 
     async def one(row: dict) -> None:
         nonlocal cleared
-        workload = row.get("workload")
-        probe, _info = await _probe_bot_workload(runtime, workload, log=log)
-        if probe == "untracked":
-            since = as_utc(row.get("since"))  # an unparsable stamp raises: one failure
-            if since is None:
-                raise UnprovenTeardownFailed(f"no since recorded for {workload}: grace unknown")
-            if (now - since).total_seconds() <= untracked_grace:
-                return  # the kernel doesn't know it yet: not evidence, not a failure
-        elif probe == "alive":
-            verdict = await _teardown_verdict(runtime, workload, meeting_id=row["id"], log=log)
-            if verdict != "confirmed":
-                raise UnprovenTeardownFailed(f"delete of {workload} not confirmed ({verdict})")
-        elif probe != "gone":
-            raise UnprovenTeardownFailed(f"no runtime answer about {workload} ({probe})")
+        try:
+            since = as_utc(row.get("since"))
+        except (TypeError, ValueError, AttributeError):
+            since = None  # unreadable: a 404 can't wait out the grace from it
+        verdict, why = await prove_workload_gone(
+            runtime, row.get("workload"), meeting_id=row["id"], since=since, now=now,
+            untracked_grace=untracked_grace, log=log,
+        )
+        if verdict == "wait":
+            return
+        if verdict != "proven":
+            raise UnprovenTeardownFailed(why)
         await repo.merge_meeting_data(row["id"], {UNPROVEN_TEARDOWN: None})
         cleared += 1
 

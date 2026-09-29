@@ -581,12 +581,13 @@ async def auto_join_tick(
         if due is not None and now < due:
             return
         if not mark.get("proven_gone"):
-            if not await prove_workload_gone(
+            verdict, _why = await prove_workload_gone(
                 runtime, mark.get("workload"), meeting_id=row["id"],
-                failed_at=_parse_iso(mark.get("at")), now=now,
+                since=_parse_iso(mark.get("at")), now=now,
                 untracked_grace=untracked_grace,
                 log=logging.getLogger("meeting_api.auto_join.retry"),
-            ):
+            )
+            if verdict != "proven":
                 limit = retry.deadline(mark, untracked_grace)
                 if limit is not None and now >= limit:
                     code, message = retry.overdue(mark, limit)
