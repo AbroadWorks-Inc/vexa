@@ -197,6 +197,57 @@ def _entry_view(row: Any) -> EntryView:
     return EntryView.from_row(row_mapping(row))
 
 
+async def load_views(
+    db: AsyncSession, meetings: Sequence[Any], *, populate_existing: bool
+) -> list[MeetingView]:
+    """The meetings as views: each row with its ``meeting_aw_state`` row and all its entries.
+    ``populate_existing`` refreshes rows the session already holds (a transaction that has
+    written them)."""
+    from sqlalchemy import select
+
+    from ..sessions.models import MeetingAwState, MeetingEntry
+
+    ids = [m.id for m in meetings]
+    if not ids:
+        return []
+
+    options = {"populate_existing": True} if populate_existing else {}
+    aws = {
+        aw.meeting_id: aw
+        for aw in (
+            await db.execute(
+                select(MeetingAwState)
+                .where(MeetingAwState.meeting_id.in_(ids))
+                .execution_options(**options)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    entries: dict[int, list[EntryView]] = {}
+    for row in (
+        (
+            await db.execute(
+                select(MeetingEntry)
+                .where(MeetingEntry.meeting_id.in_(ids))
+                .order_by(MeetingEntry.id)
+                .execution_options(**options)
+            )
+        )
+        .scalars()
+        .all()
+    ):
+        entries.setdefault(row.meeting_id, []).append(_entry_view(row))
+    return [
+        MeetingView(
+            row=row_mapping(m),
+            aw=row_mapping(aws[m.id]) if m.id in aws else None,
+            entries=tuple(entries.get(m.id, ())),
+        )
+        for m in meetings
+    ]
+
+
 class PostgresIntakeStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -243,34 +294,7 @@ class PostgresIntakeTx:
         return list(result.scalars().all())
 
     async def _views(self, meetings: Sequence[Any]) -> list[MeetingView]:
-        from sqlalchemy import select
-
-        from ..sessions.models import MeetingAwState, MeetingEntry
-
-        ids = [m.id for m in meetings]
-        if not ids:
-            return []
-        aws = {
-            aw.meeting_id: aw
-            for aw in await self._scalars(
-                select(MeetingAwState).where(MeetingAwState.meeting_id.in_(ids))
-            )
-        }
-        entries: dict[int, list[EntryView]] = {}
-        for row in await self._scalars(
-            select(MeetingEntry)
-            .where(MeetingEntry.meeting_id.in_(ids))
-            .order_by(MeetingEntry.id)
-        ):
-            entries.setdefault(row.meeting_id, []).append(_entry_view(row))
-        return [
-            MeetingView(
-                row=row_mapping(m),
-                aw=row_mapping(aws[m.id]) if m.id in aws else None,
-                entries=tuple(entries.get(m.id, ())),
-            )
-            for m in meetings
-        ]
+        return await load_views(self._db, meetings, populate_existing=True)
 
     async def find_entry(
         self, user_id: int, source_user: str, external_id: str

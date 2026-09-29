@@ -26,9 +26,9 @@ import binascii
 import json
 import uuid as uuid_mod
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
-from .adapters import take_link_lock
+from .adapters import load_views, take_link_lock
 from .export import store_export
 from .ports import (
     EntryView,
@@ -119,44 +119,6 @@ def _uuid(value: str) -> Optional[uuid_mod.UUID]:
         return None
 
 
-async def _views(db: AsyncSession, meetings: Sequence[Any]) -> list[MeetingView]:
-    """The meetings as views: each row with its ``meeting_aw_state`` row and all its entries."""
-    from sqlalchemy import select
-
-    from ..sessions.models import MeetingAwState, MeetingEntry
-
-    ids = [m.id for m in meetings]
-    if not ids:
-        return []
-    aws = {
-        aw.meeting_id: aw
-        for aw in (
-            await db.execute(
-                select(MeetingAwState).where(MeetingAwState.meeting_id.in_(ids))
-            )
-        ).scalars()
-    }
-    entries: dict[int, list[EntryView]] = {}
-    for row in (
-        await db.execute(
-            select(MeetingEntry)
-            .where(MeetingEntry.meeting_id.in_(ids))
-            .order_by(MeetingEntry.id)
-        )
-    ).scalars():
-        entries.setdefault(row.meeting_id, []).append(
-            EntryView.from_row(row_mapping(row))
-        )
-    return [
-        MeetingView(
-            row=row_mapping(m),
-            aw=row_mapping(aws[m.id]) if m.id in aws else None,
-            entries=tuple(entries.get(m.id, ())),
-        )
-        for m in meetings
-    ]
-
-
 _EVENT_TIME = (
     "meeting_event_time(meetings.data, meetings.start_time, meetings.created_at)"
 )
@@ -233,7 +195,7 @@ class PostgresIntakeReads:
         )
         async with self._session_factory() as db:
             rows = (await db.execute(stmt)).scalars().all()
-            return await _views(db, rows)
+            return await load_views(db, rows, populate_existing=False)
 
     async def meeting_by_uuid(self, user_id: int, uuid: str) -> Optional[MeetingView]:
         from sqlalchemy import select
@@ -255,7 +217,7 @@ class PostgresIntakeReads:
                 .scalars()
                 .all()
             )
-            views = await _views(db, rows)
+            views = await load_views(db, rows, populate_existing=False)
         return views[0] if views else None
 
     async def visible_to(self, user_id: int, meeting_id: int, user: str) -> bool:
