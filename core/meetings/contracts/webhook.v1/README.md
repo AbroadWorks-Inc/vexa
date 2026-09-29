@@ -139,9 +139,10 @@ the same bytes.
   meeting.completed · meeting.scheduled · meeting.updated · meeting.removed ·
   meeting.waiting_for_room · meeting.not_sent · bot.failed · bot.retry · recording.ready ·
   transcription.ready · export.handed_off · export.failed · webhook.test`). `bot.retry` is sent
-  when a bot fails while its meeting is on and a new bot will be sent on the same meeting; the
-  legacy deliveries (system hook, per-user `webhook_url`) get it too, with the `status_change`
-  block of the failed bot's session.
+  when a bot fails while its meeting is on and a new bot will be sent on the same meeting. The
+  legacy per-user `webhook_url` delivery gets it too, with the `status_change` block of the failed
+  bot's session; the system hook never does: it gets only `meeting.completed` and `bot.failed`, at
+  the meeting's end.
 - **`SignatureHeaders`** — the headers a verifier recomputes: `sha256=<hmac_sha256(secret,
   "<X-Webhook-Timestamp>." + raw_body)>`, timestamp-then-payload, bounding replay. `Authorization`
   appears on legacy deliveries only; `X-Webhook-Signature-Previous` on subscription deliveries
