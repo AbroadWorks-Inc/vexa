@@ -65,12 +65,14 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 | `meetingApi.intakeConflictRetries` | `3` | `INTAKE_CONFLICT_RETRIES`: retries for an entry write that lost a database-constraint race before it answers `500 internal_error`. |
 | `meetingApi.autoJoinLeadSeconds` / `notSentSweepIntervalSeconds` / `jitsiHosts` | `120` / `30` / `""` | `AUTO_JOIN_LEAD_S`, `NOT_SENT_SWEEP_INTERVAL_S`, `VEXA_JITSI_HOSTS`. |
 | `meetingApi.botSendMaxAttempts` / `botSendRetryBackoffSeconds` | `3` / `60` | `BOT_SEND_MAX_ATTEMPTS`, `BOT_SEND_RETRY_BACKOFF_S`: retry budget and backoff for an entry-managed meeting's bot send. |
+| `meetingApi.meetingUntrackedGraceSeconds` | `600` | `MEETING_UNTRACKED_GRACE_SEC` (§6.9 F-K2): how long a runtime 404 must last before a workload counts as gone, and how long past `due_at` a waiting meeting or an unfinished spawn gets before it ends `failed`. |
 | `meetingApi.sweepBatchSize` / `sweepMaxItemFailures` | `200` / `5` | `SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`: paging size and give-up threshold shared by the auto-join tick, the not-sent sweep and the outbox publisher. |
 | `meetingApi.webhookPrivateHostAllowlist` / `adminApi.webhookPrivateHostAllowlist` | `""` | `WEBHOOK_PRIVATE_HOST_ALLOWLIST`: private hosts a webhook may target; empty refuses every private target. Set both the same. |
 | `meetingApi.webhookPublishIntervalSeconds` / `webhookSendIntervalSeconds` | `1` / `1` | `WEBHOOK_PUBLISH_INTERVAL_S`, `WEBHOOK_SEND_INTERVAL_S`. |
 | `meetingApi.webhookRetryScheduleSeconds` / `webhookDnsThreads` / `webhookDnsTimeoutSeconds` | `60,300,1800,7200` / `4` / `5` | `WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S`: the sender's retry waits, its own DNS pool size and per-lookup timeout. |
 | `adminApi.webhookMaxSubscriptions` / `webhookDeliveryRetentionDays` | `20` / `30` | `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS`. |
 | `gateway.intakeRateLimitPerMin` | `600` | `INTAKE_RATE_LIMIT_PER_MIN`: entry writes per account per minute. |
+| `gateway.rateLimitBurst` / `rateLimitRps` | `120` / `40` | `GATEWAY_RATE_LIMIT_BURST`, `GATEWAY_RATE_LIMIT_RPS` (WS-6): the per-user token bucket at the single REST funnel — burst capacity and refill rate. |
 | `meetingApi.podAnnotations` / `adminApi.podAnnotations` | `{}` | Merged over `global.podAnnotations` for that service's pods; a key set here wins (e.g. `prometheus.io/scrape`). |
 
 ## Known boundaries (v0.12)

@@ -481,8 +481,8 @@
    "key": "MEETING_UNTRACKED_GRACE_SEC",
    "class": "defaulted",
    "default": "600",
-   "description": "continuous-untracked window (s): a meeting whose workload the runtime 404s for this long with no re-adoption and no bot callback is presumed lost and failed with an evidence note",
-   "targets": []
+   "description": "continuous-untracked window (s): a meeting whose workload the runtime 404s for this long with no re-adoption and no bot callback is presumed lost and failed with an evidence note. Also §6.9 F-K2's proof-of-gone wait on a runtime 404, and the grace a waiting meeting or an unproven spawn gets past due_at.",
+   "targets": ["helm"]
   },
   {
    "key": "VEXA_SERVICE_AUTHORITY_CONFIG",

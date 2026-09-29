@@ -296,12 +296,12 @@ Every setting lives in configuration, not code:
 | Webhook delivery | `WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S` (meeting-api) | `60,300,1800,7200`, 4, 5 s |
 | Upstream's system webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (meeting-api; both or neither) | unset |
 | Bot sends and retries | `BOT_SEND_MAX_ATTEMPTS`, `BOT_SEND_RETRY_BACKOFF_S` (meeting-api), for meetings entries manage; a bot replaced after it failed spends the same count | 3, 60 s |
-| Proof that a failed bot is gone | `MEETING_UNTRACKED_GRACE_SEC` (meeting-api; upstream's, no chart value): how long a runtime 404 must last, and how long past its due time a waiting meeting or an unfinished spawn gets | 600 s |
+| Proof that a failed bot is gone | `MEETING_UNTRACKED_GRACE_SEC` (meeting-api): how long a runtime 404 must last, and how long past its due time a waiting meeting or an unfinished spawn gets | 600 s |
 | Bounded work | `SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`, `INTAKE_CONFLICT_RETRIES` (meeting-api) | 200, 5, 3 |
+| Per-user rate limit | `GATEWAY_RATE_LIMIT_BURST`, `GATEWAY_RATE_LIMIT_RPS` (gateway, WS-6): the per-user token bucket at the single REST funnel | 120, 40/s |
 
 Every meeting-api, admin-api and gateway setting is declared in its service's `config.v1.json`;
-the chart's `meetingApi.*`, `adminApi.*` and `gateway.*` values set the ones above, except
-`MEETING_UNTRACKED_GRACE_SEC`, which keeps its default. The full list
+the chart's `meetingApi.*`, `adminApi.*` and `gateway.*` values set every one above. The full list
 of exporter settings (among them `EXPORTER_WEBHOOK_SECRET` and `EXPORT_MAX_RECORDINGS`) is in
 [`integrations/out/aw-notetaker/README.md`](integrations/out/aw-notetaker/README.md). Secret values
 live only in Kubernetes Secrets, never in this repo. On EKS the four new keys (the two key rings

@@ -86,6 +86,20 @@
    "targets": ["helm"]
   },
   {
+   "key": "GATEWAY_RATE_LIMIT_BURST",
+   "class": "defaulted",
+   "default": "120",
+   "description": "WS-6: the per-user token bucket's burst capacity (ratelimit.py) — every REST request forwarded at the single funnel (app._forward, keyed by the resolved user_id) costs one token; a request past an empty bucket is 429.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "GATEWAY_RATE_LIMIT_RPS",
+   "class": "defaulted",
+   "default": "40",
+   "description": "WS-6: the per-user token bucket's refill rate (tokens/s, ratelimit.py) — how fast a user's burst capacity comes back after being spent.",
+   "targets": ["helm"]
+  },
+  {
    "key": "LOG_LEVEL",
    "class": "defaulted",
    "default": "info",

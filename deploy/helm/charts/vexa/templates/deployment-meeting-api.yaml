@@ -189,6 +189,8 @@ spec:
               value: {{ .Values.meetingApi.sweepBatchSize | default "200" | quote }}
             - name: SWEEP_MAX_ITEM_FAILURES
               value: {{ .Values.meetingApi.sweepMaxItemFailures | default "5" | quote }}
+            - name: MEETING_UNTRACKED_GRACE_SEC
+              value: {{ .Values.meetingApi.meetingUntrackedGraceSeconds | default "600" | quote }}
             - name: VEXA_JITSI_HOSTS
               value: {{ .Values.meetingApi.jitsiHosts | default "" | quote }}
             # Webhook subscriptions: the outbox publisher and the sender.

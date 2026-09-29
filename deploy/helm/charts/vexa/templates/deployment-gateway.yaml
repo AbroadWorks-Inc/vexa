@@ -75,6 +75,10 @@ spec:
                   key: GATEWAY_IDENTITY_ACTIVE_KEY
             - name: INTAKE_RATE_LIMIT_PER_MIN
               value: {{ .Values.gateway.intakeRateLimitPerMin | default 600 | quote }}
+            - name: GATEWAY_RATE_LIMIT_BURST
+              value: {{ .Values.gateway.rateLimitBurst | default 120 | quote }}
+            - name: GATEWAY_RATE_LIMIT_RPS
+              value: {{ .Values.gateway.rateLimitRps | default 40 | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.gateway.logLevel | default "info" | quote }}
             # fastapi-guard edge layer (edge_guard.py): per-IP throttle + auto-ban at the edge.

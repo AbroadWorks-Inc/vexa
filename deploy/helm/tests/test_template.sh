@@ -559,6 +559,7 @@ for kv in \
   'BOT_SEND_RETRY_BACKOFF_S|value: "60"' \
   'SWEEP_BATCH_SIZE|value: "200"' \
   'SWEEP_MAX_ITEM_FAILURES|value: "5"' \
+  'MEETING_UNTRACKED_GRACE_SEC|value: "600"' \
   'VEXA_JITSI_HOSTS|value: ""' \
   'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' \
   'WEBHOOK_PUBLISH_INTERVAL_S|value: "1"' \
@@ -576,6 +577,8 @@ for kv in \
   env_is "$RENDER" admin-api "${kv%%|*}" "${kv##*|}"
 done
 env_is "$RENDER" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "600"'
+env_is "$RENDER" gateway GATEWAY_RATE_LIMIT_BURST 'value: "120"'
+env_is "$RENDER" gateway GATEWAY_RATE_LIMIT_RPS 'value: "40"'
 # A deployment's own values reach the env (the hosts lists are the ones a deployment sets).
 RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
   --set meetingApi.entryBlockedHosts=meet.example.org --set meetingApi.autoJoinLeadSeconds=300 \
@@ -583,10 +586,12 @@ RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml
   --set meetingApi.intakeConflictRetries=5 --set meetingApi.botSendMaxAttempts=7 \
   --set meetingApi.botSendRetryBackoffSeconds=45 \
   --set meetingApi.sweepBatchSize=50 --set meetingApi.sweepMaxItemFailures=2 \
+  --set meetingApi.meetingUntrackedGraceSeconds=900 \
   --set meetingApi.webhookRetryScheduleSeconds=30\\,120 --set meetingApi.webhookDnsThreads=8 \
   --set meetingApi.webhookDnsTimeoutSeconds=2 \
   --set adminApi.webhookPrivateHostAllowlist=portal.example.svc.cluster.local \
-  --set gateway.intakeRateLimitPerMin=900)"
+  --set gateway.intakeRateLimitPerMin=900 \
+  --set gateway.rateLimitBurst=240 --set gateway.rateLimitRps=80)"
 env_is "$RENDER_INTAKE" meeting-api ENTRY_BLOCKED_HOSTS 'value: "meet.example.org"'
 env_is "$RENDER_INTAKE" meeting-api AUTO_JOIN_LEAD_S 'value: "300"'
 env_is "$RENDER_INTAKE" meeting-api VEXA_JITSI_HOSTS 'value: "meet.example.org"'
@@ -595,11 +600,14 @@ env_is "$RENDER_INTAKE" meeting-api BOT_SEND_MAX_ATTEMPTS 'value: "7"'
 env_is "$RENDER_INTAKE" meeting-api BOT_SEND_RETRY_BACKOFF_S 'value: "45"'
 env_is "$RENDER_INTAKE" meeting-api SWEEP_BATCH_SIZE 'value: "50"'
 env_is "$RENDER_INTAKE" meeting-api SWEEP_MAX_ITEM_FAILURES 'value: "2"'
+env_is "$RENDER_INTAKE" meeting-api MEETING_UNTRACKED_GRACE_SEC 'value: "900"'
 env_is "$RENDER_INTAKE" meeting-api WEBHOOK_RETRY_SCHEDULE_S 'value: "30,120"'
 env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_THREADS 'value: "8"'
 env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_TIMEOUT_S 'value: "2"'
 env_is "$RENDER_INTAKE" admin-api WEBHOOK_PRIVATE_HOST_ALLOWLIST 'value: "portal.example.svc.cluster.local"'
 env_is "$RENDER_INTAKE" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "900"'
+env_is "$RENDER_INTAKE" gateway GATEWAY_RATE_LIMIT_BURST 'value: "240"'
+env_is "$RENDER_INTAKE" gateway GATEWAY_RATE_LIMIT_RPS 'value: "80"'
 
 # §1.10/§1.11 secrets reach the services by secretKeyRef to the shared Secret (existingSecretName
 # when set): the gateway identity ring GATEWAY_IDENTITY_KEYS on all three services and its active

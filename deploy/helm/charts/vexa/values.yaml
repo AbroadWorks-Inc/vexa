@@ -151,6 +151,9 @@ gateway:
   # Entry writes (PUT /v2/entries + POST /v2/entries/remove) allowed per account per minute,
   # counted in Redis across every gateway replica (INTAKE_RATE_LIMIT_PER_MIN).
   intakeRateLimitPerMin: 600
+  # WS-6 per-user token bucket at the single REST funnel (GATEWAY_RATE_LIMIT_BURST / _RPS).
+  rateLimitBurst: 120
+  rateLimitRps: 40
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 512Mi }
@@ -255,6 +258,7 @@ meetingApi:
   botSendRetryBackoffSeconds: "60"      # BOT_SEND_RETRY_BACKOFF_S — backoff between entry-managed bot-send attempts
   sweepBatchSize: "200"                 # SWEEP_BATCH_SIZE — paging size shared by the auto-join tick, not-sent sweep and outbox publisher
   sweepMaxItemFailures: "5"             # SWEEP_MAX_ITEM_FAILURES — give-up threshold shared by those same sweeps
+  meetingUntrackedGraceSeconds: "600"   # MEETING_UNTRACKED_GRACE_SEC — a runtime 404's proof-of-gone wait; a waiting meeting's/unproven spawn's grace past due_at
   jitsiHosts: ""                        # VEXA_JITSI_HOSTS — comma-separated self-hosted Jitsi hostnames
   # Webhook subscriptions (meeting-api side: the outbox publisher and the sender).
   webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — same list as adminApi's, applied on send
