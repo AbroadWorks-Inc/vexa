@@ -966,9 +966,10 @@ async def test_pg_a_create_the_runtime_did_not_refuse_is_never_recorded_gone(pg,
     assert unknown.specs == []
 
 
-async def test_pg_a_failure_before_the_workload_create_is_not_recorded_gone(
+async def test_pg_a_failure_before_the_workload_create_is_proven_and_retried(
     pg, monkeypatch
 ):
+    """The token could not be minted: the create never ran, so no pod can exist."""
     from meeting_api.intake.fakes import FakePublisher
     from meeting_api.intake.spawn import ExactRowSpawn
 
@@ -983,11 +984,13 @@ async def test_pg_a_failure_before_the_workload_create_is_not_recorded_gone(
         token_secret=None,
         redis_url="redis://r",
     )
+    runtime = FakeRuntimeClient()
+    port._runtime = runtime
     assert (await port.spawn_exact(USER, mid)).code == "internal_error"
+    assert runtime.specs == []  # the create never ran
     marker = (await pg.row(mid))["data"]["bot_retry"]
-    assert (marker["workload"], marker["proven_gone"]) == (None, False)
-    runtime = _gone()
-    assert (await pg.tick(runtime, at=_later()))["spawned"] == 0
+    assert (marker["workload"], marker["proven_gone"]) == (None, True)
+    assert (await pg.tick(_gone(), at=_later()))["spawned"] == 1
 
 
 async def test_pg_a_session_without_a_recorded_workload_names_its_own(pg):
