@@ -58,14 +58,6 @@ async def _ctx(_user_id: int) -> dict:
     return {"max_concurrent": 45}
 
 
-class _NoStop:
-    async def stop_live(self, user_id, meeting_id, *, outcome):
-        raise AssertionError("no stop expected")
-
-    async def leave(self, user_id, stop):
-        raise AssertionError("no leave expected")
-
-
 class Pg:
     """The SQLAlchemy repo, the Postgres intake store, and an ``IntakeService`` over them with
     the real spawn port."""
@@ -96,11 +88,11 @@ class Pg:
         )
 
     def service(self, runtime: Optional[FakeRuntimeClient] = None):
-        from meeting_api.intake.fakes import FakePublisher
+        from meeting_api.intake.fakes import FakePublisher, NoStop
         from meeting_api.intake.service import IntakeService
 
         return IntakeService(
-            self.store, self.port(runtime), _NoStop(), FakePublisher(), make_settings()
+            self.store, self.port(runtime), NoStop(), FakePublisher(), make_settings()
         )
 
     async def scalar(self, sql: str, **params: Any) -> Any:

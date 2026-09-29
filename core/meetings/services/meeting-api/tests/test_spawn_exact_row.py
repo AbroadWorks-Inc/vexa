@@ -897,16 +897,11 @@ async def test_pg_exact_claim_and_post_bots_race_without_deadlock(pg_engine):
         assert live == 1
 
 
-class _NoStop:
-    async def stop_live(self, user_id, meeting_id, *, outcome):
-        raise AssertionError("no stop expected")
-
-
 def _pg_intake(pg: PgBackend, runtime=None, *, send_max_attempts: int = 3, **port_kw):
     """``IntakeService`` over Postgres with the real ``ExactRowSpawn`` over the same database."""
     from intake_builders import make_settings
     from meeting_api.intake import PostgresIntakeStore
-    from meeting_api.intake.fakes import FakePublisher
+    from meeting_api.intake.fakes import FakePublisher, NoStop
     from meeting_api.intake.service import IntakeService
 
     store = PostgresIntakeStore(pg.session_factory)
@@ -915,7 +910,7 @@ def _pg_intake(pg: PgBackend, runtime=None, *, send_max_attempts: int = 3, **por
     service = IntakeService(
         store,
         port,
-        _NoStop(),
+        NoStop(),
         publisher,
         make_settings(send_max_attempts=send_max_attempts),
     )
