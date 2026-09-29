@@ -1292,8 +1292,9 @@ class SqlAlchemyMeetingRepo:
         ``cancelled_by_calendar``, stands); the writer types the event (``meeting.not_sent`` for a
         ``not_sent`` outcome, else ``bot.failed``).
 
-        §6.9 F-K2: a failure while the meeting is on is retried instead (``intake.retry``), the
-        workload ``workload_id`` (else the row's) recorded with ``workload_gone``. The last one on
+        §6.9 F-K2: a failure while the meeting is on is retried instead (``intake.retry``), this
+        attempt's workload ``workload_id`` (``None``: it started none) recorded with
+        ``workload_gone``. The last one on
         a meeting entries manage that already had a bot session is a failed bot, not a bot never
         sent: its ``not_sent`` outcome is dropped."""
         from sqlalchemy import exists, select
@@ -1337,7 +1338,7 @@ class SqlAlchemyMeetingRepo:
                     message=str(reason),
                     stage=failure_stage,
                     session=newest,
-                    workload=workload_id or m.bot_container_id,
+                    workload=workload_id,  # this attempt's, never an earlier bot's
                     proven_gone=workload_gone,
                     code=outcome.detail if outcome is not None and outcome.detail
                     else retry.BOT_FAILED,

@@ -1731,3 +1731,25 @@ async def test_pg_a_cancel_before_the_create_is_proven_gone_and_bounded(pg):
     marker = (await pg.row(mid))["data"]["bot_retry"]
     assert (marker["workload"], marker["proven_gone"]) == (None, True)
     assert (await pg.tick(_gone(), at=_later()))["spawned"] == 1
+
+
+async def test_pg_a_retry_marker_never_names_an_earlier_bots_container(pg, monkeypatch):
+    from meeting_api.intake.fakes import FakePublisher
+    from meeting_api.intake.spawn import ExactRowSpawn
+
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meetings SET bot_container_id = 'mtg-earlier-bot' WHERE id = :m", m=mid
+    )
+    port = ExactRowSpawn(
+        pg.repo,
+        FakeRuntimeClient(),
+        store=pg.store,
+        fetch_bot_context=_ctx,
+        publisher=FakePublisher(),
+        token_secret=None,
+        redis_url="redis://r",
+    )
+    await port.spawn_exact(USER, mid)
+    assert (await pg.row(mid))["data"]["bot_retry"]["workload"] is None

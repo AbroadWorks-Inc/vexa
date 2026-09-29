@@ -176,8 +176,8 @@ class MeetingRepo(Protocol):
         finished is left as it is: its terminal is written once.
 
         §6.9 F-K2: on a meeting entries manage that is still on, the failure is retried instead
-        (``intake.retry``): the row goes back to ``requested`` with ``bot.retry``, recording the
-        workload ``workload_id`` (else the row's) and whether it is already gone
+        (``intake.retry``): the row goes back to ``requested`` with ``bot.retry``, recording this
+        attempt's workload ``workload_id`` (``None``: it started none) and whether it is gone
         (``workload_gone``: the runtime refused it; a timed-out create is not proof). A row
         waiting for its next bot is left as it is. The last failure of a meeting that already had
         a bot session drops the ``not_sent`` outcome on a meeting entries manage: a bot was
