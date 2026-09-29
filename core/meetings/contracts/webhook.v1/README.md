@@ -113,6 +113,12 @@ the same bytes.
   and the typed `meeting.started`; these are DISTINCT logical events with DISTINCT `event_id`s.
   The per-user URL receives the event types its `webhook_events` enables; the system hook receives
   `meeting.completed` and `bot.failed`.
+- **Every end is delivered.** However a meeting ends, it gets the same finish (design §6.9 F-FIN),
+  so both legacy URLs receive its `meeting.completed` or `bot.failed`. A meeting aw-bots ends
+  itself (a retry's planned end, a stop while it waits for a new bot, its deadline, its last send,
+  the reconcile backstop) sends the typed event only, with no `meeting.status_change`: that
+  envelope's `event_id` comes from the last bot session and its status, which the session's own
+  terminal event already used. AW configures neither legacy URL.
 - **`event_id`** = `evt_` + the first 32 hex of sha256 of `<connection_id>|<event_type>|<new_status>`
   (`lifecycle.webhook.derive_event_id`), the same across every (re)delivery (#519; this closes the
   #330 4×-billing class, where a per-emission `uuid4` made redeliveries look like distinct events).

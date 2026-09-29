@@ -17,12 +17,19 @@ The production edge logic, injectable. Modules:
   forwarded request carrying `x-user-id`: HMAC-SHA256 with the active key of the
   `GATEWAY_IDENTITY_KEYS` ring (`GATEWAY_IDENTITY_ACTIVE_KEY`, named in the header as `kid`) over
   the version, the kid, `t`, the user, the forwarded `x-user-scopes` and `x-user-limits`, the method, the SHA-256 of the exact body forwarded, the raw query and the
-  decoded path of the URL httpx sends. meeting-api and admin-api verify it (also under their
-  optional previous key, for rotation); the rule is pinned by
+  decoded path of the URL httpx sends. meeting-api and admin-api verify it with the ring key its
+  `kid` names, so a key rotates by adding it to the ring, switching the active kid and later
+  dropping the old key (`core/gateway/contracts/gateway-identity/README.md`); the rule is pinned by
   `core/gateway/contracts/gateway-identity/signature.vectors.json`.
 - **`intake_limit.py`** — §1.13: the per-account entry-write budget (`INTAKE_RATE_LIMIT_PER_MIN`
   per 60 s window, `INCR` + `EXPIRE` in one `MULTI` on the gateway's Redis, shared by every replica).
-  `create_app` applies it to `PUT /v2/entries` and `POST /v2/entries/remove` only.
+  `create_app` applies it to `PUT /v2/entries` and `POST /v2/entries/remove` only. A refusal is
+  429 `rate_limited` with `Retry-After` = the seconds left in the window; a count that can't be
+  taken is 503 `unavailable`.
+- **`edge_guard.py`** — the per-address guard (fastapi-guard, `GUARD_*`). `EdgeGuardMiddleware`
+  answers its refusals on a `/v2` path in the §2.5 body: 429 `rate_limited` with `Retry-After` =
+  `GUARD_RATE_LIMIT_WINDOW`, 403 `forbidden` for a blocked address. Off `/v2` the guard's own
+  plain-text answer stands.
 - **`obs.py`** — the lane's `logevent.v1` trace emitter: `TraceMiddleware` (mint/read/forward
   `X-Trace-Id`), `log_event` bound to `service="gateway"`, and the `make_*` factories the
   downstream conformance hop reuses for `service="meeting-api"`.

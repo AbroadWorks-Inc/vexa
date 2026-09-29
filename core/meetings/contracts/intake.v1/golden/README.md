@@ -24,6 +24,9 @@ by `meeting-api/tests/test_intake_contract.py` through the Python `jsonschema` p
   `quota_exceeded`, `internal_error`, `unavailable`, and the `/v2/webhooks` codes
   `webhook_not_found` and `account_not_found`.
 
+The scheduled meetings' `bot_joins_at` (08:55 for a 09:00 `start`) uses AW's 300 s
+`AUTO_JOIN_LEAD_S`; meeting-api's default, 120 s, would give 08:58.
+
 `content-hash-vector.json` (one level up, NOT in this directory) is a separate, non-schema-shaped
 fixture — the shared `content_hash` test vector — deliberately kept out of `golden/` so
 `validate.mjs` never tries to resolve it against a `$def`.

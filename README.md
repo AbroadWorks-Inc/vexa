@@ -26,8 +26,9 @@ end up with the same kind of transcript.
    │                                                   joins before start, records audio,
    │                                                   writes speaker-activity.jsonl
    │  stores recordings + speaker activity in  s3://aw-bots/
+   │  a bot that fails mid-meeting is replaced on the same meeting ("bot.retry")
    │  every status change: signed webhook to each /v2/webhooks subscriber (the portal, the exporter)
-   │  the exporter acts on  "meeting.completed" (or "bot.failed")
+   │  the exporter acts on  "meeting.completed", or "bot.failed" when a recording exists
    ▼
  exporter (our addition, integrations/out/aw-notetaker/)
    │  reads the meeting's recordings through the gateway (its own key)
@@ -93,12 +94,13 @@ they are sealed as `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
   secret is rotated, `X-Webhook-Signature-Previous` carries the same signature under the old
   secret; a receiver accepts a match on either header and rejects a timestamp more than 300 s off.
 - **Delivery** is at least once and not in order. Retries after a 5xx, 429, timeout or connection
-  error come at 1 min, 5 min, 30 min and 2 h, then the delivery is `dead`; any other answer that
+  error come after the waits in `WEBHOOK_RETRY_SCHEDULE_S` (default 1 min, 5 min, 30 min and 2 h),
+  then the delivery is `dead`; any other answer that
   isn't 2xx (including a redirect) is `failed`. **Receivers dedupe on `event_id` and ignore an event
   whose `sequence` is older than one they already applied.**
 - The exporter is a subscriber like the portal (its own subscription and secret). Upstream's
-  system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) and the per-user `webhook_url` still work, with
-  upstream's meeting block; AW sets neither.
+  system webhook (`VEXA_SYSTEM_WEBHOOK_URL` + `VEXA_SYSTEM_WEBHOOK_SECRET`, both or neither) and the
+  per-user `webhook_url` carry upstream's meeting block and retry through Redis; AW sets neither.
 
 ### Keys and signed identity
 
@@ -136,10 +138,14 @@ Everything else is upstream Vexa, unchanged.
 | **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the §2.4 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
-| **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |
+| **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. The meeting (§2.4) carries `upstream_id`, `started_at` and `ended_at` too. | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |
 | **One status writer and the webhook outbox.** Every status change goes through one function, which records the event in the same transaction. Leased senders deliver it, with their state in Postgres. | `meeting_api/intake/status.py`, `meeting_api/webhooks/`; new `webhook.v1` events | No change is lost or sent twice from our side, whichever meeting-api replica handles it. |
+| **One finish.** Every way a meeting ends, whether the bot reports it or aw-bots ends the meeting itself, runs the same finish steps: the transcript finalized, the service provenance, the typed event and its edges (flows, the per-user `webhook_url`, the system hook when one is set), the copilot reap. | `meeting_api/app.py` (`_finish`) | A meeting's end is reported the same way whoever ended it. |
+| **Bounded bot sends.** A meeting entries manage gets at most `BOT_SEND_MAX_ATTEMPTS` sends, `BOT_SEND_RETRY_BACKOFF_S` apart; the last failure ends it `not_sent` with the typed code. | `meeting_api/intake/service.py`, `bot_spawn/auto_join.py`; `meeting_aw_state.send_attempts` | A bot that can't be sent is tried again a few times, never forever, and the reason reaches the webhook and the metrics. |
+| **A new bot on the same meeting.** A bot that fails while its meeting is on (a failed start, joining, a lobby rejection or timeout, a crash in the call, a lost bot) is replaced on the same meeting, from the same send count, once the failed pod is proven gone; a deadline, a pending-teardown list, a spawn that names its workload before it creates it, and a reconcile backstop bound every case. Not replaced: a user's stop, the host removing the bot, nobody joining, a normal end. | `meeting_api/intake/retry.py`, `bot_spawn/`, `lifecycle/reconcile.py`; webhook `bot.retry` | Never two bots in one call, and a meeting whose bot failed early still gets recorded. The exporter joins every session's audio and speakers into one folder. |
+| **Bounded sweeps.** Every intake sweep reads in pages of `SWEEP_BATCH_SIZE` and gives an item up after `SWEEP_MAX_ITEM_FAILURES`, logged and counted; an entry write that loses a database race is run again `INTAKE_CONFLICT_RETRIES` times, then answered 500. | `meeting_api/sweeps/item_failures.py` (`run_pages`, `run_item`), table `sweep_item_failures`; `intake/service.py` | Nothing retries forever, and one bad item never stops the rest. |
 | **Webhook subscriptions, scopes and keys.** `/v2/webhooks`, encrypted receiver secrets, new scopes `webhooks`, `erase`, `export`. | `core/identity/services/admin-api`; `core/identity/contracts/identity.v1/` | Each app subscribes on its own; each consumer's key can do only its own job. |
-| **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can no longer act as any user by setting a header. |
+| **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can't act as any user by setting a header. |
 | **Metrics.** `/metrics` on meeting-api and admin-api (not routed through the gateway). | `meeting_api/metrics.py`, `admin_api/app/metrics.py`; Helm `meetingApi.podAnnotations`, `adminApi.podAnnotations` | Prometheus scrapes them; the alerts live in aw-notetaker. |
 | **Image workflow.** Builds and pushes our five images (meeting-api, bot, exporter, gateway, admin-api) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
@@ -176,7 +182,7 @@ We leave those folders in place so upstream changes keep merging cleanly.
 |---|---|
 | `main` | Mirror of upstream Vexa. We never commit to it. |
 | `development` | Our working line. Feature branches merge here. |
-| `feat/<topic>`, `fix/<topic>` | Work in progress, cut from `development` (current: `feat/aw-rearchitecture`). |
+| `feat/<topic>`, `fix/<topic>` | Work in progress, cut from `development` (current: `feat/meeting-intake`). |
 | `aw/main` and `aw/*` | The old cloud bot (Vexa v0.10.4). Kept for reference only. |
 
 **Taking upstream changes:** update `main` from upstream, then merge `main` into `development` on a
@@ -202,7 +208,7 @@ One Helm install runs all of these. Each service is its own Docker image.
 | **exporter** | built from `integrations/out/aw-notetaker` | **ours**, deployed next to the chart |
 
 Our images go to GHCR, under the names `ghcr.io/voyantt-consultancy-services-llp/aw-bots-meeting-api`,
-`…/aw-bots-bot` and `…/aw-bots-exporter`, and now also `…/aw-bots-gateway` and `…/aw-bots-admin-api`.
+`…/aw-bots-bot`, `…/aw-bots-exporter`, `…/aw-bots-gateway` and `…/aw-bots-admin-api`.
 **The gateway and admin-api need our images, like meeting-api:** upstream's `vexaai/v012-gateway` and
 `vexaai/v012-admin-api` don't have the `/v2` routes, the new scopes or the signed identity, and the
 new meeting-api refuses every client request that upstream's gateway forwards unsigned. Our Helm
@@ -287,11 +293,21 @@ Every setting lives in configuration, not code:
 | Webhook secret encryption | `WEBHOOK_SECRET_ENC_KEYS` (a key ring) and `WEBHOOK_SECRET_ENC_ACTIVE_KEY`, on meeting-api and admin-api, read only from an existing Secret | required for webhook subscriptions; unset, subscriptions are off and the services log why |
 | Intake | `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES` (meeting-api); `INTAKE_RATE_LIMIT_PER_MIN` (gateway) | 30 days, 3600 s, `meet.abroadworks.com` until the Jitsi cutover, 100 000, 600 |
 | Webhooks | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (meeting-api, admin-api); `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS` (admin-api) | `portal.notetaker.svc.cluster.local,aw-exporter.aw-bots.svc.cluster.local`, 20, 30 days |
+| Webhook delivery | `WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S` (meeting-api) | `60,300,1800,7200`, 4, 5 s |
+| Upstream's system webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (meeting-api; both or neither) | unset |
+| Bot sends and retries | `BOT_SEND_MAX_ATTEMPTS`, `BOT_SEND_RETRY_BACKOFF_S` (meeting-api), for meetings entries manage; a bot replaced after it failed spends the same count | 3, 60 s |
+| Proof that a failed bot is gone | `MEETING_UNTRACKED_GRACE_SEC` (meeting-api; upstream's, no chart value): how long a runtime 404 must last, and how long past its due time a waiting meeting or an unfinished spawn gets | 600 s |
+| Bounded work | `SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`, `INTAKE_CONFLICT_RETRIES` (meeting-api) | 200, 5, 3 |
 
-The full list of exporter settings is in
+Every meeting-api, admin-api and gateway setting is declared in its service's `config.v1.json`;
+the chart's `meetingApi.*`, `adminApi.*` and `gateway.*` values set the ones above, except
+`MEETING_UNTRACKED_GRACE_SEC`, which keeps its default. The full list
+of exporter settings (among them `EXPORTER_WEBHOOK_SECRET` and `EXPORT_MAX_RECORDINGS`) is in
 [`integrations/out/aw-notetaker/README.md`](integrations/out/aw-notetaker/README.md). Secret values
-live only in Kubernetes Secrets, never in this repo. On EKS the three new secret names go into
-`aw-bots-secrets` **before** the `helm upgrade` that brings the new services. Docker Compose, Lite and
+live only in Kubernetes Secrets, never in this repo. On EKS the four new keys (the two key rings
+and their active ids) go into `aw-bots-secrets` **before** the `helm upgrade` that brings the new
+services, and `VEXA_SYSTEM_WEBHOOK_SECRET` leaves it right before the upgrade that turns the system
+webhook off. Docker Compose, Lite and
 a chart-managed Secret (`secrets.gatewayIdentityKeys`, `secrets.gatewayIdentityActiveKey`) supply
 `GATEWAY_IDENTITY_KEYS` and `GATEWAY_IDENTITY_ACTIVE_KEY` too; they don't need the webhook key ring.
 
@@ -341,11 +357,13 @@ bots that write a speaker file.
 
 **Bringing in the intake and webhooks release** follows the rollout order in Part 5 of the
 [intake design](integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md),
-with no meeting in progress. In short: the database migration (`MIGRATION-0008`) first; the three new
-secret names into `aw-bots-secrets` before any `helm upgrade`; our gateway and admin-api images; the
-four keys; drain the exporter queue with the old exporter; then meeting-api and the bot, and only
-after them the new exporter, its subscription, and `VEXA_SYSTEM_WEBHOOK_URL` unset (see its
-[README](integrations/out/aw-notetaker/README.md)).
+with no meeting in progress until the exporter's subscription exists. In short: the database
+migration (`MIGRATION-0008`) first; the gateway identity ring and the webhook key ring into
+`aw-bots-secrets` before any `helm upgrade`; our gateway and admin-api images, with the system
+webhook off in the same upgrade; the four keys; drain the exporter queue with the old exporter;
+then meeting-api and the bot, and only after them the exporter's `EXPORTER_WEBHOOK_SECRET`, the new
+exporter and its subscription (see its [README](integrations/out/aw-notetaker/README.md)). The
+commands are aw-notetaker's runbook, steps 9–18.
 
 ---
 

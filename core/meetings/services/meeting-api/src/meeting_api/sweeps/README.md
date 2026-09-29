@@ -14,7 +14,13 @@ so single-replica behaviour is unchanged. The `segment-consumer` loop is deliber
 it is already single-delivery via the Redis consumer group, and wrapping it would serialize the
 replicas' stream reads.
 
-`item_failures` bounds the intake sweeps' work (§6.9 F-I): each reads in pages of `SWEEP_BATCH_SIZE`,
-and runs every item through `run_item`, which logs a failing item with its id and stack, counts it
-in `aw_sweep_items_total{sweep,result}`, and after `SWEEP_MAX_ITEM_FAILURES` (kept per sweep in
-`sweep_item_failures`, so every replica shares the count) gives it up for good.
+`item_failures` bounds the sweeps' work (§6.9 F-I). `run_pages` is the one paged loop: it reads a
+sweep's work `SWEEP_BATCH_SIZE` items at a time in a stable order, skips the items the sweep has
+given up, and runs every other one through `run_item`, until a short page. `run_item` logs a
+failing item with its id and stack, counts it in `aw_sweep_items_total{sweep,result}`, and after
+`SWEEP_MAX_ITEM_FAILURES` (kept per sweep in `sweep_item_failures`, so every replica shares the
+count) gives it up for good; it never raises. The sweeps that use them are `auto-join`, `not-sent`,
+`webhook-publisher` (its own page loop, with `run_item` per row when a page's transaction fails),
+and the reconcile sweep's `unproven-teardown` and `retry-overdue`. Each takes the give-up record
+(`ItemFailures`) as a required argument: the composition root passes `PostgresItemFailures`, and
+without Postgres (Lite) one `InMemoryItemFailures` for the process.

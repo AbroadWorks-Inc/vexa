@@ -35,9 +35,9 @@ Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.m
 
 ## Which meetings are exported (design §6.9 F-K2)
 The subscription carries two events the exporter acts on, and both are exported:
-- **`meeting.completed`**, as before. One with no audio recording is a failed export (`no_audio`).
+- **`meeting.completed`**. One with no audio recording is a failed export (`no_audio`).
   One without a `started_at` never had its bot in the meeting (for example it was stopped in the
-  lobby): intake answers 200, exports nothing and logs the WARNING `completed_skipped
+  lobby): the exporter answers 200, exports nothing and logs the WARNING `completed_skipped
   meeting_id=<uuid> reason=no_start_time`, the line to count. It is never a 400, which a
   subscription would record as a permanent `failed` delivery.
 - **`bot.failed`**: the meeting ended `failed`, for example because its bot recorded part of the call,
@@ -45,8 +45,8 @@ The subscription carries two events the exporter acts on, and both are exported:
   every session into the one folder. When it has no audio recording, it is skipped with the log line
   `bot_failed_skipped … reason=no_recording`: nothing is written, `/process` isn't called, and **no
   export result is reported** (nothing was exported, and the meeting's own `bot.failed` already says
-  why). A `bot.failed` without a `started_at` never had its bot in the meeting, so intake answers
-  200 and skips it (`reason=no_start_time`).
+  why). A `bot.failed` without a `started_at` never had its bot in the meeting, so the exporter
+  answers 200 and skips it (`reason=no_start_time`).
 - **Never exported:** any other event (answered 200, `webhook.test` included), and a `not_sent`
   meeting (`outcome.kind == "not_sent"`, no bot was ever sent), whatever event carries it.
 - **One export per meeting.** The queue is keyed by the meeting id and the folder's `_export.json`
@@ -66,10 +66,10 @@ The subscription carries two events the exporter acts on, and both are exported:
   and the transcript and to find the speaker-activity files. Those are under
   `signal/<owner>/<vexa_meeting_id>/<session>/`, where the owner and the session are the ones the
   recording's `storage_path` (`recordings/<owner>/<recording>/<session>/…`) names. The folder name
-  `<platform>_<room>_<startUTC>` is unchanged; `<startUTC>` is `started_at`. A queued meeting that
-  is not the §2.4 meeting (no UUID `id` or no integer `upstream_id`, such as an item the old
-  exporter queued from the system hook) is moved to `aw-exporter/failed/` on its first attempt
-  and writes nothing to the export bucket.
+  is `<platform>_<room>_<startUTC>`, `<startUTC>` being `started_at`. A queued meeting that is not
+  the §2.4 meeting (no UUID `id` or no integer `upstream_id`, such as an item the old exporter
+  queued from the system hook) is moved to `aw-exporter/failed/` on its first attempt and writes
+  nothing to the export bucket.
 - **Export result.** After `_export.json` records the outcome, the exporter reports it with
   `POST /v2/meetings/{uuid}/export` `{"state": "handed_off" | "failed", "s3_path": "s3://…/", "error": "…"}`
   (`error` only on `failed`): `handed_off` after `/process`, `failed` when the meeting has no audio
@@ -77,27 +77,31 @@ The subscription carries two events the exporter acts on, and both are exported:
   / `export.failed`; repeating a report changes nothing. A report that isn't accepted fails the job
   step, and the queue retries it with its normal backoff.
 
-## Rollout (design Part 5)
-1. **Drain the queue with the old exporter** before anything else changes: `aw-exporter/pending/`
-   must be empty. Queued items from before the rollout are the system hook's meeting, not the
-   §2.4 one.
-2. **Deploy meeting-api and the gateway, and mint the `exporter` key into `aw-bots-key-exporter`,
-   before the new exporter.** The new exporter needs `GATEWAY_URL`, `EXPORTER_API_KEY` and the new
-   export route.
-3. **Don't re-enqueue items in `aw-exporter/failed/` from before the rollout as they are.** They
-   are the system hook's meeting, and `notetaker-worker` would see a new `idempotency_key` (the
-   UUID instead of `vexa-<n>`) for a meeting it may already have.
-4. **Move the trigger to the subscription** in a window with no meeting finishing (a meeting that
-   finishes between the two steps below is delivered to neither):
-   - put a new random secret into `EXPORTER_WEBHOOK_SECRET` (Secret `aw-exporter-secrets`, which
-     no longer holds `VEXA_WEBHOOK_SECRET`) and deploy this exporter;
-   - add `aw-exporter.aw-bots.svc.cluster.local` to `WEBHOOK_PRIVATE_HOST_ALLOWLIST` on both
-     admin-api and meeting-api;
-   - with the `operator` key, `POST /v2/webhooks` `{"url":
-     "http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa", "secret": <the same secret>,
-     "events": ["meeting.completed", "bot.failed"], "description": "aw-exporter"}`, then
-     `POST /v2/webhooks/{id}/test` (the exporter answers 200);
-   - unset `VEXA_SYSTEM_WEBHOOK_URL` (and `VEXA_SYSTEM_WEBHOOK_SECRET`) on meeting-api.
+## Rollout (design Part 5; aw-notetaker runbook steps 11–14e)
+In a window with no meeting in progress: from the step that turns the system webhook off until the
+subscription exists, no webhook reaches the exporter, so a meeting that finished in between would
+be exported by nobody.
+1. **The system webhook goes off** with the `helm upgrade` that brings our gateway and admin-api
+   (step 11): the values set no `VEXA_SYSTEM_WEBHOOK_URL`, and `VEXA_SYSTEM_WEBHOOK_SECRET` leaves
+   `aw-bots-secrets` right before it (meeting-api refuses to start with only one of the two). The
+   same values allow-list `aw-exporter.aw-bots.svc.cluster.local` in
+   `WEBHOOK_PRIVATE_HOST_ALLOWLIST` on admin-api and meeting-api.
+2. **Mint the `exporter` key** into `aw-bots-key-exporter` (step 12).
+3. **Drain the queue with the old exporter** (step 13): `aw-exporter/pending/` must be empty; its
+   items are the system hook's meeting, not the §2.4 one. **Don't re-enqueue items in
+   `aw-exporter/failed/` from before the rollout as they are:** `notetaker-worker` would see a new
+   `idempotency_key` (the UUID instead of `vexa-<n>`) for a meeting it may already have.
+4. **meeting-api and the bot** (step 14a). The new exporter needs its export route and the gateway.
+5. **`EXPORTER_WEBHOOK_SECRET`** (step 14b): a fresh random value in Secret `aw-exporter-secrets`,
+   its only key.
+6. **This exporter** (step 14c), once meeting-api is ready, with `GATEWAY_URL`, `EXPORTER_API_KEY`,
+   `EXPORTER_WEBHOOK_SECRET` and `EXPORT_MAX_RECORDINGS`.
+7. **The subscription** (step 14d), with the `operator` key: `POST /v2/webhooks` `{"url":
+   "http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa", "secret": <the same secret>,
+   "events": ["meeting.completed", "bot.failed"], "description": "aw-exporter"}`, then
+   `POST /v2/webhooks/{id}/test`: its delivery shows `delivered` with 200 (`ignored`).
+8. **Optional** (step 14e): an S3 lifecycle rule expiring `aw-exporter/events/` (for example 30
+   days; it must be over 48 h).
 
 ## Several bot sessions (design §6.9 F-K2)
 A meeting can have more than one bot session: a bot fails and a new one joins the same meeting.
@@ -122,14 +126,14 @@ one transcript with speaker names:
   `EXPORT_MAX_RECORDINGS` fails the export and exports nothing: the ERROR
   `too_many_recordings vexa_meeting_id=… max_recordings=…`, `_export.json {state:"too_many_recordings",
   error}` and the export result `failed` with `more than <n> recordings (EXPORT_MAX_RECORDINGS)`.
-- **Unchanged files.** `meeting.json` is the webhook's meeting as sent (the intake.v1 `Meeting`,
+- **The other files.** `meeting.json` is the webhook's meeting as sent (the intake.v1 `Meeting`,
   not ours to extend), and `recordings.json` lists every recording as meeting-api returned it.
   `live_transcript.json` is the meeting's transcript (`GET /transcripts/by-id/{id}`) when it has
   segments, which only a bot that ran with live transcription leaves. A recording with no audio file (the bot failed before it recorded) is skipped with
   the log line `recording_skipped … reason=no_audio`. With `EXPORT_DEBUG`, each session's signal
   files go to `signal/<session_uid>/`.
-- **One session** is exported from its recording exactly as before: `master.webm` is a server-side
-  copy, `audio.wav` its transcode, `signal/*` flat.
+- **One session** is exported from its recording alone: `master.webm` is a server-side copy,
+  `audio.wav` its transcode, `signal/*` flat.
 
 ## Config (names only — see spec §4.4)
 `GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `EXPORTER_WEBHOOK_SECRET` (the
