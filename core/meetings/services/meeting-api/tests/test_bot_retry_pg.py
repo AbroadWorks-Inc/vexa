@@ -1048,3 +1048,78 @@ async def test_pg_a_failed_attempt_with_a_session_retires_it_at_the_next_claim(p
         await pg.repo.update_meeting_status(session_uid=session, status="joining")
         is None
     )
+
+
+# ── a waiting meeting is bounded ────────────────────────────────────────────────────────────
+
+
+class _Unknown(FakeRuntimeClient):
+    async def get_workload(self, workload_id):
+        raise RuntimeError("the kernel does not answer")
+
+
+async def test_pg_an_instant_join_whose_old_pod_never_proves_gone_ends_at_the_deadline(
+    pg,
+):
+    reply = await pg.service().put_entry(USER, instant_body("paste:7", ZOOM))
+    mid = await pg.id_of(reply["meeting"]["id"])
+    (session,) = await pg.sessions(mid)
+    await _fail(pg, session, "failed", "join_failure", "bot_callback")
+    runtime = _Unknown()
+    assert (await pg.tick(runtime, at=_later(), untracked_grace=600))["spawned"] == 0
+    assert (await pg.row(mid))["status"] == "requested"
+    await pg.tick(runtime, at=_later(61 + 601), untracked_grace=600)
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == (
+        "failed",
+        "join_failure",
+    )
+    assert not row["data"].get("bot_retry") and runtime.specs == []
+    events = await pg.events(mid)
+    assert events[-1]["event_type"] == "bot.failed"
+    assert events[-1]["data"]["change"]["reason"] == "workload_not_proven"
+
+
+async def test_pg_the_reconcile_sweep_ends_a_waiting_meeting_the_driver_gave_up(pg):
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    class Log:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    mid, session = await pg.sent(status="joining")
+    await _fail(pg, session, "failed", "join_failure", "bot_callback")
+
+    async def post(body):
+        raise AssertionError("a waiting meeting is not ended through the lifecycle")
+
+    await reconcile_stale_nonterminal_sweep(
+        pg.repo,
+        _Unknown(),
+        post,
+        stop_grace=45,
+        active_grace=300,
+        log=Log(),
+        untracked_grace=600,
+    )
+    assert (await pg.row(mid))["status"] == "requested"  # before its deadline
+    await pg.execute(
+        "UPDATE meetings SET data = jsonb_set(data, '{bot_retry,due_at}', "
+        "'\"2026-01-01T00:00:00Z\"') WHERE id = :m",
+        m=mid,
+    )
+    await reconcile_stale_nonterminal_sweep(
+        pg.repo,
+        _Unknown(),
+        post,
+        stop_grace=45,
+        active_grace=300,
+        log=Log(),
+        untracked_grace=600,
+    )
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == (
+        "failed",
+        "join_failure",
+    )
+    assert (await pg.types(mid))[-1] == "bot.failed"

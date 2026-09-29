@@ -299,7 +299,9 @@ async def auto_join_tick(
     ``failed`` with the kept reason (``retry.end``). Once its ``due_at`` has passed, the failed
     workload is proven gone (``reconcile.prove_workload_gone``: the runtime reports it terminal,
     a delete is confirmed, or it has been untracked for ``untracked_grace`` —
-    ``MEETING_UNTRACKED_GRACE_SEC`` — since the failure) and marked so (``prove_retry_gone``),
+    ``MEETING_UNTRACKED_GRACE_SEC`` — since the failure) and marked so (``prove_retry_gone``); one
+    still unproven at ``due_at`` + ``untracked_grace`` (``retry.deadline``) ends ``failed``
+    (``workload_not_proven``),
     and a new bot session is spawned on the row through ``ExactRowSpawn`` (counted in
     ``spawned``). A failure after the claim goes back through ``retry``; one before it (the claim
     never ran) is one more of the meeting's bounded sends, and the last one ends it ``failed``
@@ -502,15 +504,20 @@ async def auto_join_tick(
                   user_id=user_id, meeting_id=str(row["id"]),
                   fields={"platform": row["platform"], "native": row["native_meeting_id"]})
 
-    async def _end_waiting(row: dict, *, stopped: bool) -> None:
-        """A waiting meeting that was stopped, or whose planned end passed: ``failed`` with the
-        kept reason (``stopped`` for a stop), under its link lock."""
+    async def _end_waiting(
+        row: dict, *, stopped: bool, change_reason: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """A waiting meeting that was stopped, whose planned end passed, or that is past its
+        deadline: ``failed`` with the kept reason (``stopped`` for a stop), under its link
+        lock."""
         from ..intake import retry
 
         room = Room(row["platform"], row["native_meeting_id"])
         async with store.room_lock(row["user_id"], [room]) as tx:
             written = await retry.end(
-                tx, row["id"], completion_reason="stopped" if stopped else None
+                tx, row["id"], completion_reason="stopped" if stopped else None,
+                change_reason=change_reason, message=message,
             )
         if written is not None:
             await publish_events(publisher, [written.event_id])
@@ -565,6 +572,11 @@ async def auto_join_tick(
                 untracked_grace=untracked_grace,
                 log=logging.getLogger("meeting_api.auto_join.retry"),
             ):
+                limit = retry.deadline(mark, untracked_grace)
+                if limit is not None and now >= limit:
+                    code, message = retry.overdue(mark, limit)
+                    await _end_waiting(row, stopped=False, change_reason=code, message=message)
+                    return
                 log_event("auto_join_retry_waiting_for_workload", audience="system",
                           span="meetings.auto_join", user_id=row["user_id"],
                           meeting_id=str(row["id"]), fields={"workload": mark.get("workload")})

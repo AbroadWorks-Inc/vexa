@@ -791,6 +791,8 @@ async def test_the_reconcile_sweep_leaves_a_waiting_meeting_to_the_retry():
     from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
 
     repo = _waiting_repo(proven=False)
+    soon = datetime.now(UTC) + timedelta(minutes=1)
+    repo._meetings[5]["data"]["bot_retry"]["due_at"] = soon.isoformat()
     await repo.create_session(meeting_id=5, session_uid="sess-old")
     assert await repo.list_stale_nonterminal(stop_grace=0, active_grace=0) == []
     posted: list[dict] = []
@@ -803,6 +805,39 @@ async def test_the_reconcile_sweep_leaves_a_waiting_meeting_to_the_retry():
         repo, runtime, post, stop_grace=0, active_grace=0, log=_Log()
     )
     assert posted == [] and runtime.deleted == []
+    assert repo._meetings[5]["status"] == "requested"
+
+
+async def test_the_reconcile_sweep_ends_a_waiting_meeting_past_its_deadline():
+    """Past ``due_at`` + ``MEETING_UNTRACKED_GRACE_SEC`` a waiting meeting ends, whatever the retry
+    driver did (it may have given the item up)."""
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    repo = _waiting_repo(proven=False)
+    late = datetime.now(UTC) - timedelta(seconds=601)
+    repo._meetings[5]["data"]["bot_retry"]["due_at"] = late.isoformat()
+    posted: list[dict] = []
+
+    async def post(body):
+        posted.append(body)
+
+    await reconcile_stale_nonterminal_sweep(
+        repo,
+        FakeRuntimeClient(),
+        post,
+        stop_grace=0,
+        active_grace=0,
+        log=_Log(),
+        untracked_grace=600,
+    )
+    row = repo._meetings[5]
+    assert (row["status"], row["data"]["completion_reason"]) == (
+        "failed",
+        "join_failure",
+    )
+    assert not row["data"].get("bot_retry") and posted == []
+    assert "not proven gone" in row["data"]["failure_reason"]
 
 
 def test_the_intake_retry_golden_is_the_projection_of_a_waiting_meeting():

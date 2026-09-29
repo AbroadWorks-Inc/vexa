@@ -357,6 +357,7 @@ async def reconcile_stale_nonterminal_sweep(
     Returns the number of meetings reconciled."""
     if repo is None or not hasattr(repo, "list_stale_nonterminal"):
         return 0
+    ended = await end_overdue_retries(repo, untracked_grace=untracked_grace, log=log)
     try:
         stale = await repo.list_stale_nonterminal(
             stop_grace=stop_grace, active_grace=active_grace,
@@ -479,7 +480,41 @@ async def reconcile_stale_nonterminal_sweep(
     # stale), or it was reconciled — drops its tracker entry. Only CONTINUOUS untracked escalates.
     for mid in [m for m in tracker if m not in seen_untracked]:
         tracker.pop(mid, None)
-    return reconciled
+    return reconciled + ended
+
+
+async def end_overdue_retries(repo: Any, *, untracked_grace: float, log: Any) -> int:
+    """§6.9 F-K2's backstop: every meeting waiting for its next bot past its deadline
+    (``intake.retry.deadline``: ``due_at`` + ``untracked_grace``) ends ``failed`` through
+    ``repo.end_retry``, whatever the retry driver did (it may have given the item up). Before its
+    deadline a waiting meeting is left to the driver: ``list_stale_nonterminal`` never lists one.
+    Best-effort: never raises. Returns how many ended."""
+    if not hasattr(repo, "list_retry_meetings") or not hasattr(repo, "end_retry"):
+        return 0
+    from datetime import timezone
+
+    from ..intake import retry
+
+    now = datetime.now(timezone.utc)
+    ended = 0
+    try:
+        waiting = await repo.list_retry_meetings()
+    except Exception:  # noqa: BLE001 — best-effort; retried next sweep
+        log.exception("nonterminal-reconcile: list_retry_meetings failed")
+        return 0
+    for row in waiting:
+        mark = retry.marker(row.get("data"))
+        limit = None if mark is None else retry.deadline(mark, untracked_grace)
+        if mark is None or limit is None or now < limit:
+            continue
+        code, message = retry.overdue(mark, limit)
+        try:
+            await repo.end_retry(meeting_id=row["id"], change_reason=code, message=message)
+            ended += 1
+            log.warning("nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message)
+        except Exception:  # noqa: BLE001 — best-effort; retried next sweep
+            log.exception("nonterminal-reconcile: end_retry failed for meeting %s", row["id"])
+    return ended
 
 
 def _log_orphan_kill_failed(meeting_id, workload_id, err, *, unconfirmed: bool = False) -> None:

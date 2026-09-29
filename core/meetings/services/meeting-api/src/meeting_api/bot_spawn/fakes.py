@@ -413,6 +413,25 @@ class InMemoryMeetingRepo:
         row["data"][retry.MARKER] = {**mark, "proven_gone": True}
         return True
 
+    async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
+        """The real adapter's ``retry.end`` on a waiting row (no outbox here)."""
+        from ..intake import retry
+
+        row = self._meetings.get(meeting_id)
+        if row is None:
+            return None
+        mark = retry.marker(row.get("data"))
+        if mark is None or row["status"] != "requested":
+            return None
+        row["status"] = "failed"
+        row["data"][retry.MARKER] = None
+        row["data"]["failure_reason"] = message or mark.get("message")
+        if mark.get("reason") is not None:
+            row["data"]["completion_reason"] = mark["reason"]
+        if mark.get("stage") is not None:
+            row["data"]["failure_stage"] = mark["stage"]
+        return None
+
     async def list_retry_meetings(self, *, after=None, limit=None) -> list:
         """The real adapter's retry read: ``requested`` rows with ``data.bot_retry``, by id, each
         with its ``scheduled_end_at`` (an ISO string, as the adapter renders it)."""

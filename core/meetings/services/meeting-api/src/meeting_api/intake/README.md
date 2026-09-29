@@ -155,7 +155,11 @@ into `completion_history`), leaving the row out of its own duplicate check, bot 
 session check. A new bot that fails before its claim is one more bounded send. A stop of a
 waiting meeting (`record_stop`: the `/v2` stop, R5) ends it at once, `failed` with `stopped` and
 the outcome, and sends no leave command; a removal of its last entry answers `removed`. Its
-`bot_joins_at` is the retry's `due_at`, the reconcile sweep's listing leaves it out, and every
+`bot_joins_at` is the retry's `due_at`, and the reconcile sweep's listing leaves it out. A waiting
+meeting is bounded: at `due_at` + `MEETING_UNTRACKED_GRACE_SEC` (`retry.deadline`) one still
+unproven, or still without its new bot, ends `failed` (`workload_not_proven` / `retry_not_sent`),
+by the retry driver or, if the driver gave the item up, by the reconcile sweep
+(`end_overdue_retries`, `repo.end_retry`). Every
 `bot.retry` moves `aw_bot_retries_total{reason,user_id}` once its transaction commits.
 `IntakeStop` (`stop.py`) is the production `StopPort` (§1.7), behind `POST /v2/meetings/{id}/stop`
 (no outcome: the meeting ends with upstream's `stopped`) and R5 (outcome `cancelled_by_calendar`

@@ -335,6 +335,24 @@ class SqlAlchemyMeetingRepo:
             await db.commit()
             return True
 
+    async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
+        """§6.9 F-K2: end a meeting waiting for its next bot ``failed`` (``intake.retry.end``)
+        under the link lock and the row lock; the event's id, or ``None`` when it isn't waiting."""
+        from ..intake import retry
+        from ..intake.adapters import PostgresIntakeTx, lock_meeting_on_its_link
+
+        async with self._session_factory() as db:
+            m = await lock_meeting_on_its_link(db, meeting_id)
+            if m is None:
+                return None
+            written = await retry.end(
+                PostgresIntakeTx(db), m.id, change_reason=change_reason, message=message
+            )
+            if written is None:
+                return None
+            await db.commit()
+            return written.event_id
+
     async def list_retry_meetings(self, *, after=None, limit=None) -> list[dict]:
         """The meetings waiting for their next bot (§6.9 F-K2: ``requested`` with
         ``data.bot_retry``), by id, one page of ``limit`` after ``after``, each with its
@@ -572,7 +590,8 @@ class SqlAlchemyMeetingRepo:
         meeting yet, and holds the lobby budget the control plane handed it) uses ``preactive_grace``,
         everything else ``active_grace`` (a longer idle so a momentarily-quiet live bot is not
         reaped). A meeting waiting for its next bot (§6.9 F-K2, ``data.bot_retry``) is left out:
-        the auto-join tick's retry driver owns it. Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested), …]`` with
+        the auto-join tick's retry driver owns it, and past its deadline the sweep ends it
+        (``reconcile.end_overdue_retries``). Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested), …]`` with
         the LATEST session_uid per meeting (mirrors ``list_stale_stopping``)."""
         from datetime import datetime, timezone
 

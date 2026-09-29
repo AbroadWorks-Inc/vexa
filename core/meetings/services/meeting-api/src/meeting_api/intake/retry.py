@@ -36,6 +36,11 @@ marker while the meeting is live (the row's own ``completion_reason`` stays empt
 ``workload`` is the failed bot's workload and ``proven_gone`` whether it is already proven gone.
 It returns ``None``, having written nothing, when the failure isn't retried.
 
+A waiting meeting is bounded by ``deadline``: ``due_at`` plus ``MEETING_UNTRACKED_GRACE_SEC``. A
+failed workload not proven gone by then, or a new bot not sent by then, ends the meeting
+(``overdue``: ``workload_not_proven`` / ``retry_not_sent``); the retry driver and the reconcile
+sweep both apply it.
+
 A waiting meeting leaves ``requested`` one of two ways. A new bot claims it once ``proven``: the
 claim writes ``claimed(data)`` (the marker's failure moved into ``completion_history``, the marker
 removed) and no status change. Or ``end(tx, meeting_id, …)`` ends it ``failed`` (``bot.failed``,
@@ -51,6 +56,7 @@ from typing import Any, Mapping, Optional
 
 from .ports import IntakeTx, MeetingView
 from .projection import iso_utc
+from .rules import as_utc
 from .settings import IntakeSettings
 from .status import RETRY_EVENT, Outcome, WrittenEvent
 
@@ -61,12 +67,14 @@ __all__ = [
     "NOT_RETRIED",
     "RETRY_EVENT",
     "claimed",
+    "deadline",
     "due_at",
     "end",
     "in_scope",
     "is_bot_failure",
     "is_last",
     "marker",
+    "overdue",
     "pending_from",
     "proven",
     "retired_sessions",
@@ -150,6 +158,25 @@ def retired_sessions(data: Any) -> frozenset[str]:
         str(h["after_session"])
         for h in history
         if isinstance(h, Mapping) and h.get("after_session")
+    )
+
+
+def deadline(mark: Mapping[str, Any], untracked_grace: float) -> Optional[datetime]:
+    """When a waiting meeting stops waiting: its ``due_at`` plus ``untracked_grace``
+    (``MEETING_UNTRACKED_GRACE_SEC``, the longest a failed workload may stay unaccounted for).
+    """
+    due = as_utc(mark.get("due_at"))
+    return None if due is None else due + timedelta(seconds=untracked_grace)
+
+
+def overdue(mark: Mapping[str, Any], limit: datetime) -> tuple[str, str]:
+    """The change reason and message a waiting meeting past its ``deadline`` ends with."""
+    if mark.get("proven_gone"):
+        return "retry_not_sent", f"no new bot was sent by {iso_utc(limit)}"
+    return (
+        "workload_not_proven",
+        f"the failed bot's workload {mark.get('workload')} was not proven gone by "
+        f"{iso_utc(limit)}",
     )
 
 
@@ -244,18 +271,22 @@ async def end(
     completion_reason: Optional[str] = None,
     change_reason: Optional[str] = None,
     outcome: Optional[Outcome] = None,
+    message: Optional[str] = None,
 ) -> Optional[WrittenEvent]:
     """End a meeting waiting for its next bot ``failed``: ``completion_reason`` (else the
-    marker's), the marker's stage and message as ``failure_stage`` / ``failure_reason``, the
-    marker cleared, with ``outcome`` when given; the change reason is ``change_reason``, else the
-    completion reason. ``None``, having written nothing, when the meeting isn't waiting.
-    """
+    marker's), the marker's stage as ``failure_stage`` and ``message`` (else the marker's) as
+    ``failure_reason``, the marker cleared, with ``outcome`` when given; the change reason is
+    ``change_reason``, else the completion reason. ``None``, having written nothing, when the
+    meeting isn't waiting."""
     meeting = await tx.meeting(meeting_id)
     mark = marker(meeting.data)
     if mark is None or meeting.status != "requested":
         return None
     reason = completion_reason or mark.get("reason")
-    patch: dict[str, Any] = {MARKER: None, "failure_reason": mark.get("message")}
+    patch: dict[str, Any] = {
+        MARKER: None,
+        "failure_reason": message or mark.get("message"),
+    }
     if reason is not None:
         patch["completion_reason"] = reason
     if mark.get("stage") is not None:
