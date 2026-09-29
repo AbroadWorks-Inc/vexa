@@ -19,6 +19,8 @@ counted.
 ``PostgresItemFailures`` keeps the counts in ``sweep_item_failures`` (one row per sweep and item),
 so every replica and every tick shares them; ``InMemoryItemFailures`` is its fake. The row stores
 the error's type, never its text: a database error's text can carry the values it was given.
+``prune_item_failures`` deletes the records untouched for ``SWEEP_ITEM_FAILURES_RETENTION_S``
+(7 days), a page of ``SWEEP_BATCH_SIZE`` at a time; the reconcile sweep runs it every pass.
 
 SQLAlchemy is imported inside the Postgres methods, so this module imports without it.
 """
@@ -26,6 +28,7 @@ SQLAlchemy is imported inside the Postgres methods, so this module imports witho
 from __future__ import annotations
 
 import os
+import time
 import traceback
 from functools import partial
 from typing import (
@@ -48,9 +51,11 @@ __all__ = [
     "ItemExpired",
     "ItemFailures",
     "PostgresItemFailures",
+    "prune_item_failures",
     "run_item",
     "run_pages",
     "sweep_batch_size",
+    "sweep_item_failures_retention_s",
     "sweep_max_item_failures",
 ]
 
@@ -63,6 +68,11 @@ def sweep_batch_size() -> int:
 def sweep_max_item_failures() -> int:
     """``SWEEP_MAX_ITEM_FAILURES``: the failures after which a sweep gives an item up."""
     return int(os.getenv("SWEEP_MAX_ITEM_FAILURES", "5"))
+
+
+def sweep_item_failures_retention_s() -> float:
+    """``SWEEP_ITEM_FAILURES_RETENTION_S``: how long a failure record untouched is kept."""
+    return float(os.getenv("SWEEP_ITEM_FAILURES_RETENTION_S", "604800"))
 
 
 class ItemDeferred(Exception):
@@ -90,6 +100,23 @@ class ItemFailures(Protocol):
     async def given_up(self, sweep: str, item_ids: Collection[str]) -> set[str]:
         """Which of ``item_ids`` the sweep has given up."""
         ...
+
+    async def prune(self, *, older_than_s: float, limit: int) -> int:
+        """Delete the records untouched for ``older_than_s``, ``limit`` at a time; how many."""
+        ...
+
+
+async def prune_item_failures(failures: ItemFailures, *, log: Any) -> int:
+    """Delete the failure records untouched for ``SWEEP_ITEM_FAILURES_RETENTION_S``, a page of
+    ``SWEEP_BATCH_SIZE`` at a time. Never raises (a failure is logged); returns how many.
+    """
+    try:
+        return await failures.prune(
+            older_than_s=sweep_item_failures_retention_s(), limit=sweep_batch_size()
+        )
+    except Exception:
+        log.exception("sweep_item_failures prune failed")
+        return 0
 
 
 async def run_item(
@@ -229,10 +256,12 @@ class InMemoryItemFailures:
         self._max = max_failures
         self.counts: dict[tuple[str, str], int] = {}
         self.gave_up: set[tuple[str, str]] = set()
+        self.updated: dict[tuple[str, str], float] = {}
 
     async def failed(self, sweep: str, item_id: str, error: BaseException) -> bool:
         key = (sweep, item_id)
         self.counts[key] = self.counts.get(key, 0) + 1
+        self.updated[key] = time.time()
         if key in self.gave_up or self.counts[key] < self._max:
             return False
         self.gave_up.add(key)
@@ -241,6 +270,7 @@ class InMemoryItemFailures:
     async def give_up(self, sweep: str, item_id: str, error: BaseException) -> bool:
         key = (sweep, item_id)
         self.counts[key] = self.counts.get(key, 0) + 1
+        self.updated[key] = time.time()
         if key in self.gave_up:
             return False
         self.gave_up.add(key)
@@ -248,6 +278,15 @@ class InMemoryItemFailures:
 
     async def given_up(self, sweep: str, item_ids: Collection[str]) -> set[str]:
         return {i for i in item_ids if (sweep, i) in self.gave_up}
+
+    async def prune(self, *, older_than_s: float, limit: int) -> int:
+        cutoff = time.time() - older_than_s
+        old = sorted(k for k, at in self.updated.items() if at < cutoff)
+        for key in old:
+            self.counts.pop(key, None)
+            self.gave_up.discard(key)
+            self.updated.pop(key, None)
+        return len(old)
 
 
 class PostgresItemFailures:
@@ -307,3 +346,31 @@ class PostgresItemFailures:
         async with self._session_factory() as db:
             rows = await db.execute(stmt, {"sweep": sweep, "items": list(item_ids)})
             return {str(r[0]) for r in rows}
+
+    async def prune(self, *, older_than_s: float, limit: int) -> int:
+        """One ``DELETE`` of at most ``limit`` records untouched since the cutoff per page, each
+        page in its own transaction, until a short page. The cutoff is fixed first, so a record
+        written meanwhile is never taken and the pages end."""
+        from sqlalchemy import text
+
+        stmt = text(
+            "DELETE FROM sweep_item_failures WHERE (sweep, item_id) IN ("
+            "SELECT sweep, item_id FROM sweep_item_failures WHERE updated_at < :cutoff "
+            "ORDER BY sweep, item_id LIMIT :limit)"
+        )
+        async with self._session_factory() as db:
+            cutoff = (
+                await db.execute(
+                    text("SELECT now() - make_interval(secs => :age)"),
+                    {"age": older_than_s},
+                )
+            ).scalar_one()
+        pruned = 0
+        while True:
+            async with self._session_factory() as db, db.begin():
+                deleted = (
+                    await db.execute(stmt, {"cutoff": cutoff, "limit": limit})
+                ).rowcount
+            pruned += deleted
+            if deleted < limit:
+                return pruned

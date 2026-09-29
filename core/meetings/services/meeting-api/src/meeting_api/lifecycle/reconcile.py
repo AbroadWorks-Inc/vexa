@@ -438,7 +438,9 @@ async def reconcile_stale_nonterminal_sweep(
     await retry_unproven_teardowns(
         repo, runtime, untracked_grace=untracked_grace, log=log, failures=item_failures
     )
-    from ..sweeps.item_failures import run_pages, sweep_batch_size
+    from ..sweeps.item_failures import prune_item_failures, run_pages, sweep_batch_size
+
+    await prune_item_failures(item_failures, log=log)
 
     limit = sweep_batch_size()
     reconciled = 0

@@ -17,8 +17,10 @@ from meeting_api.sweeps.item_failures import (
     InMemoryItemFailures,
     ItemDeferred,
     ItemExpired,
+    prune_item_failures,
     run_item,
     sweep_batch_size,
+    sweep_item_failures_retention_s,
     sweep_max_item_failures,
 )
 
@@ -164,6 +166,48 @@ async def test_the_give_up_action_runs_once_right_after_the_give_up(capsys):
     assert events[-2:] == ["sweep_item_given_up", "sweep_item_give_up_action_failed"]
 
 
+def test_the_retention_defaults_to_seven_days(monkeypatch):
+    monkeypatch.delenv("SWEEP_ITEM_FAILURES_RETENTION_S", raising=False)
+    assert sweep_item_failures_retention_s() == 604800.0
+    monkeypatch.setenv("SWEEP_ITEM_FAILURES_RETENTION_S", "3600")
+    assert sweep_item_failures_retention_s() == 3600.0
+
+
+async def test_records_older_than_the_retention_are_pruned(monkeypatch):
+    """M8: a failure record untouched for ``SWEEP_ITEM_FAILURES_RETENTION_S`` goes, a page of
+    ``SWEEP_BATCH_SIZE`` at a time; a newer one stays."""
+    import time
+
+    monkeypatch.setenv("SWEEP_ITEM_FAILURES_RETENTION_S", "3600")
+    monkeypatch.setenv("SWEEP_BATCH_SIZE", "2")
+    failures = InMemoryItemFailures(max_failures=1)
+    for item in ("1", "2", "3", "fresh"):
+        await failures.failed("probe", item, RuntimeError("x"))
+    for item in ("1", "2", "3"):
+        failures.updated[("probe", item)] = time.time() - 3601
+    assert await prune_item_failures(failures, log=_Log()) == 3
+    assert failures.counts == {("probe", "fresh"): 1}
+    assert failures.gave_up == {("probe", "fresh")}
+
+
+async def test_a_prune_that_fails_is_logged_and_not_raised():
+    class Down(InMemoryItemFailures):
+        async def prune(self, *, older_than_s, limit):
+            raise ConnectionRefusedError("database is down")
+
+    log = _Log()
+    assert await prune_item_failures(Down(max_failures=1), log=log) == 0
+    assert log.errors == ["sweep_item_failures prune failed"]
+
+
+class _Log:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+
+    def exception(self, message: str, *args) -> None:
+        self.errors.append(message % args if args else message)
+
+
 # ── Postgres ─────────────────────────────────────────────────────────────────────────────────
 
 pg_only = pytest.mark.skipif(
@@ -217,3 +261,31 @@ async def test_pg_give_up_gives_the_item_up_on_its_first_call_once(link_pg_engin
     assert await failures.give_up("unproven-teardown", "5:w", error) is True
     assert await failures.give_up("unproven-teardown", "5:w", error) is False
     assert await failures.given_up("unproven-teardown", ["5:w"]) == {"5:w"}
+
+
+@pg_only
+async def test_pg_records_older_than_the_retention_are_pruned_a_page_at_a_time(
+    link_pg_engine,
+):
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    factory = async_sessionmaker(link_pg_engine, expire_on_commit=False)
+    failures = PostgresItemFailures(factory, max_failures=5)
+    for item in ("1", "2", "3", "fresh"):
+        await failures.failed("probe", item, RuntimeError("x"))
+    async with link_pg_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE sweep_item_failures SET updated_at = now() - interval '8 days' "
+                "WHERE item_id <> 'fresh'"
+            )
+        )
+    assert await failures.prune(older_than_s=7 * 86400, limit=2) == 3
+    async with link_pg_engine.connect() as conn:
+        left = (
+            await conn.execute(text("SELECT item_id FROM sweep_item_failures"))
+        ).scalars()
+        assert list(left) == ["fresh"]

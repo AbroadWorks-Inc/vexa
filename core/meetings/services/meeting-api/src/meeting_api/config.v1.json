@@ -756,6 +756,13 @@
    "targets": []
   },
   {
+   "key": "SWEEP_ITEM_FAILURES_RETENTION_S",
+   "class": "defaulted",
+   "default": "604800",
+   "description": "§6.9 F-I: how long (s) a sweep_item_failures record untouched is kept; each reconcile pass deletes the older ones, SWEEP_BATCH_SIZE at a time (7 days). A given-up item whose record goes is tried again by its sweep if it is still listed",
+   "targets": []
+  },
+  {
    "key": "CALENDAR_SYNC_INTERVAL_S",
    "class": "defaulted",
    "default": "300",

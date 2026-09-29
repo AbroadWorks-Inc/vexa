@@ -1570,6 +1570,31 @@ async def test_the_general_reconcile_sweep_reads_its_rows_in_pages(monkeypatch):
     assert reads == [(None, 2), (2, 2)]
 
 
+async def test_the_general_reconcile_sweep_prunes_old_failure_records(monkeypatch):
+    """M8: each pass of the reconcile sweep prunes the failure records older than
+    ``SWEEP_ITEM_FAILURES_RETENTION_S``."""
+    import time
+
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    monkeypatch.setenv("SWEEP_ITEM_FAILURES_RETENTION_S", "60")
+    failures = InMemoryItemFailures(max_failures=1)
+    await failures.failed("not-sent", "7", RuntimeError("x"))
+    await failures.failed("not-sent", "8", RuntimeError("x"))
+    failures.updated[("not-sent", "7")] = time.time() - 61
+    await reconcile_stale_nonterminal_sweep(
+        InMemoryMeetingRepo(),
+        FakeRuntimeClient(),
+        _ok,
+        stop_grace=45,
+        active_grace=300,
+        log=_Log(),
+        item_failures=failures,
+    )
+    assert failures.gave_up == {("not-sent", "8")}
+
+
 async def test_a_stale_row_whose_delete_keeps_failing_is_given_up_and_counted():
     """I2: the general sweep's row whose delete keeps failing is counted each pass and given
     up after ``SWEEP_MAX_ITEM_FAILURES``, under its own sweep name."""
