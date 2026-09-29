@@ -461,41 +461,40 @@ class InMemoryMeetingRepo:
             row["data"].update(unproven_teardown(row["data"], str(mark["workload"])))
         return f"evt_retry_end_{meeting_id}"
 
-    async def list_claimed_meetings(self, *, after=None, limit=None) -> list:
-        """The real adapter's read of ``requested`` rows with no marker and no container, each
-        with its ``newest_session``."""
+    async def list_unfinished_spawns(self, *, after=None, limit=None) -> list:
+        """The real adapter's read of ``requested`` rows with no marker, no container and a
+        ``data.spawn_session``, each with ``written`` and its ``newest_session``."""
         rows = []
         for mid, m in sorted(self._meetings.items()):
             data = m.get("data") or {}
-            if (m["status"] != "requested" or m.get("bot_container_id")
-                    or data.get("bot_retry") or not isinstance(data.get("completion_history"), list)
-                    or (after is not None and mid <= after)):
+            if (m["status"] != "requested" or m.get("bot_container_id") or data.get("bot_retry")
+                    or not data.get("spawn_session") or (after is not None and mid <= after)):
                 continue
-            newest = next((s["session_uid"] for s in reversed(self.sessions)
-                           if s["meeting_id"] == mid), None)
-            rows.append({**m, "newest_session": newest})
+            sessions = [s["session_uid"] for s in self.sessions if s["meeting_id"] == mid]
+            rows.append({**m, "written": data["spawn_session"].get("session") in sessions,
+                         "newest_session": sessions[-1] if sessions else None})
         return rows if limit is None else rows[:limit]
 
-    async def end_unsent_claim(self, *, meeting_id, untracked_grace) -> Optional[str]:
-        """The real adapter's end of a claimed meeting whose spawn never wrote its session."""
+    async def end_unfinished_spawn(self, *, meeting_id, untracked_grace) -> Optional[str]:
+        """The real adapter's end of a meeting whose spawn died before its session write."""
         from ..intake import retry
 
         row = self._meetings.get(meeting_id)
-        if row is None or row["status"] != "requested" or row.get("bot_container_id"):
+        if (row is None or row["status"] != "requested" or row.get("bot_container_id")
+                or retry.marker(row["data"]) is not None):
             return None
-        newest = next((s["session_uid"] for s in reversed(self.sessions)
-                       if s["meeting_id"] == meeting_id), None)
-        ending = retry.unsent_claim(row["data"], newest, untracked_grace,
-                                    datetime.now(timezone.utc))
-        if retry.marker(row["data"]) is not None or ending is None:
+        sessions = [s["session_uid"] for s in self.sessions if s["meeting_id"] == meeting_id]
+        plan = row["data"].get("spawn_session") or {}
+        ending = retry.unfinished_spawn(
+            meeting_id, row["data"], written=plan.get("session") in sessions,
+            newest_session=sessions[-1] if sessions else None,
+            untracked_grace=untracked_grace, now=datetime.now(timezone.utc),
+        )
+        if ending is None:
             return None
-        last = (row["data"].get("completion_history") or [{}])[-1]
         row["status"] = "failed"
-        row["data"]["failure_reason"] = ending[1]
-        for key in ("completion_reason", "failure_stage"):
-            if last.get(key) is not None:
-                row["data"][key] = last[key]
-        return f"evt_unsent_claim_{meeting_id}"
+        row["data"].update(ending[1])
+        return f"evt_unfinished_spawn_{meeting_id}"
 
     async def list_retry_meetings(self, *, after=None, limit=None) -> list:
         """The real adapter's retry read: ``requested`` rows with ``data.bot_retry``, by id, each

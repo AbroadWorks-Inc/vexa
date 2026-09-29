@@ -432,6 +432,20 @@ def teardown_done(data: Any, workload: Optional[str]) -> dict:
     return {UNPROVEN_TEARDOWN: rest or None}
 
 
+#: ``meetings.data`` key: the session a spawn will write, and when it claimed, inserted or reopened
+#: the row: ``{session, at}``. Written in that same transaction, before the workload create.
+SPAWN_SESSION = "spawn_session"
+
+
+def spawn_session(session_uid: str, *, now: Optional[datetime] = None) -> dict:
+    """The ``meetings.data`` patch a spawn writes with its claim, insert or reopen, before it
+    creates the workload. ``workload_id_for(meeting_id, session)`` names that workload, so a spawn
+    that dies between the create and its session write leaves a row that names it
+    (``intake.retry.unfinished_spawn``, §6.9 F-K2)."""
+    at = now or datetime.now(timezone.utc)
+    return {SPAWN_SESSION: {"session": session_uid, "at": at.isoformat()}}
+
+
 def workload_id_for(meeting_id: Any, session_uid: str) -> str:
     """The workload id a spawn asks the runtime for: the meeting and the session's first eight
     characters (``request_bot``). A session with no recorded workload is known by it (§6.9 F-K2)."""

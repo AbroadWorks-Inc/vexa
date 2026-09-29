@@ -53,6 +53,7 @@ from .ports import (
     SpawnFailed,
     TranscriptionNotConfigured,
     _stopped_reopen_detail,
+    spawn_session,
     unproven_teardown,
     workload_id_for,
 )
@@ -716,10 +717,14 @@ async def request_bot(
                 "recording_enabled": recording_enabled,
                 "transcription_provider": transcription_provider,
                 "service_authority": authority_record,
+                # Before the create, in the reopen's transaction: names this spawn's workload.
+                **spawn_session(connection_id),
             },
         )
     else:
-        meeting_data: dict[str, Any] = {}
+        # Before the create, in the claim's or the insert's transaction: names this spawn's
+        # workload should the process die before its session write (§6.9 F-K2).
+        meeting_data: dict[str, Any] = dict(spawn_session(connection_id))
         if constructed_url:
             meeting_data["constructed_meeting_url"] = constructed_url
         meeting_data["transcribe_enabled"] = transcribe_enabled

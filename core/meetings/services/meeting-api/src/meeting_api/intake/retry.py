@@ -187,18 +187,46 @@ def overdue(
     )
 
 
-def unsent_claim(
-    data: Any, newest_session: Optional[str], untracked_grace: float, now: datetime
-) -> Optional[tuple[str, str]]:
-    """A meeting a new bot claimed (``claimed``) whose spawn never wrote its session: its newest
-    session is still the retired one. Past the claim's send time (``auto_join_last_attempt``)
-    plus ``untracked_grace`` it ends like a waiting meeting whose new bot was not sent
-    (``overdue``: ``retry_not_sent``, the old workload was proven gone before the claim); the
-    change reason and message, or ``None`` while the spawn may still write it."""
-    if not newest_session or newest_session not in retired_sessions(data):
+def unfinished_spawn(
+    meeting_id: int,
+    data: Any,
+    *,
+    written: bool,
+    newest_session: Optional[str],
+    untracked_grace: float,
+    now: datetime,
+) -> Optional[tuple[str, dict[str, Any]]]:
+    """A spawn that died after its claim, insert or reopen and before its session write: the row
+    names the session it planned (``bot_spawn.ports.spawn_session``) and no session row has it
+    (``written`` False). Past that time plus ``untracked_grace`` the meeting ends ``failed``;
+    returns the change reason and the data patch, or ``None`` while the spawn may still write
+    it. The planned workload (``workload_id_for``) may run, so the patch records it through the
+    one ``unproven_teardown`` builder. A claimed retry (its newest session is the retired one)
+    keeps the failed bot's reason and ends as a new bot not sent (``overdue``:
+    ``retry_not_sent``); any other spawn is ``start_failed``."""
+    from ..bot_spawn.ports import SPAWN_SESSION, unproven_teardown, workload_id_for
+
+    plan = data.get(SPAWN_SESSION) if isinstance(data, Mapping) else None
+    if written or not isinstance(plan, Mapping) or not plan.get("session"):
         return None
-    sent = data.get("auto_join_last_attempt") if isinstance(data, Mapping) else None
-    return overdue({"due_at": sent, "proven_gone": True}, untracked_grace, now)
+    sent = {"due_at": plan.get("at"), "proven_gone": True}
+    over = overdue(sent, untracked_grace, now)
+    if over is None:
+        return None
+    workload = workload_id_for(meeting_id, str(plan["session"]))
+    patch: dict[str, Any] = dict(unproven_teardown(data, workload))
+    if newest_session and newest_session in retired_sessions(data):
+        code, message = over
+        last = data["completion_history"][-1]
+        for key in ("completion_reason", "failure_stage"):
+            if last.get(key) is not None:
+                patch[key] = last[key]
+    else:
+        code = "start_failed"
+        message = f"the bot did not start by {iso_utc(deadline(sent, untracked_grace))}"
+        patch.update(completion_reason="start_failed", failure_stage="requested")
+    patch["failure_reason"] = f"{message}; its workload {workload} may still run"
+    return code, patch
 
 
 def is_bot_failure(failure: Failure) -> bool:

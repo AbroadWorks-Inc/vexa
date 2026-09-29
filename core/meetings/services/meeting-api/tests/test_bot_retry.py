@@ -1255,16 +1255,27 @@ async def test_a_containerless_stopping_row_has_its_workload_deleted_before_it_c
     assert [p["status"] for p in posted] == ["completed"]
 
 
-def test_an_unsent_claim_is_only_one_whose_newest_session_is_retired_past_its_deadline():
-    data = {
+def test_an_unfinished_spawn_names_its_workload_past_its_deadline():
+    at = datetime(2026, 9, 29, 9, 21, tzinfo=UTC)  # the plan + 600 s
+    plan = {"session": "new-sess-1", "at": "2026-09-29T09:11:00Z"}
+    claimed = {
+        "spawn_session": plan,
         "completion_history": [{"completion_reason": "left_alone", "after_session": "old"}],
-        "auto_join_last_attempt": "2026-09-29T09:11:00Z",
     }
-    at = datetime(2026, 9, 29, 9, 21, tzinfo=UTC)  # the claim + 600 s
-    assert retry.unsent_claim(data, "old", 600, at) == (
-        "retry_not_sent",
-        "no new bot was sent by 2026-09-29T09:21:00Z",
+
+    def ending(data, *, written=False, newest="old", now=at):
+        return retry.unfinished_spawn(
+            5, data, written=written, newest_session=newest, untracked_grace=600, now=now
+        )
+
+    code, patch = ending(claimed)
+    assert code == "retry_not_sent" and patch["completion_reason"] == "left_alone"
+    assert patch["failure_reason"] == (
+        "no new bot was sent by 2026-09-29T09:21:00Z; its workload mtg-5-new-sess may still run"
     )
-    assert retry.unsent_claim(data, "old", 600, at - timedelta(seconds=1)) is None
-    assert retry.unsent_claim(data, "new", 600, at) is None  # its session was written
-    assert retry.unsent_claim({}, "old", 600, at) is None  # never claimed
+    assert [t["workload"] for t in patch["unproven_teardown"]] == ["mtg-5-new-sess"]
+    code, patch = ending({"spawn_session": plan}, newest=None)
+    assert (code, patch["completion_reason"]) == ("start_failed", "start_failed")
+    assert ending(claimed, now=at - timedelta(seconds=1)) is None
+    assert ending(claimed, written=True) is None  # its session was written
+    assert ending({}) is None  # no planned session

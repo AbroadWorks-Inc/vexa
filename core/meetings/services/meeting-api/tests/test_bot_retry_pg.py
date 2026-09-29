@@ -1427,13 +1427,46 @@ class _Died(BaseException):
     """The spawning process dying: nothing in the spawn catches it."""
 
 
-async def test_pg_a_claim_whose_spawn_died_before_its_session_ends_at_the_deadline(pg):
-    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
-    from meeting_api.lifecycle.machine import TransitionSource
+class _DiesAtTheSession:
+    """A repo whose ``create_session`` never returns: the process died right after the
+    workload create."""
 
-    class DiesAtTheSession(SqlAlchemyMeetingRepo):
-        async def create_session(self, **kw):
-            raise _Died()
+    def __new__(cls, pg: Pg):
+        from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+        class Repo(SqlAlchemyMeetingRepo):
+            async def create_session(self, **kw):
+                raise _Died()
+
+        return Repo(pg.session_factory)
+
+
+async def _past_the_spawn_deadline(pg: Pg, mid: int) -> None:
+    await pg.execute(
+        "UPDATE meetings SET data = jsonb_set(data, '{spawn_session,at}', "
+        "'\"2026-01-01T00:00:00+00:00\"'), updated_at = now() - interval '2 hours' "
+        "WHERE id = :m",
+        m=mid,
+    )
+
+
+async def _deleted_by_the_teardown_sweep(pg: Pg, workload: str) -> list[str]:
+    from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
+
+    runtime = FakeRuntimeClient(workloads={workload: {"state": "running"}})
+    await retry_unproven_teardowns(
+        pg.repo,
+        runtime,
+        untracked_grace=600,
+        log=_SilentLog(),
+        failures=InMemoryItemFailures(max_failures=5),
+    )
+    return runtime.deleted
+
+
+async def test_pg_a_claim_whose_spawn_died_after_the_create_names_and_bounds_it(pg):
+    from meeting_api.bot_spawn.ports import workload_id_for
+    from meeting_api.lifecycle.machine import TransitionSource
 
     mid, session = await pg.sent(status="active")
     workload = (await pg.row(mid))["bot_container_id"]
@@ -1447,25 +1480,60 @@ async def test_pg_a_claim_whose_spawn_died_before_its_session_ends_at_the_deadli
         transition_source=TransitionSource.RUNTIME_DESTROY,
         force_terminal_on_destroy=True,
     )
+    runtime = _gone(workload)
     with pytest.raises(_Died):
-        await pg.tick(
-            _gone(workload), at=_later(), repo=DiesAtTheSession(pg.session_factory)
-        )
+        await pg.tick(runtime, at=_later(), repo=_DiesAtTheSession(pg))
+    new = runtime.specs[0]["workloadId"]
     row = await pg.row(mid)
     assert (row["status"], row["data"].get("bot_retry")) == ("requested", None)
     assert await pg.sessions(mid) == [session]  # only the retired one
-    await pg.execute(
-        "UPDATE meetings SET data = jsonb_set(data, '{auto_join_last_attempt}', "
-        "'\"2026-01-01T00:00:00+00:00\"'), updated_at = now() - interval '2 hours' "
-        "WHERE id = :m",
-        m=mid,
-    )
+    assert workload_id_for(mid, row["data"]["spawn_session"]["session"]) == new
+    await _past_the_spawn_deadline(pg, mid)
     await _sweep(pg, _gone(), InMemoryItemFailures(max_failures=5), finish=app)
     row = await pg.row(mid)
     assert row["status"] == "failed"
     assert row["data"]["failure_reason"].startswith("no new bot was sent by ")
+    assert _pending(row) == [new]
     assert (await pg.types(mid))[-1] == "bot.failed"
     assert sink.events == ["bot.failed"]
+    assert await _deleted_by_the_teardown_sweep(pg, new) == [new]
+    assert "unproven_teardown" not in (await pg.row(mid))["data"]
+
+
+async def test_pg_an_upstream_spawn_that_died_after_the_create_names_and_bounds_it(
+    pg, monkeypatch
+):
+    from meeting_api.bot_spawn import request_bot
+    from meeting_api.bot_spawn.ports import workload_id_for
+
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.example")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+    runtime = FakeRuntimeClient()
+    with pytest.raises(_Died):
+        await request_bot(
+            _DiesAtTheSession(pg),
+            runtime,
+            user_id=USER,
+            platform="google_meet",
+            native_meeting_id="abc-defg-hij",
+            redis_url="redis://r",
+            token_secret="s",
+        )
+    new = runtime.specs[0]["workloadId"]
+    mid = int(new.split("-")[1])
+    row = await pg.row(mid)
+    assert (row["status"], row["bot_container_id"]) == ("requested", None)
+    assert await pg.sessions(mid) == []
+    assert workload_id_for(mid, row["data"]["spawn_session"]["session"]) == new
+    await _past_the_spawn_deadline(pg, mid)
+    await _sweep(pg, _gone(), InMemoryItemFailures(max_failures=5))
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == (
+        "failed",
+        "start_failed",
+    )
+    assert _pending(row) == [new]
+    assert await _deleted_by_the_teardown_sweep(pg, new) == [new]
 
 
 # ── an unproven workload's failed delete is retried, bounded (F-I) ──────────────────────────

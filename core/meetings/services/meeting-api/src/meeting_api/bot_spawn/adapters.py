@@ -387,15 +387,21 @@ class SqlAlchemyMeetingRepo:
             await db.commit()
             return written.event_id
 
-    async def list_claimed_meetings(self, *, after=None, limit=None) -> list[dict]:
-        """The ``requested`` meetings a new bot may have claimed (no ``data.bot_retry``, no
-        ``bot_container_id``), by id, one page of ``limit`` after ``after``, each with its
-        ``newest_session``: the read ``reconcile.end_overdue_retries`` checks with
-        ``intake.retry.unsent_claim``."""
-        from sqlalchemy import func, select, text
+    async def list_unfinished_spawns(self, *, after=None, limit=None) -> list[dict]:
+        """The ``requested`` meetings whose spawn may have died before its session write (no
+        ``data.bot_retry``, no ``bot_container_id``, a ``data.spawn_session``), by id, one page
+        of ``limit`` after ``after``, each with ``written`` (a session row has the planned session)
+        and its ``newest_session``: the read ``reconcile.end_overdue_retries`` checks with
+        ``intake.retry.unfinished_spawn``."""
+        from sqlalchemy import exists, select, text
 
         from ..sessions.models import Meeting, MeetingSession
+        from .ports import SPAWN_SESSION
 
+        written = exists().where(
+            MeetingSession.meeting_id == Meeting.id,
+            MeetingSession.session_uid == Meeting.data[SPAWN_SESSION]["session"].astext,
+        )
         newest = (
             select(MeetingSession.session_uid)
             .where(MeetingSession.meeting_id == Meeting.id)
@@ -404,12 +410,12 @@ class SqlAlchemyMeetingRepo:
             .scalar_subquery()
         )
         stmt = (
-            select(Meeting, newest)
+            select(Meeting, written, newest)
             .where(
                 text("meetings.status = 'requested'"),
                 Meeting.bot_container_id.is_(None),
                 Meeting.data["bot_retry"].astext.is_(None),
-                func.jsonb_typeof(Meeting.data["completion_history"]) == "array",
+                Meeting.data[SPAWN_SESSION].astext.isnot(None),
             )
             .order_by(Meeting.id)
         )
@@ -419,13 +425,16 @@ class SqlAlchemyMeetingRepo:
             stmt = stmt.limit(limit)
         async with self._session_factory() as db:
             rows = (await db.execute(stmt)).all()
-            return [{**_row_to_dict(m), "newest_session": s} for m, s in rows]
+            return [
+                {**_row_to_dict(m), "written": bool(w), "newest_session": s}
+                for m, w, s in rows
+            ]
 
-    async def end_unsent_claim(self, *, meeting_id, untracked_grace) -> Optional[str]:
-        """§6.9 F-K2: end ``failed`` a claimed meeting whose spawn never wrote its session, past
-        its deadline (``intake.retry.unsent_claim``, checked again under the link lock and the row
-        lock), with the failed bot's reason and stage; the event's id, or ``None`` when it isn't
-        such a meeting (a session was written, or it ended)."""
+    async def end_unfinished_spawn(self, *, meeting_id, untracked_grace) -> Optional[str]:
+        """§6.9 F-K2: end ``failed`` a meeting whose spawn died before its session write, past
+        its deadline (``intake.retry.unfinished_spawn``, checked again under the link lock and
+        the row lock), recording its planned workload; the event's id, or ``None`` when it isn't
+        such a meeting (the session was written, a container recorded, or it ended)."""
         from sqlalchemy import select
 
         from ..intake import retry
@@ -438,25 +447,26 @@ class SqlAlchemyMeetingRepo:
             if m is None or m.status != "requested" or m.bot_container_id is not None:
                 return None
             data = dict(m.data) if isinstance(m.data, dict) else {}
-            newest = (
-                await db.execute(
-                    select(MeetingSession.session_uid)
-                    .where(MeetingSession.meeting_id == meeting_id)
-                    .order_by(MeetingSession.id.desc())
-                    .limit(1)
-                )
-            ).scalar()
-            ending = retry.unsent_claim(
-                data, newest, untracked_grace, datetime.now(timezone.utc)
-            )
-            if retry.marker(data) is not None or ending is None:
+            if retry.marker(data) is not None:
                 return None
-            code, message = ending
-            last = (data.get("completion_history") or [{}])[-1]
-            patch = {"failure_reason": message}
-            for key in ("completion_reason", "failure_stage"):
-                if last.get(key) is not None:
-                    patch[key] = last[key]
+            sessions = list(
+                (
+                    await db.execute(
+                        select(MeetingSession.session_uid)
+                        .where(MeetingSession.meeting_id == meeting_id)
+                        .order_by(MeetingSession.id)
+                    )
+                ).scalars()
+            )
+            plan = data.get("spawn_session") or {}
+            ending = retry.unfinished_spawn(
+                meeting_id, data, written=plan.get("session") in sessions,
+                newest_session=sessions[-1] if sessions else None,
+                untracked_grace=untracked_grace, now=datetime.now(timezone.utc),
+            )
+            if ending is None:
+                return None
+            code, patch = ending
             written = await write_status(
                 db, meeting_id, "failed", expected_from={"requested"}, data_patch=patch,
                 change_reason=code,
