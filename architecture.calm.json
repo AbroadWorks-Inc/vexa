@@ -2350,7 +2350,7 @@
      }
     }
    },
-   "description": "proxy /bots /transcripts /meetings /recordings /v2/entries /v2/meetings and per-calendar sync; every forwarded client request carries the gateway's signed identity (x-gateway-signature: kid=<kid>,t=<unix>,v2=HMAC-SHA256 under the active key of the GATEWAY_IDENTITY_KEYS ring, over the kid, t, x-user-id, x-user-scopes, x-user-limits, method, SHA-256 of the body, raw query and path), which meeting-api verifies under the key its kid names in the same ring and rejects if missing, wrong, under a kid not in its ring, or stale; the ring rotates by adding a key everywhere, switching the gateway's active kid, then dropping the old key (§1.10, §6.9 F-E)",
+   "description": "proxy /bots /transcripts /meetings /recordings /v2/entries /v2/meetings and per-calendar sync; every forwarded client request carries the gateway's signed identity (x-gateway-signature: kid=<kid>,t=<unix>,v2=HMAC-SHA256 under the key GATEWAY_IDENTITY_ACTIVE_KEY names in the GATEWAY_IDENTITY_KEYS ring, over the 15 fields v2, kid, t, x-user-id, x-user-email, x-user-scopes, x-user-limits, x-user-workspaces, x-user-webhook-url, x-user-webhook-secret, x-user-webhook-events (every x-user-* header it forwards; an absent one is an empty field), method, SHA-256 of the body, raw query and path), which meeting-api verifies under the key its kid names in the same ring and rejects with 401 if missing, wrong, under a kid not in its ring, carrying an identity header more than once, or more than GATEWAY_IDENTITY_MAX_SKEW_S seconds from its clock; the ring rotates by adding a key everywhere, switching the gateway's active kid, then dropping the old key (§1.10, §6.9 F-E)",
    "protocol": "HTTPS"
   },
   {
@@ -2398,7 +2398,7 @@
      }
     }
    },
-   "description": "POST /internal/validate (authz oracle) plus user calendar connection CRUD and /v2/webhooks subscription management (§2.7); the same signed gateway identity (v2, kid-named key of the GATEWAY_IDENTITY_KEYS ring) that meeting-api verifies is verified here too (§1.10, §6.9 F-E)",
+   "description": "POST /internal/validate (authz oracle) plus user calendar connection CRUD and /v2/webhooks subscription management (§2.7); the same signed gateway identity that meeting-api verifies is verified here too: v2 under the kid-named key of the GATEWAY_IDENTITY_KEYS ring, over the kid, t, all eight x-user-* headers (x-user-id, x-user-email, x-user-scopes, x-user-limits, x-user-workspaces, x-user-webhook-url, x-user-webhook-secret, x-user-webhook-events), method, SHA-256 of the body, raw query and path, fresh within GATEWAY_IDENTITY_MAX_SKEW_S seconds (§1.10, §6.9 F-E)",
    "protocol": "HTTPS"
   },
   {
