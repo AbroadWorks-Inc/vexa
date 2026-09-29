@@ -136,19 +136,25 @@ of the meeting's sends (`record_send_failure`), then `requested` through `write_
 `workload`, `at`, `due_at`, `proven_gone`); the row's `completion_reason` stays empty while it
 waits. Three writers call it: the session-keyed lifecycle write (`update_meeting_status`; a lost bot
 on the last attempt ends `failed`; a session with no recorded workload is known by
-`workload_id_for`), `fail_meeting` and `ExactRowSpawn`'s post-claim ending. A workload is recorded
-proven gone only on evidence: the runtime refused it (429, 4xx, a dead body), its teardown was
-confirmed, or the failure came before the create was called (the token, the invocation, the spec:
-no workload is named). A create the runtime did not answer (a timeout, a transport error, a 5xx,
-the request cancelled mid-create) or a post-spawn write failure with an unconfirmed teardown names
-the workload unproven; when that failure ends the meeting instead of retrying it, the workload is
-deleted through the reconcile sweeps' teardown, and a delete not confirmed stays on the finished
-row (`data.unproven_teardown`) for the reconcile sweep to retry each pass, bounded by §6.9 F-I
-(`retry_unproven_teardowns`, sweep `unproven-teardown`: cleared on a confirmed delete, the runtime
-reporting it gone, or a 404 past `MEETING_UNTRACKED_GRACE_SEC`; given up and counted after
-`SWEEP_MAX_ITEM_FAILURES`). The spawn port's own ending (which
-knows no workload) never records one gone. The last failure ends `failed` with
-`bot.failed` and `aw_meetings_failed_total`; on a meeting that already had a bot session its
+`workload_id_for`), `fail_meeting` and `ExactRowSpawn`'s post-claim ending. A marker names only
+the workload its own attempt asked for, or none. A workload is recorded proven gone only on
+evidence: the runtime refused it (429, 4xx, a dead body), its teardown was confirmed, or the
+failure (a cancel included) came before the create was called (the token, the invocation, the
+spawn fence, the spec: no workload is named). A create the runtime did not answer (a timeout, a
+transport error, a 5xx, the request cancelled mid-create) names the workload unproven, and the
+spawn port's own ending (which knows no workload) never records one gone. One rule covers every
+end that frees the link while a workload may still run: it records `data.unproven_teardown`
+(`{workload, since}`, built only by `bot_spawn.ports.unproven_teardown`). `request_bot`'s
+`_teardown_or_record` deletes the workload through the reconcile sweeps' teardown and records it
+when the delete isn't confirmed: an unanswered create or a post-spawn write failure that ends the
+meeting instead of retrying it, and the raced-stop interlock. `retry.end` records it in its own
+status write when a waiting meeting ends (a stop, the planned end, the deadline) with a marker
+that isn't proven. The reconcile sweep retries every recorded one each pass, bounded by §6.9 F-I
+(`retry_unproven_teardowns`, sweep `unproven-teardown`, a page of `SWEEP_BATCH_SIZE`): cleared on
+a confirmed delete, the runtime reporting it gone, or a 404 past `MEETING_UNTRACKED_GRACE_SEC`
+since `since` (a missing or unreadable `since` counts as a failure); given up and counted after
+`SWEEP_MAX_ITEM_FAILURES`. The last failure ends `failed` with `bot.failed` and
+`aw_meetings_failed_total`; on an entry-managed meeting that already had a bot session its
 `not_sent` outcome is dropped. A row waiting for its next bot takes no status write from a session
 (data-only writes still land), a session that isn't the meeting's newest writes nothing, and the
 entry service answers a new instant join sent back this way `created`. The auto-join tick drives
@@ -166,8 +172,10 @@ the outcome, and sends no leave command; a removal of its last entry answers `re
 meeting is bounded: at `due_at` + `MEETING_UNTRACKED_GRACE_SEC` (`retry.deadline`) one still
 unproven, or still without its new bot, ends `failed` (`workload_not_proven` / `retry_not_sent`),
 by the retry driver or, if the driver gave the item up, by the reconcile sweep
-(`end_overdue_retries`, `repo.end_retry`). A meeting the retry ends this way (its planned end, a
-stop, its deadline, its last send) gets the same meeting-level finish as a lifecycle end: the app's
+(`end_overdue_retries`, `repo.end_retry`, a page of `SWEEP_BATCH_SIZE` at a time; it finishes only
+a meeting its own end ended). A meeting the retry ends this way (its planned end, a stop, its
+deadline, its last send, or its new bot's claimed spawn failing on the last attempt) gets the same
+meeting-level finish as a lifecycle end, once: the app's
 `finish_meeting` (transcript finalized, service provenance, `bot.failed` to the system hook, the
 copilot reap), keyed by its last bot session. Every
 `bot.retry` moves `aw_bot_retries_total{reason,user_id}` once its transaction commits.
