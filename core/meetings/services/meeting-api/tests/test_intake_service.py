@@ -45,7 +45,9 @@ async def test_unchanged_emits_nothing():
     assert h.store.lock_log[locks:] == [(1, (GROOM,))]
 
 
-async def test_unchanged_closed_entry_stays_closed():
+async def test_a_closed_entry_sent_again_unchanged_is_not_changed_finished():
+    """§1.3 step 4: a closed entry that comes back, even with the same ``content_hash``, takes
+    R7's future-time check; this one isn't a future time, so it stays closed."""
     h = make_harness()
     uuid = (await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z"))[
         "meeting"
@@ -56,7 +58,11 @@ async def test_unchanged_closed_entry_stays_closed():
     h.set_status(uuid, "completed")
     mark = h.mark()
     reply = await h.put(start="2026-09-29T09:00:00Z", end="2026-09-29T10:00:00Z")
-    assert (reply["result"], reply["entry"]["state"]) == ("unchanged", "closed")
+    assert (reply["result"], reply["entry"]["state"]) == (
+        "not_changed_finished",
+        "closed",
+    )
+    assert reply["meeting"]["id"] == uuid
     assert h.events(mark) == []
 
 

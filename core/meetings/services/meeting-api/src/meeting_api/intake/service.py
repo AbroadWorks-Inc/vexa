@@ -15,11 +15,11 @@ and spawns run after the commit, each through its own port.
 ``PUT`` (§1.3 steps 1–9):
   1. validate (``parse_entry``) and parse the link: unknown → ``unrecognized_link``, a host in
      ``ENTRY_BLOCKED_HOSTS`` → ``platform_not_enabled``;
-  2. an active or closed entry with the same ``content_hash`` → ``unchanged``, nothing written;
+  2. an active entry with the same ``content_hash`` → ``unchanged``, nothing written;
   3. a new entry, or a ``removed`` one coming back, takes the R1 path: it joins the meeting R1
      matches (``joined_existing``) or gets a new ``scheduled`` meeting (``created``). A ``closed``
-     entry does the same only if the update points to a new future time (R7); otherwise →
-     ``not_changed_finished``;
+     entry, even with the same ``content_hash``, does the same only if the update points to a new
+     future time (R7); otherwise → ``not_changed_finished``;
   4. an entry of a live meeting that the update moves to a new future time (R7,
      ``rules.is_future_move``: from the later of now and the meeting's planned end) leaves it at
      once and takes the R1 path, with ``previous_meeting_id``. Its row stays on the live meeting,
@@ -417,7 +417,7 @@ class IntakeService:
             await self._check_quota(tx, user_id)
             return await self._attach(w, user_id, entry, room, now, previous=None)
         old = await tx.meeting(existing.meeting_id)
-        if existing.state != "removed" and existing.content_hash == entry.content_hash:
+        if existing.state == "active" and existing.content_hash == entry.content_hash:
             return _Done("unchanged", old)
         if existing.state == "removed":
             await self._check_quota(tx, user_id)
