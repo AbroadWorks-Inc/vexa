@@ -444,7 +444,9 @@ def build_webhook_router(
         try:
             sid = uuid.UUID(subscription_id)
         except ValueError as exc:
-            raise WebhookError("invalid_request", "subscription_id: not a UUID") from exc
+            raise WebhookError(
+                "invalid_request", "subscription_id: not a UUID"
+            ) from exc
         stmt = select(WebhookSubscription).where(
             WebhookSubscription.id == sid, WebhookSubscription.user_id == user_id
         )

@@ -76,7 +76,9 @@ def test_every_webhook_error_code_is_a_sealed_intake_v1_error_code():
     in its enum and has its golden."""
     contract = _intake_contract()
     schema = json.loads((contract / "intake.schema.json").read_text())
-    codes = set(schema["$defs"]["Error"]["properties"]["error"]["properties"]["code"]["enum"])
+    codes = set(
+        schema["$defs"]["Error"]["properties"]["error"]["properties"]["code"]["enum"]
+    )
     assert set(WebhookError.STATUS) <= codes
     for code in WebhookError.STATUS:
         assert (contract / "golden" / f"Error.{code}.json").is_file(), code
