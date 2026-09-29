@@ -24,6 +24,8 @@ class Settings:
     concurrency: int = 4
     sweep_seconds: float = 60.0
     max_attempts: int = 5
+    # A failed export waits this × 2**attempts seconds before its next try.
+    retry_backoff_seconds: float = 30.0
     rms_speech_threshold: float = (
         0.026  # measured on 2026-09-22 Meet recording (spec §4.3)
     )
@@ -59,6 +61,7 @@ class Settings:
             concurrency=int(env.get("EXPORT_CONCURRENCY", "4")),
             sweep_seconds=float(env.get("EXPORT_SWEEP_SECONDS", "60")),
             max_attempts=int(env.get("EXPORT_MAX_ATTEMPTS", "5")),
+            retry_backoff_seconds=float(env.get("EXPORT_RETRY_BACKOFF_SECONDS", "30")),
             rms_speech_threshold=float(env.get("RMS_SPEECH_THRESHOLD", "0.026")),
             speech_hangover_ms=int(env.get("SPEECH_HANGOVER_MS", "700")),
             min_dominant_utterance_ms=int(env.get("MIN_DOMINANT_UTTERANCE_MS", "1500")),

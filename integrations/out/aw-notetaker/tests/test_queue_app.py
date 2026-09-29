@@ -463,7 +463,9 @@ def test_done_deletes_pending(storage: Storage) -> None:
 def test_record_failure_increments_attempts_and_sets_backoff(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    attempts = queue.record_failure(KEY, "boom", now=lambda: 1000.0)
+    attempts = queue.record_failure(
+        KEY, "boom", backoff_seconds=30.0, now=lambda: 1000.0
+    )
     assert attempts == 1
     item = queue.load(KEY)
     assert item is not None
@@ -471,10 +473,36 @@ def test_record_failure_increments_attempts_and_sets_backoff(storage: Storage) -
     assert item["next_attempt_at"] == 1000.0 + 30 * 2**1
 
 
+def test_record_failure_backs_off_from_the_base_it_is_given(storage: Storage) -> None:
+    queue = PendingQueue(storage, VEXA_BUCKET)
+    queue.enqueue(_envelope())
+    queue.record_failure(KEY, "boom", backoff_seconds=5.0, now=lambda: 1000.0)
+    queue.record_failure(KEY, "boom", backoff_seconds=5.0, now=lambda: 1000.0)
+    item = queue.load(KEY)
+    assert item is not None
+    assert item["next_attempt_at"] == 1000.0 + 5 * 2**2
+
+
+def test_the_sweep_backs_off_by_the_setting(storage: Storage) -> None:
+    settings = _settings(retry_backoff_seconds=7.0)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+
+    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+        raise RuntimeError("boom")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=failing_job, now=lambda: 1000.0)
+    )
+    item = queue.load(KEY)
+    assert item is not None
+    assert item["next_attempt_at"] == 1000.0 + 7 * 2**1
+
+
 def test_fail_moves_pending_to_failed(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    queue.record_failure(KEY, "boom", now=lambda: 1000.0)
+    queue.record_failure(KEY, "boom", backoff_seconds=30.0, now=lambda: 1000.0)
     queue.fail(KEY)
     assert queue.pending_ids() == []
     assert queue.load(KEY) is None
@@ -495,7 +523,7 @@ def test_reenqueue_of_pending_id_refreshes_envelope_but_keeps_attempts(
 ) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    queue.record_failure(KEY, "boom", now=lambda: 1000.0)
+    queue.record_failure(KEY, "boom", backoff_seconds=30.0, now=lambda: 1000.0)
 
     updated_envelope = _envelope(ended_at="2026-06-18T10:50:00Z")
     queue.enqueue(updated_envelope)
@@ -904,7 +932,7 @@ def test_a_redelivered_event_is_a_duplicate_and_queued_once(
     client, queue = _client(storage, settings)
     with client, caplog.at_level(logging.INFO, logger="exporter"):
         first = _post_signed(client, _envelope())
-        queue.record_failure(KEY, "boom", now=lambda: 1000.0)
+        queue.record_failure(KEY, "boom", backoff_seconds=30.0, now=lambda: 1000.0)
         again = _post_signed(client, _envelope())
         pending = queue.load(KEY)
         queue.done(KEY)

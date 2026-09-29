@@ -54,6 +54,12 @@ def test_settings_defaults() -> None:
     assert s.record_chunk_timeslice_ms == 15000
     assert s.activity_wait_seconds == 120.0
     assert s.max_recordings == 50
+    assert s.retry_backoff_seconds == 30.0
+
+
+def test_settings_retry_backoff_env_override() -> None:
+    s = Settings.from_env({**BASE, "EXPORT_RETRY_BACKOFF_SECONDS": "5"})
+    assert s.retry_backoff_seconds == 5.0
 
 
 def test_settings_max_recordings_env_override() -> None:

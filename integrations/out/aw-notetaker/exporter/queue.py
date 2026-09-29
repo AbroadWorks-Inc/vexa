@@ -11,8 +11,8 @@ is recorded under `aw-exporter/events/<event_id>.json` (`meeting_id`,
 (`seen`) after its meeting has left the queue.
 
 Retries: a job that raises is recorded as a failure and becomes visible to
-the sweep again only after its backoff (`next_attempt_at`), up to
-`EXPORT_MAX_ATTEMPTS`. The export result report (`export_result.py`) is a
+the sweep again only after its backoff (`next_attempt_at`:
+`EXPORT_RETRY_BACKOFF_SECONDS` × 2**attempts), up to `EXPORT_MAX_ATTEMPTS`. The export result report (`export_result.py`) is a
 step of the job, so an unaccepted report is retried the same way: the re-run
 finds the folder's `_export.json` already `handed_off` and only reports
 again. When the attempts run out, the item is quarantined: an unaccepted
@@ -129,15 +129,19 @@ class PendingQueue:
         self,
         meeting_id: str,
         error: str,
+        *,
+        backoff_seconds: float,
         now: Callable[[], float] = time.time,
     ) -> int:
+        """Count one failed attempt; the next waits `backoff_seconds` ×
+        2**attempts."""
         item = self.load(meeting_id)
         if item is None:
             raise KeyError(meeting_id)
         attempts = int(item["attempts"]) + 1
         item["attempts"] = attempts
         item["last_error"] = error
-        item["next_attempt_at"] = now() + 30 * 2**attempts
+        item["next_attempt_at"] = now() + backoff_seconds * 2**attempts
         self._storage.put_json(self._bucket, self._pending_key(meeting_id), item)
         return attempts
 
@@ -194,7 +198,12 @@ async def sweep_once(
                 async with semaphore:
                     await asyncio.to_thread(job, envelope, deps)
             except NotAV2Meeting as exc:
-                attempts = queue.record_failure(meeting_id, str(exc), now=now)
+                attempts = queue.record_failure(
+                    meeting_id,
+                    str(exc),
+                    backoff_seconds=settings.retry_backoff_seconds,
+                    now=now,
+                )
                 logger.error(
                     "export job failed: not a v2 meeting meeting_id=%s "
                     "attempts=%s; moved to failed/, nothing exported",
@@ -203,7 +212,12 @@ async def sweep_once(
                 )
                 queue.fail(meeting_id)
             except Exception as exc:  # noqa: BLE001 - contained per id, logged
-                attempts = queue.record_failure(meeting_id, str(exc), now=now)
+                attempts = queue.record_failure(
+                    meeting_id,
+                    str(exc),
+                    backoff_seconds=settings.retry_backoff_seconds,
+                    now=now,
+                )
                 logger.warning(
                     "export job failed meeting_id=%s attempts=%s error_class=%s",
                     meeting_id,
