@@ -660,3 +660,25 @@ class TestBothLayers:
             assert (
                 resp.headers.get("retry-after") is None
             )  # guard's 429, not the limiter's
+
+
+def test_no_gateway_module_imports_another_modules_private_names():
+    """A module's ``_``-names are its own: the edge guard shapes its /v2 refusals through the
+    app's public ``refusal``, ``V2_PREFIX`` and ``V2_ERROR_CODES``."""
+    import ast
+    import pathlib
+
+    package = pathlib.Path(_edge_guard.__file__).parent
+    private = []
+    for source in sorted(package.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level == 0 and not (node.module or "").startswith("gateway"):
+                continue
+            private += [
+                f"{source.name}: {alias.name} from {'.' * node.level}{node.module or ''}"
+                for alias in node.names
+                if alias.name.startswith("_") and not alias.name.startswith("__")
+            ]
+    assert private == []

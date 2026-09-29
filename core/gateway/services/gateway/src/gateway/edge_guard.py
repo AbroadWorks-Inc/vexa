@@ -43,7 +43,7 @@ from guard.adapters import StarletteGuardResponse
 from starlette.requests import Request
 from starlette.responses import Response
 
-from .app import _V2_ERROR_CODES, _V2_PREFIX, _refusal
+from .app import V2_ERROR_CODES, V2_PREFIX, refusal
 from .ratelimit import env_truthy
 
 if TYPE_CHECKING:
@@ -198,13 +198,13 @@ class EdgeGuardMiddleware(SecurityMiddleware):
     ) -> GuardResponse:
         response = await super().create_error_response(status_code, default_message)
         path = _REQUEST_PATH.get()
-        if not path.startswith(_V2_PREFIX) or status_code not in _V2_ERROR_CODES:
+        if not path.startswith(V2_PREFIX) or status_code not in V2_ERROR_CODES:
             return response
         message = (response.body or b"").decode("utf-8", "replace") or default_message
         headers = None
         if status_code == 429:
             headers = {"Retry-After": str(int(self.config.rate_limit_window))}
-        return StarletteGuardResponse(_refusal(path, status_code, message, headers))
+        return StarletteGuardResponse(refusal(path, status_code, message, headers))
 
 
 def apply_guard(app: FastAPI, config: SecurityConfig | None = None) -> None:

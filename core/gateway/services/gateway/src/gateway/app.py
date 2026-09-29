@@ -59,16 +59,16 @@ def _auth_unavailable_response(exc: Exception, *, span: str, path: str) -> Respo
         span=span,
         fields={"reason": type(exc).__name__, "detail": str(exc)},
     )
-    return _refusal(path, 503, "Authentication temporarily unavailable, retry",
+    return refusal(path, 503, "Authentication temporarily unavailable, retry",
                     headers={"Retry-After": "1"})
 
 
 # §2.5: every error the edge itself answers on a /v2 path carries the /v2 error body; every other
 # route keeps {"detail": ...}. A downstream answer is never rewritten — this shapes only what the
-# gateway itself refuses. The mapping is CLOSED: every `_refusal` call passes a literal status that is
+# gateway itself refuses. The mapping is CLOSED: every `refusal` call passes a literal status that is
 # a key here (pinned by test_every_refusal_status_the_gateway_uses_has_a_v2_code).
-_V2_PREFIX = "/v2/"
-_V2_ERROR_CODES = {
+V2_PREFIX = "/v2/"
+V2_ERROR_CODES = {
     400: "invalid_request",
     401: "unauthorized",
     403: "forbidden",
@@ -79,9 +79,9 @@ _V2_ERROR_CODES = {
 }
 
 
-def _refusal(path: str, status: int, message: str, headers: Optional[Dict[str, str]] = None) -> Response:
-    if path.startswith(_V2_PREFIX):
-        body: dict = {"error": {"code": _V2_ERROR_CODES[status], "message": message}}
+def refusal(path: str, status: int, message: str, headers: Optional[Dict[str, str]] = None) -> Response:
+    if path.startswith(V2_PREFIX):
+        body: dict = {"error": {"code": V2_ERROR_CODES[status], "message": message}}
     else:
         body = {"detail": message}
     return Response(
@@ -222,7 +222,7 @@ def _path_segment(value: str, path: str) -> Tuple[Optional[str], Optional[Respon
 
 
 def _invalid_path_param_response(path: str) -> Response:
-    return _refusal(path, 400, "invalid path parameter")
+    return refusal(path, 400, "invalid path parameter")
 
 
 def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
@@ -265,7 +265,7 @@ def _is_authority_header(name: str) -> bool:
 
 
 def _insufficient_scope_response(path: str) -> Response:
-    return _refusal(path, 403, "Insufficient scope for this endpoint")
+    return refusal(path, 403, "Insufficient scope for this endpoint")
 
 
 def create_app(
@@ -360,7 +360,7 @@ def create_app(
         client_key = api_key if api_key is not None else request.headers.get("x-api-key")
         # Fail-closed: a client route with no key is rejected before any downstream call.
         if not client_key:
-            return None, _refusal(request.url.path, 401, "Missing API key")
+            return None, refusal(request.url.path, 401, "Missing API key")
 
         try:
             user_data = await authorizer.resolve(client_key)
@@ -369,7 +369,7 @@ def create_app(
             # retry), never 401. A valid key must not be reported as invalid because we are slow.
             return None, _auth_unavailable_response(e, span="auth", path=request.url.path)
         if not user_data:
-            return None, _refusal(request.url.path, 401, "Invalid API key")
+            return None, refusal(request.url.path, 401, "Invalid API key")
 
         # Bind the resolved user to the trace context so every later line carries user_id.
         user_id = user_data["user_id"]
@@ -379,7 +379,7 @@ def create_app(
         # the control plane (the max_concurrent_bots cap bounds active bots, not request rate). 429 when
         # the per-user token bucket is empty; the bucket refills continuously (Retry-After: 1s).
         if rate_limiter is not None and not rate_limiter.allow(str(user_id)):
-            return None, _refusal(request.url.path, 429, "Rate limit exceeded", headers={"Retry-After": "1"})
+            return None, refusal(request.url.path, 429, "Rate limit exceeded", headers={"Retry-After": "1"})
 
         # Scope enforcement — DENY BY DEFAULT. Every proxied route declares its scopes in
         # ROUTE_SCOPES; an undeclared route is refused here rather than forwarded, so the failure
@@ -428,7 +428,7 @@ def create_app(
                     user_id=user_id,
                     fields={"method": method, "path": request.url.path, "reason": str(e)},
                 )
-                return None, _refusal(request.url.path, 503, "Entry writes are temporarily unavailable, retry")
+                return None, refusal(request.url.path, 503, "Entry writes are temporarily unavailable, retry")
             if not decision.allowed:
                 log_event(
                     "intake_rate_limited",
@@ -438,7 +438,7 @@ def create_app(
                     user_id=user_id,
                     fields={"method": method, "path": request.url.path, "retry_after": decision.retry_after},
                 )
-                return None, _refusal(
+                return None, refusal(
                     request.url.path, 429, "Entry write rate limit exceeded",
                     headers={"Retry-After": str(decision.retry_after)},
                 )
@@ -496,7 +496,7 @@ def create_app(
                 user_id=user_id,
                 fields={"method": method, "path": request.url.path, "fault": str(e)},
             )
-            return None, _refusal(request.url.path, 503, str(e))
+            return None, refusal(request.url.path, 503, str(e))
         return headers, None
 
     # §1.10, §6.9 F-E: signed with the ring's active key, named by kid, over the forwarded
@@ -530,9 +530,9 @@ def create_app(
             # even though the fault is in what the CALLER put in the path.
             return _invalid_path_param_response(request.url.path)
         except httpx.TimeoutException:
-            return _refusal(request.url.path, 504, "upstream timeout")
+            return refusal(request.url.path, 504, "upstream timeout")
         except httpx.RequestError as e:
-            return _refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
+            return refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
 
         # SYSTEM/debug event: the proxy hop completed.
         log_event(
@@ -1010,10 +1010,10 @@ def create_app(
             )
         except httpx.TimeoutException:
             await stack.aclose()
-            return _refusal(request.url.path, 504, "upstream timeout")
+            return refusal(request.url.path, 504, "upstream timeout")
         except httpx.RequestError as e:
             await stack.aclose()
-            return _refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
+            return refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
 
         log_event(
             "downstream_stream_opened",

@@ -533,7 +533,7 @@ def test_an_upstream_fault_on_v2_is_unavailable_and_detail_elsewhere(
 
 
 def test_every_refusal_status_the_gateway_uses_has_a_v2_code():
-    """``_V2_ERROR_CODES`` is a closed mapping: every ``_refusal`` call site in app.py passes a
+    """``V2_ERROR_CODES`` is a closed mapping: every ``refusal`` call site in app.py passes a
     literal status, and each one has a §2.5 code, so no refusal can fail on an unknown status.
     """
     import ast
@@ -547,17 +547,17 @@ def test_every_refusal_status_the_gateway_uses_has_a_v2_code():
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "_refusal"
+            and node.func.id == "refusal"
         ):
             status = node.args[1]
             assert isinstance(status, ast.Constant) and isinstance(
                 status.value, int
-            ), f"line {node.lineno}: _refusal must be called with a literal status"
+            ), f"line {node.lineno}: refusal must be called with a literal status"
             statuses.append(status.value)
     assert set(statuses) >= {400, 401, 403, 429, 502, 503, 504}
-    missing = sorted(set(statuses) - set(gateway_app._V2_ERROR_CODES))
+    missing = sorted(set(statuses) - set(gateway_app.V2_ERROR_CODES))
     assert not missing, f"statuses with no §2.5 code: {missing}"
-    assert set(gateway_app._V2_ERROR_CODES.values()) <= {
+    assert set(gateway_app.V2_ERROR_CODES.values()) <= {
         "invalid_request",
         "unauthorized",
         "forbidden",
