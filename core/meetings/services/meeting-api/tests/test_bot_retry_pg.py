@@ -10,7 +10,8 @@ is ``FakeRuntimeClient``). Groups:
     ``requested`` with ``bot.retry``; the last one ends ``failed`` (``bot.failed``, counted once);
     what isn't retried ends as before; a pending row refuses status writes;
   * the lifecycle callback — a retried session's terminal goes out as ``bot.retry`` and reaches
-    none of the meeting-level edges (the system sink the exporter reads above all).
+    none of the meeting-level edges (the system sink the exporter reads above all);
+  * the newest-session guard — a session that isn't the meeting's newest writes nothing.
 
 Skips cleanly unless ``MEETING_API_TEST_DATABASE_URL`` is set; see ``test_intake_pg_schema.py``'s
 docstring for the ephemeral SQLAlchemy/asyncpg install.
@@ -562,3 +563,30 @@ async def test_pg_a_lost_workload_through_the_lifecycle_is_bot_retry_only(pg):
     assert app.state.typed_webhooks[-1]["event_type"] == "bot.retry"
     assert sink.events == []
     assert (await pg.types(mid))[-1] == "bot.retry"
+
+
+# ── the newest session speaks for the meeting ───────────────────────────────────────────────
+
+
+async def test_pg_a_session_that_is_not_the_meetings_newest_writes_nothing(pg):
+    mid, old = await pg.sent(status="joining")
+    await pg.repo.create_session(meeting_id=mid, session_uid="sess-new")
+    events = len(await pg.events(mid))
+    assert await pg.repo.update_meeting_status(session_uid=old, status="active") is None
+    assert (
+        await pg.repo.update_meeting_status(
+            session_uid=old, status="joining", data={"x": 1}
+        )
+        is None
+    )
+    assert (
+        await pg.repo.update_meeting_status(
+            session_uid=old, status="failed", completion_reason="join_failure"
+        )
+        is None
+    )
+    row = await pg.row(mid)
+    assert (row["status"], "x" in row["data"]) == ("joining", False)
+    assert len(await pg.events(mid)) == events
+    new = await pg.repo.update_meeting_status(session_uid="sess-new", status="active")
+    assert new["status"] == "active"

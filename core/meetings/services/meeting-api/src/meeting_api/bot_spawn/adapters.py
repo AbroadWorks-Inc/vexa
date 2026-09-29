@@ -337,6 +337,23 @@ class SqlAlchemyMeetingRepo:
             m = await lock_meeting_on_its_link(db, sess.meeting_id)
             if m is None:
                 return None
+            # Only the meeting's newest session speaks for it (§6.9 F-K2): a bot the meeting has
+            # already replaced — a late or retried callback of a failed session — writes nothing.
+            newest = (
+                await db.execute(
+                    select(MeetingSession.session_uid)
+                    .where(MeetingSession.meeting_id == m.id)
+                    .order_by(MeetingSession.id.desc())
+                    .limit(1)
+                )
+            ).scalar()
+            if newest != session_uid:
+                log_event(
+                    "lifecycle_stale_session_refused", audience="system", level="warning",
+                    span="lifecycle.persist", meeting_id=str(m.id),
+                    fields={"session": session_uid, "newest": newest, "to": status},
+                )
+                return None
             # §1.4's conditional write: the status changes only from one of the caller's
             # predecessors (the live statuses by default), and a finished meeting never changes
             # status again. A refused write changes nothing (a stale stop, a stale replica's edge).

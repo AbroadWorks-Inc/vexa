@@ -434,3 +434,31 @@ async def test_a_normal_end_still_reaches_every_sink_once(monkeypatch):
     assert sinks.system == ["meeting.completed"]
     assert sinks.published.count("meeting.completed") == 1
     assert sinks.finalized == [row["id"]]
+
+
+# ── the newest session speaks for the meeting ───────────────────────────────────────────────
+
+
+async def test_a_session_that_is_not_the_meetings_newest_writes_nothing():
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    repo = InMemoryMeetingRepo()
+    meeting = await repo.create_meeting(
+        user_id=USER, platform="google_meet", native_meeting_id="kxo-misr-avz", data={}
+    )
+    await repo.create_session(meeting_id=meeting["id"], session_uid="sess-old")
+    await repo.create_session(meeting_id=meeting["id"], session_uid="sess-new")
+    assert (
+        await repo.update_meeting_status(session_uid="sess-old", status="joining")
+        is None
+    )
+    assert (
+        await repo.update_meeting_status(
+            session_uid="sess-old", status="requested", data={"x": 1}
+        )
+        is None
+    )
+    assert repo._meetings[meeting["id"]]["status"] == "requested"
+    assert "x" not in repo._meetings[meeting["id"]]["data"]
+    row = await repo.update_meeting_status(session_uid="sess-new", status="joining")
+    assert row["status"] == "joining"

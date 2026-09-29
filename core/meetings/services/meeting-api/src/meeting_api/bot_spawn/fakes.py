@@ -388,6 +388,9 @@ class InMemoryMeetingRepo:
         row = self._meetings.get(sess["meeting_id"])
         if row is None:
             return
+        # Only the meeting's newest session writes (the adapter's §6.9 F-K2 guard).
+        if [s for s in self.sessions if s["meeting_id"] == row["id"]][-1] is not sess:
+            return None
         # The adapter's conditional write: only from a predecessor, never off a finished status.
         from .auto_join import LIVE_STATUSES
 

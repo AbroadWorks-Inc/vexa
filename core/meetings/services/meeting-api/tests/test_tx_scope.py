@@ -32,9 +32,9 @@ _RETRY_TX = (
     "is DB work under the caller's link and row locks"
 )
 ALLOWLIST: dict[str, str] = {
-    "src/meeting_api/bot_spawn/adapters.py:395": _RETRY_TX,  # update_meeting_status → retry.retry
-    "src/meeting_api/bot_spawn/adapters.py:404": _RETRY_TX,  # update_meeting_status → tx.meeting
-    "src/meeting_api/bot_spawn/adapters.py:1147": _RETRY_TX,  # fail_meeting → retry.retry
+    "src/meeting_api/bot_spawn/adapters.py:412": _RETRY_TX,  # update_meeting_status → retry.retry
+    "src/meeting_api/bot_spawn/adapters.py:421": _RETRY_TX,  # update_meeting_status → tx.meeting
+    "src/meeting_api/bot_spawn/adapters.py:1164": _RETRY_TX,  # fail_meeting → retry.retry
 }
 
 # Param is a live DB session if named one of these OR annotated with a name ending in "Session".

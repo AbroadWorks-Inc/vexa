@@ -284,7 +284,8 @@ class MeetingRepo(Protocol):
         ``transition_source`` is what drove the edge (``lifecycle.machine.TransitionSource``): a
         ``completed`` the runtime drove (``runtime_destroy``) is a lost bot, and its workload is
         proven gone. A lost bot on the meeting's last attempt ends it ``failed``. A meeting
-        waiting for its next bot takes no status write (data-only writes still land)."""
+        waiting for its next bot takes no status write (data-only writes still land), and a
+        session that isn't the meeting's newest writes nothing at all (``None``)."""
         ...
 
 
