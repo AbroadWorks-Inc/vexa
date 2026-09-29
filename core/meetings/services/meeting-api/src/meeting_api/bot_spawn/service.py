@@ -831,9 +831,9 @@ async def request_bot(
         return verdict
 
     # 4–5a. Everything before the workload create. A failure here cannot have started a pod —
-    #       `create_workload` has not been called — so on a claimed row it is recorded with the
-    #       workload proven gone (§6.9 F-K2: the meeting retries normally). The stop fence's own
-    #       ending stands.
+    #       `create_workload` has not been called — so the row is failed with the workload proven
+    #       gone (a claimed row retries normally, §6.9 F-K2; an inserted one ends). The stop
+    #       fence's own ending stands.
     try:
         # 4. MeetingToken + invocation. connection_id IS the session_uid (parent's connectionId).
         redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
@@ -915,11 +915,12 @@ async def request_bot(
     except MeetingStopped:
         raise
     except (Exception, asyncio.CancelledError) as e:
-        # A cancel here is bounded the same way: no pod can exist before the create.
-        if claim_meeting_id is not None:
-            await _fail_row(
-                f"the bot could not be prepared ({type(e).__name__})", e, gone=True, created=False
-            )
+        # The row this spawn claimed or inserted is failed with no workload (no pod can exist
+        # before the create), a cancel the same way: a session-less `requested` row would hold
+        # its link for good, since the reconcile sweeps list only rows with a session.
+        await _fail_row(
+            f"the bot could not be prepared ({type(e).__name__})", e, gone=True, created=False
+        )
         raise
 
     try:

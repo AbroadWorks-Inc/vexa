@@ -6,6 +6,7 @@ is eager-created keyed by the bot's connectionId, and the quota / dedup seams su
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -225,6 +226,32 @@ async def test_request_bot_dead_on_arrival_fails_the_row(monkeypatch):
     assert row["data"]["completion_reason"] == "start_failed"
     assert "start_failed" in row["data"]["failure_reason"]
     assert repo.sessions == [], "no MeetingSession for a workload that never started"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("no token"), asyncio.CancelledError()])
+async def test_request_bot_a_failure_before_the_create_fails_the_upstream_row(monkeypatch, error):
+    """``POST /bots`` (no claimed row): a failure while the bot is prepared (the token, the
+    invocation, the spec), or a cancel there, fails the row it just inserted, with no workload
+    (none was created). A session-less ``requested`` row would otherwise hold the link for good:
+    the reconcile sweeps list only rows with a session."""
+    import meeting_api.bot_spawn.service as service
+
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+
+    def broken(*a, **k):
+        raise error
+
+    monkeypatch.setattr(service, "build_invocation", broken)
+    repo = InMemoryMeetingRepo()
+    runtime = FakeRuntimeClient()
+    with pytest.raises(type(error)):
+        await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                          native_meeting_id="prep", redis_url="r", token_secret=SECRET)
+    (row,) = repo._meetings.values()
+    assert row["status"] == "failed"
+    assert row["data"]["failure_reason"].startswith("the bot could not be prepared")
+    assert runtime.specs == [] and repo.sessions == []
 
 
 async def test_request_bot_spawnfailed_fails_the_row(monkeypatch):
