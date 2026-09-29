@@ -61,7 +61,7 @@ from .ports import (
     Room,
     SpawnOutcome,
 )
-from .export import EXPORT_NOT_FINISHED
+from .export import ERASE_NOT_FINISHED, EXPORT_NOT_FINISHED, NOT_FOUND
 from .projection import iso_utc
 from .resolver import LinkRow
 from .rules import (
@@ -708,12 +708,9 @@ class InMemoryIntakeReads:
     async def erase(self, user_id: int, meeting_id: int) -> ErasedRows:
         row = self._s.meetings.get(meeting_id)
         if row is None or row["user_id"] != user_id:
-            raise IntakeError("meeting_not_found", "no such meeting")
+            raise IntakeError("meeting_not_found", NOT_FOUND)
         if row["status"] not in FINISHED_STATUSES:
-            raise IntakeError(
-                "meeting_not_finished",
-                "the meeting hasn't finished; remove its entries or stop it first",
-            )
+            raise IntakeError("meeting_not_finished", ERASE_NOT_FINISHED)
         events = [e for e in self._s.events if e.meeting_id == meeting_id]
         deliveries = sum(self.deliveries.pop(e.event_id, 0) for e in events)
         self._s.events[:] = [e for e in self._s.events if e.meeting_id != meeting_id]
@@ -731,7 +728,7 @@ class InMemoryIntakeReads:
     ) -> Optional[str]:
         row = self._s.meetings.get(meeting_id)
         if row is None or row["user_id"] != user_id:
-            raise IntakeError("meeting_not_found", "no such meeting")
+            raise IntakeError("meeting_not_found", NOT_FOUND)
         if row["status"] not in FINISHED_STATUSES:
             raise IntakeError("meeting_not_finished", EXPORT_NOT_FINISHED)
         aw = self._s.aw[meeting_id]

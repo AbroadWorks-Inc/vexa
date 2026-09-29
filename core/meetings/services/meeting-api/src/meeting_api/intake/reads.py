@@ -28,18 +28,17 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
-from .adapters import load_views, take_link_lock
-from .export import store_export
+from .adapters import load_views
+from .export import ERASE_NOT_FINISHED, lock_finished_meeting, store_export
 from .ports import (
     EntryView,
     ErasedRows,
     ExportReport,
     MeetingQuery,
     MeetingView,
-    Room,
 )
-from .rules import FINISHED_STATUSES, meeting_start
-from .status import lock_meeting, row_mapping
+from .rules import meeting_start
+from .status import row_mapping
 from .validation import IntakeError
 
 if TYPE_CHECKING:
@@ -244,31 +243,13 @@ class PostgresIntakeReads:
         from sqlalchemy import delete, select
 
         from ..sessions.models import (
-            Meeting,
             MeetingEntry,
             WebhookDelivery,
             WebhookOutbox,
         )
 
         async with self._session_factory() as db, db.begin():
-            found = (
-                await db.execute(
-                    select(Meeting.platform, Meeting.platform_specific_id).where(
-                        Meeting.id == meeting_id, Meeting.user_id == user_id
-                    )
-                )
-            ).first()
-            if found is None:
-                raise IntakeError("meeting_not_found", "no such meeting")
-            await take_link_lock(db, user_id, Room(found[0], found[1]))
-            meeting = await lock_meeting(db, meeting_id)
-            if meeting is None or meeting.user_id != user_id:
-                raise IntakeError("meeting_not_found", "no such meeting")
-            if meeting.status not in FINISHED_STATUSES:
-                raise IntakeError(
-                    "meeting_not_finished",
-                    "the meeting hasn't finished; remove its entries or stop it first",
-                )
+            await lock_finished_meeting(db, user_id, meeting_id, ERASE_NOT_FINISHED)
             events = select(WebhookOutbox.event_id).where(
                 WebhookOutbox.meeting_id == meeting_id
             )

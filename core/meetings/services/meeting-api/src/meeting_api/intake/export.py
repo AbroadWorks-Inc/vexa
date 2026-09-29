@@ -9,10 +9,15 @@ meeting's export::
 characters, ``error`` at most 2000, no other key, no coercion) into an ``ExportReport``, or raises
 ``IntakeError("invalid_request")`` naming the first failed field and rule, never the value sent.
 
+``lock_finished_meeting(db, user_id, meeting_id, not_finished)`` is the one lock of a finished
+meeting, taken by the export write and by the erase (``reads.PostgresIntakeReads.erase``): the
+meeting's link lock, then its row lock (the §1.4 order). A meeting of another account is
+``meeting_not_found``; a scheduled or live one is ``meeting_not_finished`` with ``not_finished``
+(``EXPORT_NOT_FINISHED`` or ``ERASE_NOT_FINISHED``).
+
 ``store_export(db, user_id, meeting_id, report)`` is ``IntakeReads.record_export`` over Postgres,
-inside the caller's transaction (``PostgresIntakeReads`` opens one per call): it takes the meeting's
-link lock, then its row lock, then its ``meeting_aw_state`` lock (the §1.4 order). A meeting of another account is ``meeting_not_found``;
-a scheduled or live one is ``meeting_not_finished``. The result goes on ``export_state`` /
+inside the caller's transaction (``PostgresIntakeReads`` opens one per call): it takes that lock,
+then the meeting's ``meeting_aw_state`` lock. The result goes on ``export_state`` /
 ``export_s3_path`` / ``export_error`` / ``export_at`` and ``export.handed_off`` /
 ``export.failed`` is written through ``write_event`` in the same transaction; the event id comes
 back. A report with the stored state and path writes nothing and returns ``None``, so the exporter
@@ -38,11 +43,21 @@ from .validation import IntakeError
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-__all__ = ["EXPORT_NOT_FINISHED", "ExportIn", "parse_export", "store_export"]
+__all__ = [
+    "ERASE_NOT_FINISHED",
+    "EXPORT_NOT_FINISHED",
+    "NOT_FOUND",
+    "ExportIn",
+    "lock_finished_meeting",
+    "parse_export",
+    "store_export",
+]
 
+NOT_FOUND = "no such meeting"
 EXPORT_NOT_FINISHED = (
     "the meeting hasn't finished; an export result is taken only for a finished meeting"
 )
+ERASE_NOT_FINISHED = "the meeting hasn't finished; remove its entries or stop it first"
 
 
 class ExportIn(BaseModel):
@@ -68,9 +83,11 @@ def parse_export(body: Any) -> ExportReport:
     return ExportReport(parsed.state, parsed.s3_path, parsed.error)
 
 
-async def store_export(
-    db: AsyncSession, user_id: int, meeting_id: int, report: ExportReport
-) -> Optional[str]:
+async def lock_finished_meeting(
+    db: AsyncSession, user_id: int, meeting_id: int, not_finished: str
+) -> Any:
+    """Lock ``user_id``'s finished meeting ``meeting_id`` and return its row (see the module
+    docstring)."""
     from sqlalchemy import select
 
     from ..sessions.models import Meeting
@@ -83,13 +100,20 @@ async def store_export(
         )
     ).first()
     if found is None:
-        raise IntakeError("meeting_not_found", "no such meeting")
+        raise IntakeError("meeting_not_found", NOT_FOUND)
     await take_link_lock(db, user_id, Room(found[0], found[1]))
     meeting = await lock_meeting(db, meeting_id)
     if meeting is None or meeting.user_id != user_id:
-        raise IntakeError("meeting_not_found", "no such meeting")
+        raise IntakeError("meeting_not_found", NOT_FOUND)
     if meeting.status not in FINISHED_STATUSES:
-        raise IntakeError("meeting_not_finished", EXPORT_NOT_FINISHED)
+        raise IntakeError("meeting_not_finished", not_finished)
+    return meeting
+
+
+async def store_export(
+    db: AsyncSession, user_id: int, meeting_id: int, report: ExportReport
+) -> Optional[str]:
+    await lock_finished_meeting(db, user_id, meeting_id, EXPORT_NOT_FINISHED)
     aw = await lock_aw_state(db, meeting_id)
     if (aw.export_state, aw.export_s3_path) == (report.state, report.s3_path):
         return None

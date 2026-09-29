@@ -59,7 +59,7 @@ from ..collector.app import delete_completed_artifacts
 from ..collector.ports import TranscriptStore
 from ..metrics import export_recorded, intake_request
 from ..obs import log_event
-from .export import EXPORT_NOT_FINISHED, parse_export
+from .export import ERASE_NOT_FINISHED, EXPORT_NOT_FINISHED, NOT_FOUND, parse_export
 from .ports import IntakeReads, MeetingQuery, MeetingView, StopPort
 from .reads import (
     decode_entry_cursor,
@@ -88,8 +88,6 @@ _PROGRAMMING_ERRORS = (TypeError, AttributeError, KeyError, AssertionError, Name
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _NO_LIVE_BOT = "no bot in this meeting; to cancel it, remove the entry"
-_NOT_FINISHED = "the meeting hasn't finished; remove its entries or stop it first"
-_NOT_FOUND = "no such meeting"
 
 ArtifactDeleter = Callable[[dict], Awaitable[list[str]]]
 
@@ -259,11 +257,11 @@ def build_intake_router(
     ) -> MeetingView:
         meeting = await reads.meeting_by_uuid(user_id, meeting_id)
         if meeting is None:
-            raise IntakeError("meeting_not_found", _NOT_FOUND)
+            raise IntakeError("meeting_not_found", NOT_FOUND)
         if user is not None and not await reads.visible_to(
             user_id, meeting.id, _user(user)
         ):
-            raise IntakeError("meeting_not_found", _NOT_FOUND)
+            raise IntakeError("meeting_not_found", NOT_FOUND)
         return meeting
 
     async def _fresh(user_id: int, meeting: MeetingView) -> MeetingView:
@@ -377,7 +375,7 @@ def build_intake_router(
         user_id = _account(x_user_id)
         meeting = await _meeting(user_id, meeting_id, None)
         if meeting.status not in FINISHED_STATUSES:
-            raise IntakeError("meeting_not_finished", _NOT_FINISHED)
+            raise IntakeError("meeting_not_finished", ERASE_NOT_FINISHED)
         try:
             artifacts = await delete_completed_artifacts(
                 artifact_store, artifact_deleter, user_id, meeting.id
