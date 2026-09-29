@@ -37,8 +37,6 @@ gateway's tests and meeting-api's tests read too.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import functools
 import hashlib
 import hmac
@@ -49,13 +47,15 @@ import re
 import time
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
+from . import key_ring
+from .key_ring import KeyRingError
+
 SIGNATURE_HEADER = "x-gateway-signature"
 USER_HEADER = "x-user-id"
 SCOPES_HEADER = "x-user-scopes"
 LIMITS_HEADER = "x-user-limits"
 MAX_SKEW_S = 60
 KEYS_ENV = "GATEWAY_IDENTITY_KEYS"
-KEY_BYTES = 32
 KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 EXEMPT_PATHS = frozenset({"/metrics"})
@@ -70,36 +70,11 @@ def is_exempt(path: str) -> bool:
     return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
 
 
-class KeyRingError(ValueError):
-    """The identity key ring is unusable. The message names the fault, never a key."""
-
-
 def parse_ring(keys_json: str) -> dict[str, bytes]:
     """The ring in ``keys_json``: kid → 32 raw key bytes."""
-    try:
-        raw = json.loads(keys_json)
-    except ValueError as exc:
-        raise KeyRingError(f"{KEYS_ENV} is not valid JSON") from exc
-    if not isinstance(raw, dict) or not raw:
-        raise KeyRingError(f"{KEYS_ENV} must be a non-empty JSON object of id -> key")
-    ring: dict[str, bytes] = {}
-    for kid, encoded in raw.items():
-        if not KID.fullmatch(kid):
-            raise KeyRingError(
-                f"{KEYS_ENV}: a key id must be 1-64 characters of A-Z a-z 0-9 . _ -"
-            )
-        if not isinstance(encoded, str):
-            raise KeyRingError(f"{KEYS_ENV}: key {kid!r} is not a base64 string")
-        try:
-            key = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise KeyRingError(f"{KEYS_ENV}: key {kid!r} is not valid base64") from exc
-        if len(key) != KEY_BYTES:
-            raise KeyRingError(
-                f"{KEYS_ENV}: key {kid!r} must be exactly {KEY_BYTES} bytes"
-            )
-        ring[kid] = key
-    return ring
+    return key_ring.parse(
+        keys_json, KEYS_ENV, KID, "1-64 characters of A-Z a-z 0-9 . _ -"
+    )
 
 
 @functools.lru_cache(maxsize=4)
