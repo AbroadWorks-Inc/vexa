@@ -282,14 +282,15 @@ def test_default_lead_dispatches_two_minutes_before_the_start():
 
 
 def test_entrypoint_lead_default_matches_the_sweep_default(monkeypatch):
-    """One default, two readers: the entrypoint's env fallback IS ``DEFAULT_LEAD_S``, so the sweep's
-    own default and the deployed default can never drift apart. Deploy values still override."""
-    import os
+    """One default, one reader: ``AUTO_JOIN_LEAD_S`` is read only by ``auto_join_lead_s``, whose
+    fallback IS ``DEFAULT_LEAD_S``, so the sweep's own default and the deployed default can never
+    drift apart. Deploy values still override."""
+    from meeting_api.intake.settings import auto_join_lead_s
 
     monkeypatch.delenv("AUTO_JOIN_LEAD_S", raising=False)
-    assert float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))) == 120.0
+    assert auto_join_lead_s() == DEFAULT_LEAD_S == 120
     monkeypatch.setenv("AUTO_JOIN_LEAD_S", "60")
-    assert float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))) == 60.0
+    assert auto_join_lead_s() == 60
 
 
 def test_lead_and_lobby_budget_together_cover_a_late_host():

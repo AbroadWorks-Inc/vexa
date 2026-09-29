@@ -582,13 +582,12 @@ def _attach_background_loops(
     # (AUTO_JOIN_ALLOW_UNCAPPED=1 is the explicit self-host opt-in); an UNREACHABLE identity
     # likewise skips the tick. Both sweeps need Postgres (the intake store), so neither runs
     # without a session factory.
-    from .bot_spawn.auto_join import DEFAULT_LEAD_S
+    from .intake.settings import auto_join_grace_s, auto_join_lead_s
 
     auto_join_interval = float(os.getenv("AUTO_JOIN_SWEEP_INTERVAL_S", "30"))
-    # The DEFAULT lives in one place (``auto_join.DEFAULT_LEAD_S``) so the sweep's own default and
-    # the entrypoint's env fallback can never drift apart. Deploy values may still override it.
-    auto_join_lead = float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S)))
-    auto_join_grace = float(os.getenv("AUTO_JOIN_GRACE_S", "600"))
+    # One reader each (``intake.settings``), with the sweep's own defaults.
+    auto_join_lead = auto_join_lead_s()
+    auto_join_grace = auto_join_grace_s()
     auto_join_backoff = float(os.getenv("AUTO_JOIN_RETRY_BACKOFF_S", "300"))
     admin_api_url = (os.getenv("ADMIN_API_URL") or "").rstrip("/")
     internal_secret = os.getenv("INTERNAL_API_SECRET") or ""

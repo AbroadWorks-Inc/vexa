@@ -1,12 +1,13 @@
 """The entry service's settings (§1.11), each declared in meeting-api's ``config.v1.json``.
 
-``AUTO_JOIN_LEAD_S`` is the auto-join sweep's own setting: ``auto_join_lead_s`` reads it exactly as
-the sweep's entrypoint does, with the sweep's default, and is the one reader intake uses.
+``auto_join_lead_s`` is the one reader of the auto-join sweep's ``AUTO_JOIN_LEAD_S`` (whole seconds,
+with the sweep's default): the entrypoint hands it to the sweep, and intake and the meeting reads
+use it for ``bot_joins_at``.
 ``join_now_adopt_ahead_s`` is the one reader of ``JOIN_NOW_ADOPT_AHEAD_S``, which a ``join_now``
-entry and upstream ``POST /bots`` both adopt by (§1.1 R1, §1.5). ``auto_join_grace_s`` reads the
-sweep's ``AUTO_JOIN_GRACE_S`` with the sweep's default: the link resolver ignores a timed,
-entry-less ``scheduled`` plan past its ``scheduled_at`` plus this grace, which the sweep will never
-send (§1.6, Ruling R22). ``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of
+entry and upstream ``POST /bots`` both adopt by (§1.1 R1, §1.5). ``auto_join_grace_s`` is the one
+reader of the sweep's ``AUTO_JOIN_GRACE_S``, with the sweep's default: the entrypoint hands it to
+the sweep, and the link resolver ignores a timed, entry-less ``scheduled`` plan past its
+``scheduled_at`` plus this grace, which the sweep will never send (§1.6, Ruling R22). ``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of
 an entry-managed meeting's bot (§6.9 F-K): that many failed sends in total, this many seconds
 apart, then the meeting ends ``not_sent``. ``INTAKE_CONFLICT_RETRIES`` is how many more times an
 entry write that lost a constraint race is run again (§6.9 F-D).
