@@ -1394,3 +1394,29 @@ async def test_pg_a_cancelled_create_on_the_last_attempt_ends_and_deletes(pg):
         await pg.port(runtime).spawn_exact(USER, mid)
     assert (await pg.row(mid))["status"] == "failed"
     assert runtime.deleted == [runtime.specs[0]["workloadId"]]
+
+
+async def test_pg_the_last_new_bot_failing_after_its_claim_is_finished_like_any_end(pg):
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    mid, session = await pg.sent(status="active")
+    app, sink, streams, finalized = await _finishing_app(pg)
+    await app.state.apply_lifecycle_event(
+        {
+            "connection_id": session,
+            "status": "completed",
+            "completion_reason": "left_alone",
+        },
+        transition_source=TransitionSource.RUNTIME_DESTROY,
+        force_terminal_on_destroy=True,
+    )
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+    runtime = FakeRuntimeClient(
+        fail=True
+    )  # the new bot's create is refused after its claim
+    await pg.tick(runtime, at=_later(), finish_meeting=app.state.finish_meeting)
+    assert (await pg.row(mid))["status"] == "failed"
+    assert sink.events == ["bot.failed"]
+    assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]

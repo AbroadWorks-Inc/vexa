@@ -306,7 +306,8 @@ async def auto_join_tick(
     and a new bot session is spawned on the row through ``ExactRowSpawn`` (counted in
     ``spawned``). A failure after the claim goes back through ``retry``; one before it (the claim
     never ran) is one more of the meeting's bounded sends, and the last one ends it ``failed``
-    (counted in ``errors``). Every meeting the driver ends gets the meeting-level finish
+    (counted in ``errors``). Every meeting the driver ends, or its new bot's failed spawn ends,
+    gets the meeting-level finish
     ``finish_meeting(meeting_id, stopped=…)`` (the app's, the same as a lifecycle end)."""
     from ..intake.ports import Room
     from ..intake.spawn import (
@@ -615,6 +616,11 @@ async def auto_join_tick(
             return
         counters["errors"] += 1
         current = await repo.get_meeting(row["id"])
+        if (current or {}).get("status") in ("completed", "failed"):
+            # The new bot failed after its claim on the meeting's last attempt: the spawn flow
+            # ended the meeting; it gets the meeting-level finish like every other end.
+            await _finish(row["id"], stopped=False)
+            return
         still = retry.marker((current or {}).get("data"))
         if still is not None and still.get("at") == mark.get("at"):
             await _failed_before_claim(row, mark, outcome.code or "internal_error",
