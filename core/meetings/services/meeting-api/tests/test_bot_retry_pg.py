@@ -8,7 +8,9 @@ is ``FakeRuntimeClient``). Groups:
   * the failure writers — the session-keyed lifecycle write (``update_meeting_status``),
     ``fail_meeting`` and the spawn port's post-claim ending each send a retried failure back to
     ``requested`` with ``bot.retry``; the last one ends ``failed`` (``bot.failed``, counted once);
-    what isn't retried ends as before; a pending row refuses status writes.
+    what isn't retried ends as before; a pending row refuses status writes;
+  * the lifecycle callback — a retried session's terminal goes out as ``bot.retry`` and reaches
+    none of the meeting-level edges (the system sink the exporter reads above all).
 
 Skips cleanly unless ``MEETING_API_TEST_DATABASE_URL`` is set; see ``test_intake_pg_schema.py``'s
 docstring for the ephemeral SQLAlchemy/asyncpg install.
@@ -526,3 +528,37 @@ async def test_pg_a_retried_post_claim_failure_of_a_new_instant_join_replies_cre
     assert reply["result"] == "created"
     assert reply["meeting"]["status"] == "requested"
     assert reply["meeting"]["outcome"] is None
+
+
+# ── the lifecycle callback ──────────────────────────────────────────────────────────────────
+
+
+class _SystemSink:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    async def deliver(self, envelope, *, label=""):
+        self.events.append(envelope["event_type"])
+
+
+async def test_pg_a_lost_workload_through_the_lifecycle_is_bot_retry_only(pg):
+    from meeting_api import create_app
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    mid, session = await pg.sent(status="active")
+    sink = _SystemSink()
+    app = create_app(meeting_repo=pg.repo, system_webhook_sink=sink)
+    status, _ = await app.state.apply_lifecycle_event(
+        {
+            "connection_id": session,
+            "status": "completed",
+            "completion_reason": "left_alone",
+        },
+        transition_source=TransitionSource.RUNTIME_DESTROY,
+        force_terminal_on_destroy=True,
+    )
+    assert status == 200
+    assert (await pg.row(mid))["status"] == "requested"
+    assert app.state.typed_webhooks[-1]["event_type"] == "bot.retry"
+    assert sink.events == []
+    assert (await pg.types(mid))[-1] == "bot.retry"

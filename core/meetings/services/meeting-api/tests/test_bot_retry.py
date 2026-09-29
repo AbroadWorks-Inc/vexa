@@ -1,8 +1,13 @@
 """§6.9 F-K2 — a bot that fails while its meeting is on gets a new bot on the SAME meeting.
 
-Offline, on the in-memory intake store: the decision (``retry.due_at``) and the one writer
-(``retry.retry``). The Postgres wiring (the lifecycle write, ``fail_meeting``, the spawn port) is
-in ``test_bot_retry_pg.py``.
+Offline, on the in-memory fakes:
+  * the decision (``retry.due_at``) and the one writer (``retry.retry``);
+  * the lifecycle callback (``app._apply_lifecycle_event``) on a session whose terminal the repo
+    turned into a retry, into the last lost bot's ``failed``, or refused as stale: the meeting-level
+    side effects follow the row's persisted status, not the session's.
+
+The Postgres wiring (the lifecycle write, ``fail_meeting``, the spawn port) is in
+``test_bot_retry_pg.py``.
 """
 
 from __future__ import annotations
@@ -261,3 +266,171 @@ def test_an_outcome_on_the_meeting_is_an_ending():
     mid = _meeting(store)
     store.aw[mid]["outcome_kind"] = Outcome("cancelled_by_calendar", None, None).kind
     assert retry.in_scope(store.view(mid)) is False
+
+
+# ── the lifecycle callback follows the row, not the session ─────────────────────────────────
+
+MARKER = {
+    "reason": "join_failure",
+    "due_at": "2026-09-29T09:11:00Z",
+    "proven_gone": False,
+}
+
+
+class _Repo:
+    """``InMemoryMeetingRepo`` whose session terminal comes back the way the SQL adapter writes
+    it (``mode``): ``retry`` → the row ``requested`` with ``data.bot_retry``; ``last_lost`` → a
+    lost ``completed`` as the row's ``failed``; ``stale`` → refused (``None``)."""
+
+    def __new__(cls, mode: str):
+        from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+        class Repo(InMemoryMeetingRepo):
+            async def update_meeting_status(self, **kw):
+                terminal = kw["status"] in ("completed", "failed")
+                sess = next(
+                    s for s in self.sessions if s["session_uid"] == kw["session_uid"]
+                )
+                row = self._meetings[sess["meeting_id"]]
+                if terminal and mode == "stale":
+                    return None
+                if (
+                    terminal
+                    and mode == "retry"
+                    and row["status"] not in ("completed", "failed")
+                ):
+                    row["status"] = "requested"
+                    row["data"]["bot_retry"] = dict(MARKER)
+                    return dict(row)
+                if kw["status"] == "completed" and mode == "last_lost":
+                    kw = {**kw, "status": "failed"}
+                return await super().update_meeting_status(**kw)
+
+        return Repo()
+
+
+class _Sinks:
+    def __init__(self) -> None:
+        self.system: list[str] = []
+        self.user: list[str] = []
+        self.finalized: list[int] = []
+        self.reaped: list[str] = []
+        self.published: list[str] = []
+
+    async def deliver(self, *args, **kwargs):  # the system sink: (envelope, label=)
+        from types import SimpleNamespace
+
+        if len(args) == 1:
+            self.system.append(args[0]["event_type"])
+        else:  # the per-user sink: (url, envelope, secret, …)
+            self.user.append(args[1]["event_type"])
+        return SimpleNamespace(status="delivered", status_code=200, error=None)
+
+    async def finalize(self, meeting_id: int) -> int:
+        self.finalized.append(meeting_id)
+        return 0
+
+    async def publish(self, channel: str, data: str):
+        return 1
+
+    async def xadd(self, stream: str, payload: dict):
+        self.reaped.append(stream)
+        return "1-0"
+
+
+class _UserSink:
+    def __init__(self, sinks: _Sinks) -> None:
+        self._sinks = sinks
+
+    async def deliver(self, url, env, secret, **kw):
+        return await self._sinks.deliver(url, env, secret)
+
+
+async def _drive(mode: str, events: list[tuple[dict, bool]], monkeypatch) -> tuple:
+    from meeting_api import create_app
+    from meeting_api import events as events_mod
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    sinks = _Sinks()
+
+    async def publish(event_type, source_event_id, refs, **kw):
+        sinks.published.append(event_type)
+        return True
+
+    monkeypatch.setattr(events_mod, "publish", publish)
+    repo = _Repo(mode)
+    meeting = await repo.create_meeting(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="kxo-misr-avz",
+        data={"webhook_url": "https://hooks.example/aw"},
+    )
+    await repo.create_session(meeting_id=meeting["id"], session_uid="sess-1")
+    app = create_app(
+        meeting_repo=repo,
+        system_webhook_sink=sinks,
+        webhook_sink=_UserSink(sinks),
+        transcript_finalizer=sinks.finalize,
+        redis=sinks,
+    )
+    for body, destroyed in events:
+        status, content = await app.state.apply_lifecycle_event(
+            {"connection_id": "sess-1", **body},
+            transition_source=(
+                TransitionSource.RUNTIME_DESTROY
+                if destroyed
+                else TransitionSource.BOT_CALLBACK
+            ),
+            force_terminal_on_destroy=destroyed,
+        )
+        assert status == 200, content
+    return app, sinks, repo._meetings[meeting["id"]]
+
+
+JOINING = ({"status": "joining"}, False)
+ACTIVE = ({"status": "active"}, False)
+
+
+async def test_a_retried_session_sends_bot_retry_and_no_meeting_level_side_effect(
+    monkeypatch,
+):
+    failed = ({"status": "failed", "completion_reason": "join_failure"}, False)
+    app, sinks, row = await _drive("retry", [JOINING, failed], monkeypatch)
+    assert row["status"] == "requested"
+    typed = app.state.typed_webhooks[-1]
+    assert typed["event_type"] == "bot.retry"
+    assert typed["data"]["meeting"]["status"] == "requested"
+    assert typed["data"]["status_change"]["to"] == "failed"
+    assert sinks.user[-2:] == ["meeting.status_change", "bot.retry"]
+    assert sinks.system == []
+    assert sinks.finalized == [] and sinks.reaped == [] and sinks.published == []
+
+
+async def test_a_lost_bot_on_its_last_attempt_is_bot_failed_everywhere(monkeypatch):
+    lost = ({"status": "completed", "completion_reason": "left_alone"}, True)
+    app, sinks, row = await _drive("last_lost", [JOINING, ACTIVE, lost], monkeypatch)
+    assert row["status"] == "failed"
+    assert app.state.typed_webhooks[-1]["event_type"] == "bot.failed"
+    assert sinks.system == ["bot.failed"]
+    assert sinks.user[-1] == "bot.failed"
+    assert sinks.finalized == [row["id"]] and len(sinks.reaped) == 1
+    assert "meeting.completed" not in sinks.published
+
+
+async def test_a_refused_stale_terminal_reaches_no_system_sink_and_no_flows(
+    monkeypatch,
+):
+    done = ({"status": "completed", "completion_reason": "left_alone"}, False)
+    _, sinks, _ = await _drive("stale", [JOINING, ACTIVE, done], monkeypatch)
+    assert sinks.system == []
+    assert "meeting.completed" not in sinks.published
+    assert sinks.finalized == [] and sinks.reaped == []
+
+
+async def test_a_normal_end_still_reaches_every_sink_once(monkeypatch):
+    done = ({"status": "completed", "completion_reason": "left_alone"}, False)
+    _, sinks, row = await _drive("normal", [JOINING, ACTIVE, done, done], monkeypatch)
+    assert row["status"] == "completed"
+    assert sinks.system == ["meeting.completed"]
+    assert sinks.published.count("meeting.completed") == 1
+    assert sinks.finalized == [row["id"]]

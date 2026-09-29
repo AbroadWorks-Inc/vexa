@@ -145,6 +145,7 @@ def build_typed_envelope(
     meeting: Optional[Dict[str, Any]] = None,
     event_id: Optional[str] = None,
     created_at: Optional[str] = None,
+    event_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Wrap a ``StatusChange`` as the TYPED webhook.v1 ``Envelope`` its transition maps to.
 
@@ -158,10 +159,15 @@ def build_typed_envelope(
       parent's ``send_completion_webhook``; no status_change block — golden
       ``Envelope.meeting-completed.json``).
 
+    ``event_type`` names the event when the meeting's row, not the session's transition, decides
+    it (§6.9 F-K2): ``bot.retry`` for a session whose failure sent the meeting back for another
+    bot, ``bot.failed`` for a lost bot's ``completed`` that ended the meeting ``failed``. Both
+    carry the ``status_change`` block.
+
     Validated against the frozen schema before it is returned (the seam, P8) — the schema's
-    ``EventType`` enum already declares all three, so this is a code-only, additive change.
+    ``EventType`` enum already declares all of them, so this is a code-only, additive change.
     """
-    event_type = typed_event_type(change)
+    event_type = event_type or typed_event_type(change)
     if event_type is None:
         return None
     if meeting is None:

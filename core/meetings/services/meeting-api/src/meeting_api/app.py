@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, Response
 
 from . import bot_spawn as _bot_spawn
 from . import events as _flows_events
+from .intake import retry as _retry
 from . import recordings as _recordings
 from .callback_auth import (
     INTERNAL_SECRET_HEADER,
@@ -630,6 +631,16 @@ def _mount_lifecycle(
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
                           span="lifecycle.callback", fields={"error": str(e)})
+        # §6.9 F-K2: the session's terminal is not always the meeting's. A bot failure while the
+        # meeting is on sends the row back to `requested` for another bot (`data.bot_retry`), and a
+        # lost bot's `completed` on the last attempt ends the row `failed`. Every meeting-level
+        # side effect below (finalize, provenance, the system and flows edges, the copilot reap)
+        # follows the row's persisted status; a refused write (no row) reaches none of them.
+        persisted_status = meeting_row.get("status") if isinstance(meeting_row, dict) else None
+        row_finished = persisted_status in ("completed", "failed")
+        retry_pending = isinstance(meeting_row, dict) and (
+            _retry.marker(meeting_row.get("data")) is not None
+        )
         # COMPLETION FINALIZATION — the moment the FSM lands on a terminal status, flush the
         # meeting's remaining live redis segments to the durable store (threshold 0: the mutable
         # tail included, no more updates are coming) and persist the processed doc into
@@ -643,6 +654,7 @@ def _mount_lifecycle(
             and rec.status.value in ("completed", "failed")
             and isinstance(meeting_row, dict)
             and meeting_row.get("id") is not None
+            and row_finished
         )
         if (
             transcript_finalizer is not None
@@ -656,7 +668,7 @@ def _mount_lifecycle(
                     rec_data["segments_captured"] = finalized_segments
                     updated_row = await meeting_repo.update_meeting_status(
                         session_uid=rec.connection_id,
-                        status=rec.status.value,
+                        status=persisted_status,
                         completion_reason=(
                             rec.completion_reason.value if rec.completion_reason else None
                         ),
@@ -671,7 +683,7 @@ def _mount_lifecycle(
                 try:
                     updated_row = await meeting_repo.update_meeting_status(
                         session_uid=rec.connection_id,
-                        status=rec.status.value,
+                        status=persisted_status,
                         completion_reason=(
                             rec.completion_reason.value if rec.completion_reason else None
                         ),
@@ -697,7 +709,7 @@ def _mount_lifecycle(
                 try:
                     updated_row = await meeting_repo.update_meeting_status(
                         session_uid=rec.connection_id,
-                        status=rec.status.value,
+                        status=persisted_status,
                         completion_reason=(
                             rec.completion_reason.value if rec.completion_reason else None
                         ),
@@ -727,6 +739,13 @@ def _mount_lifecycle(
                 change,
                 meeting=legacy_meeting_projection(meeting_row)
                 if isinstance(meeting_row, dict) else None,
+                event_type=(
+                    "bot.retry" if retry_pending and rec.status is not None
+                    and rec.status.value in ("completed", "failed")
+                    else "bot.failed" if persisted_status == "failed"
+                    and rec.status is not None and rec.status.value == "completed"
+                    else None
+                ),
             )
             if typed_envelope is not None:
                 app.state.typed_webhooks.append(typed_envelope)
@@ -767,7 +786,7 @@ def _mount_lifecycle(
                         )
                     except Exception:  # noqa: BLE001 — a publish edge is not a dependency
                         pass
-                elif _uid is not None and _et == "meeting.completed":
+                elif _uid is not None and _et == "meeting.completed" and row_finished:
                     try:
                         await _flows_events.publish_meeting_completed(
                             _meeting_block.get("id"),
@@ -785,6 +804,7 @@ def _mount_lifecycle(
         if (
             system_webhook_sink is not None
             and typed_envelope is not None
+            and row_finished
             and typed_envelope.get("event_type") in {
                 "meeting.completed",
                 "bot.failed",
@@ -968,6 +988,7 @@ def _mount_lifecycle(
             and rec.status is not None
             and rec.status.value in ("completed", "failed")
             and isinstance(meeting_row, dict)
+            and row_finished
             and hasattr(redis, "xadd")
         ):
             meeting_row_id = meeting_row.get("id")
