@@ -634,7 +634,7 @@ async def test_a_404_is_gone_only_after_the_untracked_grace():
     assert await _proven(runtime, failed_s_ago=601)
 
 
-async def test_an_unknown_answer_is_not_proof_and_no_workload_needs_none():
+async def test_an_unknown_answer_or_an_unknown_workload_is_not_proof():
     from meeting_api.bot_spawn.fakes import FakeRuntimeClient
 
     class Broken(FakeRuntimeClient):
@@ -643,7 +643,38 @@ async def test_an_unknown_answer_is_not_proof_and_no_workload_needs_none():
 
     assert not await _proven(Broken())
     assert not await _proven(None)
-    assert await _proven(Broken(), workload=None)
+    assert not await _proven(
+        FakeRuntimeClient(workloads={}), workload=None, failed_s_ago=9999
+    )
+
+
+class _Resp:
+    def __init__(self, code: int) -> None:
+        self.status_code = code
+        self.text = "busy"
+
+    def json(self):
+        return {"detail": "busy"}
+
+
+class _Http:
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+    async def post(self, url, json=None, timeout=None):
+        return _Resp(self.code)
+
+
+@pytest.mark.parametrize(
+    "code,refused", [(400, True), (422, True), (500, False), (503, False)]
+)
+async def test_a_runtime_5xx_is_not_a_refusal(code, refused):
+    from meeting_api.bot_spawn.adapters import HttpRuntimeClient
+    from meeting_api.bot_spawn.ports import SpawnFailed
+
+    with pytest.raises(SpawnFailed) as caught:
+        await HttpRuntimeClient(_Http(code), "http://runtime").create_workload({})
+    assert caught.value.refused is refused
 
 
 # ── the runtime callback on a waiting meeting ───────────────────────────────────────────────

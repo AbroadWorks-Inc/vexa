@@ -370,7 +370,15 @@ class SpawnFailed(Exception):
 
     ALSO raised (ROB3) when a post-spawn DB write fails AFTER the workload was created: the orphaned
     workload is torn down (``RuntimeClient.delete_workload``) and the spawn is re-raised as this, so
-    the route maps it to 502 and no inconsistent half-spawned state is left behind."""
+    the route maps it to 502 and no inconsistent half-spawned state is left behind.
+
+    ``refused`` says whether the runtime explicitly refused the workload (a 4xx, or a body that
+    reports it dead), so none was started. A 5xx is not a refusal: the workload may exist
+    (§6.9 F-K2 proves it gone before another bot goes)."""
+
+    def __init__(self, *args: object, refused: bool = True) -> None:
+        super().__init__(*args)
+        self.refused = refused
 
 
 class WorkloadUnknown(Exception):
@@ -390,6 +398,12 @@ class WorkloadUnknown(Exception):
 class TranscriptionNotConfigured(Exception):
     """transcribe_enabled=true but no transcription backend resolved (Settings nor env)."""
 
+
+
+def workload_id_for(meeting_id: Any, session_uid: str) -> str:
+    """The workload id a spawn asks the runtime for: the meeting and the session's first eight
+    characters (``request_bot``). A session with no recorded workload is known by it (§6.9 F-K2)."""
+    return f"mtg-{meeting_id}-{session_uid[:8]}"
 
 
 # ── shared row-shaping helpers (here, not in adapters, so the in-memory fakes reuse the

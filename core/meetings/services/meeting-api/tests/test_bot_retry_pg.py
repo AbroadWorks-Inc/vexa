@@ -494,25 +494,20 @@ async def test_pg_a_post_claim_spawn_failure_is_retried(pg):
     assert (await pg.aw(mid))["send_attempts"] == 1
 
 
-async def test_pg_a_post_claim_failure_the_flow_left_is_retried_by_the_port(pg):
+async def test_pg_a_runtime_quota_refusal_is_retried_with_the_workload_proven_gone(pg):
+    """The runtime's 429 is an explicit refusal: no workload was started."""
     mid = await pg.calendar_meeting()
-    outcome = await pg.port(FakeRuntimeClient(quota_exceeded=True)).spawn_exact(
-        USER, mid
-    )
+    runtime = FakeRuntimeClient(quota_exceeded=True)
+    outcome = await pg.port(runtime).spawn_exact(USER, mid)
     assert (outcome.result, outcome.code) == ("failed", "account_limit")
     row = await pg.row(mid)
     marker = row["data"]["bot_retry"]
-    assert (row["status"], marker["reason"], marker["proven_gone"]) == (
-        "requested",
-        None,
-        True,
-    )
-    assert marker["message"] == "bot limit reached (owner quota exceeded)"
+    assert (row["status"], marker["proven_gone"]) == ("requested", True)
+    assert marker["workload"] == runtime.specs[0]["workloadId"]
+    assert marker["message"] == "owner quota exceeded"
     aw = await pg.aw(mid)
     assert (aw["send_attempts"], aw["last_error_code"]) == (1, "account_limit")
-    events = await pg.events(mid)
-    assert events[-1]["event_type"] == "bot.retry"
-    assert events[-1]["data"]["change"]["reason"] == "account_limit"
+    assert (await pg.types(mid)).count("bot.retry") == 1
 
 
 async def test_pg_the_last_post_claim_failure_after_a_bot_session_is_bot_failed(pg):
@@ -883,3 +878,118 @@ async def test_pg_each_retry_counts_once_by_its_reason(pg):
     for _ in range(2):  # the bot's retried callback is refused the second time
         await _fail(pg, session, "failed", "awaiting_admission_timeout", "bot_callback")
     assert _retries("awaiting_admission_timeout") == before + 1
+
+
+# ── never two bots: a workload that may exist is never recorded gone ────────────────────────
+
+
+class _TeardownFails(FakeRuntimeClient):
+    async def delete_workload(self, workload_id):
+        raise RuntimeError("the kernel is down")
+
+
+def _session_write_fails(pg: Pg):
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class Repo(SqlAlchemyMeetingRepo):
+        async def create_session(self, **kw):
+            raise RuntimeError("the database went away")
+
+    return Repo(pg.session_factory)
+
+
+async def test_pg_a_post_spawn_failure_with_a_failed_teardown_waits_for_proof(pg):
+    mid = await pg.calendar_meeting()
+    runtime = _TeardownFails()
+    outcome = await pg.port(runtime, repo=_session_write_fails(pg)).spawn_exact(
+        USER, mid
+    )
+    assert (outcome.result, outcome.code) == ("failed", "spawn_error")
+    workload = runtime.specs[0]["workloadId"]
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (workload, False)
+    still_up = _TeardownFails(workloads={workload: {"state": "running"}})
+    assert (await pg.tick(still_up, at=_later()))["spawned"] == 0
+    assert still_up.specs == []
+    confirmed = FakeRuntimeClient(workloads={workload: {"state": "running"}})
+    assert (await pg.tick(confirmed, at=_later()))["spawned"] == 1
+    assert confirmed.deleted == [workload]
+
+
+async def test_pg_a_post_spawn_failure_with_a_confirmed_teardown_is_proven(pg):
+    mid = await pg.calendar_meeting()
+    runtime = FakeRuntimeClient()
+    await pg.port(runtime, repo=_session_write_fails(pg)).spawn_exact(USER, mid)
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (
+        runtime.specs[0]["workloadId"],
+        True,
+    )
+    assert runtime.deleted == [runtime.specs[0]["workloadId"]]
+
+
+def _unanswered():
+    import httpx
+
+    from meeting_api.bot_spawn.ports import SpawnFailed
+
+    return [
+        pytest.param(httpx.ReadError("connection reset"), id="read-error"),
+        pytest.param(httpx.RemoteProtocolError("peer closed"), id="protocol-error"),
+        pytest.param(httpx.ConnectError("refused"), id="connect-error"),
+        pytest.param(TimeoutError("slow"), id="timeout"),
+        pytest.param(
+            SpawnFailed("runtime kernel returned 503: busy", refused=False), id="5xx"
+        ),
+    ]
+
+
+@pytest.mark.parametrize("error", _unanswered())
+async def test_pg_a_create_the_runtime_did_not_refuse_is_never_recorded_gone(pg, error):
+    class Unanswered(FakeRuntimeClient):
+        async def create_workload(self, spec):
+            self.specs.append(spec)
+            raise error
+
+    mid = await pg.calendar_meeting()
+    runtime = Unanswered()
+    outcome = await pg.port(runtime).spawn_exact(USER, mid)
+    assert outcome.result == "failed"
+    workload = runtime.specs[0]["workloadId"]
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (workload, False)
+    unknown = FakeRuntimeClient(workloads={})  # 404: not proof before the grace
+    assert (await pg.tick(unknown, at=_later()))["spawned"] == 0
+    assert unknown.specs == []
+
+
+async def test_pg_a_failure_before_the_workload_create_is_not_recorded_gone(
+    pg, monkeypatch
+):
+    from meeting_api.intake.fakes import FakePublisher
+    from meeting_api.intake.spawn import ExactRowSpawn
+
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    mid = await pg.calendar_meeting()
+    port = ExactRowSpawn(
+        pg.repo,
+        FakeRuntimeClient(),
+        store=pg.store,
+        fetch_bot_context=_ctx,
+        publisher=FakePublisher(),
+        token_secret=None,
+        redis_url="redis://r",
+    )
+    assert (await port.spawn_exact(USER, mid)).code == "internal_error"
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (None, False)
+    runtime = _gone()
+    assert (await pg.tick(runtime, at=_later()))["spawned"] == 0
+
+
+async def test_pg_a_session_without_a_recorded_workload_names_its_own(pg):
+    mid, session = await pg.sent(status="joining")
+    await pg.execute("UPDATE meetings SET bot_container_id = NULL WHERE id = :m", m=mid)
+    await _fail(pg, session, "failed", "join_failure", "bot_callback")
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert marker["workload"] == f"mtg-{mid}-{session[:8]}"

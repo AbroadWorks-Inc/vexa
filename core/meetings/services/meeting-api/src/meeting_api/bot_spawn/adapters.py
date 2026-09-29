@@ -26,6 +26,7 @@ from .ports import (
     _archive_completion,
     _stopped_reopen_detail,
     reconcile_grace_for_status,
+    workload_id_for,
 )
 
 
@@ -455,7 +456,8 @@ class SqlAlchemyMeetingRepo:
                     stage=failure_stage,
                     lost=status == "completed" and runtime_destroy and m.status != "stopping",
                     session=session_uid,
-                    workload=m.bot_container_id,
+                    # A session whose workload isn't recorded (yet) is known by its own id.
+                    workload=m.bot_container_id or workload_id_for(m.id, session_uid),
                     proven_gone=runtime_destroy,
                 )
                 await db.flush()
@@ -1259,6 +1261,8 @@ class SqlAlchemyMeetingRepo:
                     stage=failure_stage,
                     workload=workload_id or m.bot_container_id,
                     proven_gone=workload_gone,
+                    code=outcome.detail if outcome is not None and outcome.detail
+                    else retry.BOT_FAILED,
                 ),
                 now=datetime.now(timezone.utc),
                 settings=IntakeSettings.from_env(),
@@ -1303,8 +1307,12 @@ class HttpRuntimeClient:
             raise QuotaExceeded("runtime kernel: owner quota exceeded")
         if resp.status_code != 201:
             # Carry the kernel's own reason (its {detail}) so the 502 the user sees NAMES the cause
-            # — e.g. "No such image: …" for an absent bot image (#718 C1 → C2).
-            raise SpawnFailed(f"runtime kernel returned {resp.status_code}: {_reason(resp)}")
+            # — e.g. "No such image: …" for an absent bot image (#718 C1 → C2). A 5xx is not a
+            # refusal: the workload may have been started.
+            raise SpawnFailed(
+                f"runtime kernel returned {resp.status_code}: {_reason(resp)}",
+                refused=resp.status_code < 500,
+            )
         body = resp.json()
         # Belt-and-suspenders (#718 C2): even a 201 must be a workload that actually STARTED. A kernel
         # that answers 201 with a dead body (state=stopped/destroyed, e.g. start_failed) is dead on

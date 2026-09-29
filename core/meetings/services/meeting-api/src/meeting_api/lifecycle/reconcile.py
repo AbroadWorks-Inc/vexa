@@ -163,10 +163,10 @@ async def prove_workload_gone(
     meeting. The reap gate's own evidence: ``gone`` (the kernel reports it terminal) is proof; an
     ``alive`` workload is torn down and proof only once the kernel confirms the delete; a 404
     (``untracked``) counts only once ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) has
-    passed since the failure (``failed_at``); anything else (no runtime, a probe error) is not
-    proof. No workload at all has nothing to prove."""
+    passed since the failure (``failed_at``); anything else (no runtime, a probe error, no workload
+    id to ask about) is not proof."""
     if not workload_id:
-        return True
+        return False
     probe, _info = await _probe_bot_workload(runtime, workload_id, log=log)
     if probe == "gone":
         return True

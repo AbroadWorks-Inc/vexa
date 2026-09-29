@@ -294,8 +294,9 @@ class ExactRowSpawn:
         self, user_id: int, meeting_id: int, code: str, message: str
     ) -> None:
         """Ruling R17: the claimed row ends ``not_sent`` with the code and message, or, while the
-        meeting is on, goes back to ``requested`` for another bot (§6.9 F-K2, ``retry.retry``;
-        nothing was started, so no workload is left to prove gone). The last failure of a meeting
+        meeting is on, goes back to ``requested`` for another bot (§6.9 F-K2, ``retry.retry``). The
+        spawn flow fails the row itself wherever a workload may exist, so a row that reaches here
+        names no workload, and it is never recorded as gone. The last failure of a meeting
         that already had a bot session ends ``failed`` without the ``not_sent`` outcome. A row the
         spawn flow already sent back (``data.bot_retry``) is left alone. Best effort: a failure
         here is logged with its stack, and the spawn's answer stands."""
@@ -323,9 +324,10 @@ class ExactRowSpawn:
                         fields={"code": code},
                     )
                 elif current.status == "requested":
+                    # Nothing says whether a workload was started: never recorded gone.
                     failure = retry.Failure(
                         "failed", None, message, stage="requested", code=code,
-                        proven_gone=True,
+                        proven_gone=False,
                     )
                     written = await retry.retry(
                         tx, meeting_id, failure, now=datetime.now(timezone.utc),

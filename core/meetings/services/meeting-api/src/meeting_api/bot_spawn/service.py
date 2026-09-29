@@ -52,6 +52,7 @@ from .ports import (
     SpawnFailed,
     TranscriptionNotConfigured,
     _stopped_reopen_detail,
+    workload_id_for,
 )
 
 # Re-exported here (defined in ports.py to avoid an adapters→service circular import) so callers that
@@ -372,14 +373,6 @@ async def _stop_requested_on(repo: MeetingRepo, meeting_id: Any) -> bool:
     except Exception:  # noqa: BLE001 — a read failure must never fail a spawn; the interlock backstops
         return False
     return bool(((row or {}).get("data") or {}).get("stop_requested"))
-
-
-def _create_timeouts() -> tuple[type[BaseException], ...]:
-    """The exceptions a workload create that timed out raises: the kernel may have started the
-    workload without answering, so the workload is not proven gone."""
-    import httpx
-
-    return (TimeoutError, httpx.TimeoutException)
 
 
 def _not_sent(exc: BaseException) -> Any:
@@ -835,7 +828,7 @@ async def request_bot(
         raise stopped
 
     # 5. Spawn over runtime.v1.
-    workload_id = f"mtg-{meeting_id}-{connection_id[:8]}"
+    workload_id = workload_id_for(meeting_id, connection_id)
     spec = build_workload_spec(
         workload_id=workload_id,
         invocation=invocation,
@@ -844,6 +837,22 @@ async def request_bot(
             f"{meeting_api_url}/runtime/callback", workload_id, internal_secret or ""
         ),
     )
+    async def _fail_row(reason: str, exc: BaseException, *, gone: bool) -> None:
+        """Fail the claimed row BY ID (the ``MeetingSession`` may not exist yet), naming the
+        workload and whether it is proven gone (§6.9 F-K2: a meeting that is on retries, and a
+        new bot goes only once that workload is proven gone). Best-effort: never masks the spawn
+        error the caller re-raises."""
+        try:
+            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
+                                    outcome=_not_sent(exc), workload_id=workload_id,
+                                    workload_gone=gone)
+        except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
+            log_event(
+                "bot_spawn_fail_row_error", audience="system", level="error",
+                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                fields={"error": str(fail_err)},
+            )
+
     try:
         result = await runtime.create_workload(spec)
         # Defense in depth at the service/port seam (#718 C2): the adapter already refuses a dead
@@ -853,48 +862,35 @@ async def request_bot(
         spawned_state = result.get("state")
         if spawned_state in ("stopped", "destroyed"):
             raise SpawnFailed(f"workload dead on spawn: {result.get('stopReason') or spawned_state}")
-    except QuotaExceeded:
+    except QuotaExceeded as e:
+        # The kernel's 429 is an explicit refusal: no workload was started.
         log_event(
             "bot_spawn_quota_exceeded", audience="user", level="warning",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
         )
-        raise
-    except _create_timeouts() as e:
-        # The kernel may have started the workload without answering in time: the row is failed
-        # with the workload named and NOT proven gone (§6.9 F-K2), so a retry proves it gone first.
-        reason = f"the runtime did not answer the workload create in time ({type(e).__name__})"
-        try:
-            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
-                                    outcome=_not_sent(e), workload_id=workload_id,
-                                    workload_gone=False)
-        except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
-            log_event(
-                "bot_spawn_fail_row_error", audience="system", level="error",
-                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                fields={"error": str(fail_err)},
-            )
+        await _fail_row(str(e) or "runtime quota exceeded", e, gone=True)
         raise
     except SpawnFailed as e:
         # No workload came up. Mark the just-inserted meeting row `failed` with the reason so no
         # `requested` row lingers for the 5-minute reaper to flip reason-less (#718): the failure and
         # its cause are on the row NOW, and POST /bots answers 502 with the same reason. The row is
         # failed BY ID — the MeetingSession is not created until after a successful spawn, so the
-        # session-keyed update_meeting_status cannot reach it yet. The kernel's refusal proves the
-        # workload gone (§6.9 F-K2).
+        # session-keyed update_meeting_status cannot reach it yet. Only an explicit refusal proves
+        # the workload gone; a 5xx does not (``SpawnFailed.refused``).
         reason = str(e) or "bot workload failed to start"
-        try:
-            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
-                                    outcome=_not_sent(e), workload_id=workload_id)
-        except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
-            log_event(
-                "bot_spawn_fail_row_error", audience="system", level="error",
-                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                fields={"error": str(fail_err)},
-            )
+        await _fail_row(reason, e, gone=e.refused)
         log_event(
             "bot_spawn_failed", audience="system", level="error",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
             fields={"reason": reason},
+        )
+        raise
+    except Exception as e:
+        # No answer from the kernel (a timeout, a dropped connection, a protocol error): it may
+        # have started the workload, so the row is failed with the workload named and NOT proven
+        # gone (§6.9 F-K2).
+        await _fail_row(
+            f"the runtime did not answer the workload create ({type(e).__name__})", e, gone=False
         )
         raise
 
@@ -905,13 +901,16 @@ async def request_bot(
     #      (a live bot with no session row to resolve its uploads, the meeting stuck `requested`) —
     #      ROB3. Wrap both DB writes: on failure, tear the just-created workload DOWN (best-effort) and
     #      re-raise as SpawnFailed so the route maps it to 502 and no half-spawned state is left behind.
+    #      The row is failed with the workload and whether its teardown was confirmed (§6.9 F-K2).
     try:
         # For a continued meeting this APPENDS a session to the reused row — N sessions per meeting (P3c).
         await repo.create_session(meeting_id=meeting_id, session_uid=connection_id)
         row = await repo.set_bot_container(meeting_id=meeting_id, bot_container_id=workload_id)
     except Exception as e:  # noqa: BLE001 — any post-spawn DB failure must trigger compensation
+        torn_down = False
         try:
             await runtime.delete_workload(workload_id)
+            torn_down = True
         except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the cause
             log_event(
                 "bot_spawn_orphan_teardown_failed", audience="system", level="error",
@@ -923,9 +922,13 @@ async def request_bot(
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
             fields={"workload_id": workload_id, "error": str(e)},
         )
-        raise SpawnFailed(
+        failed = SpawnFailed(
             f"post-spawn DB write failed; workload {workload_id} torn down"
-        ) from e
+            if torn_down
+            else f"post-spawn DB write failed; workload {workload_id} not torn down"
+        )
+        await _fail_row(str(failed), failed, gone=torn_down)
+        raise failed from e
 
     # THE INTERLOCK — the half of the fence that has no TOCTOU hole (F2).
     #
