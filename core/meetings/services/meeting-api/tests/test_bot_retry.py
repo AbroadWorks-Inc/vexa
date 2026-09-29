@@ -800,6 +800,26 @@ async def test_removing_the_last_entry_of_a_waiting_meeting_ends_it_cancelled():
     assert commands.published == [] and runtime.deleted == []
 
 
+async def test_removing_the_last_entry_of_a_stopped_waiting_meeting_keeps_the_outcome():
+    """DELETE /bots flagged the waiting meeting first (data only); the removal still ends it now,
+    with R5's ``cancelled_by_calendar``."""
+    from intake_builders import A
+
+    h, service, _, commands, _, mid = await _waiting_intake()
+    row = h.store.meetings[mid]
+    h.store.meetings[mid] = {**row, "data": {**row["data"], "stop_requested": True}}
+    reply = await service.remove_entry(
+        1, {"external_id": "google:3n5kq8example", "user": A, "reason": "cancelled"}
+    )
+    meeting = reply["meeting"]
+    assert (reply["result"], meeting["status"]) == ("removed", "failed")
+    assert (meeting["outcome"]["kind"], meeting["outcome"]["detail"]) == (
+        "cancelled_by_calendar",
+        "cancelled",
+    )
+    assert commands.published == []
+
+
 async def test_a_waiting_meeting_shows_when_its_next_bot_goes():
     h, *_, mid = await _waiting_intake()
     projected = h.store.view(mid).project(lead_s=300)

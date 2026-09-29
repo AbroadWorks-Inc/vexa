@@ -24,8 +24,8 @@ lock and calls ``record_stop``. ``IntakeStop.leave`` is steps 5–6 after the co
 ``completed``/``failed`` with upstream's ``stopped`` reason.
 
 A meeting waiting for its next bot (§6.9 F-K2, ``data.bot_retry``) has no bot to leave: its stop
-ends it at once, ``failed`` with ``stopped`` and the outcome (``retry.end``), and ``leave`` sends
-nothing for it.
+ends it at once, ``failed`` with ``stopped`` and the outcome (``retry.end``), even when a
+``DELETE /bots`` already flagged it, and ``leave`` sends no command for it.
 
 A meeting with no live bot, or one already stop-requested, is left as it is: nothing is written
 and nothing is sent (the route answers ``no_live_bot`` for the first before it gets here). A
@@ -73,14 +73,18 @@ async def record_stop(
     """§1.7 steps 2–4 in ``tx``, which holds the meeting's link lock. ``None`` when there is no
     live bot to stop, or its stop is already recorded."""
     meeting = await tx.meeting(meeting_id)
-    if not is_live(meeting.status) or _stop_requested(meeting):
+    if not is_live(meeting.status):
         return None
-    if retry.marker(meeting.data) is not None:
+    # A meeting waiting for its next bot ends now, even one a DELETE /bots already flagged
+    # (``data.stop_requested`` alone): the outcome is recorded with the ending.
+    if retry.marker(meeting.data) is not None and meeting.status == "requested":
         ended = await retry.end(
             tx, meeting_id, completion_reason=STOPPED, outcome=outcome
         )
         events = () if ended is None else (ended.event_id,)
         return RecordedStop(meeting_id, dict(meeting.row), outcome, events)
+    if _stop_requested(meeting):
+        return None
     if meeting.status in BOOTING_STATUSES:
         await tx.mark_stop_requested(meeting_id, outcome)
         return RecordedStop(meeting_id, dict(meeting.row), outcome, ())
