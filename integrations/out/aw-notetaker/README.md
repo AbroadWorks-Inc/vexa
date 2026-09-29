@@ -3,27 +3,48 @@
 On a finished meeting that has a recording, builds the per-meeting AbroadWorks notetaker folder in
 `aw-chatworks-transcribe` (audio, speaker-activity-derived speaker attribution, meeting metadata)
 and hands it off to `notetaker-worker` via `POST /process`. The meeting's UUID is its id in every
-file and in the hand-off. It reads meeting-api and reports the export result
+file and in the hand-off. It learns that a meeting finished from its own aw-bots `/v2/webhooks`
+subscription, like the portal. It reads meeting-api and reports the export result
 (`POST /v2/meetings/{uuid}/export`) through the gateway with its own key (scopes `tx` + `export`),
 never with `X-User-Id` or the internal secret (design
-[`docs/2026-09-25-meeting-intake-and-webhooks-design.md`](docs/2026-09-25-meeting-intake-and-webhooks-design.md) §1.9).
+[`docs/2026-09-25-meeting-intake-and-webhooks-design.md`](docs/2026-09-25-meeting-intake-and-webhooks-design.md) §1.9, §2.7, §6.9 F-X).
 
 Spec: [`docs/2026-09-23-aw-rearchitecture-design.md`](docs/2026-09-23-aw-rearchitecture-design.md)
 (§4), [`docs/2026-09-23-speaker-activity-design.md`](docs/2026-09-23-speaker-activity-design.md).
 Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.md).
 
+## The trigger: a `/v2/webhooks` subscription (design §2.7, §6.9 F-X)
+- **Delivery.** aw-bots posts each event (webhook.v1 `MeetingEvent`) to `POST /hooks/vexa` from
+  its Postgres outbox, and retries a 5xx, 429, timeout or connection error at 1 min, 5 min,
+  30 min and 2 h, then gives up (`dead`, in the subscription's delivery log). Any other answer is
+  final (`failed`). The exporter answers 202 when it queues a meeting, 200 for everything it
+  does not act on, 401 for a bad signature, 400 for an event it can't use, 503 when it can't
+  queue (aw-bots retries).
+- **Signature.** `X-Webhook-Signature` (and, for 24 h after a `rotate-secret`,
+  `X-Webhook-Signature-Previous`) is `sha256=<HMAC-SHA256(secret, "<X-Webhook-Timestamp>." +
+  raw body)>`. A match on either header under `EXPORTER_WEBHOOK_SECRET` is accepted, so the
+  exporter keeps receiving while its secret is rotated; a timestamp more than 300 s off is
+  refused.
+- **The meeting.** `data.meeting` is the §2.4 meeting: `id` (UUID), `upstream_id` (the integer
+  the recordings and transcript reads take), `platform`, `room`, `meeting_url`, `started_at` and
+  `ended_at` (the bot's actual times). Everything else the exporter needs comes from the gateway
+  reads below.
+- **Once per event.** Delivery is at-least-once. A queued event is recorded under
+  `aw-exporter/events/<event_id>.json`; the same `event_id` again is answered 200
+  (`duplicate`) and changes nothing, before and after its meeting was exported.
+
 ## Which meetings are exported (design §6.9 F-K2)
-The system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) carries two events, and both are exported:
+The subscription carries two events the exporter acts on, and both are exported:
 - **`meeting.completed`**, as before. One with no audio recording is a failed export (`no_audio`).
 - **`bot.failed`**: the meeting ended `failed`, for example because its bot recorded part of the call,
   failed, and could not be replaced in time. It is exported and transcribed like a completed one,
   every session into the one folder. When it has no audio recording, it is skipped with the log line
   `bot_failed_skipped … reason=no_recording`: nothing is written, `/process` isn't called, and **no
   export result is reported** (nothing was exported, and the meeting's own `bot.failed` already says
-  why). A `bot.failed` without a `start_time` never had its bot in the meeting, so intake answers
+  why). A `bot.failed` without a `started_at` never had its bot in the meeting, so intake answers
   200 and skips it (`reason=no_start_time`).
-- **Never exported:** any other event, and a `not_sent` meeting (`outcome.kind == "not_sent"`, no bot
-  was ever sent), whatever event carries it.
+- **Never exported:** any other event (answered 200, `webhook.test` included), and a `not_sent`
+  meeting (`outcome.kind == "not_sent"`, no bot was ever sent), whatever event carries it.
 - **One export per meeting.** The queue is keyed by the meeting id and the folder's `_export.json`
   `handed_off` ends it, so repeated or crossed events (`bot.failed` twice, or `bot.failed` then
   `meeting.completed`) export once.
@@ -34,12 +55,17 @@ The system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) carries two events, and both are 
   `export`, Secret `aw-bots-key-exporter`). The gateway checks the scope and tells meeting-api which
   account is calling, so the exporter reads the meetings of its key's account. meeting-api refuses a
   direct call that names a user itself, so there is no direct path.
-- **UUIDs.** The meeting's UUID (`data.meeting.uuid` in the webhook) is the id in
+- **UUIDs.** The meeting's UUID (`data.meeting.id` in the webhook) is the id in
   `speaker_timeline.json`, `participants.json` and the `/process` `meeting_id` and
   `idempotency_key`. `_export.json` keeps the UUID (`meeting_id`) and the integer Vexa id
-  (`vexa_meeting_id`); the integer is used only to read recordings and the transcript. The folder
-  name `<platform>_<room>_<startUTC>` is unchanged. A webhook without a UUID is moved to
-  `aw-exporter/failed/` on its first attempt and writes nothing to the export bucket.
+  (`vexa_meeting_id`, the webhook's `upstream_id`); the integer is used only to read recordings
+  and the transcript and to find the speaker-activity files. Those are under
+  `signal/<owner>/<vexa_meeting_id>/<session>/`, where the owner and the session are the ones the
+  recording's `storage_path` (`recordings/<owner>/<recording>/<session>/…`) names. The folder name
+  `<platform>_<room>_<startUTC>` is unchanged; `<startUTC>` is `started_at`. A queued meeting that
+  is not the §2.4 meeting (no UUID `id` or no integer `upstream_id`, such as an item the old
+  exporter queued from the system hook) is moved to `aw-exporter/failed/` on its first attempt
+  and writes nothing to the export bucket.
 - **Export result.** After `_export.json` records the outcome, the exporter reports it with
   `POST /v2/meetings/{uuid}/export` `{"state": "handed_off" | "failed", "s3_path": "s3://…/", "error": "…"}`
   (`error` only on `failed`): `handed_off` after `/process`, `failed` when the meeting has no audio
@@ -49,13 +75,25 @@ The system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) carries two events, and both are 
 
 ## Rollout (design Part 5)
 1. **Drain the queue with the old exporter** before anything else changes: `aw-exporter/pending/`
-   must be empty. Queued items from before the rollout have no meeting UUID.
+   must be empty. Queued items from before the rollout are the system hook's meeting, not the
+   §2.4 one.
 2. **Deploy meeting-api and the gateway, and mint the `exporter` key into `aw-bots-key-exporter`,
    before the new exporter.** The new exporter needs `GATEWAY_URL`, `EXPORTER_API_KEY` and the new
    export route.
 3. **Don't re-enqueue items in `aw-exporter/failed/` from before the rollout as they are.** They
-   have no UUID, and `notetaker-worker` would see a new `idempotency_key` (the UUID instead of
-   `vexa-<n>`) for a meeting it may already have.
+   are the system hook's meeting, and `notetaker-worker` would see a new `idempotency_key` (the
+   UUID instead of `vexa-<n>`) for a meeting it may already have.
+4. **Move the trigger to the subscription** in a window with no meeting finishing (a meeting that
+   finishes between the two steps below is delivered to neither):
+   - put a new random secret into `EXPORTER_WEBHOOK_SECRET` (Secret `aw-exporter-secrets`, which
+     no longer holds `VEXA_WEBHOOK_SECRET`) and deploy this exporter;
+   - add `aw-exporter.aw-bots.svc.cluster.local` to `WEBHOOK_PRIVATE_HOST_ALLOWLIST` on both
+     admin-api and meeting-api;
+   - with the `operator` key, `POST /v2/webhooks` `{"url":
+     "http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa", "secret": <the same secret>,
+     "events": ["meeting.completed", "bot.failed"], "description": "aw-exporter"}`, then
+     `POST /v2/webhooks/{id}/test` (the exporter answers 200);
+   - unset `VEXA_SYSTEM_WEBHOOK_URL` (and `VEXA_SYSTEM_WEBHOOK_SECRET`) on meeting-api.
 
 ## Several bot sessions (design §6.9 F-K2)
 A meeting can have more than one bot session: a bot fails and a new one joins the same meeting.
@@ -80,16 +118,18 @@ one transcript with speaker names:
   `EXPORT_MAX_RECORDINGS` fails the export and exports nothing: the ERROR
   `too_many_recordings vexa_meeting_id=… max_recordings=…`, `_export.json {state:"too_many_recordings",
   error}` and the export result `failed` with `more than <n> recordings (EXPORT_MAX_RECORDINGS)`.
-- **Unchanged files.** `meeting.json` stays the webhook's meeting row as sent (a copy of
-  `webhook.v1`, not ours to extend), and `recordings.json` lists every recording as meeting-api
-  returned it. A recording with no audio file (the bot failed before it recorded) is skipped with
+- **Unchanged files.** `meeting.json` is the webhook's meeting as sent (the intake.v1 `Meeting`,
+  not ours to extend), and `recordings.json` lists every recording as meeting-api returned it.
+  `live_transcript.json` is the meeting's transcript (`GET /transcripts/by-id/{id}`) when it has
+  segments, which only a bot that ran with live transcription leaves. A recording with no audio file (the bot failed before it recorded) is skipped with
   the log line `recording_skipped … reason=no_audio`. With `EXPORT_DEBUG`, each session's signal
   files go to `signal/<session_uid>/`.
 - **One session** is exported from its recording exactly as before: `master.webm` is a server-side
   copy, `audio.wav` its transcode, `signal/*` flat.
 
 ## Config (names only — see spec §4.4)
-`GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `VEXA_WEBHOOK_SECRET`,
+`GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `EXPORTER_WEBHOOK_SECRET` (the
+secret of its `/v2/webhooks` subscription),
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`,
@@ -102,8 +142,10 @@ IRSA (no static keys).
 (`exporter/retention.py`): `master.webm` -> `recording-mp4` (30 days), `audio.wav` and
 `EXPORT_DEBUG`'s `signal/*` copies -> `audio` (7 days), every JSON the exporter writes ->
 `metadata` (365 days). Objects the exporter writes into `VEXA_BUCKET`
-(`aw-exporter/pending/`, `failed/`) are never tagged — that bucket has its own prefix
-lifecycle. The exporter's IAM role needs `s3:PutObjectTagging` on `EXPORT_BUCKET`.
+(`aw-exporter/pending/`, `failed/`, `events/`) are never tagged — that bucket has its own prefix
+lifecycle (`events/` markers need to outlive the 48 h a redelivery can come late; they are a few
+hundred bytes each, one per exported meeting). The exporter's IAM role needs
+`s3:PutObjectTagging` on `EXPORT_BUCKET`.
 
 ## Dev setup
 

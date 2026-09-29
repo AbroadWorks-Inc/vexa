@@ -1,9 +1,65 @@
-"""Synthetic speaker-activity builders for tests."""
+"""Synthetic speaker-activity builders and aw-bots webhook envelopes for tests."""
 
 import io
 import json
 import wave
 from pathlib import Path
+from typing import Any
+
+MEETING_UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
+EVENT_ID = "evt_" + "7c1e0b0a" * 8
+
+
+def meeting_v2(**overrides: Any) -> dict[str, Any]:
+    """An intake.v1 `Meeting` (design §2.4) as a finished meeting's
+    webhook carries it: every key, in order."""
+    meeting: dict[str, Any] = {
+        "id": MEETING_UUID,
+        "upstream_id": 11367,
+        "status": "completed",
+        "completion_reason": "stopped",
+        "failure_stage": None,
+        "outcome": None,
+        "platform": "google_meet",
+        "room": "abc-defg-hij",
+        "meeting_url": "https://meet.google.com/abc-defg-hij",
+        "title": "Weekly sync",
+        "start": "2026-06-18T10:00:00Z",
+        "end": "2026-06-18T10:45:00Z",
+        "time_zone": "Asia/Kolkata",
+        "bot_joins_at": "2026-06-18T09:58:00Z",
+        "started_at": "2026-06-18T10:00:00Z",
+        "ended_at": "2026-06-18T10:42:00Z",
+        "entries": [
+            {
+                "external_id": "google:3n5kq8example",
+                "user": "a@abroadworks.com",
+                "attendees": ["a@abroadworks.com", "b@example.com"],
+                "series_id": None,
+                "metadata": None,
+            }
+        ],
+        "export": None,
+        "sequence": 9,
+    }
+    meeting.update(overrides)
+    return meeting
+
+
+def meeting_event(
+    event_type: str = "meeting.completed",
+    *,
+    event_id: str = EVENT_ID,
+    **meeting_overrides: Any,
+) -> dict[str, Any]:
+    """A webhook.v1 `MeetingEvent`: a subscription delivery (design §2.7)."""
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "api_version": "2026-09-25",
+        "created_at": "2026-06-18T10:42:00Z",
+        "data": {"meeting": meeting_v2(**meeting_overrides)},
+    }
 
 
 def header(lane: str = "gmeet") -> str:

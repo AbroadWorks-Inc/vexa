@@ -26,7 +26,7 @@ from exporter.export_result import (
 from exporter.job import Deps, ExportResult
 from exporter.queue import PendingQueue, sweep_once
 from exporter.storage import Storage
-from tests.builders import write_silent_wav
+from tests.builders import meeting_event, write_silent_wav
 
 UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
 KEY = "test-exporter-key"
@@ -155,21 +155,7 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[Storage]:
 
 
 def _envelope() -> dict[str, Any]:
-    return {
-        "event_id": "evt_test",
-        "event_type": "meeting.completed",
-        "data": {
-            "meeting": {
-                "id": 11367,
-                "uuid": UUID,
-                "user_id": 7,
-                "platform": "google_meet",
-                "native_meeting_id": "abc-defg-hij",
-                "start_time": "2026-06-18T10:00:00.000Z",
-                "end_time": None,
-            }
-        },
-    }
+    return meeting_event(ended_at=None)
 
 
 class _MeetingApi:
@@ -218,7 +204,7 @@ class _Gateway:
 
 
 def _deps(storage: Storage, gateway: _Gateway, notetaker: _Notetaker) -> Deps:
-    storage_path = "recordings/1/3/uid-1/audio/master.webm"
+    storage_path = "recordings/7/3/uid-1/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
 
     def transcode(src: Path, dst: Path) -> None:
@@ -264,7 +250,7 @@ def test_the_result_is_retried_by_the_queue_until_accepted(storage: Storage) -> 
     queue.enqueue(_envelope())
 
     asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
-    item = queue.load("11367")
+    item = queue.load(UUID)
     assert item is not None and item["attempts"] == 1
     assert "503" in item["last_error"]
 
@@ -273,7 +259,7 @@ def test_the_result_is_retried_by_the_queue_until_accepted(storage: Storage) -> 
     assert len(gateway.bodies) == 1
 
     asyncio.run(sweep_once(queue, deps, now=lambda: 5000.0))
-    item = queue.load("11367")
+    item = queue.load(UUID)
     assert item is not None and item["attempts"] == 2
 
     asyncio.run(sweep_once(queue, deps, now=lambda: 50000.0))
@@ -302,7 +288,7 @@ def test_a_report_never_accepted_ends_in_failed_and_keeps_the_hand_off(
         asyncio.run(sweep_once(queue, deps, now=_at(now)))
 
     assert queue.pending_ids() == []
-    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is not None
+    assert storage.get_json(VEXA_BUCKET, f"aw-exporter/failed/{UUID}.json") is not None
     assert len(gateway.bodies) == 5
     assert all(body["state"] == "handed_off" for body in gateway.bodies)
     assert notetaker.calls == [UUID]
@@ -352,7 +338,7 @@ def test_a_failed_report_that_is_not_accepted_still_quarantines(
         asyncio.run(sweep_once(queue, deps, job=failing_job, now=_at(now)))
 
     assert queue.pending_ids() == []
-    failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
+    failed = storage.get_json(VEXA_BUCKET, f"aw-exporter/failed/{UUID}.json")
     assert failed is not None
     assert len(gateway.bodies) == 1
     assert any(
@@ -436,7 +422,7 @@ def test_an_unreadable_marker_at_quarantine_is_left_alone(
     )
 
     assert queue.pending_ids() == []
-    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is not None
+    assert storage.get_json(VEXA_BUCKET, f"aw-exporter/failed/{UUID}.json") is not None
     assert _marker(storage)["state"] == "handed_off"
     assert len(gateway.bodies) == 4
     assert any(
@@ -457,7 +443,7 @@ def test_an_accepted_hand_off_at_quarantine_completes_the_item(
     )
 
     assert queue.pending_ids() == []
-    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is None
+    assert storage.get_json(VEXA_BUCKET, f"aw-exporter/failed/{UUID}.json") is None
     assert gateway.bodies[-1] == {"state": "handed_off", "s3_path": S3_PATH}
 
 
@@ -471,7 +457,7 @@ def test_an_unaccepted_hand_off_at_quarantine_goes_to_failed(
     )
 
     assert queue.pending_ids() == []
-    assert storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json") is not None
+    assert storage.get_json(VEXA_BUCKET, f"aw-exporter/failed/{UUID}.json") is not None
     assert _marker(storage)["state"] == "handed_off"
     assert len(gateway.bodies) == 5
     assert gateway.bodies[-1] == {"state": "handed_off", "s3_path": S3_PATH}

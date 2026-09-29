@@ -26,7 +26,7 @@ from exporter.job import (
     ActivityNotReady,
     Deps,
     ExportResult,
-    MissingMeetingUuid,
+    NotAV2Meeting,
     export_meeting,
     recording_origin_ms,
 )
@@ -38,6 +38,7 @@ from tests.builders import (
     capped,
     frame,
     header,
+    meeting_event,
     two_speaker_gmeet_lines,
     wav_samples,
     write_constant_wav,
@@ -61,26 +62,8 @@ def _origin_ms() -> int:
 
 
 def _envelope(**meeting_overrides: Any) -> dict[str, Any]:
-    meeting: dict[str, Any] = {
-        "id": 11367,
-        "uuid": MEETING_UUID,
-        "user_id": 7,
-        "platform": "google_meet",
-        "native_meeting_id": "abc-defg-hij",
-        "constructed_meeting_url": "https://meet.google.com/abc-defg-hij",
-        "status": "completed",
-        "start_time": "2026-06-18T10:00:00.000Z",
-        "end_time": "2026-06-18T10:42:00.000Z",
-        "data": {"name": "Weekly sync"},
-    }
-    meeting.update(meeting_overrides)
-    return {
-        "event_id": "evt_test",
-        "event_type": "meeting.completed",
-        "api_version": "2026-03-01",
-        "created_at": "2026-06-18T10:42:00.000Z",
-        "data": {"meeting": meeting},
-    }
+    """A `meeting.completed` subscription delivery (webhook.v1 MeetingEvent)."""
+    return meeting_event(**meeting_overrides)
 
 
 class FakeMeetingApi:
@@ -236,7 +219,7 @@ def test_recording_origin_ms_subtracts_the_chunk_timeslice() -> None:
 
 
 def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None:
-    storage_path = "recordings/1/855958819514/01ba075a-test/audio/master.webm"
+    storage_path = "recordings/7/855958819514/01ba075a-test/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
 
     origin_ms = _origin_ms()
@@ -288,7 +271,7 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
     assert marker["audio_recordings"] == 1
 
     meeting_json = storage.get_json(EXPORT_BUCKET, BASE + "meeting.json")
-    assert meeting_json["id"] == 11367
+    assert meeting_json == _envelope()["data"]["meeting"]
     recordings_json = storage.get_json(EXPORT_BUCKET, BASE + "recordings.json")
     assert recordings_json == {"recordings": [_audio_recording(855958819514)]}
 
@@ -322,8 +305,9 @@ def test_the_meeting_uuid_is_the_id_in_every_exported_file_and_the_hand_off(
     assert b"vexa-" not in written
 
 
-def test_a_webhook_without_uuid_fails_loudly_and_writes_nothing(
-    storage: Storage,
+@pytest.mark.parametrize("missing", ["id", "upstream_id"])
+def test_a_meeting_without_its_ids_fails_loudly_and_writes_nothing(
+    storage: Storage, missing: str
 ) -> None:
     storage_path = _put_master(storage, 51, "uid-51")
     notetaker = FakeNotetaker()
@@ -331,9 +315,9 @@ def test_a_webhook_without_uuid_fails_loudly_and_writes_nothing(
     export_result = FakeExportResult()
     deps = _deps(storage, meeting_api, notetaker, export_result=export_result)
     envelope = _envelope()
-    del envelope["data"]["meeting"]["uuid"]
+    del envelope["data"]["meeting"][missing]
 
-    with pytest.raises(MissingMeetingUuid, match="11367"):
+    with pytest.raises(NotAV2Meeting, match="not a v2 meeting"):
         export_meeting(envelope, deps)
 
     assert storage.list_keys(EXPORT_BUCKET, "") == []
@@ -342,14 +326,48 @@ def test_a_webhook_without_uuid_fails_loudly_and_writes_nothing(
     assert export_result.calls == []
 
 
-@pytest.mark.parametrize("blank", ["", "   ", None])
-def test_a_blank_uuid_is_a_missing_uuid(storage: Storage, blank: Any) -> None:
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": ""},
+        {"id": "   "},
+        {"id": None},
+        {"id": 11367},  # the old system hook's integer id
+        {"upstream_id": "11367"},
+        {"upstream_id": True},
+    ],
+)
+def test_a_meeting_whose_ids_are_not_the_v2_ones_is_not_exported(
+    storage: Storage, overrides: dict[str, Any]
+) -> None:
     deps = _deps(storage, FakeMeetingApi(), FakeNotetaker())
 
-    with pytest.raises(MissingMeetingUuid):
-        export_meeting(_envelope(uuid=blank), deps)
+    with pytest.raises(NotAV2Meeting):
+        export_meeting(_envelope(**overrides), deps)
 
     assert storage.list_keys(EXPORT_BUCKET, "") == []
+
+
+def test_the_speaker_activity_is_read_under_the_recordings_owner(
+    storage: Storage,
+) -> None:
+    """The §2.4 meeting has no user id: the bot's signal files are keyed by
+    the owner its recording's storage path names."""
+    storage_path = "recordings/42/77/uid-owner/audio/master.webm"
+    storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
+    storage.put_bytes(
+        VEXA_BUCKET,
+        "signal/42/11367/uid-owner/speaker-activity.jsonl",
+        ("\n".join(two_speaker_gmeet_lines(_origin_ms())) + "\n").encode(),
+        "application/x-ndjson",
+    )
+    deps = _deps(storage, _api_for(77, storage_path), FakeNotetaker())
+
+    export_meeting(_envelope(), deps)
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["speaker_activity"] == "ok"
+    assert marker["speaker_activity_events"] > 0
 
 
 def test_an_unaccepted_report_fails_the_job_after_the_hand_off_is_recorded(
@@ -414,7 +432,7 @@ def test_no_audio_is_reported_as_a_failed_export(storage: Storage) -> None:
 def test_rerun_after_success_is_already_done_and_does_not_reprocess(
     storage: Storage,
 ) -> None:
-    storage_path = "recordings/1/855958819514/01ba075a-test/audio/master.webm"
+    storage_path = "recordings/7/855958819514/01ba075a-test/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     meeting_api = FakeMeetingApi(
         recordings=[_audio_recording(855958819514)],
@@ -457,7 +475,7 @@ def test_no_audio_recording_marks_no_audio_and_does_not_process(
 
 
 def test_debug_copies_signal_files(storage: Storage) -> None:
-    storage_path = "recordings/1/2/uid-1/audio/master.webm"
+    storage_path = "recordings/7/2/uid-1/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     storage.put_bytes(
         VEXA_BUCKET,
@@ -484,8 +502,10 @@ def test_debug_copies_signal_files(storage: Storage) -> None:
     assert storage.get_bytes(EXPORT_BUCKET, BASE + "signal/botlog.txt") == b"log"
 
 
-def test_transcribe_enabled_writes_live_transcript(storage: Storage) -> None:
-    storage_path = "recordings/1/3/uid-2/audio/master.webm"
+def test_a_transcript_with_segments_is_written_as_live_transcript(
+    storage: Storage,
+) -> None:
+    storage_path = "recordings/7/3/uid-2/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     meeting_api = FakeMeetingApi(
         recordings=[_audio_recording(3)],
@@ -495,9 +515,7 @@ def test_transcribe_enabled_writes_live_transcript(storage: Storage) -> None:
     notetaker = FakeNotetaker()
     deps = _deps(storage, meeting_api, notetaker)
 
-    result = export_meeting(
-        _envelope(data={"name": "x", "transcribe_enabled": True}), deps
-    )
+    result = export_meeting(_envelope(), deps)
 
     assert result.state == "handed_off"
     assert meeting_api.transcript_calls == [11367]
@@ -506,10 +524,31 @@ def test_transcribe_enabled_writes_live_transcript(storage: Storage) -> None:
     }
 
 
+@pytest.mark.parametrize("transcript", [None, {"segments": []}, {}])
+def test_a_meeting_without_transcript_segments_gets_no_live_transcript(
+    storage: Storage, transcript: dict[str, Any] | None
+) -> None:
+    """A bot that ran without live transcription leaves no segments (or no
+    transcript at all, a 404): there is no `live_transcript.json`."""
+    storage_path = _put_master(storage, 3, "uid-2")
+    meeting_api = FakeMeetingApi(
+        recordings=[_audio_recording(3)],
+        master={"storage_path": storage_path},
+        transcript=transcript,
+    )
+    deps = _deps(storage, meeting_api, FakeNotetaker())
+
+    result = export_meeting(_envelope(), deps)
+
+    assert result.state == "handed_off"
+    assert meeting_api.transcript_calls == [11367]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") is None
+
+
 def test_notetaker_failure_propagates_and_leaves_no_handoff_marker(
     storage: Storage,
 ) -> None:
-    storage_path = "recordings/1/4/uid-3/audio/master.webm"
+    storage_path = "recordings/7/4/uid-3/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     meeting_api = FakeMeetingApi(
         recordings=[_audio_recording(4)], master={"storage_path": storage_path}
@@ -525,7 +564,7 @@ def test_notetaker_failure_propagates_and_leaves_no_handoff_marker(
 def test_missing_speaker_activity_still_hands_off_with_missing_marker(
     storage: Storage,
 ) -> None:
-    storage_path = "recordings/1/5/uid-4/audio/master.webm"
+    storage_path = "recordings/7/5/uid-4/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     meeting_api = FakeMeetingApi(
         recordings=[_audio_recording(5)], master={"storage_path": storage_path}
@@ -551,7 +590,7 @@ def test_captured_signal_present_without_speaker_activity_is_missing_no_fallback
 ) -> None:
     """Proves there is no fallback: even though the debug tape file exists at
     the same prefix, the exporter never reads it for attribution."""
-    storage_path = "recordings/1/5/uid-4b/audio/master.webm"
+    storage_path = "recordings/7/5/uid-4b/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     storage.put_bytes(
         VEXA_BUCKET,
@@ -659,7 +698,7 @@ def test_every_timeline_speaker_id_has_a_matching_participant(
     and participants.json must agree on speaker ids, with no duplicate
     participant records even when the file carries two spellings of one
     name (same slug)."""
-    storage_path = "recordings/1/6/uid-5/audio/master.webm"
+    storage_path = "recordings/7/6/uid-5/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     origin_ms = _origin_ms()
     activity_key = "signal/7/11367/uid-5/speaker-activity.jsonl"
@@ -702,7 +741,7 @@ def test_every_timeline_speaker_id_has_a_matching_participant(
 
 
 def _put_master(storage: Storage, rec_id: int, uid: str) -> str:
-    storage_path = f"recordings/1/{rec_id}/{uid}/audio/master.webm"
+    storage_path = f"recordings/7/{rec_id}/{uid}/audio/master.webm"
     storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
     return storage_path
 
@@ -782,7 +821,7 @@ def test_activity_wait_respects_activity_wait_seconds_setting(storage: Storage) 
     assert export_meeting(_envelope(), deps).state == "handed_off"
 
 
-def test_naive_end_time_is_treated_as_utc_for_the_activity_wait(
+def test_naive_ended_at_is_treated_as_utc_for_the_activity_wait(
     storage: Storage,
 ) -> None:
     storage_path = _put_master(storage, 23, "uid-23")
@@ -794,20 +833,20 @@ def test_naive_end_time_is_treated_as_utc_for_the_activity_wait(
     )
 
     with pytest.raises(ActivityNotReady):
-        export_meeting(_envelope(end_time="2026-06-18T10:42:00"), deps)
+        export_meeting(_envelope(ended_at="2026-06-18T10:42:00"), deps)
 
 
-def test_null_end_time_does_not_wait_forever_for_speaker_activity(
+def test_null_ended_at_does_not_wait_forever_for_speaker_activity(
     storage: Storage,
 ) -> None:
-    """A null end_time has no fixed deadline to wait against (anchoring on
+    """A null ended_at has no fixed deadline to wait against (anchoring on
     deps.now() would move the deadline on every retry), so the job does not
     wait: it hands off with speaker_activity "missing"."""
     storage_path = _put_master(storage, 24, "uid-24")
     notetaker = FakeNotetaker()
     deps = _deps(storage, _api_for(24, storage_path), notetaker)
 
-    result = export_meeting(_envelope(end_time=None), deps)
+    result = export_meeting(_envelope(ended_at=None), deps)
 
     assert result.state == "handed_off"
     assert (
@@ -831,7 +870,7 @@ def test_activity_not_ready_then_retry_with_activity_present_hands_off_once(
 
     asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
 
-    item = queue.load("11367")
+    item = queue.load(MEETING_UUID)
     assert item is not None and item["attempts"] == 1
     assert "speaker activity not ready" in item["last_error"]
     assert notetaker.calls == []
@@ -1007,20 +1046,13 @@ def test_intervals_are_clipped_at_the_wav_duration(storage: Storage) -> None:
     ("overrides", "expected"),
     [
         (
-            {
-                "constructed_meeting_url": "https://meet.google.com/top-level",
-                "data": {"constructed_meeting_url": "https://meet.google.com/in-data"},
-            },
-            "https://meet.google.com/in-data",
+            {"meeting_url": "https://meet.google.com/abc-defg-hij"},
+            "https://meet.google.com/abc-defg-hij",
         ),
-        (
-            {"constructed_meeting_url": "https://meet.google.com/top-level"},
-            "https://meet.google.com/top-level",
-        ),
-        ({"constructed_meeting_url": None, "data": None}, "abc-defg-hij"),
+        ({"meeting_url": None}, "abc-defg-hij"),
     ],
 )
-def test_room_name_prefers_data_constructed_meeting_url(
+def test_room_name_is_the_meeting_url_else_the_room(
     storage: Storage, overrides: dict[str, Any], expected: str
 ) -> None:
     storage_path = _put_master(storage, 35, "uid-35")
@@ -1049,9 +1081,7 @@ def test_export_tags_every_object_with_its_retention_class(storage: Storage) -> 
     notetaker = FakeNotetaker()
     deps = _deps(storage, meeting_api, notetaker, settings=_settings(debug=True))
 
-    result = export_meeting(
-        _envelope(data={"name": "x", "transcribe_enabled": True}), deps
-    )
+    result = export_meeting(_envelope(), deps)
 
     assert result.state == "handed_off"
 
@@ -1197,7 +1227,7 @@ def _seed_sessions(
     by_body: dict[bytes, _Session] = {}
     for session in sessions:
         body = f"webm-{session.uid}".encode()
-        path = f"recordings/1/{session.rec_id}/{session.uid}/audio/master.webm"
+        path = f"recordings/7/{session.rec_id}/{session.uid}/audio/master.webm"
         storage.put_bytes(VEXA_BUCKET, path, body, "video/webm")
         masters[session.rec_id] = {"storage_path": path}
         by_body[body] = session
@@ -1693,7 +1723,7 @@ def test_duplicate_and_crossed_events_for_one_meeting_export_once(
 
     queue.enqueue(_failed_envelope())
     queue.enqueue(_failed_envelope())
-    assert queue.pending_ids() == ["11367"]
+    assert queue.pending_ids() == [MEETING_UUID]
     asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
     queue.enqueue(_envelope())
     asyncio.run(sweep_once(queue, deps, now=lambda: 2000.0))

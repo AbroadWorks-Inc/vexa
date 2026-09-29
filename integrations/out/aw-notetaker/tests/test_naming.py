@@ -37,7 +37,7 @@ def test_missing_start_time_raises() -> None:
 BASE = {
     "GATEWAY_URL": "http://gateway:8000/",
     "EXPORTER_API_KEY": "test-exporter-key",
-    "VEXA_WEBHOOK_SECRET": "test-secret",
+    "EXPORTER_WEBHOOK_SECRET": "test-secret",
     "VEXA_BUCKET": "aw-bots",
     "EXPORT_BUCKET": "aw-chatworks-transcribe",
     "NOTETAKER_URL": "http://notetaker-api:8080",
@@ -78,5 +78,18 @@ def test_settings_no_longer_read_meeting_api_url() -> None:
 
 
 def test_settings_missing_required() -> None:
-    with pytest.raises(RuntimeError, match="VEXA_WEBHOOK_SECRET"):
-        Settings.from_env({k: v for k, v in BASE.items() if k != "VEXA_WEBHOOK_SECRET"})
+    with pytest.raises(RuntimeError, match="EXPORTER_WEBHOOK_SECRET"):
+        Settings.from_env(
+            {k: v for k, v in BASE.items() if k != "EXPORTER_WEBHOOK_SECRET"}
+        )
+
+
+def test_the_webhook_secret_is_the_subscriptions() -> None:
+    s = Settings.from_env(BASE)
+    assert s.webhook_secret == "test-secret"
+
+
+def test_the_system_hook_secret_is_not_read() -> None:
+    env = {k: v for k, v in BASE.items() if k != "EXPORTER_WEBHOOK_SECRET"}
+    with pytest.raises(RuntimeError, match="EXPORTER_WEBHOOK_SECRET"):
+        Settings.from_env({**env, "VEXA_WEBHOOK_SECRET": "test-secret"})

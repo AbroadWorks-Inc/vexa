@@ -1,10 +1,13 @@
 """Per-meeting export job (spec §4.2-4.3, design §1.9); idempotent, keyed on
 the export folder.
 
-The meeting's UUID (`data.meeting.uuid`) is its id in every file written and
-in the `/process` hand-off; the integer Vexa id is kept in `_export.json` and
-used only to read the meeting's recordings and transcript. A webhook without
-a UUID raises `MissingMeetingUuid` before anything is read or written.
+The envelope is an aw-bots subscription delivery (webhook.v1 `MeetingEvent`);
+its `data.meeting` is the §2.4 meeting. The meeting's UUID (`id`) is its id in
+every file written and in the `/process` hand-off; the integer Vexa id
+(`upstream_id`) is kept in `_export.json` and used only to read the meeting's
+recordings and transcript and to find its speaker-activity files, under the
+owner the recording's storage path names. A meeting without both raises
+`NotAV2Meeting` before anything is read or written.
 
 The meeting is `meeting.completed`, or `bot.failed` after its bot recorded
 part of the call (§6.9 F-K2); a `bot.failed` meeting with no recording is
@@ -66,8 +69,9 @@ ActivityState = Literal["ok", "missing", "invalid", "capped"]
 _ACTIVITY_SEVERITY: tuple[ActivityState, ...] = ("ok", "capped", "invalid", "missing")
 
 
-class MissingMeetingUuid(Exception):
-    """The webhook's meeting has no `uuid`; retrying can't give it one."""
+class NotAV2Meeting(Exception):
+    """The queued meeting is not the §2.4 meeting (a UUID `id` and an integer
+    `upstream_id`); retrying can't change it."""
 
 
 class ActivityNotReady(Exception):
@@ -302,13 +306,19 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     storage = deps.storage
     started = deps.now()
     m = envelope["data"]["meeting"]
-    vexa_meeting_id = m["id"]
-    meeting_uuid = str(m.get("uuid") or "").strip()
-    if not meeting_uuid:
-        raise MissingMeetingUuid(
-            f"webhook for vexa_meeting_id={vexa_meeting_id} has no meeting uuid"
+    vexa_meeting_id = m.get("upstream_id")
+    meeting_uuid = m.get("id")
+    if (
+        not isinstance(meeting_uuid, str)
+        or not meeting_uuid.strip()
+        or not isinstance(vexa_meeting_id, int)
+        or isinstance(vexa_meeting_id, bool)
+    ):
+        raise NotAV2Meeting(
+            f"meeting id={meeting_uuid!r} upstream_id={vexa_meeting_id!r} is not "
+            "a v2 meeting (a UUID id and an integer upstream_id)"
         )
-    folder = folder_name(m["platform"], m["native_meeting_id"], m["start_time"])
+    folder = folder_name(m["platform"], m["room"], m["started_at"])
     base = settings.export_prefix + folder + "/"
     s3_path = f"s3://{settings.export_bucket}/{base}"
 
@@ -317,7 +327,6 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         deps.export_result.report(meeting_uuid, "handed_off", s3_path)
         return ExportResult("already_done", folder)
 
-    user_id = m["user_id"]
     platform = m["platform"]
 
     try:
@@ -377,8 +386,11 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     for rec in audio_recs:
         master = deps.meeting_api.master(rec["id"])
         storage_path = str(master["storage_path"])
-        session_uid = storage_path.split("/")[3]
-        signal_prefix = f"signal/{user_id}/{vexa_meeting_id}/{session_uid}/"
+        # recordings/<owner>/<recording>/<session>/…; the bot's signal files
+        # are keyed by the same owner and session.
+        parts = storage_path.split("/")
+        owner, session_uid = parts[1], parts[3]
+        signal_prefix = f"signal/{owner}/{vexa_meeting_id}/{session_uid}/"
         sessions.append(
             _Session(
                 recording_id=rec["id"],
@@ -395,9 +407,9 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
 
     not_uploaded = [s.session_uid for s in sessions if not s.activity_exists]
     if not_uploaded:
-        end_time = m.get("end_time")
-        if end_time:
-            deadline = parse_utc(str(end_time)) + timedelta(
+        ended_at = m.get("ended_at")
+        if ended_at:
+            deadline = parse_utc(str(ended_at)) + timedelta(
                 seconds=settings.activity_wait_seconds
             )
             if deps.now() < deadline:
@@ -429,13 +441,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         sessions[0].origin_ms / 1000, tz=timezone.utc
     )
     recording_ended_at = recording_started_at + timedelta(seconds=wav_duration_s)
-    meeting_data = m.get("data") or {}
-    room_name = str(
-        meeting_data.get("constructed_meeting_url")
-        or m.get("constructed_meeting_url")
-        or m["native_meeting_id"]
-    )
-    host_email = meeting_data.get("organizer_email")
+    room_name = str(m.get("meeting_url") or m["room"])
 
     # Each session's events stay inside its own span, so none lands in a gap;
     # the timeline clips the outer ends to the recording.
@@ -480,7 +486,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         platform=platform,
         meeting_id=meeting_uuid,
         joined_at=recording_started_at,
-        host_email=host_email,
+        host_email=None,
     )
 
     storage.put_json(
@@ -505,15 +511,16 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
         retention=METADATA,
     )
 
-    if (m.get("data") or {}).get("transcribe_enabled"):
-        transcript = deps.meeting_api.transcript(vexa_meeting_id)
-        if transcript is not None:
-            storage.put_json(
-                settings.export_bucket,
-                base + "live_transcript.json",
-                transcript,
-                retention=METADATA,
-            )
+    # A meeting whose bot ran with live transcription has segments; one
+    # without has none, and gets no file.
+    transcript = deps.meeting_api.transcript(vexa_meeting_id)
+    if transcript is not None and transcript.get("segments"):
+        storage.put_json(
+            settings.export_bucket,
+            base + "live_transcript.json",
+            transcript,
+            retention=METADATA,
+        )
 
     if settings.debug:
         for session in sessions:

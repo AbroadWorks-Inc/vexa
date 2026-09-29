@@ -14,6 +14,7 @@ def _bool(raw: str | None) -> bool:
 class Settings:
     gateway_url: str
     exporter_api_key: str
+    # The exporter's `/v2/webhooks` subscription secret (EXPORTER_WEBHOOK_SECRET).
     webhook_secret: str
     vexa_bucket: str
     export_bucket: str
@@ -30,7 +31,7 @@ class Settings:
     min_dominant_utterance_ms: int = 1500
     record_chunk_timeslice_ms: int = 15000
     # The bot uploads speaker-activity.jsonl in its teardown, AFTER
-    # meeting.completed (spec §4.2 step 5): wait this long past end_time
+    # meeting.completed (spec §4.2 step 5): wait this long past ended_at
     # before "missing".
     activity_wait_seconds: float = 120.0
     # A meeting's recordings are read page by page up to this many; past it
@@ -49,7 +50,7 @@ class Settings:
         return cls(
             gateway_url=req("GATEWAY_URL").rstrip("/"),
             exporter_api_key=req("EXPORTER_API_KEY"),
-            webhook_secret=req("VEXA_WEBHOOK_SECRET"),
+            webhook_secret=req("EXPORTER_WEBHOOK_SECRET"),
             vexa_bucket=req("VEXA_BUCKET"),
             export_bucket=req("EXPORT_BUCKET"),
             export_prefix=prefix if prefix.endswith("/") else prefix + "/",

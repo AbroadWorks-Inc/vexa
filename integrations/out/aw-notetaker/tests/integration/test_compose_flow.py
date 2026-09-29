@@ -41,7 +41,13 @@ from botocore.exceptions import ClientError
 from exporter.audio import webm_to_wav
 from exporter.job import recording_origin_ms
 from exporter.naming import folder_name
-from tests.builders import frame, header, two_speaker_gmeet_lines, wav_samples
+from tests.builders import (
+    frame,
+    header,
+    meeting_event,
+    two_speaker_gmeet_lines,
+    wav_samples,
+)
 from tests.integration.stub_meeting_api import create_app as create_meeting_api_app
 from tests.integration.stub_notetaker import create_app as create_notetaker_app
 
@@ -66,7 +72,7 @@ EXPORTER_API_KEY = "it-exporter-key"  # test-only literal, not a real credential
 NATIVE_MEETING_ID = "it-synthetic-meet-abcd"
 START_TIME = "2026-09-23T10:00:00.000Z"
 END_TIME = "2026-09-23T10:00:03.000Z"
-PENDING_KEY = f"aw-exporter/pending/{VEXA_MEETING_ID}.json"
+PENDING_KEY = f"aw-exporter/pending/{MEETING_UUID}.json"
 
 
 @dataclass(frozen=True)
@@ -206,24 +212,15 @@ def _sign(body: bytes, secret: str) -> dict[str, str]:
 
 
 def _envelope() -> dict[str, Any]:
-    return {
-        "event_id": "evt-it-1",
-        "event_type": "meeting.completed",
-        "data": {
-            "meeting": {
-                "id": VEXA_MEETING_ID,
-                "uuid": MEETING_UUID,
-                "user_id": USER_ID,
-                "platform": "google_meet",
-                "native_meeting_id": NATIVE_MEETING_ID,
-                "start_time": START_TIME,
-                "end_time": END_TIME,
-                "constructed_meeting_url": "https://meet.google.com/it-synthetic-meet",
-                "status": "completed",
-                "data": {"name": "aw-exporter compose integration test"},
-            }
-        },
-    }
+    """A `meeting.completed` subscription delivery (webhook.v1 MeetingEvent)."""
+    return meeting_event(
+        upstream_id=VEXA_MEETING_ID,
+        room=NATIVE_MEETING_ID,
+        meeting_url="https://meet.google.com/it-synthetic-meet",
+        title="aw-exporter compose integration test",
+        started_at=START_TIME,
+        ended_at=END_TIME,
+    )
 
 
 def _list_keys(s3: S3Client, bucket: str, prefix: str) -> set[str]:
@@ -388,7 +385,7 @@ def exporter(
     env = {
         "GATEWAY_URL": f"http://host.docker.internal:{meeting_api_server['port']}",
         "EXPORTER_API_KEY": EXPORTER_API_KEY,
-        "VEXA_WEBHOOK_SECRET": WEBHOOK_SECRET,
+        "EXPORTER_WEBHOOK_SECRET": WEBHOOK_SECRET,
         "VEXA_BUCKET": VEXA_BUCKET,
         "EXPORT_BUCKET": EXPORT_BUCKET,
         "EXPORT_PREFIX": "recordings/",

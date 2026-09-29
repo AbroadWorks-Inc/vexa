@@ -1,16 +1,24 @@
-"""HTTP intake — `POST /hooks/vexa` (spec §4.1).
+"""HTTP intake — `POST /hooks/vexa`, the exporter's aw-bots `/v2/webhooks`
+subscription (spec §4.1, design §1.9, §2.7).
 
-Verifies Vexa's webhook signature on the raw body before touching JSON,
-validates the meeting fields the export job needs before anything is
-durably enqueued, hands finished meetings to the worker in `queue.py`, and
-no-ops (200) on any other event type. Enqueue failure is a 503 so Vexa's own
-delivery retries redeliver it.
+Verifies the delivery's signature on the raw body before touching JSON
+(`X-Webhook-Signature`, or `X-Webhook-Signature-Previous` during a secret
+rotation, under `EXPORTER_WEBHOOK_SECRET`), validates the webhook.v1
+`MeetingEvent` fields the export job needs before anything is durably
+enqueued, hands finished meetings to the worker in `queue.py`, and answers
+2xx to every other event (`webhook.test` included) without acting on it.
+aw-bots retries a 5xx, so an enqueue failure is a 503; any other refusal is
+final.
 
 A finished meeting is `meeting.completed`, or `bot.failed`: a meeting whose
 bot recorded part of the call and then failed is still exported (§6.9 F-K2);
 the job skips one that has no recording. A `bot.failed` without a
-`start_time` never had its bot in the meeting, so it is skipped here, and a
+`started_at` never had its bot in the meeting, so it is skipped here, and a
 `not_sent` meeting (no bot was ever sent) is never exported.
+
+Delivery is at-least-once: an `event_id` already queued is answered 2xx as a
+duplicate. The event is recorded after its meeting is queued, so a failure
+between the two is a 503 and aw-bots' retry queues it again.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -33,17 +42,13 @@ from exporter.queue import PendingQueue, run_worker
 
 logger = logging.getLogger("exporter")
 
-# The fields export_meeting/naming.folder_name need out of data.meeting;
-# an envelope missing any of these is rejected at intake rather than being
-# durably enqueued and failing (or being quarantined) later.
-_REQUIRED_MEETING_FIELDS = (
-    "id",
-    "user_id",
-    "platform",
-    "native_meeting_id",
-    "start_time",
-)
+# The data.meeting fields export_meeting/naming.folder_name need (intake.v1
+# Meeting); an envelope missing any of these is rejected at intake rather than
+# being durably enqueued and failing (or being quarantined) later.
+_REQUIRED_MEETING_FIELDS = ("id", "platform", "room", "started_at")
 
+# webhook.v1 MeetingEvent.event_id; it names the event's marker object.
+_EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 
 _EXPORTED_EVENTS = frozenset({"meeting.completed", "bot.failed"})
 
@@ -56,11 +61,14 @@ def _not_sent(meeting: Mapping[str, Any]) -> bool:
 def _meeting_is_valid(meeting: Mapping[str, Any]) -> bool:
     for field in _REQUIRED_MEETING_FIELDS:
         value = meeting.get(field)
-        if value is None:
+        if not isinstance(value, str) or not value.strip():
             return False
-        if isinstance(value, str) and not value.strip():
-            return False
-    return True
+    upstream_id = meeting.get("upstream_id")
+    return (
+        isinstance(upstream_id, int)
+        and not isinstance(upstream_id, bool)
+        and upstream_id > 0
+    )
 
 
 def create_app(
@@ -117,7 +125,7 @@ def create_app(
         if (
             event_type == "bot.failed"
             and isinstance(meeting, dict)
-            and not meeting.get("start_time")
+            and not meeting.get("started_at")
         ):
             logger.info(
                 "bot_failed_skipped meeting_id=%s reason=no_start_time; "
@@ -128,12 +136,25 @@ def create_app(
         if not isinstance(meeting, dict) or not _meeting_is_valid(meeting):
             logger.warning("webhook rejected: invalid or incomplete data.meeting")
             raise HTTPException(status_code=400, detail="invalid data.meeting")
+        event_id = envelope.get("event_id")
+        if not isinstance(event_id, str) or not _EVENT_ID.match(event_id):
+            logger.warning("webhook rejected: invalid event_id")
+            raise HTTPException(status_code=400, detail="invalid event_id")
         try:
+            if await asyncio.to_thread(queue.seen, event_id):
+                logger.info(
+                    "duplicate_event event_id=%s meeting_id=%s; ignored",
+                    event_id,
+                    meeting["id"],
+                )
+                return JSONResponse({"status": "duplicate"})
             await asyncio.to_thread(queue.enqueue, envelope)
+            await asyncio.to_thread(queue.record_event, envelope)
         except Exception as exc:
             logger.error(
-                "enqueue failed meeting_id=%s error_class=%s",
-                meeting.get("id"),
+                "enqueue failed meeting_id=%s event_id=%s error_class=%s",
+                meeting["id"],
+                event_id,
                 type(exc).__name__,
             )
             raise HTTPException(status_code=503, detail="enqueue failed") from exc

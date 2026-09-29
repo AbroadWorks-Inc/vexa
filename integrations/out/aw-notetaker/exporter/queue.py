@@ -2,10 +2,13 @@
 (spec §4.1).
 
 Pending objects live in the VEXA bucket under `aw-exporter/pending/<id>.json`
-as `{"envelope": {...}, "attempts": int, "next_attempt_at": epoch seconds
-float, "last_error": str | None}`; a restart re-lists that prefix, so an
-in-flight job always resumes. Failed ones (>= max_attempts) move to
-`aw-exporter/failed/<id>.json`.
+(`<id>` is the meeting's UUID) as `{"envelope": {...}, "attempts": int,
+"next_attempt_at": epoch seconds float, "last_error": str | None}`; a restart
+re-lists that prefix, so an in-flight job always resumes. Failed ones
+(>= max_attempts) move to `aw-exporter/failed/<id>.json`. Each queued event
+is recorded under `aw-exporter/events/<event_id>.json` (`meeting_id`,
+`event_type`, `sequence`), so a redelivery of it is recognised
+(`seen`) after its meeting has left the queue.
 
 Retries: a job that raises is recorded as a failure and becomes visible to
 the sweep again only after its backoff (`next_attempt_at`), up to
@@ -18,9 +21,9 @@ folder's `_export.json` first. A folder already `handed_off` keeps its marker
 and reports `handed_off` once; once that report is accepted the item is
 finished and leaves the queue (`done`), not `failed/`. Otherwise the `failed`
 marker is written and `failed` reported once. A marker that can't be read is
-left as it is. A webhook without a meeting uuid
-(`MissingMeetingUuid`) is quarantined on its first attempt and writes nothing
-to the export bucket.
+left as it is. An item whose meeting is not the §2.4 meeting
+(`NotAV2Meeting`) is quarantined on its first attempt and writes nothing to
+the export bucket.
 
 The worker must never die: a bad envelope, a broken S3 call for one id, or
 an unexpected exception anywhere in a single sweep is logged and contained
@@ -36,7 +39,7 @@ from collections.abc import Callable
 from typing import Any
 
 from exporter.export_result import ExportReportError, ReportState
-from exporter.job import Deps, ExportResult, MissingMeetingUuid, export_meeting
+from exporter.job import Deps, ExportResult, NotAV2Meeting, export_meeting
 from exporter.naming import folder_name
 from exporter.retention import METADATA
 from exporter.storage import Storage
@@ -45,6 +48,7 @@ logger = logging.getLogger("exporter")
 
 _PENDING_PREFIX = "aw-exporter/pending/"
 _FAILED_PREFIX = "aw-exporter/failed/"
+_EVENTS_PREFIX = "aw-exporter/events/"
 
 
 class PendingQueue:
@@ -87,6 +91,24 @@ class PendingQueue:
             },
         )
         logger.info("enqueue: new pending meeting_id=%s", meeting_id)
+
+    def seen(self, event_id: str) -> bool:
+        """True when the event `event_id` was queued before."""
+        key = f"{_EVENTS_PREFIX}{event_id}.json"
+        return self._storage.size(self._bucket, key) is not None
+
+    def record_event(self, envelope: dict[str, Any]) -> None:
+        """Record the queued event, so a redelivery of it is a duplicate."""
+        meeting = envelope["data"]["meeting"]
+        self._storage.put_json(
+            self._bucket,
+            f"{_EVENTS_PREFIX}{envelope['event_id']}.json",
+            {
+                "meeting_id": meeting["id"],
+                "event_type": envelope["event_type"],
+                "sequence": meeting.get("sequence"),
+            },
+        )
 
     def pending_ids(self) -> list[str]:
         keys = self._storage.list_keys(self._bucket, _PENDING_PREFIX)
@@ -138,15 +160,15 @@ def _quarantine_marker(
     must still quarantine the pending item even when this returns `None`."""
     try:
         m = envelope["data"]["meeting"]
-        folder = folder_name(m["platform"], m["native_meeting_id"], m["start_time"])
-        vexa_meeting_id = m["id"]
+        folder = folder_name(m["platform"], m["room"], m["started_at"])
+        vexa_meeting_id = m["upstream_id"]
     except (KeyError, ValueError, TypeError):
         return None
     return folder, {
         "state": "failed",
         "error": error,
         "attempts": attempts,
-        "meeting_id": m.get("uuid"),
+        "meeting_id": m.get("id"),
         "vexa_meeting_id": vexa_meeting_id,
     }
 
@@ -171,10 +193,10 @@ async def sweep_once(
             try:
                 async with semaphore:
                     await asyncio.to_thread(job, envelope, deps)
-            except MissingMeetingUuid as exc:
+            except NotAV2Meeting as exc:
                 attempts = queue.record_failure(meeting_id, str(exc), now=now)
                 logger.error(
-                    "export job failed: webhook has no meeting uuid meeting_id=%s "
+                    "export job failed: not a v2 meeting meeting_id=%s "
                     "attempts=%s; moved to failed/, nothing exported",
                     meeting_id,
                     attempts,

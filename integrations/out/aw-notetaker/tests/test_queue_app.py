@@ -1,5 +1,6 @@
 """Tests for exporter.queue (durable pending queue + sweep worker) and
-exporter.app (signed webhook intake) — spec §4.1."""
+exporter.app (the signed aw-bots subscription intake) — spec §4.1, design
+§1.9, §2.7."""
 
 from __future__ import annotations
 
@@ -40,37 +41,34 @@ from exporter.notetaker import Notetaker  # noqa: E402
 from exporter.queue import PendingQueue, run_worker, sweep_once  # noqa: E402
 from exporter.storage import Storage  # noqa: E402
 from exporter.vexa_client import MeetingApi  # noqa: E402
+from tests.builders import (  # noqa: E402
+    EVENT_ID,
+    MEETING_UUID,
+    meeting_event,
+    meeting_v2,
+)
 
 WEBHOOK_SECRET = "test-secret"
 VEXA_BUCKET = "aw-bots"
 EXPORT_BUCKET = "aw-chatworks-transcribe"
-MEETING = {
-    "id": 11367,
-    "uuid": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
-    "user_id": 7,
-    "platform": "google_meet",
-    "native_meeting_id": "abc-defg-hij",
-    "start_time": "2026-06-18T10:00:00.000Z",
-    "end_time": "2026-06-18T10:42:00.000Z",
-}
+MEETING = meeting_v2()
 FOLDER = folder_name(
     str(MEETING["platform"]),
-    str(MEETING["native_meeting_id"]),
-    str(MEETING["start_time"]),
+    str(MEETING["room"]),
+    str(MEETING["started_at"]),
 )
 BASE = f"recordings/{FOLDER}/"
+# The queue and the event markers are keyed by the meeting's UUID and the event's id.
+KEY = MEETING_UUID
+PENDING_KEY = f"aw-exporter/pending/{KEY}.json"
+FAILED_KEY = f"aw-exporter/failed/{KEY}.json"
+EVENT_KEY = f"aw-exporter/events/{EVENT_ID}.json"
 
 
 def _envelope(
     event_type: str = "meeting.completed", **meeting_overrides: Any
 ) -> dict[str, Any]:
-    meeting = dict(MEETING)
-    meeting.update(meeting_overrides)
-    return {
-        "event_id": "evt_test",
-        "event_type": event_type,
-        "data": {"meeting": meeting},
-    }
+    return meeting_event(event_type, **meeting_overrides)
 
 
 def _envelope_missing(*fields: str) -> dict[str, Any]:
@@ -199,7 +197,7 @@ def test_meeting_completed_enqueues_and_returns_202(storage: Storage) -> None:
         resp = client.post("/hooks/vexa", content=body, headers=headers)
     assert resp.status_code == 202
     assert resp.json() == {"status": "queued"}
-    stored = storage.get_json(VEXA_BUCKET, "aw-exporter/pending/11367.json")
+    stored = storage.get_json(VEXA_BUCKET, PENDING_KEY)
     assert stored is not None
     assert stored["envelope"] == envelope
     assert stored["attempts"] == 0
@@ -228,18 +226,19 @@ def test_bot_failed_is_queued_like_a_completed_meeting(storage: Storage) -> None
 
     assert resp.status_code == 202
     assert resp.json() == {"status": "queued"}
-    stored = storage.get_json(VEXA_BUCKET, "aw-exporter/pending/11367.json")
+    stored = storage.get_json(VEXA_BUCKET, PENDING_KEY)
     assert stored is not None and stored["envelope"] == envelope
 
 
 def test_bot_failed_without_a_start_time_is_skipped_not_rejected(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The bot never got into the meeting (webhook.v1 golden: start_time
-    null), so nothing was recorded; a 400 would only make Vexa redeliver."""
+    """The bot never got into the meeting (webhook.v1 golden: started_at
+    null), so nothing was recorded; it is answered 2xx, never a failed
+    delivery."""
     with caplog.at_level(logging.INFO, logger="exporter"):
         resp, queue = _post(
-            storage, _envelope("bot.failed", status="failed", start_time=None)
+            storage, _envelope("bot.failed", status="failed", started_at=None)
         )
 
     assert resp.status_code == 200
@@ -247,7 +246,8 @@ def test_bot_failed_without_a_start_time_is_skipped_not_rejected(
     assert queue.pending_ids() == []
     assert any(
         r.getMessage()
-        == "bot_failed_skipped meeting_id=11367 reason=no_start_time; nothing recorded"
+        == f"bot_failed_skipped meeting_id={MEETING_UUID} reason=no_start_time; "
+        "nothing recorded"
         for r in caplog.records
     )
 
@@ -351,7 +351,7 @@ def test_missing_start_time_returns_400_and_not_queued(storage: Storage) -> None
         clock=_fixed_clock,
         start_worker=False,
     )
-    envelope = _envelope_missing("start_time")
+    envelope = _envelope_missing("started_at")
     body = json.dumps(envelope).encode()
     headers = _sign(body)
     with TestClient(app) as client:
@@ -421,8 +421,8 @@ def test_enqueue_load_pending_ids_roundtrip(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     envelope = _envelope()
     queue.enqueue(envelope)
-    assert queue.pending_ids() == ["11367"]
-    item = queue.load("11367")
+    assert queue.pending_ids() == [KEY]
+    item = queue.load(KEY)
     assert item is not None
     assert item["envelope"] == envelope
     assert item["attempts"] == 0
@@ -434,26 +434,26 @@ def test_enqueue_writes_untagged_pending_object(storage: Storage) -> None:
     prefix lifecycle."""
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    tags = storage._client.get_object_tagging(
-        Bucket=VEXA_BUCKET, Key="aw-exporter/pending/11367.json"
-    )["TagSet"]
+    tags = storage._client.get_object_tagging(Bucket=VEXA_BUCKET, Key=PENDING_KEY)[
+        "TagSet"
+    ]
     assert tags == []
 
 
 def test_done_deletes_pending(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    queue.done("11367")
+    queue.done(KEY)
     assert queue.pending_ids() == []
-    assert queue.load("11367") is None
+    assert queue.load(KEY) is None
 
 
 def test_record_failure_increments_attempts_and_sets_backoff(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    attempts = queue.record_failure("11367", "boom", now=lambda: 1000.0)
+    attempts = queue.record_failure(KEY, "boom", now=lambda: 1000.0)
     assert attempts == 1
-    item = queue.load("11367")
+    item = queue.load(KEY)
     assert item is not None
     assert item["last_error"] == "boom"
     assert item["next_attempt_at"] == 1000.0 + 30 * 2**1
@@ -462,11 +462,11 @@ def test_record_failure_increments_attempts_and_sets_backoff(storage: Storage) -
 def test_fail_moves_pending_to_failed(storage: Storage) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    queue.record_failure("11367", "boom", now=lambda: 1000.0)
-    queue.fail("11367")
+    queue.record_failure(KEY, "boom", now=lambda: 1000.0)
+    queue.fail(KEY)
     assert queue.pending_ids() == []
-    assert queue.load("11367") is None
-    failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
+    assert queue.load(KEY) is None
+    failed = storage.get_json(VEXA_BUCKET, FAILED_KEY)
     assert failed is not None
     assert failed["last_error"] == "boom"
 
@@ -475,7 +475,7 @@ def test_restart_semantics_fresh_queue_sees_still_pending_id(storage: Storage) -
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
     fresh_queue = PendingQueue(storage, VEXA_BUCKET)
-    assert fresh_queue.pending_ids() == ["11367"]
+    assert fresh_queue.pending_ids() == [KEY]
 
 
 def test_reenqueue_of_pending_id_refreshes_envelope_but_keeps_attempts(
@@ -483,13 +483,13 @@ def test_reenqueue_of_pending_id_refreshes_envelope_but_keeps_attempts(
 ) -> None:
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
-    queue.record_failure("11367", "boom", now=lambda: 1000.0)
+    queue.record_failure(KEY, "boom", now=lambda: 1000.0)
 
-    updated_envelope = _envelope(end_time="2026-06-18T10:50:00.000Z")
+    updated_envelope = _envelope(ended_at="2026-06-18T10:50:00Z")
     queue.enqueue(updated_envelope)
 
-    assert queue.pending_ids() == ["11367"]
-    item = queue.load("11367")
+    assert queue.pending_ids() == [KEY]
+    item = queue.load(KEY)
     assert item is not None
     assert item["envelope"] == updated_envelope
     assert item["attempts"] == 1
@@ -527,14 +527,14 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
 
     asyncio.run(sweep_once(queue, deps, job=failing_job, now=lambda: 1000.0))
     # First failure: attempts=1 < max_attempts=2, still pending, backed off.
-    assert queue.pending_ids() == ["11367"]
-    item = queue.load("11367")
+    assert queue.pending_ids() == [KEY]
+    item = queue.load(KEY)
     assert item is not None
     assert item["attempts"] == 1
 
     # A sweep before the backoff window elapses must not reprocess.
     asyncio.run(sweep_once(queue, deps, job=failing_job, now=lambda: 1000.0))
-    item = queue.load("11367")
+    item = queue.load(KEY)
     assert item is not None
     assert item["attempts"] == 1
 
@@ -542,8 +542,8 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
     asyncio.run(sweep_once(queue, deps, job=failing_job, now=lambda: 5000.0))
 
     assert queue.pending_ids() == []
-    assert storage.get_json(VEXA_BUCKET, "aw-exporter/pending/11367.json") is None
-    failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
+    assert storage.get_json(VEXA_BUCKET, PENDING_KEY) is None
+    failed = storage.get_json(VEXA_BUCKET, FAILED_KEY)
     assert failed is not None
     assert failed["attempts"] == 2
 
@@ -552,7 +552,7 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
     assert marker["state"] == "failed"
     assert marker["error"] == "boom"
     assert marker["attempts"] == 2
-    assert marker["meeting_id"] == MEETING["uuid"]
+    assert marker["meeting_id"] == MEETING_UUID
     assert marker["vexa_meeting_id"] == 11367
 
     # retention-class tagging (spec §3/§7): the quarantine marker is exporter-bucket
@@ -562,20 +562,35 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
     )["TagSet"]
     assert {"Key": "retention-class", "Value": "metadata"} in marker_tags
     failed_tags = storage._client.get_object_tagging(
-        Bucket=VEXA_BUCKET, Key="aw-exporter/failed/11367.json"
+        Bucket=VEXA_BUCKET, Key=FAILED_KEY
     )["TagSet"]
     assert failed_tags == []
 
 
-def test_a_webhook_without_uuid_goes_straight_to_failed_and_writes_no_export(
+# The old system hook's meeting block: an integer id and no upstream_id.
+LEGACY_MEETING = {
+    "id": 11367,
+    "uuid": MEETING_UUID,
+    "user_id": 7,
+    "platform": "google_meet",
+    "native_meeting_id": "abc-defg-hij",
+    "start_time": "2026-06-18T10:00:00.000Z",
+}
+
+
+def test_a_queued_item_that_is_not_a_v2_meeting_goes_straight_to_failed(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Design §1.9: a webhook without `uuid` fails the job loudly. Retrying
-    can't give it one, so it is quarantined on its first attempt, and nothing
-    is written to the export bucket (no `_export.json`, no report)."""
+    """Design §1.9: an item whose meeting is not the §2.4 meeting (a UUID
+    `id` and an integer `upstream_id`), such as one the old exporter queued
+    from the system hook, fails loudly. Retrying can't change it, so it is
+    quarantined on its first attempt, and nothing is written to the export
+    bucket (no `_export.json`, no report)."""
     settings = _settings(max_attempts=5)
     queue = PendingQueue(storage, settings.vexa_bucket)
-    queue.enqueue(_envelope_missing("uuid"))
+    queue.enqueue(
+        {"event_type": "meeting.completed", "data": {"meeting": LEGACY_MEETING}}
+    )
     deps = _deps(storage, settings)
 
     with caplog.at_level(logging.ERROR, logger="exporter"):
@@ -585,12 +600,26 @@ def test_a_webhook_without_uuid_goes_straight_to_failed_and_writes_no_export(
     failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
     assert failed is not None
     assert failed["attempts"] == 1
-    assert "uuid" in failed["last_error"]
+    assert "upstream_id" in failed["last_error"]
     assert storage.list_keys(EXPORT_BUCKET, "") == []
     assert any(
-        "no meeting uuid" in r.getMessage() and "meeting_id=11367" in r.getMessage()
+        "not a v2 meeting" in r.getMessage() and "meeting_id=11367" in r.getMessage()
         for r in caplog.records
     )
+
+
+def test_a_meeting_without_upstream_id_goes_straight_to_failed(
+    storage: Storage,
+) -> None:
+    settings = _settings(max_attempts=5)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope_missing("upstream_id"))
+
+    asyncio.run(sweep_once(queue, _deps(storage, settings)))
+
+    failed = storage.get_json(VEXA_BUCKET, FAILED_KEY)
+    assert failed is not None and failed["attempts"] == 1
+    assert storage.list_keys(EXPORT_BUCKET, "") == []
 
 
 def test_run_worker_exits_when_stop_is_set(storage: Storage) -> None:
@@ -612,19 +641,19 @@ def test_sweep_once_quarantines_malformed_envelope_without_raising(
     storage: Storage,
 ) -> None:
     """A pending item seeded directly (bypassing intake validation) missing
-    start_time must not crash sweep_once: export_meeting's own folder_name
+    started_at must not crash sweep_once: export_meeting's own folder_name
     call raises, the quarantine's own folder_name call also raises, so the
     marker is skipped but the item still lands under failed/."""
     settings = _settings(max_attempts=1)
     queue = PendingQueue(storage, settings.vexa_bucket)
-    queue.enqueue(_envelope_missing("start_time"))
+    queue.enqueue(_envelope_missing("started_at"))
     deps = _deps(storage, settings)
 
     asyncio.run(sweep_once(queue, deps))  # default job=export_meeting
 
     assert queue.pending_ids() == []
-    assert storage.get_json(VEXA_BUCKET, "aw-exporter/pending/11367.json") is None
-    failed = storage.get_json(VEXA_BUCKET, "aw-exporter/failed/11367.json")
+    assert storage.get_json(VEXA_BUCKET, PENDING_KEY) is None
+    failed = storage.get_json(VEXA_BUCKET, FAILED_KEY)
     assert failed is not None
     assert failed["attempts"] == 1
     assert storage.list_keys(EXPORT_BUCKET, "") == []
@@ -633,12 +662,12 @@ def test_sweep_once_quarantines_malformed_envelope_without_raising(
 def test_sweep_once_isolates_per_id_failures(storage: Storage) -> None:
     settings = _settings(max_attempts=5)
     queue = PendingQueue(storage, settings.vexa_bucket)
-    queue.enqueue(_envelope(id=1, native_meeting_id="good-meeting"))
-    queue.enqueue(_envelope(id=2, native_meeting_id="bad-meeting"))
+    queue.enqueue(_envelope(id="1", room="good-meeting"))
+    queue.enqueue(_envelope(id="2", room="bad-meeting"))
     deps = _deps(storage, settings)
 
     def selective_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
-        if envelope["data"]["meeting"]["id"] == 2:
+        if envelope["data"]["meeting"]["id"] == "2":
             raise RuntimeError("boom")
         return ExportResult("handed_off", "folder")
 
@@ -693,9 +722,255 @@ def test_caplog_shows_job_failure_and_quarantine(
 
     messages = " | ".join(record.getMessage() for record in caplog.records)
     assert "export job failed" in messages
-    assert "meeting_id=11367" in messages
+    assert f"meeting_id={MEETING_UUID}" in messages
     assert "quarantine" in messages
 
 
 def test_import_main_module_is_safe() -> None:
     import exporter.__main__  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# The subscription delivery: signature, events, dedupe (design §2.7)
+# ---------------------------------------------------------------------------
+
+
+def _client(storage: Storage, settings: Settings | None = None) -> tuple[Any, Any]:
+    settings = settings or _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    app = create_app(
+        settings,
+        queue,
+        _deps(storage, settings),
+        clock=_fixed_clock,
+        start_worker=False,
+    )
+    return TestClient(app), queue
+
+
+def _post_signed(
+    client: Any, envelope: Any, headers: dict[str, str] | None = None
+) -> Any:
+    body = json.dumps(envelope).encode()
+    return client.post("/hooks/vexa", content=body, headers=headers or _sign(body))
+
+
+def test_a_rotated_delivery_verifies_on_the_previous_header(storage: Storage) -> None:
+    """For 24 h after `rotate-secret` aw-bots signs with the new secret and
+    sends the old one's signature in `X-Webhook-Signature-Previous`; an
+    exporter still on the old secret keeps receiving."""
+    body = json.dumps(_envelope()).encode()
+    headers = _sign(body, secret="the-new-secret")
+    headers["X-Webhook-Signature-Previous"] = _sign(body)["X-Webhook-Signature"]
+    client, queue = _client(storage)
+    with client:
+        resp = client.post("/hooks/vexa", content=body, headers=headers)
+    assert resp.status_code == 202
+    assert queue.pending_ids() == [KEY]
+
+
+def test_a_signature_under_another_secret_is_401(storage: Storage) -> None:
+    body = json.dumps(_envelope()).encode()
+    client, queue = _client(storage)
+    with client:
+        resp = client.post(
+            "/hooks/vexa", content=body, headers=_sign(body, secret="other")
+        )
+    assert resp.status_code == 401
+    assert queue.pending_ids() == []
+
+
+@pytest.mark.parametrize("ts", ["699", "1401"])
+def test_a_timestamp_more_than_300_s_off_is_401(storage: Storage, ts: str) -> None:
+    body = json.dumps(_envelope()).encode()
+    client, queue = _client(storage)
+    with client:
+        resp = client.post("/hooks/vexa", content=body, headers=_sign(body, ts=ts))
+    assert resp.status_code == 401
+    assert queue.pending_ids() == []
+
+
+# Every webhook.v1 EventType the exporter does not act on.
+IGNORED_EVENTS = [
+    "meeting.scheduled",
+    "meeting.updated",
+    "meeting.removed",
+    "meeting.waiting_for_room",
+    "meeting.not_sent",
+    "meeting.status_change",
+    "meeting.started",
+    "bot.retry",
+    "recording.ready",
+    "transcription.ready",
+    "export.handed_off",
+    "export.failed",
+]
+
+
+@pytest.mark.parametrize("event_type", IGNORED_EVENTS)
+def test_every_other_event_is_answered_2xx_and_ignored(
+    storage: Storage, event_type: str
+) -> None:
+    client, queue = _client(storage)
+    with client:
+        resp = _post_signed(client, _envelope(event_type))
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored"}
+    assert queue.pending_ids() == []
+    assert storage.list_keys(VEXA_BUCKET, "aw-exporter/") == []
+
+
+def test_a_verified_webhook_test_is_answered_2xx_and_does_nothing(
+    storage: Storage,
+) -> None:
+    envelope = {
+        "event_id": "evt_test_" + "0c4d8e2f" * 4,
+        "event_type": "webhook.test",
+        "api_version": "2026-09-25",
+        "created_at": "2026-06-18T10:42:00Z",
+        "data": {"subscription_id": "2d9f6c1e-4b7a-4e3d-8c5f-1a2b3c4d5e6f"},
+    }
+    client, queue = _client(storage)
+    with client:
+        resp = _post_signed(client, envelope)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored"}
+    assert storage.list_keys(VEXA_BUCKET, "aw-exporter/") == []
+
+
+@pytest.mark.parametrize("event_type", ["meeting.completed", "bot.failed"])
+def test_each_exported_event_is_queued_under_the_meeting_uuid(
+    storage: Storage, event_type: str
+) -> None:
+    envelope = _envelope(
+        event_type, status="failed" if "failed" in event_type else "completed"
+    )
+    client, queue = _client(storage)
+    with client:
+        resp = _post_signed(client, envelope)
+    assert resp.status_code == 202
+    assert queue.pending_ids() == [KEY]
+    stored = storage.get_json(VEXA_BUCKET, PENDING_KEY)
+    assert stored is not None and stored["envelope"] == envelope
+
+
+@pytest.mark.parametrize(
+    "event_id", [None, "", "evt_test", "evt_" + "G" * 64, "../evt_" + "a" * 64]
+)
+def test_an_exported_event_without_a_valid_event_id_is_400(
+    storage: Storage, event_id: Any
+) -> None:
+    envelope = _envelope()
+    if event_id is None:
+        del envelope["event_id"]
+    else:
+        envelope["event_id"] = event_id
+    client, queue = _client(storage)
+    with client:
+        resp = _post_signed(client, envelope)
+    assert resp.status_code == 400
+    assert queue.pending_ids() == []
+
+
+@pytest.mark.parametrize("upstream_id", [None, "11367", 0, True])
+def test_an_exported_event_without_an_integer_upstream_id_is_400(
+    storage: Storage, upstream_id: Any
+) -> None:
+    client, queue = _client(storage)
+    with client:
+        resp = _post_signed(client, _envelope(upstream_id=upstream_id))
+    assert resp.status_code == 400
+    assert queue.pending_ids() == []
+
+
+def test_a_redelivered_event_is_a_duplicate_and_queued_once(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At-least-once delivery: the same `event_id` again is answered 2xx and
+    changes nothing, while the meeting is pending and after it is done."""
+    settings = _settings()
+    client, queue = _client(storage, settings)
+    with client, caplog.at_level(logging.INFO, logger="exporter"):
+        first = _post_signed(client, _envelope())
+        queue.record_failure(KEY, "boom", now=lambda: 1000.0)
+        again = _post_signed(client, _envelope())
+        pending = queue.load(KEY)
+        queue.done(KEY)
+        after_done = _post_signed(client, _envelope())
+
+    assert first.status_code == 202
+    assert again.status_code == 200 and again.json() == {"status": "duplicate"}
+    assert after_done.status_code == 200
+    assert after_done.json() == {"status": "duplicate"}
+    assert pending is not None and pending["attempts"] == 1
+    assert queue.pending_ids() == []
+    assert storage.get_json(VEXA_BUCKET, EVENT_KEY) == {
+        "meeting_id": MEETING_UUID,
+        "event_type": "meeting.completed",
+        "sequence": 9,
+    }
+    assert any(
+        r.getMessage()
+        == f"duplicate_event event_id={EVENT_ID} meeting_id={MEETING_UUID}; ignored"
+        for r in caplog.records
+    )
+
+
+def test_an_event_that_could_not_be_recorded_is_503_and_queued_on_redelivery(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The event is recorded after it is queued, so a failed record never
+    loses it: the 503 makes aw-bots retry, and the retry is queued again."""
+    client, queue = _client(storage)
+    real = queue.record_event
+    calls = {"n": 0}
+
+    def flaky(envelope: dict[str, Any]) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("s3 put failed")
+        real(envelope)
+
+    monkeypatch.setattr(queue, "record_event", flaky)
+    with client:
+        first = _post_signed(client, _envelope())
+        retry = _post_signed(client, _envelope())
+    assert first.status_code == 503
+    assert retry.status_code == 202
+    assert queue.pending_ids() == [KEY]
+    assert queue.seen(EVENT_ID)
+
+
+def test_a_second_event_for_the_same_meeting_refreshes_the_pending_item(
+    storage: Storage,
+) -> None:
+    """One export per meeting: the queue is keyed by the meeting, so a
+    `bot.failed` and a `meeting.completed` of one meeting are one item."""
+    client, queue = _client(storage)
+    failed = _envelope("bot.failed", status="failed")
+    completed = meeting_event(event_id="evt_" + "b" * 64)
+    with client:
+        assert _post_signed(client, failed).status_code == 202
+        assert _post_signed(client, completed).status_code == 202
+    assert queue.pending_ids() == [KEY]
+    item = queue.load(KEY)
+    assert item is not None and item["envelope"] == completed
+
+
+def test_the_export_runs_once_for_a_redelivered_event(storage: Storage) -> None:
+    settings = _settings()
+    client, queue = _client(storage, settings)
+    deps = _deps(storage, settings)
+    runs: list[str] = []
+
+    def job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+        runs.append(envelope["event_id"])
+        return ExportResult("handed_off", FOLDER)
+
+    with client:
+        _post_signed(client, _envelope())
+        asyncio.run(sweep_once(queue, deps, job=job))
+        _post_signed(client, _envelope())
+        asyncio.run(sweep_once(queue, deps, job=job))
+    assert runs == [EVENT_ID]
+    assert queue.pending_ids() == []
