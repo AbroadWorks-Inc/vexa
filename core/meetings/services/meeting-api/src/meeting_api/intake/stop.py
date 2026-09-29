@@ -54,6 +54,7 @@ from .ports import (
     Room,
 )
 from .rules import is_live
+from .settings import IntakeSettings
 from .status import Outcome
 from .validation import IntakeError
 
@@ -184,10 +185,11 @@ class IntakeStop:
     async def _record(
         self, user_id: int, meeting_id: int, outcome: Optional[Outcome]
     ) -> Optional[RecordedStop]:
-        """Steps 1–4 in one transaction under the meeting's link lock (restarted once when the
-        link changed between the read and the lock)."""
+        """Steps 1–4 in one transaction under the meeting's link lock (restarted, up to
+        ``INTAKE_STOP_LINK_RETRIES`` more times, when the link changed between the read and the
+        lock)."""
         room = await self._room(user_id, meeting_id)
-        for _ in range(2):
+        for _ in range(1 + IntakeSettings.from_env().stop_link_retries):
             async with self._store.room_lock(user_id, [room]) as tx:
                 current = (await tx.meeting(meeting_id)).room
                 if current != room:

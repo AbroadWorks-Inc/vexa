@@ -622,7 +622,7 @@ async def test_a_timeout_is_retried(h):
         allowlist=frozenset(),
         resolver=resolve_public,
         clock=clock,
-        send_timeout_s=0.05,
+        settings=SenderSettings(send_timeout_s=0.05),
     )
     w = World(h, clock, subs, receiver, sender)
     sub = await w.subscribe()
@@ -981,7 +981,7 @@ async def test_two_senders_never_send_the_same_delivery(pg_engine):
             allowlist=frozenset(),
             resolver=resolve_public,
             clock=clock,
-            claim_limit=7,
+            settings=SenderSettings(claim_limit=7),
         )
 
     a, b = sender(), sender()
@@ -1293,6 +1293,72 @@ async def test_close_shuts_the_dns_pool_down(world):
     assert not worker.is_alive()
 
 
+def test_the_default_send_bounds():
+    settings = SenderSettings.from_env({})
+    assert (settings.send_timeout_s, settings.lease_s, settings.claim_limit) == (
+        10.0,
+        60,
+        50,
+    )
+    assert SenderSettings.from_env(
+        {
+            "WEBHOOK_SEND_TIMEOUT_S": "4.5",
+            "WEBHOOK_LEASE_S": "30",
+            "WEBHOOK_CLAIM_LIMIT": "7",
+        }
+    ) == SenderSettings(send_timeout_s=4.5, lease_s=30, claim_limit=7)
+
+
+@pytest.mark.parametrize(
+    "key, raw",
+    [
+        ("WEBHOOK_SEND_TIMEOUT_S", "0"),
+        ("WEBHOOK_SEND_TIMEOUT_S", "ten"),
+        ("WEBHOOK_SEND_TIMEOUT_S", "nan"),
+        ("WEBHOOK_LEASE_S", "0"),
+        ("WEBHOOK_LEASE_S", "1.5"),
+        ("WEBHOOK_CLAIM_LIMIT", "0"),
+        ("WEBHOOK_CLAIM_LIMIT", "many"),
+    ],
+)
+def test_a_malformed_send_bound_is_refused(key, raw):
+    with pytest.raises(SenderSettingsError) as err:
+        SenderSettings.from_env({key: raw})
+    assert key in str(err.value)
+
+
+def test_a_lease_too_short_to_post_inside_is_refused():
+    with pytest.raises(SenderSettingsError) as err:
+        SenderSettings.from_env(
+            {"WEBHOOK_SEND_TIMEOUT_S": "10", "WEBHOOK_LEASE_S": "15"}
+        )
+    assert "WEBHOOK_LEASE_S" in str(err.value)
+
+
+async def test_the_sender_claims_with_its_lease_and_limit():
+    class Claims:
+        def __init__(self) -> None:
+            self.asked: list[tuple[int, int]] = []
+
+        async def claim(self, *, lease_s: int, limit: int) -> list[Any]:
+            self.asked.append((lease_s, limit))
+            return []
+
+    store = Claims()
+    sender = WebhookSender(
+        store,  # type: ignore[arg-type]
+        StaticSubscriptions(),
+        box(),
+        Receiver(),
+        allowlist=frozenset(),
+        resolver=resolve_public,
+        settings=SenderSettings(lease_s=30, claim_limit=7),
+    )
+    assert await sender.run_once() == 0
+    assert store.asked == [(30, 7)]
+    sender.close()
+
+
 def test_the_default_dns_settings():
     settings = SenderSettings.from_env({})
     assert (settings.dns_threads, settings.dns_timeout_s) == (4, 5.0)
@@ -1383,7 +1449,7 @@ def _faulting_world(h: Any, *, claim_limit: int = 50) -> World:
         allowlist=frozenset(),
         resolver=resolve_or_fault,
         clock=h.clock,
-        claim_limit=claim_limit,
+        settings=SenderSettings(claim_limit=claim_limit),
     )
     return World(h, h.clock, subs, receiver, sender)
 

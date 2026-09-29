@@ -3,9 +3,10 @@
 One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``. Each tick
 (``WebhookSender.run_once``):
 
-1. **Claim** up to ``claim_limit`` due ``webhook_deliveries`` rows (``state IN ('pending',
-   'sending') AND next_attempt_at <= now AND (lease_until IS NULL OR lease_until < now)``) with
-   ``FOR UPDATE SKIP LOCKED``, set ``state = 'sending'`` and ``lease_until = now + LEASE_S``, and
+1. **Claim** up to ``WEBHOOK_CLAIM_LIMIT`` (50) due ``webhook_deliveries`` rows (``state IN
+   ('pending', 'sending') AND next_attempt_at <= now AND (lease_until IS NULL OR lease_until <
+   now)``) with ``FOR UPDATE SKIP LOCKED``, set ``state = 'sending'`` and ``lease_until = now +
+   WEBHOOK_LEASE_S`` (60), and
    commit. Two replicas never claim the same row; a crashed replica's row is claimed again once its
    lease has passed. Every instant here is the database's ``now()``, never a replica's clock.
    The claim also reads the subscription's sealed secrets from ``webhook_subscriptions``
@@ -18,12 +19,13 @@ One sender loop runs per meeting-api replica, every ``WEBHOOK_SEND_INTERVAL_S``.
    guard's DNS lookup runs on the sender's own pool of ``WEBHOOK_DNS_THREADS`` threads, never the
    default executor recording storage uses, under ``WEBHOOK_DNS_TIMEOUT_S`` per lookup; a lookup
    that times out is a failed attempt (``dns timeout``). ``close()`` shuts the pool down.
-   Before posting, the claim must still have ``SEND_TIMEOUT_S + LEASE_MARGIN_S`` of its lease left,
+   Before posting, the claim must still have ``WEBHOOK_SEND_TIMEOUT_S`` (10) + ``LEASE_MARGIN_S``
+   of its lease left,
    measured on the monotonic clock from just before the claim. If it hasn't (a slow subscription
    read or DNS), nothing is sent and a failed attempt (``lease short``) is recorded.
 3. **Sign** the stored ``payload_text`` (``signing.signed_headers``; the claim's secret opened by
    ``secret_box.py``, the previous one too while it is still valid) and post those exact bytes,
-   under ``SEND_TIMEOUT_S`` in total, to the address the guard validated.
+   under ``WEBHOOK_SEND_TIMEOUT_S`` in total, to the address the guard validated.
 4. **Record** one attempt row and move the row, in one transaction:
 
    ============================================  =====================  ==================
@@ -150,26 +152,39 @@ def _dns_threads(raw: str) -> int:
 
 
 def _dns_timeout_s(raw: str) -> float:
+    return _seconds(raw, "WEBHOOK_DNS_TIMEOUT_S")
+
+
+def _seconds(raw: str, key: str) -> float:
     try:
         value = float(raw)
     except ValueError:
         value = math.nan
     if math.isfinite(value) and value > 0:
         return value
-    raise SenderSettingsError(
-        "WEBHOOK_DNS_TIMEOUT_S must be a number of seconds above 0"
-    )
+    raise SenderSettingsError(f"{key} must be a number of seconds above 0")
+
+
+def _whole(raw: str, key: str, what: str) -> int:
+    if raw.isascii() and raw.isdigit() and int(raw) >= 1:
+        return int(raw)
+    raise SenderSettingsError(f"{key} must be a whole number of {what} of at least 1")
 
 
 @dataclass(frozen=True)
 class SenderSettings:
     """The sender's settings (``config.v1.json``). ``retry_schedule_s`` holds one wait per
     retry; ``dns_threads`` sizes the sender's own DNS pool and ``dns_timeout_s`` bounds each
-    lookup."""
+    lookup. ``send_timeout_s`` bounds one post, ``lease_s`` is how long a claim holds its row
+    (it must leave room for a post and ``LEASE_MARGIN_S``), and ``claim_limit`` is the most
+    rows one tick claims."""
 
     retry_schedule_s: tuple[int, ...] = DEFAULT_RETRY_SCHEDULE_S
     dns_threads: int = DEFAULT_DNS_THREADS
     dns_timeout_s: float = DEFAULT_DNS_TIMEOUT_S
+    send_timeout_s: float = SEND_TIMEOUT_S
+    lease_s: int = LEASE_S
+    claim_limit: int = CLAIM_LIMIT
 
     @classmethod
     def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> SenderSettings:
@@ -179,13 +194,29 @@ class SenderSettings:
         schedule = (env.get("WEBHOOK_RETRY_SCHEDULE_S") or "").strip()
         threads = (env.get("WEBHOOK_DNS_THREADS") or "").strip()
         timeout = (env.get("WEBHOOK_DNS_TIMEOUT_S") or "").strip()
-        return cls(
+        send = (env.get("WEBHOOK_SEND_TIMEOUT_S") or "").strip()
+        lease = (env.get("WEBHOOK_LEASE_S") or "").strip()
+        claims = (env.get("WEBHOOK_CLAIM_LIMIT") or "").strip()
+        settings = cls(
             retry_schedule_s=(
                 _retry_schedule(schedule) if schedule else DEFAULT_RETRY_SCHEDULE_S
             ),
             dns_threads=_dns_threads(threads) if threads else DEFAULT_DNS_THREADS,
             dns_timeout_s=_dns_timeout_s(timeout) if timeout else DEFAULT_DNS_TIMEOUT_S,
+            send_timeout_s=(
+                _seconds(send, "WEBHOOK_SEND_TIMEOUT_S") if send else SEND_TIMEOUT_S
+            ),
+            lease_s=_whole(lease, "WEBHOOK_LEASE_S", "seconds") if lease else LEASE_S,
+            claim_limit=(
+                _whole(claims, "WEBHOOK_CLAIM_LIMIT", "rows") if claims else CLAIM_LIMIT
+            ),
         )
+        if settings.lease_s <= settings.send_timeout_s + LEASE_MARGIN_S:
+            raise SenderSettingsError(
+                "WEBHOOK_LEASE_S must be more than WEBHOOK_SEND_TIMEOUT_S + "
+                f"{LEASE_MARGIN_S:g} s, or no claim can post inside its lease"
+            )
+        return settings
 
 
 @dataclass(frozen=True)
@@ -317,8 +348,6 @@ class WebhookSender:
         resolver: Optional[Callable[[str], List[str]]] = None,
         clock: Callable[[], datetime] = _utcnow,
         monotonic: Callable[[], float] = time.monotonic,
-        claim_limit: int = CLAIM_LIMIT,
-        send_timeout_s: float = SEND_TIMEOUT_S,
         settings: SenderSettings = SenderSettings(),
     ) -> None:
         self._store = store
@@ -329,8 +358,9 @@ class WebhookSender:
         self._resolver = resolver
         self._clock = clock
         self._monotonic = monotonic
-        self._claim_limit = claim_limit
-        self._send_timeout_s = send_timeout_s
+        self._claim_limit = settings.claim_limit
+        self._send_timeout_s = settings.send_timeout_s
+        self._lease_s = settings.lease_s
         self._schedule = settings.retry_schedule_s
         self._dns_timeout_s = settings.dns_timeout_s
         self._dns_pool = ThreadPoolExecutor(
@@ -346,7 +376,7 @@ class WebhookSender:
         # Read before the claim, so the lease measured from here is never longer than the one the
         # store granted.
         claimed_at = self._monotonic()
-        claims = await self._store.claim(lease_s=LEASE_S, limit=self._claim_limit)
+        claims = await self._store.claim(lease_s=self._lease_s, limit=self._claim_limit)
         if claims:
             await asyncio.gather(*(self._deliver(c, claimed_at) for c in claims))
         return len(claims)
@@ -438,7 +468,7 @@ class WebhookSender:
 
         if (
             self._monotonic() - claimed_at + self._send_timeout_s + LEASE_MARGIN_S
-            > LEASE_S
+            > self._lease_s
         ):
             # Too little lease left to post and record inside it: send nothing, and record a
             # failed attempt so the row moves along the retry schedule like any other failure.

@@ -850,6 +850,57 @@ async def test_a_constraint_race_resolves_on_a_retry():
     assert h.events() == [(reply["meeting"]["id"], "meeting.scheduled")]
 
 
+def test_the_retry_bounds_are_settings(monkeypatch):
+    from meeting_api.intake.settings import IntakeSettings
+
+    for key in (
+        "INTAKE_STOP_LINK_RETRIES",
+        "INTAKE_CONFLICT_DELAY_MIN_S",
+        "INTAKE_CONFLICT_DELAY_MAX_S",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    s = IntakeSettings.from_env()
+    assert (s.stop_link_retries, s.conflict_delay_min_s, s.conflict_delay_max_s) == (
+        1,
+        0.01,
+        0.05,
+    )
+    monkeypatch.setenv("INTAKE_STOP_LINK_RETRIES", "4")
+    monkeypatch.setenv("INTAKE_CONFLICT_DELAY_MIN_S", "0.2")
+    monkeypatch.setenv("INTAKE_CONFLICT_DELAY_MAX_S", "0.3")
+    s = IntakeSettings.from_env()
+    assert (s.stop_link_retries, s.conflict_delay_min_s, s.conflict_delay_max_s) == (
+        4,
+        0.2,
+        0.3,
+    )
+
+
+async def test_the_conflict_pause_is_drawn_between_its_bounds():
+    import dataclasses
+
+    from intake_builders import make_settings
+    from meeting_api.intake.service import IntakeService
+
+    h = make_harness()
+    racing = _Racing(h.store, 3)
+    naps: list[float] = []
+
+    async def nap(seconds: float) -> None:
+        naps.append(seconds)
+
+    settings = dataclasses.replace(
+        make_settings(), conflict_delay_min_s=0.2, conflict_delay_max_s=0.3
+    )
+    h.service = IntakeService(
+        racing, h.spawn, h.stop, h.publisher, settings, clock=h.clock, sleep=nap
+    )
+    await h.put()
+    assert len(naps) == 3
+    for attempt, pause in enumerate(naps, start=1):
+        assert 0.2 * attempt <= pause <= 0.3 * attempt
+
+
 async def test_a_constraint_that_always_fails_is_internal_error_after_the_retries():
     h, racing, naps = _racing_harness(lose=100, retries=2)
     with pytest.raises(IntakeError) as err:

@@ -8,7 +8,8 @@ remove doesn't know the links before reading, so it first reads without a link l
 Events are published after the transaction commits (a failed publish is logged: the outbox holds
 them). A transaction that loses a race on a database constraint (``ConstraintRace``: another write
 stored the same key first) is rolled back and run again, up to ``INTAKE_CONFLICT_RETRIES`` more
-times after a short random pause; if it still loses, the request fails with ``internal_error``
+times after a short random pause (``INTAKE_CONFLICT_DELAY_MIN_S`` to ``INTAKE_CONFLICT_DELAY_MAX_S``
+times the try's number); if it still loses, the request fails with ``internal_error``
 (500), logged with its stack (§6.9 F-D). A stop (R5) is recorded inside the transaction (``stop.record_stop``); the leave command
 and spawns run after the commit, each through its own port.
 
@@ -116,10 +117,6 @@ _REMOVE_RESULT = {
     "finished": "entry_removed",
 }
 
-
-#: The pause before running a write that lost a constraint race again, in seconds: a random point
-#: in this range, times the try's number, so two racers don't meet again (§6.9 F-D).
-_CONFLICT_DELAY_S = (0.01, 0.05)
 
 #: Errors that mean a bug, not an outage: a failed leave command is logged, these are raised.
 _PROGRAMMING_ERRORS = (TypeError, AttributeError, KeyError, AssertionError, NameError)
@@ -323,7 +320,13 @@ class IntakeService:
                         "internal_error",
                         "the write kept conflicting with another; it was not stored",
                     ) from exc
-                await self._sleep(random.uniform(*_CONFLICT_DELAY_S) * (attempt + 1))
+                # A random point between the bounds, times the try's number, so two racers
+                # don't meet again (§6.9 F-D).
+                pause = random.uniform(
+                    self._settings.conflict_delay_min_s,
+                    self._settings.conflict_delay_max_s,
+                )
+                await self._sleep(pause * (attempt + 1))
         await self._publish(work.events)
         for stop in work.stops:
             await self._leave(user_id, stop)

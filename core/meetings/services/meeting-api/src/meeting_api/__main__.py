@@ -770,7 +770,10 @@ def _attach_background_loops(
             PostgresDeliveryStore(session_factory),
             webhook_subscriptions,
             webhook_secret_box,
-            HttpxPoster(allowlist=webhook_allowlist),
+            HttpxPoster(
+                allowlist=webhook_allowlist,
+                timeout_s=webhook_sender_settings.send_timeout_s,
+            ),
             allowlist=webhook_allowlist,
             settings=webhook_sender_settings,
         )

@@ -443,6 +443,27 @@
    "targets": ["helm"]
   },
   {
+   "key": "WEBHOOK_SEND_TIMEOUT_S",
+   "class": "defaulted",
+   "default": "10",
+   "description": "webhooks (§1.8, §6.9 F-H): the most (s, above 0, decimals allowed) one subscription post may take in total; longer is a failed attempt (error 'timeout') on WEBHOOK_RETRY_SCHEDULE_S. Set but malformed, meeting-api refuses to start.",
+   "targets": []
+  },
+  {
+   "key": "WEBHOOK_LEASE_S",
+   "class": "defaulted",
+   "default": "60",
+   "description": "webhooks (§1.8): how long (whole s, at least 1) a sender's claim holds a delivery row before another replica may claim it again. It must be more than WEBHOOK_SEND_TIMEOUT_S + 5 s, so a claim can post and record inside it; a claim with less left sends nothing and records 'lease short'. Set but malformed, or too short, meeting-api refuses to start.",
+   "targets": []
+  },
+  {
+   "key": "WEBHOOK_CLAIM_LIMIT",
+   "class": "defaulted",
+   "default": "50",
+   "description": "webhooks (§1.8): the most delivery rows (whole, at least 1) one sender tick claims; the rest wait for the next tick. Set but malformed, meeting-api refuses to start.",
+   "targets": []
+  },
+  {
    "key": "SCHEDULER_TICK_INTERVAL",
    "class": "defaulted",
    "default": "1",
@@ -691,6 +712,27 @@
    "default": "3",
    "description": "intake (§6.9 F-D): how many more times an entry write that lost a race on a database constraint is run again, after a short random pause; one that still loses answers 500 internal_error",
    "targets": ["helm"]
+  },
+  {
+   "key": "INTAKE_CONFLICT_DELAY_MIN_S",
+   "class": "defaulted",
+   "default": "0.01",
+   "description": "entry service (§6.9 F-D): the least (s) of the random pause before an entry write that lost a constraint race runs again; the pause is a random point between this and INTAKE_CONFLICT_DELAY_MAX_S, times the try's number",
+   "targets": []
+  },
+  {
+   "key": "INTAKE_CONFLICT_DELAY_MAX_S",
+   "class": "defaulted",
+   "default": "0.05",
+   "description": "entry service (§6.9 F-D): the most (s) of that random pause, before it is multiplied by the try's number",
+   "targets": []
+  },
+  {
+   "key": "INTAKE_STOP_LINK_RETRIES",
+   "class": "defaulted",
+   "default": "1",
+   "description": "stop (§1.7): how many more times POST /v2/meetings/{id}/stop is run again when the meeting moved to another link between its read and its link lock; after the last, the stop answers 503 unavailable (retry)",
+   "targets": []
   },
   {
    "key": "SWEEP_BATCH_SIZE",

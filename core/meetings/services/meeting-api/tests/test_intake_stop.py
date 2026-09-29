@@ -725,3 +725,35 @@ async def test_pg_a_put_after_the_removal_already_sees_the_stop(pg_engine):
     assert put_reply["meeting"]["status"] == "stopping"
     row = await s.repo.get_meeting(mid)
     assert row is not None and row["status"] == "stopping"
+
+
+# ── a link that keeps changing during the stop (INTAKE_STOP_LINK_RETRIES) ───────────────────
+
+
+@pytest.mark.parametrize("retries, tries", [(None, 2), ("0", 1), ("3", 4)])
+async def test_a_stop_whose_link_keeps_changing_is_tried_a_bounded_number_of_times(
+    monkeypatch, retries, tries
+):
+    if retries is None:
+        monkeypatch.delenv("INTAKE_STOP_LINK_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("INTAKE_STOP_LINK_RETRIES", retries)
+    s = _stack()
+    mid = await s.live("active")
+    locked: list[tuple] = []
+
+    def move(store, rooms):
+        if rooms:  # every locked read finds the meeting on another link
+            locked.append(rooms)
+            row = store.meetings[mid]
+            store.meetings[mid] = {
+                **row,
+                "platform_specific_id": f"moved-{len(locked)}",
+            }
+
+    s.h.store.on_lock = move
+    with pytest.raises(IntakeError) as err:
+        await s.stop.stop_live(1, mid, outcome=None)
+    assert err.value.code == "unavailable"
+    assert len(locked) == tries
+    assert s.leaves() == []

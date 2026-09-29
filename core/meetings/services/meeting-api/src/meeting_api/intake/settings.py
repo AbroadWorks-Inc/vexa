@@ -11,7 +11,10 @@ the sweep, and the link resolver ignores a timed, entry-less ``scheduled`` plan 
 ``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of an entry-managed
 meeting's bot (§6.9 F-K): that many failed sends in total, this many seconds apart, then the
 meeting ends ``not_sent``. ``INTAKE_CONFLICT_RETRIES`` is how many more times an
-entry write that lost a constraint race is run again (§6.9 F-D).
+entry write that lost a constraint race is run again (§6.9 F-D), after a random pause between
+``INTAKE_CONFLICT_DELAY_MIN_S`` and ``INTAKE_CONFLICT_DELAY_MAX_S`` times the try's number.
+``INTAKE_STOP_LINK_RETRIES`` is how many more times a stop whose meeting moved to another link
+between the read and the lock is run again (§1.7).
 """
 
 from __future__ import annotations
@@ -59,6 +62,9 @@ class IntakeSettings:
     send_max_attempts: int
     send_retry_backoff_s: int
     conflict_retries: int
+    stop_link_retries: int = 1
+    conflict_delay_min_s: float = 0.01
+    conflict_delay_max_s: float = 0.05
 
     @classmethod
     def from_env(cls) -> IntakeSettings:
@@ -74,4 +80,11 @@ class IntakeSettings:
             send_max_attempts=int(os.getenv("BOT_SEND_MAX_ATTEMPTS", "3")),
             send_retry_backoff_s=int(os.getenv("BOT_SEND_RETRY_BACKOFF_S", "60")),
             conflict_retries=int(os.getenv("INTAKE_CONFLICT_RETRIES", "3")),
+            stop_link_retries=int(os.getenv("INTAKE_STOP_LINK_RETRIES", "1")),
+            conflict_delay_min_s=float(
+                os.getenv("INTAKE_CONFLICT_DELAY_MIN_S", "0.01")
+            ),
+            conflict_delay_max_s=float(
+                os.getenv("INTAKE_CONFLICT_DELAY_MAX_S", "0.05")
+            ),
         )
