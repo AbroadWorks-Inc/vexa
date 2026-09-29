@@ -100,6 +100,13 @@
    "targets": ["helm"]
   },
   {
+   "key": "GATEWAY_RATE_LIMIT_DISABLED",
+   "class": "defaulted",
+   "default": "",
+   "description": "WS-6: a truthy value turns the per-user token bucket off (ratelimit.from_env); unset keeps it on. A debugging switch, not set by the chart.",
+   "targets": []
+  },
+  {
    "key": "LOG_LEVEL",
    "class": "defaulted",
    "default": "info",
