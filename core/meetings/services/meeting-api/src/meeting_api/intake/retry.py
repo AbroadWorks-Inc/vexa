@@ -173,9 +173,15 @@ def overdue(mark: Mapping[str, Any], limit: datetime) -> tuple[str, str]:
     """The change reason and message a waiting meeting past its ``deadline`` ends with."""
     if mark.get("proven_gone"):
         return "retry_not_sent", f"no new bot was sent by {iso_utc(limit)}"
+    if not mark.get("workload"):
+        return (
+            "workload_not_proven",
+            "the failed bot's start recorded no workload, so none could be proven gone by "
+            f"{iso_utc(limit)}",
+        )
     return (
         "workload_not_proven",
-        f"the failed bot's workload {mark.get('workload')} was not proven gone by "
+        f"the failed bot's workload {mark['workload']} was not proven gone by "
         f"{iso_utc(limit)}",
     )
 

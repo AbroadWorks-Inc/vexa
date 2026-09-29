@@ -994,7 +994,6 @@ async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
     assert finished == []
 
 
-
 async def test_a_failing_finish_after_a_committed_stop_does_not_fail_the_stop():
     h, _, stop, commands, _, mid = await _waiting_intake()
 
@@ -1002,6 +1001,26 @@ async def test_a_failing_finish_after_a_committed_stop_does_not_fail_the_stop():
         raise RuntimeError("the database went away")
 
     stop.finish_meeting = broken_finish
-    await stop.stop_live(1, mid, outcome=None)  # the route answers the meeting, not a 500
+    await stop.stop_live(
+        1, mid, outcome=None
+    )  # the route answers the meeting, not a 500
     assert h.store.view(mid).status == "failed"
     assert commands.published == []
+
+
+def test_an_overdue_reason_never_names_a_missing_workload():
+    limit = datetime(2026, 9, 29, 9, 21, tzinfo=UTC)
+    code, message = retry.overdue({"workload": None, "proven_gone": False}, limit)
+    assert code == "workload_not_proven" and "None" not in message
+    assert message == (
+        "the failed bot's start recorded no workload, so none could be proven gone by "
+        "2026-09-29T09:21:00Z"
+    )
+    code, message = retry.overdue({"workload": "mtg-5-ab", "proven_gone": False}, limit)
+    assert message == (
+        "the failed bot's workload mtg-5-ab was not proven gone by 2026-09-29T09:21:00Z"
+    )
+    assert retry.overdue({"workload": None, "proven_gone": True}, limit) == (
+        "retry_not_sent",
+        "no new bot was sent by 2026-09-29T09:21:00Z",
+    )
