@@ -11,8 +11,10 @@ action that couldn't get an answer for a reason that isn't the item's failure (a
 didn't answer) raises ``ItemDeferred``: logged at warning level and counted under its own
 ``result``, it records nothing, and the item runs again on the next pass. One item's failure never
 stops the rest of its page. A sweep whose given-up item must still end (a meeting that would
-otherwise stay open for good) passes ``on_given_up``, run once, right after the give-up; its own
-failure is logged. ``run_item`` never raises: a failure that can't even be recorded (the
+otherwise stay open for good) passes ``on_given_up``, its give-up action: an item of its own
+(``give_up_id``, ``give-up:<item id>``), run right after the give-up and again each pass that
+still lists the given-up item, so a failed action is logged, counted and given up like any item.
+``run_item`` never raises: a failure that can't even be recorded (the
 database is down) is logged and the item is tried again on the next tick, since nothing was
 counted.
 
@@ -56,6 +58,7 @@ __all__ = [
     "ItemFailures",
     "PostgresItemFailures",
     "prune_item_failures",
+    "give_up_id",
     "run_item",
     "run_pages",
     "sweep_batch_size",
@@ -182,27 +185,19 @@ async def run_item(
         )
         sweep_item(sweep, result)
         if gave_up and on_given_up is not None:
-            try:
-                await on_given_up(exc)
-            except Exception as after:
-                log_event(
-                    "sweep_item_give_up_action_failed",
-                    audience="operator",
-                    level="error",
-                    span="sweeps",
-                    user_id=user_id,
-                    fields={
-                        "sweep": sweep,
-                        "item_id": item_id,
-                        "error": type(after).__name__,
-                        "traceback": "".join(
-                            traceback.format_exception(
-                                type(after), after, after.__traceback__
-                            )
-                        ),
-                    },
-                )
+            await run_item(
+                failures,
+                sweep,
+                give_up_id(item_id),
+                partial(on_given_up, exc),
+                user_id=user_id,
+            )
         return False
+
+
+def give_up_id(item_id: str) -> str:
+    """The item id of ``item_id``'s give-up action, an item of its own sweep."""
+    return f"give-up:{item_id}"
 
 
 T = TypeVar("T")
@@ -223,18 +218,26 @@ async def run_pages(
     user_id_of: Callable[[T], Any],
     action: Callable[[T], Awaitable[Any]],
     select: Callable[[Sequence[T]], Sequence[T]] = _every,
-    on_given_up: Optional[Callable[[T, BaseException], Awaitable[Any]]] = None,
+    on_given_up: Optional[
+        Callable[[T, Optional[BaseException]], Awaitable[Any]]
+    ] = None,
 ) -> None:
     """Run ``sweep`` over all its work, a page at a time: ``read_page(after)`` reads at most
     ``limit`` items in a stable order after the cursor ``after`` (``None`` first, then
     ``after_of`` of the page's last item), until a short page. Each item of ``select(page)`` the
     sweep hasn't given up runs ``action(item)`` through ``run_item`` as ``item_id_of(item)``, and
-    ``on_given_up(item, error)`` when that run gives it up. A failing read raises."""
+    ``on_given_up(item, error)`` when that run gives it up. A given-up item the page still holds
+    runs ``on_given_up(item, None)`` again, as the item ``give_up_id(item id)``, until that item
+    is given up in turn: the action must leave nothing to do once it has done its work (the
+    error of an earlier pass is not kept). A failing read raises."""
     after: Any = None
     while True:
         page = await read_page(after)
         work = select(page)
         skip = await failures.given_up(sweep, [item_id_of(item) for item in work])
+        done: set[str] = set()
+        if on_given_up is not None and skip:
+            done = await failures.given_up(sweep, [give_up_id(i) for i in skip])
         for item in work:
             item_id = item_id_of(item)
             if item_id not in skip:
@@ -247,6 +250,14 @@ async def run_pages(
                     on_given_up=(
                         None if on_given_up is None else partial(on_given_up, item)
                     ),
+                )
+            elif on_given_up is not None and give_up_id(item_id) not in done:
+                await run_item(
+                    failures,
+                    sweep,
+                    give_up_id(item_id),
+                    partial(on_given_up, item, None),
+                    user_id=user_id_of(item),
                 )
         if len(page) < limit:
             return

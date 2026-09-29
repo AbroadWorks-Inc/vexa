@@ -32,8 +32,10 @@ The teardown and reconcile sweeps decide between these through one rule,
 pending teardown's record time, a reconcile row's `updated_at`) it is expired. A runtime that
 doesn't answer, with a known `since`, is deferred. A definite refusal, or an unreachable runtime with
 no readable `since`, is one of the item's tries. A sweep whose given-up item must still end passes
-`on_given_up`, run once right after the give-up: the auto-join tick ends an open-ended meeting it
-gave up `not_sent`.
+`on_given_up`, its give-up action: the auto-join tick ends an open-ended meeting it gave up
+`not_sent`. The action is an item of its own, `give-up:<item id>` (`give_up_id`): it runs right
+after the give-up and again each pass that still lists the given-up item, so an action that fails
+is logged, counted and given up after `SWEEP_MAX_ITEM_FAILURES` like any item.
 
 The sweeps that use them, with each read's item ids:
 

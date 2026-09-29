@@ -282,7 +282,8 @@ whole page in one transaction and falls back to `run_item` row by row), and runs
 teardown and reconcile sweeps a runtime that doesn't answer is bounded by age instead (above). An
 open-ended meeting the auto-join tick gives up ends `failed`/`not_sent` with `internal_error`
 (`sweeps.end_given_up`, under its link lock, through the status writer), so it reports
-`meeting.not_sent`; one with an end is left to the not-sent sweep.
+`meeting.not_sent`; an end that fails is tried again each tick, bounded as the item
+`give-up:due:<id>`; one with an end is left to the not-sent sweep.
 `PostgresWebhookTests` backs `POST /internal/webhooks/test` (the route is
 `webhooks/internal_router.py`, internal secret): one `webhook.test` outbox row (sequence 0, `evt_test_<uuid4 hex>`, already published) and
 one delivery for that subscription, in one transaction; the reply is `{event_id}`.

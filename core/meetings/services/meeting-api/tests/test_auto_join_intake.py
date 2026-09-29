@@ -1449,6 +1449,75 @@ async def test_pg_an_open_ended_meeting_the_tick_gives_up_ends_not_sent(pg):
 
 
 @pg_only
+async def test_pg_an_open_ended_meeting_whose_give_up_end_fails_ends_on_the_next_pass(
+    pg, monkeypatch, capsys
+):
+    """M3's give-up action is bounded work of its own: when ending the given-up meeting fails
+    (the database flaps at that moment), the next tick ends it ``not_sent``, logged and counted
+    as the item ``give-up:due:<id>``."""
+    import json
+
+    import meeting_api.intake.sweeps as intake_sweeps
+    from intake_builders import instant_body
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    async def unavailable(_user_id: int) -> None:
+        return None
+
+    spawn = pg.service._spawn
+    spawn._fetch_bot_context = unavailable
+    reply = await pg.service.put_entry(USER, instant_body("paste:2", GMEET))
+    spawn._fetch_bot_context = _ctx
+    mid = await pg.id_of(reply["meeting"]["id"])
+    now = _now()
+
+    class Poison(SqlAlchemyMeetingRepo):
+        async def merge_meeting_data(self, meeting_id, patch):
+            raise RuntimeError("poison row")
+
+    real_end = intake_sweeps.end_given_up
+    ends: list[int] = []
+
+    async def flapping_end(*args, **kwargs):
+        ends.append(args[3])
+        if len(ends) == 1:
+            raise ConnectionRefusedError("database is down")
+        return await real_end(*args, **kwargs)
+
+    monkeypatch.setattr(intake_sweeps, "end_given_up", flapping_end)
+    pg.repo = Poison(pg.session_factory)
+    before = _not_sent_count("internal_error")
+    failures = InMemoryItemFailures(max_failures=2)
+    for n in range(2):  # the second tick gives the meeting up
+        await pg.tick(now + timedelta(hours=1, seconds=30 * n), item_failures=failures)
+    assert failures.gave_up == {("auto-join", f"due:{mid}")}
+    assert (await pg.row(mid))["status"] == "scheduled"  # the end failed
+    await pg.tick(now + timedelta(hours=1, seconds=60), item_failures=failures)
+    assert ends == [mid, mid]
+    row = await pg.row(mid)
+    assert (row["status"], row["outcome_kind"], row["outcome_detail"]) == (
+        "failed",
+        "not_sent",
+        "internal_error",
+    )
+    assert row["outcome_message"] == (
+        "the scheduler gave this meeting up: sending its bot kept failing"
+    )  # a later pass doesn't know the error's type
+    assert (await pg.events(mid))[-1] == "meeting.not_sent"
+    assert _not_sent_count("internal_error") == before + 1
+    lines = [
+        json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")
+    ]
+    assert ("sweep_item_given_up", f"give-up:due:{mid}") not in [
+        (e["event"], (e.get("fields") or {}).get("item_id")) for e in lines
+    ]
+    assert ("sweep_item_failed", f"give-up:due:{mid}") in [
+        (e["event"], (e.get("fields") or {}).get("item_id")) for e in lines
+    ]
+    assert pg.runtime.specs == []
+
+
+@pg_only
 async def test_pg_a_meeting_with_an_end_the_tick_gives_up_is_left_to_the_not_sent_sweep(
     pg,
 ):

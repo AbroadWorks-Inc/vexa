@@ -142,7 +142,7 @@ async def test_an_expired_item_is_given_up_at_once(capsys):
     assert (line["event"], line["level"]) == ("sweep_item_given_up", "error")
 
 
-async def test_the_give_up_action_runs_once_right_after_the_give_up(capsys):
+async def test_the_give_up_action_runs_right_after_the_give_up():
     failures = InMemoryItemFailures(max_failures=2)
     ended: list[str] = []
 
@@ -155,15 +155,115 @@ async def test_the_give_up_action_runs_once_right_after_the_give_up(capsys):
     for _ in range(2):
         await run_item(failures, "probe", "4", boom, on_given_up=end)
     assert ended == ["RuntimeError"]
+    assert (
+        failures.counts.get(("probe", "give-up:4")) is None
+    )  # it ran: nothing recorded
 
-    async def broken_end(error: BaseException) -> None:
+
+async def _pass(failures, listed, action, on_given_up) -> None:
+    from meeting_api.sweeps.item_failures import run_pages
+
+    async def read(after):
+        return [] if after else list(listed)
+
+    await run_pages(
+        failures,
+        "probe",
+        read,
+        limit=10,
+        after_of=lambda i: i,
+        item_id_of=lambda i: i,
+        user_id_of=lambda i: None,
+        action=action,
+        on_given_up=on_given_up,
+    )
+
+
+async def test_a_give_up_action_that_fails_runs_again_each_pass_bounded_logged_and_counted(
+    capsys,
+):
+    """The give-up action is an item of its own (``give-up:<item id>``): while the sweep still
+    lists the given-up item, each pass runs it again through ``run_item``, so its failures are
+    logged, counted and given up after ``SWEEP_MAX_ITEM_FAILURES``; then it stops."""
+    failures = InMemoryItemFailures(max_failures=2)
+    tries: list[object] = []
+
+    async def boom(item: str) -> None:
+        raise RuntimeError("poison row")
+
+    async def broken_end(item: str, error) -> None:
+        tries.append(None if error is None else type(error).__name__)
         raise ConnectionRefusedError("database is down")
 
-    capsys.readouterr()
-    assert await run_item(failures, "probe", "5", boom, on_given_up=broken_end) is False
-    assert await run_item(failures, "probe", "5", boom, on_given_up=broken_end) is False
+    failed, given_up = _count("probe", "failed"), _count("probe", "given_up")
+    for _ in range(5):
+        await _pass(failures, ["5"], boom, broken_end)
+    # passes 1-2 give the item up (the second runs the action), pass 3 gives the action up
+    assert tries == ["RuntimeError", None]
+    assert failures.gave_up == {("probe", "5"), ("probe", "give-up:5")}
+    assert _count("probe", "failed") == failed + 2
+    assert _count("probe", "given_up") == given_up + 2
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    assert [(e["event"], e["fields"]["item_id"]) for e in lines] == [
+        ("sweep_item_failed", "5"),
+        ("sweep_item_given_up", "5"),
+        ("sweep_item_failed", "give-up:5"),
+        ("sweep_item_given_up", "give-up:5"),
+    ]
+    assert lines[-1]["fields"]["error"] == "ConnectionRefusedError"
+    assert lines[-1]["level"] == "error"
+
+
+async def test_a_give_up_action_that_failed_runs_again_next_pass_until_it_ends_the_item():
+    listed = ["6"]
+    ends: list[object] = []
+
+    async def boom(item: str) -> None:
+        raise RuntimeError("poison row")
+
+    async def flaky_end(item: str, error) -> None:
+        ends.append(error)
+        if len(ends) == 1:
+            raise ConnectionRefusedError("database is down")
+        listed.remove(item)  # ended: the sweep no longer lists it
+
+    failures = InMemoryItemFailures(max_failures=2)
+    for _ in range(4):
+        await _pass(failures, listed, boom, flaky_end)
+    assert [type(e).__name__ if e else None for e in ends] == ["RuntimeError", None]
+    assert listed == []
+    assert ("probe", "give-up:6") not in failures.gave_up
+
+
+async def test_a_give_up_action_that_cannot_be_recorded_runs_again_next_pass(capsys):
+    """A database that is down when the action fails records nothing: the item is still given
+    up and still listed, so the next pass runs the action again."""
+
+    class DownOnce(InMemoryItemFailures):
+        down = True
+
+        async def failed(self, sweep, item_id, error):
+            if item_id.startswith("give-up:") and self.down:
+                self.down = False
+                raise ConnectionRefusedError("database is down")
+            return await super().failed(sweep, item_id, error)
+
+    failures = DownOnce(max_failures=1)
+    ends: list[object] = []
+
+    async def boom(item: str) -> None:
+        raise RuntimeError("poison row")
+
+    async def end(item: str, error) -> None:
+        ends.append(error)
+        if len(ends) == 1:
+            raise ConnectionRefusedError("database is down")
+
+    await _pass(failures, ["7"], boom, end)
+    await _pass(failures, ["7"], boom, end)
+    assert len(ends) == 2
     events = [json.loads(x)["event"] for x in capsys.readouterr().out.splitlines()]
-    assert events[-2:] == ["sweep_item_given_up", "sweep_item_give_up_action_failed"]
+    assert events == ["sweep_item_given_up", "sweep_item_failure_unrecorded"]
 
 
 async def test_a_given_up_item_its_sweep_still_lists_is_never_pruned(monkeypatch):

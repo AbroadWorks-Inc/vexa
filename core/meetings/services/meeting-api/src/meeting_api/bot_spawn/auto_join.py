@@ -23,7 +23,8 @@ limit can't be read, is one of the meeting's bounded sends (§6.9 F-K,
 and the ``BOT_SEND_MAX_ATTEMPTS``-th ends the meeting ``not_sent``; the not-sent sweep
 (``intake.sweeps``) ends it at its end if no bot ever went. A due row the tick itself gives up
 (§6.9 F-I) is the not-sent sweep's at its end, and an open-ended one, which has none, ends
-``not_sent`` (``internal_error``) at once (``intake.sweeps.end_given_up``).
+``not_sent`` (``internal_error``) at once (``intake.sweeps.end_given_up``); an end that fails is
+tried again each tick, bounded as the item ``give-up:due:<id>``.
 
 Defense in depth behind that dedup for an entry-less row: before spawning, the tick asks the repo
 which (user, platform, native) tuples a bot ALREADY owns (``list_live_meetings`` over
@@ -656,16 +657,18 @@ async def auto_join_tick(
         counters["due"] += len(due)
         return due
 
-    async def _gave_up(row: dict, error: BaseException) -> None:
+    async def _gave_up(row: dict, error: Optional[BaseException]) -> None:
         """A due row given up: an open-ended entry-managed meeting has no end for the not-sent
-        sweep to pass, so it ends ``not_sent`` now (``intake.sweeps.end_given_up``)."""
-        if not row.get("has_entries") or store is None:
+        sweep to pass, so it ends ``not_sent`` now (``intake.sweeps.end_given_up``). Run again
+        each tick that still lists the row until it ends (``run_pages``), when ``error`` (the
+        failure that gave the row up) is no longer known."""
+        if not row.get("has_entries") or row.get("scheduled_end_at") or store is None:
             return
+        why = "" if error is None else f" ({type(error).__name__})"
         await end_given_up(
             store, publisher, row["user_id"], row["id"],
             Room(row["platform"], row["native_meeting_id"]),
-            message="the scheduler gave this meeting up: sending its bot kept failing "
-            f"({type(error).__name__})",
+            message=f"the scheduler gave this meeting up: sending its bot kept failing{why}",
         )
 
     # Each read keeps its own give-up record: a meeting one gives up the other still works.
