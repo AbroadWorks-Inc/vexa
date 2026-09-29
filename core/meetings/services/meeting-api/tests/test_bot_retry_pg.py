@@ -2124,3 +2124,59 @@ async def test_pg_a_stale_row_whose_delete_keeps_failing_is_given_up(pg, sweep):
         i=str(mid),
     )
     assert (await pg.row(mid))["status"] == "stopping"
+
+
+# ── a first send failing after its claim gets the one finish (§6.9 F-FIN) ───────────────────
+
+
+async def test_pg_a_first_send_failing_after_its_claim_is_finished_like_any_end(pg):
+    """M1: the scheduler's first send whose spawn ended the meeting after its claim (here a
+    post-spawn write that failed on the last attempt) runs the meeting-level finish, exactly as
+    the retry driver's does."""
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class ContainerWriteFails(SqlAlchemyMeetingRepo):
+        async def set_bot_container(self, **kw):
+            raise RuntimeError("the database went away")
+
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+    app, sink, streams, finalized = await _finishing_app(pg)
+    await pg.tick(
+        FakeRuntimeClient(),
+        at=_now(),
+        finish_meeting=app.state.finish_meeting,
+        repo=ContainerWriteFails(pg.session_factory),
+    )
+    assert (await pg.row(mid))["status"] == "failed"
+    assert await pg.sessions(mid)
+    assert sink.events == ["bot.failed"]
+    assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
+
+
+async def test_pg_a_first_send_a_stop_raced_after_its_session_is_finished_as_a_stop(pg):
+    """M1: the raced-stop interlock after the session write ends the meeting; the first send
+    finishes it as the user's stop."""
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class StopAfterTheContainer(SqlAlchemyMeetingRepo):
+        async def set_bot_container(self, **kw):
+            row = await super().set_bot_container(**kw)
+            await self.merge_meeting_data(kw["meeting_id"], {"stop_requested": True})
+            return row
+
+    mid = await pg.calendar_meeting()
+    app, sink, _streams, finalized = await _finishing_app(pg)
+    await pg.tick(
+        FakeRuntimeClient(),
+        at=_now(),
+        finish_meeting=app.state.finish_meeting,
+        repo=StopAfterTheContainer(pg.session_factory),
+    )
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
+    assert sink.events == ["bot.failed"] and finalized == [mid]
+    typed = app.state.typed_webhooks[-1]
+    assert typed["data"]["status_change"]["transition_source"] == "user_stop"

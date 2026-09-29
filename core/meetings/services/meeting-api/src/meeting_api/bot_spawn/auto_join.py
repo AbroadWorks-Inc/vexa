@@ -478,6 +478,10 @@ async def auto_join_tick(
             # a manual "Send bot now" (or a racing sweep) already claimed it — success, not an error
             counters["already"] += 1
             return
+        current = None
+        if outcome.result == "failed":
+            current = await repo.get_meeting(row["id"])
+            await _finish_claimed_end(row["id"], outcome, current)
         if outcome.result == "failed" and outcome.code == "meeting_stopped":
             # The user stopped it between this tick's read and the spawn fence. Not an error and not
             # a backoff-worthy failure: the row is already terminalized as stopped by the fence, and
@@ -488,7 +492,6 @@ async def auto_join_tick(
                       fields={"reason": "the user stopped this meeting while the bot was starting"})
             return
         if outcome.result == "failed":
-            current = await repo.get_meeting(row["id"])
             if current is None or current.get("status") != "scheduled":
                 # The claim went through and the spawn failed after it: the spawn port already
                 # ended the meeting ``not_sent`` with the code and message.
@@ -520,6 +523,23 @@ async def auto_join_tick(
             log_event("auto_join_retry_finish_failed", audience="system", level="warning",
                       span="meetings.auto_join", meeting_id=str(meeting_id),
                       fields={"error": type(exc).__name__})
+
+    async def _finish_claimed_end(
+        meeting_id: int, outcome: Any, current: Optional[dict]
+    ) -> bool:
+        """A send whose spawn ended the meeting after its claim (its last attempt, the stop
+        interlock, a write after the create): the meeting-level finish, like every other end
+        (§6.9 F-FIN). A meeting someone else ended first has had its finish. Returns whether it
+        finished."""
+        if not outcome.claimed or (current or {}).get("status") not in FINISHED_STATUSES:
+            return False
+        ended = (current or {}).get("data") or {}
+        await _finish(
+            meeting_id,
+            stopped=bool(ended.get("stop_requested"))
+            or ended.get("completion_reason") == "stopped",
+        )
+        return True
 
     async def _end_waiting(
         row: dict, *, stopped: bool, change_reason: Optional[str] = None,
@@ -620,16 +640,7 @@ async def auto_join_tick(
             return
         counters["errors"] += 1
         current = await repo.get_meeting(row["id"])
-        if outcome.claimed and (current or {}).get("status") in FINISHED_STATUSES:
-            # This new bot failed after its claim and its spawn flow ended the meeting (the last
-            # attempt, or the stop fence): it gets the meeting-level finish like every other end.
-            # A meeting someone else ended first has had its finish.
-            ended = (current or {}).get("data") or {}
-            await _finish(
-                row["id"],
-                stopped=bool(ended.get("stop_requested"))
-                or ended.get("completion_reason") == "stopped",
-            )
+        if await _finish_claimed_end(row["id"], outcome, current):
             return
         still = retry.marker((current or {}).get("data"))
         if still is not None and still.get("at") == mark.get("at"):
