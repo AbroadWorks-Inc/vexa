@@ -10,10 +10,13 @@ Webhook subscriptions (§2.7): `webhook_subscriptions.py` serves `/v2/webhooks` 
 `url_guard.py` refuses private targets on save. The byte layout and the URL rules are pinned as
 shared vectors in `core/identity/contracts/webhook-subscriptions/`.
 `retention.py` is the daily single-flight sweep (§1.13) that deletes final deliveries older than
-`WEBHOOK_DELIVERY_RETENTION_DAYS`, then published outbox rows with no deliveries left.
+`WEBHOOK_DELIVERY_RETENTION_DAYS`, then published outbox rows with no deliveries left, each in
+batches of `WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE` rows and at most
+`WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES` batches of each a run.
 `metrics.py` (§1.13) serves `GET /metrics` from its own registry: the time left on each named key
-(`aw_api_token_expires_seconds{name,user_id}`, read from `api_tokens` at scrape time) and the
-retention sweep's last run (`aw_sweep_last_run_timestamp_seconds{sweep}`).
+(`aw_api_token_expires_seconds{name,user_id}`, read from `api_tokens` at scrape time), the
+retention sweep's last run (`aw_sweep_last_run_timestamp_seconds{sweep}`) and its runs by result
+(`aw_sweep_runs_total{sweep,result}`: `complete`, `capped`, `failed`).
 `identity_guard.py` (§1.10) answers 401 to any client request whose `x-user-id` doesn't carry the
 gateway's fresh `x-gateway-signature` (v2, over the user and every other identity header the gateway forwards, method, path, query and body; checked under the key its `kid` names in the `GATEWAY_IDENTITY_KEYS` ring); `/admin/*`, `/internal/*`,
 `/health*` and `/metrics` are exempt. The signing rule is pinned as shared vectors in

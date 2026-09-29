@@ -10,6 +10,9 @@ route table, so it is never public: the cluster's Prometheus scrapes the pod dir
   is served with no samples and the failure is logged.
 - ``aw_sweep_last_run_timestamp_seconds{sweep}``: when this replica last ran a sweep to its end;
   ``webhook-retention`` is stamped by ``retention.attach_retention``.
+- ``aw_sweep_runs_total{sweep,result}``: the runs of each sweep on this replica, by result
+  (``complete``, ``capped``, ``failed``); ``webhook-retention`` is counted by
+  ``retention.attach_retention``.
 
 ``user_id`` is the account that owns the key. No label carries a key, a secret, a URL or a query
 string: the values are key names, account ids and sweep names.
@@ -28,6 +31,7 @@ from typing import Any, Callable, Iterator, Optional, Protocol, Sequence
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
+    Counter,
     Gauge,
     generate_latest,
 )
@@ -40,6 +44,7 @@ __all__ = [
     "TokenExpiry",
     "render",
     "sweep_ran",
+    "sweep_run_counted",
 ]
 
 log = logging.getLogger("admin_api.metrics")
@@ -53,6 +58,12 @@ SWEEP_LAST_RUN = Gauge(
     ["sweep"],
     registry=REGISTRY,
 )
+SWEEP_RUNS = Counter(
+    "aw_sweep_runs_total",
+    "Sweep runs, by result.",
+    ["sweep", "result"],
+    registry=REGISTRY,
+)
 
 #: ``(user_id, name, expires_at)``: each named key's soonest expiry, naive UTC like ``api_tokens``.
 TokenRow = tuple[int, str, datetime]
@@ -64,6 +75,10 @@ class TokenExpiry(Protocol):
 
 def sweep_ran(sweep: str) -> None:
     SWEEP_LAST_RUN.labels(sweep=sweep).set(time.time())
+
+
+def sweep_run_counted(sweep: str, result: str) -> None:
+    SWEEP_RUNS.labels(sweep=sweep, result=result).inc()
 
 
 def _utcnow() -> datetime:

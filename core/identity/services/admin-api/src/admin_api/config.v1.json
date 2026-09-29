@@ -182,6 +182,20 @@
    "targets": ["helm"]
   },
   {
+   "key": "WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE",
+   "class": "defaulted",
+   "default": "1000",
+   "description": "webhooks (§1.13, §6.9 F-I): the daily retention sweep (app/retention.py) deletes old final deliveries, then published outbox rows with no deliveries left, at most this many rows per batch, each batch its own transaction. Not a positive whole number, admin-api refuses to start.",
+   "targets": []
+  },
+  {
+   "key": "WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES",
+   "class": "defaulted",
+   "default": "100",
+   "description": "webhooks (§1.13, §6.9 F-I): the per-run cap of the daily retention sweep: at most this many batches of each delete a run; a run that reaches it logs a warning, counts aw_sweep_runs_total{sweep=\"webhook-retention\",result=\"capped\"} and leaves the rest to the next run. Not a positive whole number, admin-api refuses to start.",
+   "targets": []
+  },
+  {
    "key": "WEBHOOK_PRIVATE_HOST_ALLOWLIST",
    "class": "defaulted",
    "default": "portal.notetaker.svc.cluster.local",

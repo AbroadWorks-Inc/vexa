@@ -96,15 +96,17 @@ def test_the_token_gauge_is_the_time_left_on_each_named_key():
 
 def test_every_metric_carries_exactly_its_labels():
     metrics.sweep_ran("webhook-retention")
+    metrics.sweep_run_counted("webhook-retention", "complete")
     text = scrape(StaticTokens([(1, "exporter", NOW + timedelta(days=1))]))
     labels = {
         f.name: {k for s in f.samples for k in s.labels}
         for f in text_string_to_metric_families(text)
-        if f.name.startswith("aw_")
+        if f.name.startswith("aw_") and not f.name.endswith("_created")
     }
     assert labels == {
         "aw_api_token_expires_seconds": {"name", "user_id"},
         "aw_sweep_last_run_timestamp_seconds": {"sweep"},
+        "aw_sweep_runs": {"sweep", "result"},
     }
 
 
