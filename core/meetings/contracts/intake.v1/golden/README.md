@@ -21,7 +21,8 @@ by `meeting-api/tests/test_intake_contract.py` through the Python `jsonschema` p
 - `Error.<code>.json` — one per §2.5 code: `invalid_request`, `unrecognized_link`,
   `platform_not_enabled`, `too_far_ahead`, `already_ended`, `unauthorized`, `forbidden`,
   `entry_not_found`, `meeting_not_found`, `meeting_not_finished`, `no_live_bot`, `rate_limited`,
-  `quota_exceeded`, `internal_error`, `unavailable`.
+  `quota_exceeded`, `internal_error`, `unavailable`, and the `/v2/webhooks` codes
+  `webhook_not_found` and `account_not_found`.
 
 `content-hash-vector.json` (one level up, NOT in this directory) is a separate, non-schema-shaped
 fixture — the shared `content_hash` test vector — deliberately kept out of `golden/` so

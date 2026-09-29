@@ -237,7 +237,7 @@
       }
     },
     "Error": {
-      "description": "Every error on the /v2 routes (§2.5): meeting-api's, and the refusals the gateway itself answers on a /v2 path (a bad key, a missing scope, a rate limit, a service it can't reach). `message` never echoes `metadata` or the URL query string (validation.py never builds one from either).",
+      "description": "Every error on the /v2 routes (§2.5): meeting-api's, admin-api's /v2/webhooks routes', and the refusals the gateway itself answers on a /v2 path (a bad key, a missing scope, a rate limit, a service it can't reach). `webhook_not_found` (404: a UUID that is not one of the account's subscriptions) and `account_not_found` (404: an account with no users row adds a subscription) come only from the /v2/webhooks routes. `message` never echoes `metadata` or the URL query string (validation.py never builds one from either).",
       "type": "object",
       "additionalProperties": false,
       "required": ["error"],
@@ -252,7 +252,8 @@
                 "invalid_request", "unrecognized_link", "platform_not_enabled", "too_far_ahead",
                 "already_ended", "unauthorized", "forbidden", "entry_not_found",
                 "meeting_not_found", "meeting_not_finished", "no_live_bot", "rate_limited",
-                "quota_exceeded", "unavailable", "internal_error"
+                "quota_exceeded", "unavailable", "internal_error", "webhook_not_found",
+                "account_not_found"
               ]
             },
             "message": { "type": "string" }

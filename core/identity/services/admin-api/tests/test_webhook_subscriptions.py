@@ -32,6 +32,7 @@ from admin_api.app.webhook_subscriptions import (
     EVENT_TYPES,
     HttpWebhookTestSender,
     WebhookDeps,
+    WebhookError,
     WebhookSettings,
     WebhookTestUnavailable,
 )
@@ -60,6 +61,25 @@ def _webhook_schema() -> dict:
 
 def test_event_types_are_the_sealed_webhook_v1_enum():
     assert EVENT_TYPES == set(_webhook_schema()["$defs"]["EventType"]["enum"])
+
+
+def _intake_contract() -> Path:
+    rel = Path("meetings") / "contracts" / "intake.v1"
+    for parent in Path(__file__).resolve().parents:
+        if (parent / rel / "intake.schema.json").is_file():
+            return parent / rel
+    raise FileNotFoundError(rel)
+
+
+def test_every_webhook_error_code_is_a_sealed_intake_v1_error_code():
+    """The §2.5 body the webhook routes answer is intake.v1's ``Error``: every code they send is
+    in its enum and has its golden."""
+    contract = _intake_contract()
+    schema = json.loads((contract / "intake.schema.json").read_text())
+    codes = set(schema["$defs"]["Error"]["properties"]["error"]["properties"]["code"]["enum"])
+    assert set(WebhookError.STATUS) <= codes
+    for code in WebhookError.STATUS:
+        assert (contract / "golden" / f"Error.{code}.json").is_file(), code
 
 
 @pytest.mark.parametrize(

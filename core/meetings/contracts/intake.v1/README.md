@@ -47,9 +47,12 @@ responses against the same shapes.
   one `Meeting`, and so does `POST /v2/meetings/{id}/stop`.
 - **`Erased`** — `DELETE /v2/meetings/{id}`: `{meeting, deleted: {objects, entries, outbox,
   deliveries}}`.
-- **`Error`** — every failure (§2.5): `{ "error": { "code", "message" } }`. `message` never echoes
-  `metadata` or the URL query string (see "Error messages" below). `code` is one of the fourteen
-  §2.5 values.
+- **`Error`** — every failure on a `/v2` route (§2.5): `{ "error": { "code", "message" } }`,
+  answered by meeting-api, by admin-api's `/v2/webhooks` routes, and by the gateway for its own
+  refusals on a `/v2` path. `message` never echoes `metadata` or the URL query string (see "Error
+  messages" below). `code` is one of the seventeen §2.5 values; `webhook_not_found` (404) and
+  `account_not_found` (404) come only from the `/v2/webhooks` routes
+  ([`identity/contracts/webhook-subscriptions`](../../../identity/contracts/webhook-subscriptions/)).
 
 ## Validation order (`meeting_api.intake.validation`)
 `parse_entry(body, *, now, max_days_ahead)` / `parse_remove(body)` are the ONLY way a request body
@@ -108,7 +111,7 @@ For a `join_now` entry, `start` is `now` at call time, so `content_hash` differs
 ## Conformance
 Goldens in [`golden/`](golden/) named `<Shape>.<case>.json`; `validate.mjs` (ajv) validates each
 against its `$def` (the filename prefix) — the identical convention `webhook.v1` uses. Run by
-`gate:schema`. One golden per `Reply` result (ten) and per `Error` code (fourteen), plus
+`gate:schema`. One golden per `Reply` result (ten) and per `Error` code (seventeen), plus
 representative `Entry`/`Remove`/`Meeting`/`EntryState` examples. `meeting-api/tests/test_intake_contract.py`
 additionally re-validates every golden through the Python `jsonschema` path (`_conforms`), so the
 two runtimes are proven to agree on the same fixtures, not just on paper.
