@@ -1615,3 +1615,24 @@ async def test_pg_a_waiting_meeting_proven_gone_ends_without_a_teardown(pg):
     await pg.tick(_gone(), at=_later(181))
     row = await pg.row(mid)
     assert row["status"] == "failed" and "unproven_teardown" not in row["data"]
+
+
+async def test_pg_a_raced_stop_whose_delete_fails_records_the_unproven_teardown(pg):
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    class StopRaces(SqlAlchemyMeetingRepo):
+        async def set_bot_container(self, **kw):
+            row = await super().set_bot_container(**kw)
+            await self.merge_meeting_data(kw["meeting_id"], {"stop_requested": True})
+            return row
+
+    mid = await pg.calendar_meeting()
+    runtime = _DeleteFails()
+    outcome = await pg.port(runtime, repo=StopRaces(pg.session_factory)).spawn_exact(
+        USER, mid
+    )
+    assert outcome.code == "meeting_stopped"
+    workload = runtime.specs[0]["workloadId"]
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
+    assert row["data"]["unproven_teardown"]["workload"] == workload

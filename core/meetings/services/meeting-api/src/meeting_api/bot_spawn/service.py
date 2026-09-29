@@ -1025,16 +1025,18 @@ async def request_bot(
     raced_status = (raced or {}).get("status")
     raced_stop = bool(((raced or {}).get("data") or {}).get("stop_requested"))
     if raced_stop or raced_status in ("stopping", "completed", "failed"):
-        try:
-            await runtime.delete_workload(workload_id)
+        # The workload runs while its meeting ends: deleted, or recorded for the reconcile sweep
+        # to delete, bounded (§6.9 F-K2) — never forgotten.
+        verdict = await _teardown_or_record()
+        if verdict == "confirmed":
             log_event("bot_spawn_raced_stop_torn_down", audience="system", level="warning",
                       span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
                       fields={"workload_id": workload_id, "raced_status": raced_status,
                               "stop_requested": raced_stop})
-        except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the spawn
+        else:
             log_event("bot_spawn_raced_stop_teardown_failed", audience="system", level="error",
                       span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                      fields={"workload_id": workload_id, "error": str(teardown_err)})
+                      fields={"workload_id": workload_id, "verdict": verdict})
         if raced_stop:
             # The run is over before it began, and the row must SAY SO now rather than sit
             # non-terminal until a reaper guesses. Truthfully: `failed` (the FSM's only legal
