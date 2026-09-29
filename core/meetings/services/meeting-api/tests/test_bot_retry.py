@@ -992,3 +992,16 @@ async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
         == 0
     )
     assert finished == []
+
+
+
+async def test_a_failing_finish_after_a_committed_stop_does_not_fail_the_stop():
+    h, _, stop, commands, _, mid = await _waiting_intake()
+
+    async def broken_finish(meeting_id: int, **kw) -> None:
+        raise RuntimeError("the database went away")
+
+    stop.finish_meeting = broken_finish
+    await stop.stop_live(1, mid, outcome=None)  # the route answers the meeting, not a 500
+    assert h.store.view(mid).status == "failed"
+    assert commands.published == []

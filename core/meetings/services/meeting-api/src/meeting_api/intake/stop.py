@@ -145,7 +145,18 @@ class IntakeStop:
             # A meeting waiting for its next bot had no bot to tell: it has ended, and gets the
             # meeting-level finish instead.
             if self.finish_meeting is not None:
-                await self.finish_meeting(stop.meeting_id, stopped=True)
+                try:
+                    await self.finish_meeting(stop.meeting_id, stopped=True)
+                except Exception as exc:  # the stop is committed: its answer stands
+                    log_event(
+                        "intake_stop_finish_failed",
+                        audience="operator",
+                        level="warning",
+                        span="meetings.intake.stop",
+                        user_id=user_id,
+                        meeting_id=str(stop.meeting_id),
+                        fields={"error": type(exc).__name__},
+                    )
             return
         try:
             await stop_meeting_row(
