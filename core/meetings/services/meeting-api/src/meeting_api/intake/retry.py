@@ -39,7 +39,7 @@ It returns ``None``, having written nothing, when the failure isn't retried.
 A waiting meeting is bounded by ``deadline``: ``due_at`` plus ``MEETING_UNTRACKED_GRACE_SEC``. A
 failed workload not proven gone by then, or a new bot not sent by then, ends the meeting
 (``overdue``: ``workload_not_proven`` / ``retry_not_sent``); the retry driver and the reconcile
-sweep both apply it.
+sweep both apply that one rule.
 
 A waiting meeting leaves ``requested`` one of two ways. A new bot claims it once ``proven``: the
 claim writes ``claimed(data)`` (the marker's failure moved into ``completion_history``, the marker
@@ -163,8 +163,15 @@ def deadline(mark: Mapping[str, Any], untracked_grace: float) -> Optional[dateti
     return None if due is None else due + timedelta(seconds=untracked_grace)
 
 
-def overdue(mark: Mapping[str, Any], limit: datetime) -> tuple[str, str]:
-    """The change reason and message a waiting meeting past its ``deadline`` ends with."""
+def overdue(
+    mark: Mapping[str, Any], untracked_grace: float, now: datetime
+) -> Optional[tuple[str, str]]:
+    """The change reason and message a waiting meeting past its ``deadline`` at ``now`` ends
+    with, or ``None`` while it may still wait. The retry driver and the reconcile sweep both end
+    a waiting meeting by this one rule."""
+    limit = deadline(mark, untracked_grace)
+    if limit is None or now < limit:
+        return None
     if mark.get("proven_gone"):
         return "retry_not_sent", f"no new bot was sent by {iso_utc(limit)}"
     if not mark.get("workload"):

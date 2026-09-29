@@ -1061,20 +1061,28 @@ async def test_a_failing_finish_after_a_committed_stop_does_not_fail_the_stop():
 
 def test_an_overdue_reason_never_names_a_missing_workload():
     limit = datetime(2026, 9, 29, 9, 21, tzinfo=UTC)
-    code, message = retry.overdue({"workload": None, "proven_gone": False}, limit)
+    due = "2026-09-29T09:11:00Z"  # + 600 s of grace: the deadline is ``limit``
+
+    def overdue(**mark):
+        return retry.overdue({"due_at": due, **mark}, 600, limit)
+
+    code, message = overdue(workload=None, proven_gone=False)
     assert code == "workload_not_proven" and "None" not in message
     assert message == (
         "the failed bot's start recorded no workload, so none could be proven gone by "
         "2026-09-29T09:21:00Z"
     )
-    code, message = retry.overdue({"workload": "mtg-5-ab", "proven_gone": False}, limit)
+    code, message = overdue(workload="mtg-5-ab", proven_gone=False)
     assert message == (
         "the failed bot's workload mtg-5-ab was not proven gone by 2026-09-29T09:21:00Z"
     )
-    assert retry.overdue({"workload": None, "proven_gone": True}, limit) == (
+    assert overdue(workload=None, proven_gone=True) == (
         "retry_not_sent",
         "no new bot was sent by 2026-09-29T09:21:00Z",
     )
+    early = limit - timedelta(seconds=1)
+    assert retry.overdue({"due_at": due, "workload": "w"}, 600, early) is None
+    assert retry.overdue({"workload": "w"}, 600, limit) is None  # no due_at: no deadline
 
 
 @pytest.mark.parametrize("since", [None, "not a time"])

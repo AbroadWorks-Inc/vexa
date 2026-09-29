@@ -583,7 +583,7 @@ async def end_overdue_retries(
     finish_meeting: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> int:
     """§6.9 F-K2's backstop: every meeting waiting for its next bot past its deadline
-    (``intake.retry.deadline``: ``due_at`` + ``untracked_grace``) ends ``failed`` through
+    (``intake.retry.overdue``: ``due_at`` + ``untracked_grace``) ends ``failed`` through
     ``repo.end_retry``, whatever the retry driver did (it may have given the item up), read a page
     of ``SWEEP_BATCH_SIZE`` at a time by meeting id, each through ``run_item`` under its own sweep
     name (§6.9 F-I, ``sweeps.item_failures.run_pages``). Before its deadline a waiting meeting is
@@ -601,19 +601,16 @@ async def end_overdue_retries(
     page_size = sweep_batch_size()
     ended = 0
 
-    def overdue(rows: Any) -> list:
-        out = []
-        for row in rows:
-            mark = retry.marker(row.get("data"))
-            limit = None if mark is None else retry.deadline(mark, untracked_grace)
-            if mark is not None and limit is not None and now >= limit:
-                out.append(row)
-        return out
+    def ending(row: dict) -> Optional[tuple[str, str]]:
+        mark = retry.marker(row.get("data"))
+        return None if mark is None else retry.overdue(mark, untracked_grace, now)
 
     async def end(row: dict) -> None:
         nonlocal ended
-        mark = retry.marker(row.get("data")) or {}
-        code, message = retry.overdue(mark, retry.deadline(mark, untracked_grace) or now)
+        over = ending(row)
+        if over is None:
+            return
+        code, message = over
         if await repo.end_retry(
             meeting_id=row["id"], change_reason=code, message=message
         ) is None:
@@ -629,7 +626,7 @@ async def end_overdue_retries(
             lambda after: repo.list_retry_meetings(after=after, limit=page_size),
             limit=page_size, after_of=lambda row: row["id"],
             item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row.get("user_id"),
-            action=end, select=overdue,
+            action=end, select=lambda rows: [row for row in rows if ending(row)],
         )
     except Exception:  # noqa: BLE001 — best-effort; retried next sweep
         log.exception("nonterminal-reconcile: list_retry_meetings failed")

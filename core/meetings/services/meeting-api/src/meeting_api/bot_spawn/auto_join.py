@@ -588,9 +588,9 @@ async def auto_join_tick(
                 log=logging.getLogger("meeting_api.auto_join.retry"),
             )
             if verdict != "proven":
-                limit = retry.deadline(mark, untracked_grace)
-                if limit is not None and now >= limit:
-                    code, message = retry.overdue(mark, limit)
+                ending = retry.overdue(mark, untracked_grace, now)
+                if ending is not None:
+                    code, message = ending
                     await _end_waiting(row, stopped=False, change_reason=code, message=message)
                     return
                 log_event("auto_join_retry_waiting_for_workload", audience="system",
