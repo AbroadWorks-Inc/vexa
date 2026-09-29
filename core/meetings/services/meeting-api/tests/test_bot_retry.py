@@ -1277,6 +1277,199 @@ async def test_a_runtime_5xx_on_a_delete_is_not_a_refusal(code, refused):
     assert caught.value.refused is refused
 
 
+# ── the upstream reconcile loops: paged, each row bounded (§6.9 F-I) ──────────────────────
+
+
+def _reconcile_items(sweep: str, result: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_sweep_items_total", {"sweep": sweep, "result": result}
+    )
+    return value or 0.0
+
+
+class _PagedStopping:
+    """A repo whose stale ``stopping`` rows are read a page at a time by meeting id."""
+
+    def __init__(self, rows) -> None:
+        self.rows = sorted(rows)
+        self.reads: list[tuple] = []
+
+    async def list_stale_stopping(self, *, older_than_seconds, after=None, limit=None):
+        self.reads.append((after, limit))
+        rows = [r for r in self.rows if after is None or r[0] > after]
+        return rows if limit is None else rows[:limit]
+
+
+class _DeleteDown:
+    """A runtime whose every delete gets a 5xx; its workloads report ``state``."""
+
+    def __init__(self, state: str = "running") -> None:
+        self.state = state
+        self.deleted: list[str] = []
+
+    async def get_workload(self, workload_id):
+        return {"workloadId": workload_id, "state": self.state}
+
+    async def delete_workload(self, workload_id):
+        from meeting_api.bot_spawn.ports import SpawnFailed
+
+        self.deleted.append(workload_id)
+        raise SpawnFailed("runtime kernel delete_workload returned 503", refused=False)
+
+
+async def _ok(body):
+    return 200
+
+
+async def test_the_stale_stopping_sweep_reads_its_rows_in_pages(monkeypatch):
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
+
+    monkeypatch.setenv("SWEEP_BATCH_SIZE", "2")
+    repo = _PagedStopping([(i, f"sess-{i}", f"mtg-{i}-w") for i in (3, 5, 8)])
+    runtime = FakeRuntimeClient()
+    n = await reconcile_stale_stopping_sweep(
+        repo,
+        runtime,
+        _ok,
+        stop_grace=45,
+        log=_Log(),
+        item_failures=InMemoryItemFailures(max_failures=5),
+    )
+    assert n == 3 and runtime.deleted == ["mtg-3-w", "mtg-5-w", "mtg-8-w"]
+    assert repo.reads == [(None, 2), (5, 2)]
+
+
+async def test_a_stopping_row_whose_delete_keeps_failing_is_given_up_and_counted():
+    """I2: a stuck ``stopping`` row whose delete keeps failing is one of the sweep's bounded
+    items: counted each pass, given up after ``SWEEP_MAX_ITEM_FAILURES``, skipped after.
+    """
+    from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
+
+    repo = _PagedStopping([(9, "sess-9", "mtg-9-x")])
+    runtime = _DeleteDown()
+    failures = InMemoryItemFailures(max_failures=2)
+    failed = _reconcile_items("stale-stopping", "failed")
+    given_up = _reconcile_items("stale-stopping", "given_up")
+    for _ in range(3):
+        assert (
+            await reconcile_stale_stopping_sweep(
+                repo,
+                runtime,
+                _ok,
+                stop_grace=45,
+                log=_Log(),
+                item_failures=failures,
+            )
+            == 0
+        )
+    assert runtime.deleted == ["mtg-9-x", "mtg-9-x"]  # the third pass skips it
+    assert failures.gave_up == {("stale-stopping", "9")}
+    assert _reconcile_items("stale-stopping", "failed") == failed + 1
+    assert _reconcile_items("stale-stopping", "given_up") == given_up + 1
+
+
+async def test_a_stopping_row_the_runtime_404s_is_left_to_the_general_escalation():
+    """A 404 is not the stopping sweep's failure: the general sweep's bounded untracked
+    escalation owns it, so it is never given up here."""
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
+
+    repo = _PagedStopping([(1, "sess-1", "mtg-1-w")])
+    failures = InMemoryItemFailures(max_failures=1)
+    for _ in range(2):
+        await reconcile_stale_stopping_sweep(
+            repo,
+            FakeRuntimeClient(workloads={}),
+            _ok,
+            stop_grace=45,
+            log=_Log(),
+            item_failures=failures,
+        )
+    assert failures.counts == {}
+
+
+def _stale_repo(n: int = 1):
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    repo = InMemoryMeetingRepo()
+    for i in range(1, n + 1):
+        repo._meetings[i] = {
+            "id": i,
+            "user_id": USER,
+            "platform": "google_meet",
+            "native_meeting_id": f"kxo-misr-av{i}",
+            "platform_specific_id": f"kxo-misr-av{i}",
+            "status": "stopping",
+            "bot_container_id": f"mtg-{i}-w",
+            "data": {},
+            "updated_at": "2026-09-01T09:00:00Z",
+        }
+        repo.sessions.append({"meeting_id": i, "session_uid": f"sess-{i}"})
+    return repo
+
+
+async def test_the_general_reconcile_sweep_reads_its_rows_in_pages(monkeypatch):
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    monkeypatch.setenv("SWEEP_BATCH_SIZE", "2")
+    repo = _stale_repo(3)
+    reads: list[tuple] = []
+    real = repo.list_stale_nonterminal
+
+    async def paged(**kw):
+        reads.append((kw.get("after"), kw.get("limit")))
+        return await real(**kw)
+
+    repo.list_stale_nonterminal = paged
+    posted: list[dict] = []
+
+    async def post(body):
+        posted.append(body)
+        return 200
+
+    runtime = FakeRuntimeClient()
+    await reconcile_stale_nonterminal_sweep(
+        repo,
+        runtime,
+        post,
+        stop_grace=45,
+        active_grace=300,
+        log=_Log(),
+        item_failures=InMemoryItemFailures(max_failures=5),
+    )
+    assert [b["connection_id"] for b in posted] == ["sess-1", "sess-2", "sess-3"]
+    assert reads == [(None, 2), (2, 2)]
+
+
+async def test_a_stale_row_whose_delete_keeps_failing_is_given_up_and_counted():
+    """I2: the general sweep's row whose delete keeps failing is counted each pass and given
+    up after ``SWEEP_MAX_ITEM_FAILURES``, under its own sweep name."""
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    repo = _stale_repo()
+    runtime = _DeleteDown()
+    failures = InMemoryItemFailures(max_failures=2)
+    given_up = _reconcile_items("stale-nonterminal", "given_up")
+    for _ in range(3):
+        await reconcile_stale_nonterminal_sweep(
+            repo,
+            runtime,
+            _ok,
+            stop_grace=45,
+            active_grace=300,
+            log=_Log(),
+            item_failures=failures,
+        )
+    assert runtime.deleted == ["mtg-1-w", "mtg-1-w"]
+    assert failures.gave_up == {("stale-nonterminal", "1")}
+    assert _reconcile_items("stale-nonterminal", "given_up") == given_up + 1
+    assert repo._meetings[1]["status"] == "stopping"
+
+
 async def test_the_sweep_reads_the_waiting_meetings_in_pages(monkeypatch):
     import copy
 
@@ -1433,7 +1626,12 @@ async def test_a_containerless_stopping_row_has_its_workload_deleted_before_it_c
         posted.append(body)
 
     await reconcile_stale_stopping_sweep(
-        repo, runtime, post, stop_grace=0, log=_QuietLog()
+        repo,
+        runtime,
+        post,
+        stop_grace=0,
+        log=_QuietLog(),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert runtime.deleted == [workload]
     assert [p["status"] for p in posted] == ["completed"]

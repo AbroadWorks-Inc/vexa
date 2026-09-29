@@ -88,6 +88,21 @@ def session_workload(
     return workload_id_for(meeting_id, session_uid)
 
 
+#: The stop-reconcile sweep's name in ``sweep_item_failures`` and ``aw_sweep_items_total``.
+STALE_STOPPING_SWEEP = "stale-stopping"
+#: The general reconcile sweep's name in ``sweep_item_failures`` and ``aw_sweep_items_total``.
+STALE_NONTERMINAL_SWEEP = "stale-nonterminal"
+
+
+class TeardownNotConfirmed(Exception):
+    """A stale meeting's workload delete was not confirmed this pass (one of its bounded tries)."""
+
+
+class UntrackedEscalationFailed(Exception):
+    """A continuously untracked meeting's ``failed`` could not be posted this pass (one of its
+    bounded tries)."""
+
+
 async def reconcile_stale_stopping_sweep(
     repo: Any,
     runtime: Optional[Any],
@@ -95,29 +110,48 @@ async def reconcile_stale_stopping_sweep(
     *,
     stop_grace: float,
     log: Any,
+    item_failures: "ItemFailures",
 ) -> int:
-    """Run ONE sweep. Returns the number of stale ``stopping`` meetings reconciled."""
-    stale = await repo.list_stale_stopping(older_than_seconds=stop_grace)
+    """Run ONE sweep, a page of ``SWEEP_BATCH_SIZE`` stale ``stopping`` meetings at a time by id,
+    each through ``run_item`` (§6.9 F-I, ``sweeps.item_failures.run_pages``): a delete not
+    confirmed, or a completion that raises, is one of the row's ``SWEEP_MAX_ITEM_FAILURES``
+    tries. A 404 is not: the general sweep's bounded untracked escalation owns it. Returns the
+    number of stale ``stopping`` meetings reconciled."""
+    from ..sweeps.item_failures import run_pages, sweep_batch_size
+
+    limit = sweep_batch_size()
     reconciled = 0
-    for meeting_id, session_uid, bot_container_id in stale:
+
+    async def one(row: tuple) -> None:
+        nonlocal reconciled
+        meeting_id, session_uid, bot_container_id = row
         bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         # 1. GUARANTEE teardown FIRST — and require confirmation. Completing before a confirmed
         #    kill is how the incident produced a `completed` meeting with a live ghost bot.
         #    (Untracked here is NOT escalated: the general sweep owns the bounded escalation.)
-        if await teardown_verdict(
-            runtime, bot_container_id, meeting_id=meeting_id, log=log
-        ) != "confirmed":
-            continue  # stays `stopping` (truthful); retried next sweep, loud in the logs
-        # 2. Complete it through the bot's own lifecycle callback.
-        try:
-            status = await post_lifecycle(
-                {"connection_id": session_uid, "status": "completed", "completion_reason": "stopped"}
+        verdict = await teardown_verdict(runtime, bot_container_id, meeting_id=meeting_id, log=log)
+        if verdict == "untracked":
+            return  # stays `stopping` (truthful); the general sweep escalates it, bounded
+        if verdict != "confirmed":
+            raise TeardownNotConfirmed(
+                f"delete of {bot_container_id} for meeting {meeting_id} not confirmed ({verdict})"
             )
-            reconciled += 1
-            log.info("stop-reconcile completed stuck meeting %s (session %s) → %s",
-                     meeting_id, session_uid, status)
-        except Exception:
-            log.exception("stop-reconcile completion failed for meeting %s", meeting_id)
+        # 2. Complete it through the bot's own lifecycle callback.
+        status = await post_lifecycle(
+            {"connection_id": session_uid, "status": "completed", "completion_reason": "stopped"}
+        )
+        reconciled += 1
+        log.info("stop-reconcile completed stuck meeting %s (session %s) → %s",
+                 meeting_id, session_uid, status)
+
+    await run_pages(
+        item_failures, STALE_STOPPING_SWEEP,
+        lambda after: repo.list_stale_stopping(
+            older_than_seconds=stop_grace, after=after, limit=limit
+        ),
+        limit=limit, after_of=lambda row: row[0], item_id_of=lambda row: str(row[0]),
+        user_id_of=lambda row: None, action=one,
+    )
     return reconciled
 
 
@@ -388,7 +422,10 @@ async def reconcile_stale_nonterminal_sweep(
     it fast), ``preactive_grace`` for a bot that has not reached the meeting yet (it holds a lobby
     budget from the control plane — our patience must OUTLAST the deadline we issued, #862), and
     ``active_grace`` for everything else (a longer idle so a momentarily-quiet live bot is not reaped).
-    Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
+    Read a page of ``SWEEP_BATCH_SIZE`` meetings at a time by id, each through ``run_item`` (§6.9
+    F-I, ``sweeps.item_failures.run_pages``): a delete not confirmed (other than a 404, which the
+    untracked window bounds) or a terminal that can't be posted is one of the row's
+    ``SWEEP_MAX_ITEM_FAILURES`` tries. Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
     ``list_stale_nonterminal``, and a redelivered terminal is an idempotent 200 no-op at the callback.
 
     Returns the number of meetings reconciled."""
@@ -401,19 +438,17 @@ async def reconcile_stale_nonterminal_sweep(
     await retry_unproven_teardowns(
         repo, runtime, untracked_grace=untracked_grace, log=log, failures=item_failures
     )
-    try:
-        stale = await repo.list_stale_nonterminal(
-            stop_grace=stop_grace, active_grace=active_grace,
-            preactive_grace=active_grace if preactive_grace is None else preactive_grace,
-        )
-    except Exception:
-        log.exception("nonterminal-reconcile: list_stale_nonterminal failed")
-        return 0
+    from ..sweeps.item_failures import run_pages, sweep_batch_size
+
+    limit = sweep_batch_size()
     reconciled = 0
     tracker = _UNTRACKED_SINCE if untracked_since is None else untracked_since
     seen_untracked: set = set()
     now = time.monotonic()
-    for meeting_id, status, session_uid, bot_container_id, stop_requested in stale:
+
+    async def one(row: tuple) -> None:
+        nonlocal reconciled
+        meeting_id, status, session_uid, bot_container_id, stop_requested = row
         bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         probe, probe_info = "unknown", None
         # LIVENESS GATE (the correctness fix): for a status where a bot may be alive and legitimately
@@ -442,12 +477,10 @@ async def reconcile_stale_nonterminal_sweep(
                 # `failed` with the evidence note instead of looping this error forever.
                 if _untracked_window_elapsed(
                     tracker, meeting_id, seen_untracked, grace=untracked_grace, now=now
-                ) and await _escalate_untracked_zombie(
-                    meeting_id, status, session_uid, bot_container_id, post_lifecycle,
-                    tracker, grace=untracked_grace, log=log, stop_requested=stop_requested,
                 ):
-                    reconciled += 1
-                continue
+                    await escalate(meeting_id, status, session_uid, bot_container_id,
+                                   stop_requested, grace=untracked_grace)
+                return
             if probe != "gone":
                 # ALIVE or UNKNOWN → do not reap a possibly-live, bot-present meeting.
                 # (No bot_container_id at all falls through to the time-based reap — there is no
@@ -455,7 +488,7 @@ async def reconcile_stale_nonterminal_sweep(
                 log.info("nonterminal-reconcile: skip live/unknown bot for meeting %s "
                          "(status %s, workload %s, probe=%s)",
                          meeting_id, status, bot_container_id, probe)
-                continue
+                return
         # GUARANTEE teardown BEFORE the FSM advances (CC6 + the incident fix): a terminal meeting
         # must never leave a live container behind. Unconfirmed (runtime 404 / delete failure) →
         # the meeting keeps its current status, loud in the logs, retried next sweep — except a
@@ -471,15 +504,20 @@ async def reconcile_stale_nonterminal_sweep(
             # process backend the bot dies WITH the runtime, so without this a `stopping` row sits
             # untracked for the full untracked_grace (10 min default) — and the in-process window resets
             # on every restart, so a redeploy burst can keep it stuck ~indefinitely (the observed bug).
+            # A 404 is bounded by that window, never an item failure; any other unconfirmed delete
+            # is one of the row's bounded tries (§6.9 F-I).
+            if verdict != "untracked":
+                raise TeardownNotConfirmed(
+                    f"delete of {bot_container_id} for meeting {meeting_id} not confirmed "
+                    f"({verdict})"
+                )
             esc_grace = stop_grace if status == "stopping" else untracked_grace
-            if verdict == "untracked" and _untracked_window_elapsed(
+            if _untracked_window_elapsed(
                 tracker, meeting_id, seen_untracked, grace=esc_grace, now=now
-            ) and await _escalate_untracked_zombie(
-                meeting_id, status, session_uid, bot_container_id, post_lifecycle,
-                tracker, grace=esc_grace, log=log, stop_requested=stop_requested,
             ):
-                reconciled += 1
-            continue
+                await escalate(meeting_id, status, session_uid, bot_container_id,
+                               stop_requested, grace=esc_grace)
+            return
         terminal = "failed" if status in _PRE_ACTIVE_NONTERMINAL else "completed"
         body: dict[str, Any] = {"connection_id": session_uid, "status": terminal}
         if terminal == "completed":
@@ -512,13 +550,39 @@ async def reconcile_stale_nonterminal_sweep(
                 body["join_evidence"] = evidence
             if stop_requested:
                 body["data"] = {"stop_requested": True}
-        try:
-            result = await post_lifecycle(body)
-            reconciled += 1
-            log.info("nonterminal-reconcile %s meeting %s (status %s, session %s) → %s",
-                     terminal, meeting_id, status, session_uid, result)
-        except Exception:
-            log.exception("nonterminal-reconcile failed for meeting %s (status %s)", meeting_id, status)
+        result = await post_lifecycle(body)
+        reconciled += 1
+        log.info("nonterminal-reconcile %s meeting %s (status %s, session %s) → %s",
+                 terminal, meeting_id, status, session_uid, result)
+
+    async def escalate(
+        meeting_id: Any, status: str, session_uid: str, bot_container_id: Optional[str],
+        stop_requested: bool, *, grace: float,
+    ) -> None:
+        nonlocal reconciled
+        if not await _escalate_untracked_zombie(
+            meeting_id, status, session_uid, bot_container_id, post_lifecycle,
+            tracker, grace=grace, log=log, stop_requested=stop_requested,
+        ):
+            raise UntrackedEscalationFailed(
+                f"meeting {meeting_id}'s untracked escalation could not be posted"
+            )
+        reconciled += 1
+
+    try:
+        await run_pages(
+            item_failures, STALE_NONTERMINAL_SWEEP,
+            lambda after: repo.list_stale_nonterminal(
+                stop_grace=stop_grace, active_grace=active_grace,
+                preactive_grace=active_grace if preactive_grace is None else preactive_grace,
+                after=after, limit=limit,
+            ),
+            limit=limit, after_of=lambda row: row[0], item_id_of=lambda row: str(row[0]),
+            user_id_of=lambda row: None, action=one,
+        )
+    except Exception:
+        log.exception("nonterminal-reconcile: list_stale_nonterminal failed")
+        return ended
     # RECOVERY resets the window: any meeting NOT observed untracked in THIS sweep — the runtime
     # re-adopted it (probe alive/gone), a bot callback bumped/terminated the row (no longer listed
     # stale), or it was reconciled — drops its tracker entry. Only CONTINUOUS untracked escalates.

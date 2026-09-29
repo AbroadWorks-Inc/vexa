@@ -20,6 +20,7 @@ from meeting_api.bot_spawn.ports import MaxBotsExceeded
 from meeting_api.bot_spawn.service import request_bot
 from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
 from meeting_api.recordings import upload_chunk
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
 from meeting_api.recordings.fakes import InMemoryRecordingRepo, InMemoryStorage
 
 USER = 7
@@ -113,8 +114,9 @@ class _ManyStaleRepo:
     def __init__(self, n):
         self._stale = [(i, f"sess-{i}", f"mtg-{i}-wl") for i in range(n)]
 
-    async def list_stale_stopping(self, *, older_than_seconds):
-        return list(self._stale)
+    async def list_stale_stopping(self, *, older_than_seconds, after=None, limit=None):
+        rows = [r for r in self._stale if after is None or r[0] > after]
+        return rows if limit is None else rows[:limit]
 
 
 async def test_stress_reconcile_kills_all_stale_workloads():
@@ -133,6 +135,7 @@ async def test_stress_reconcile_kills_all_stale_workloads():
 
     count = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("stress"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert count == n
     assert len(posted) == n, "every stale row must be completed via the lifecycle callback"

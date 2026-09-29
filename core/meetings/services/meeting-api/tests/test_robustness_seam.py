@@ -32,6 +32,7 @@ from meeting_api.bot_spawn import MaxBotsExceeded, SpawnFailed, request_bot
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.ingest import consume_segments, ingest
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
 from gateway_identity import via_gateway
 from internal_callers import BOT
 
@@ -371,8 +372,9 @@ class _StaleStoppingRepo:
     def __init__(self, stale):
         self._stale = stale
 
-    async def list_stale_stopping(self, *, older_than_seconds):
-        return list(self._stale)
+    async def list_stale_stopping(self, *, older_than_seconds, after=None, limit=None):
+        rows = [r for r in self._stale if after is None or r[0] > after]
+        return rows if limit is None else rows[:limit]
 
 
 async def test_stop_reconcile_kills_orphan_workload():
@@ -393,6 +395,7 @@ async def test_stop_reconcile_kills_orphan_workload():
 
     n = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
 
     assert n == 1
@@ -417,6 +420,7 @@ async def test_stop_reconcile_no_container_id_does_not_crash():
 
     n = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert n == 1
     assert runtime.deleted == [workload_id_for(7, "sess-7")]
@@ -446,6 +450,7 @@ async def test_stop_reconcile_kill_failure_never_completes_the_row():
 
     n = await reconcile_stale_stopping_sweep(
         repo, _ThrowingRuntime(), post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert n == 1, "only the CONFIRMED teardown completes; the failed one is retried next sweep"
     assert [b["connection_id"] for b in posted] == ["sess-10"], (
@@ -472,6 +477,7 @@ async def test_stop_reconcile_runtime_404_never_completes_the_row():
 
     n = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert n == 0
     assert posted == [], "a runtime 404 must never advance the meeting to completed"

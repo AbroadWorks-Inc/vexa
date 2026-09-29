@@ -526,6 +526,7 @@ def _attach_background_loops(
                 )
             await reconcile_stale_stopping_sweep(
                 meeting_repo, runtime, _post_lifecycle, stop_grace=stop_grace, log=log,
+                item_failures=item_failures,  # §6.9 F-I
             )
 
         while True:

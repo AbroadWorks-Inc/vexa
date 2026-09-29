@@ -1978,3 +1978,149 @@ async def test_pg_a_retry_marker_never_names_an_earlier_bots_container(pg, monke
     )
     await port.spawn_exact(USER, mid)
     assert (await pg.row(mid))["data"]["bot_retry"]["workload"] is None
+
+
+# ── the upstream reconcile loops, paged and bounded (§6.9 F-I) ──────────────────────────────
+
+
+async def _stale_rows(pg: Pg, status: str, n: int) -> list[int]:
+    """``n`` meetings with a session and a workload, quiet in ``status`` for an hour."""
+    ids = []
+    for i in range(n):
+        row = await pg.repo.create_meeting(
+            user_id=USER,
+            platform="google_meet",
+            native_meeting_id=f"abc-defg-hi{i}",
+            data={},
+        )
+        await pg.repo.create_session(meeting_id=row["id"], session_uid=f"sess-{i}")
+        await pg.execute(
+            "UPDATE meetings SET status = :s, bot_container_id = :w, "
+            "updated_at = now() - interval '1 hour' WHERE id = :m",
+            s=status,
+            w=f"mtg-{row['id']}-w",
+            m=row["id"],
+        )
+        ids.append(row["id"])
+    return ids
+
+
+async def test_pg_the_stale_listings_read_a_page_by_meeting_id(pg):
+    stopping = await _stale_rows(pg, "stopping", 3)
+    page = await pg.repo.list_stale_stopping(older_than_seconds=45, limit=2)
+    assert [r[0] for r in page] == stopping[:2]
+    rest = await pg.repo.list_stale_stopping(
+        older_than_seconds=45, after=stopping[1], limit=2
+    )
+    assert rest == [(stopping[2], "sess-2", f"mtg-{stopping[2]}-w")]
+    assert await pg.repo.list_stale_stopping(older_than_seconds=7200) == []
+    general = await pg.repo.list_stale_nonterminal(
+        stop_grace=45, active_grace=300, after=stopping[0], limit=1
+    )
+    assert general == [
+        (stopping[1], "stopping", "sess-1", f"mtg-{stopping[1]}-w", False)
+    ]
+
+
+async def test_pg_the_reconcile_sweeps_work_every_page(pg, monkeypatch):
+    from meeting_api.lifecycle.reconcile import (
+        reconcile_stale_nonterminal_sweep,
+        reconcile_stale_stopping_sweep,
+    )
+
+    monkeypatch.setenv("SWEEP_BATCH_SIZE", "1")
+    ids = await _stale_rows(pg, "stopping", 3)
+    posted: list[str] = []
+
+    async def post(body):
+        posted.append(body["connection_id"])
+        return 200
+
+    runtime = FakeRuntimeClient()
+    failures = InMemoryItemFailures(max_failures=5)
+    assert (
+        await reconcile_stale_stopping_sweep(
+            pg.repo,
+            runtime,
+            post,
+            stop_grace=45,
+            log=_SilentLog(),
+            item_failures=failures,
+        )
+        == 3
+    )
+    assert posted == ["sess-0", "sess-1", "sess-2"]
+    assert runtime.deleted == [f"mtg-{i}-w" for i in ids]
+    posted.clear()
+    await reconcile_stale_nonterminal_sweep(
+        pg.repo,
+        runtime,
+        post,
+        stop_grace=45,
+        active_grace=300,
+        log=_SilentLog(),
+        item_failures=failures,
+    )
+    assert posted == ["sess-0", "sess-1", "sess-2"]
+
+
+class _DeleteNoAnswer(FakeRuntimeClient):
+    async def delete_workload(self, workload_id):
+        from meeting_api.bot_spawn.ports import SpawnFailed
+
+        self.deleted.append(workload_id)
+        raise SpawnFailed("runtime kernel delete_workload returned 503", refused=False)
+
+
+@pytest.mark.parametrize("sweep", ["stale-stopping", "stale-nonterminal"])
+async def test_pg_a_stale_row_whose_delete_keeps_failing_is_given_up(pg, sweep):
+    from meeting_api.lifecycle.reconcile import (
+        reconcile_stale_nonterminal_sweep,
+        reconcile_stale_stopping_sweep,
+    )
+    from meeting_api.metrics import registry
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    (mid,) = await _stale_rows(pg, "stopping", 1)
+    failures = PostgresItemFailures(pg.session_factory, max_failures=2)
+    runtime = _DeleteNoAnswer()
+
+    async def post(body):
+        raise AssertionError("an unconfirmed teardown never completes the meeting")
+
+    def given_up() -> float:
+        value = registry().get_sample_value(
+            "aw_sweep_items_total", {"sweep": sweep, "result": "given_up"}
+        )
+        return value or 0.0
+
+    before = given_up()
+    for _ in range(3):
+        if sweep == "stale-stopping":
+            await reconcile_stale_stopping_sweep(
+                pg.repo,
+                runtime,
+                post,
+                stop_grace=45,
+                log=_SilentLog(),
+                item_failures=failures,
+            )
+        else:
+            await reconcile_stale_nonterminal_sweep(
+                pg.repo,
+                runtime,
+                post,
+                stop_grace=45,
+                active_grace=300,
+                log=_SilentLog(),
+                item_failures=failures,
+            )
+    assert runtime.deleted == [f"mtg-{mid}-w"] * 2  # the third pass skips it
+    assert given_up() == before + 1
+    assert await pg.scalar(
+        "SELECT gave_up_at IS NOT NULL FROM sweep_item_failures "
+        "WHERE sweep = :s AND item_id = :i",
+        s=sweep,
+        i=str(mid),
+    )
+    assert (await pg.row(mid))["status"] == "stopping"

@@ -699,13 +699,15 @@ class InMemoryMeetingRepo:
         return True
 
     async def list_stale_nonterminal(
-        self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None
+        self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None,
+        after: Any = None, limit: Optional[int] = None,
     ) -> list:
         """In-memory mirror of the SQL adapter's general reconcile query. A row is stale once its age
         (now - ``updated_at``) passes its per-status grace (``reconcile_grace_for_status`` — the SAME
         policy the SQL adapter reads, so the two listings cannot drift). Rows carry a static created/
         updated timestamp, so a test sets ``updated_at`` (or leaves it in the past) to mark a row
-        stale; a row whose ``updated_at`` is recent is NOT listed."""
+        stale; a row whose ``updated_at`` is recent is NOT listed. One page of ``limit`` by id
+        after ``after``."""
         from datetime import datetime, timezone
 
         non_terminal = {
@@ -739,7 +741,12 @@ class InMemoryMeetingRepo:
                 continue
             stop_req = bool(row.get("data", {}).get("stop_requested"))
             out[mid] = (row["status"], s["session_uid"], row.get("bot_container_id"), stop_req)
-        return [(mid, st, sid, bcid, sr) for mid, (st, sid, bcid, sr) in out.items()]
+        page = [
+            (mid, st, sid, bcid, sr)
+            for mid, (st, sid, bcid, sr) in sorted(out.items())
+            if after is None or mid > after
+        ]
+        return page if limit is None else page[:limit]
 
     # ── test affordances (not part of the port) ──────────────────────────────────────────────────
     def set_status(self, meeting_id: int, status: str) -> None:
