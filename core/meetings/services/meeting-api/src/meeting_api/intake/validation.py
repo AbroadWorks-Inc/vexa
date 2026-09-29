@@ -39,6 +39,8 @@ from typing import Any, Optional
 import jsonschema
 from referencing import Registry, Resource
 
+from .projection import iso_utc
+
 __all__ = ["EntryIn", "RemoveIn", "IntakeError", "parse_entry", "parse_remove"]
 
 #: §2.2 — "metadata | object <= 16 KB". A wire-contract limit, not a per-deployment setting, so it
@@ -155,13 +157,6 @@ class IntakeError(Exception):
         self.retry_after_s = retry_after_s
 
 
-def _iso_utc(dt: datetime) -> str:
-    """A UTC-aware ``datetime`` -> its UTC ISO-8601 string with a trailing ``Z`` (mirrors
-    ``intake/projection.py``'s ``_iso_utc``, so every intake surface renders timestamps the same
-    way)."""
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def _parse_timestamp(raw: str, field: str) -> datetime:
     """Step 2 + 3: reject a malformed or NAIVE timestamp, else normalise to UTC."""
     try:
@@ -195,12 +190,12 @@ def _content_hash(
     lives at ``contracts/intake.v1/content-hash-vector.json``)."""
     fields = {
         "attendees": list(attendees),
-        "end": _iso_utc(end) if end is not None else None,
+        "end": iso_utc(end),
         "join_now": join_now,
         "meeting_url": meeting_url,
         "metadata": metadata,
         "series_id": series_id,
-        "start": _iso_utc(start) if start is not None else None,
+        "start": iso_utc(start),
         "time_zone": time_zone,
         "title": title,
     }
