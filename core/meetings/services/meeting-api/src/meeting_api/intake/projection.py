@@ -18,6 +18,12 @@ Field-source decisions (grounded in the existing code, not invented):
     exact-row claim (``intake/spawn.py``) writes it when it claims the row. A meeting sent through
     a path that never stamps it (upstream ``POST /bots``) renders ``None`` here rather than an
     invented value.
+  * ``upstream_id`` — the integer row id, the one the upstream reads take
+    (``GET /recordings?meeting_id=``, ``GET /transcripts/by-id/{id}``) and the bot's signal files are
+    keyed by; the exporter reads a meeting's recordings with it (§1.9).
+  * ``started_at`` / ``ended_at`` — the ``start_time`` / ``end_time`` columns: when the bot first
+    went ``active`` and when the meeting finished, stamped by the lifecycle write. ``start`` stays
+    the planned time.
 """
 
 from __future__ import annotations
@@ -134,13 +140,14 @@ def project_meeting(
 ) -> dict[str, Any]:
     """The §2.4 ``meeting`` object, exactly — no more, no fewer keys, this order.
 
-    Never contains ``user_id``, the integer row id, or any secret/token: ``id`` is always
-    ``str(meeting["uuid"])``, and everything else is drawn from the named ``data``/``aw`` keys
-    below, never a verbatim copy of ``data`` or ``aw``.
+    Never contains ``user_id`` or any secret/token: ``id`` is always ``str(meeting["uuid"])``, the
+    integer row id is only ``upstream_id``, and everything else is drawn from the named
+    ``data``/``aw`` keys below, never a verbatim copy of ``data`` or ``aw``.
     """
     data = _data_of(meeting)
     return {
         "id": str(meeting["uuid"]),
+        "upstream_id": meeting.get("id"),
         "status": meeting.get("status"),
         "completion_reason": data.get("completion_reason"),
         "failure_stage": data.get("failure_stage"),
@@ -153,6 +160,8 @@ def project_meeting(
         "end": iso_utc(aw.get("scheduled_end_at")) if aw is not None else None,
         "time_zone": aw.get("time_zone") if aw is not None else None,
         "bot_joins_at": _bot_joins_at(meeting, data, lead_s=lead_s),
+        "started_at": iso_utc(meeting.get("start_time")),
+        "ended_at": iso_utc(meeting.get("end_time")),
         "entries": [_entry(e) for e in _listed(entries)],
         "export": _export(aw),
         "sequence": aw.get("event_seq", 0) if aw is not None else 0,

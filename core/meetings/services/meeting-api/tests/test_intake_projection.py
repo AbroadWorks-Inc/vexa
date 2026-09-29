@@ -19,6 +19,7 @@ Field-source decisions this test pins (see the task report for the full reasonin
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -29,6 +30,7 @@ UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
 
 EXPECTED_KEYS = [
     "id",
+    "upstream_id",
     "status",
     "completion_reason",
     "failure_stage",
@@ -41,6 +43,8 @@ EXPECTED_KEYS = [
     "end",
     "time_zone",
     "bot_joins_at",
+    "started_at",
+    "ended_at",
     "entries",
     "export",
     "sequence",
@@ -119,6 +123,7 @@ def test_every_key_present_exact_set_and_order():
 def test_matches_the_section_2_4_example_values():
     result = _project(aw=_aw(), entries=[_entry()])
     assert result["id"] == UUID
+    assert result["upstream_id"] == 42
     assert result["status"] == "scheduled"
     assert result["completion_reason"] is None
     assert result["failure_stage"] is None
@@ -131,6 +136,8 @@ def test_matches_the_section_2_4_example_values():
     assert result["end"] == "2026-09-29T09:30:00Z"
     assert result["time_zone"] == "Asia/Kolkata"
     assert result["bot_joins_at"] == "2026-09-29T08:58:00Z"
+    assert result["started_at"] is None
+    assert result["ended_at"] is None
     assert result["entries"] == [
         {
             "external_id": "google:3n5kq8example",
@@ -246,7 +253,9 @@ def test_forbidden_keys_absent():
     result = _project(meeting=meeting, aw=_aw(), entries=[_entry()])
     flat = _flatten(result)
     assert "user_id" not in flat
-    assert 42 not in _all_values(result)  # the integer row id must never surface
+    assert 7 not in _all_values(result)  # the account's integer id never surfaces
+    # the integer row id surfaces once, as upstream_id, for the upstream reads
+    assert _all_values(result).count(42) == 1 and result["upstream_id"] == 42
     for key in flat:
         lowered = key.lower()
         assert "secret" not in lowered
@@ -371,6 +380,29 @@ def test_export_null_when_export_state_absent():
 
 
 # ── start falls back to start_time when data has no scheduled_at ────────────────────────────────
+
+
+def test_started_at_and_ended_at_are_the_bots_actual_times():
+    meeting = _meeting(
+        status="completed",
+        start_time="2026-09-29T09:01:30",
+        end_time=datetime(2026, 9, 29, 9, 31, 5),
+    )
+    result = _project(meeting=meeting, aw=_aw())
+    assert result["start"] == "2026-09-29T09:00:00Z"  # the planned time stays
+    assert result["started_at"] == "2026-09-29T09:01:30Z"
+    assert result["ended_at"] == "2026-09-29T09:31:05Z"
+
+
+def test_started_at_and_ended_at_null_until_the_bot_is_in_and_out():
+    result = _project(meeting=_meeting(status="joining"), aw=_aw())
+    assert result["started_at"] is None
+    assert result["ended_at"] is None
+    result = _project(
+        meeting=_meeting(status="active", start_time="2026-09-29T09:01:30Z"), aw=_aw()
+    )
+    assert result["started_at"] == "2026-09-29T09:01:30Z"
+    assert result["ended_at"] is None
 
 
 def test_start_falls_back_to_start_time():

@@ -8,6 +8,7 @@
   },
   "meeting": {
     "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+    "upstream_id": 11367,
     "status": "completed",
     "completion_reason": "stopped",
     "failure_stage": null,
@@ -20,6 +21,8 @@
     "end": "2026-09-29T09:30:00Z",
     "time_zone": "Asia/Kolkata",
     "bot_joins_at": "2026-09-29T08:55:00Z",
+    "started_at": "2026-09-29T09:01:05Z",
+    "ended_at": "2026-09-29T09:30:00Z",
     "entries": [
       {
         "external_id": "google:3n5kq8example",

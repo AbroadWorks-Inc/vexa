@@ -197,6 +197,9 @@ TEST_NONCE = uuid.UUID("0c4d8e2f-6a1b-4c3d-9e8f-7a6b5c4d3e2f")
 SECRET = "whsec_demo_secret"
 PREVIOUS_SECRET = "whsec_demo_previous_secret"
 TIMESTAMP = 1790658761
+# The lifecycle write's time stamps (naive UTC): the bot went active, the meeting finished.
+ACTIVE_AT = datetime(2026, 9, 29, 4, 26, 11)
+ENDED_AT = datetime(2026, 9, 29, 5, 12, 41)
 
 
 @pytest.fixture
@@ -274,7 +277,16 @@ class _Session:
         return row.payload_text
 
 
-def _meeting(orm, status: str, **data: Any):
+def _meeting(
+    orm,
+    status: str,
+    *,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    **data: Any,
+):
+    """The meeting row; ``start_time``/``end_time`` as the lifecycle write stamps them (naive
+    UTC): when the bot went ``active``, and when the meeting finished."""
     return orm.Meeting(
         id=MEETING_ID,
         uuid=uuid.UUID(UUID),
@@ -288,8 +300,8 @@ def _meeting(orm, status: str, **data: Any):
             "scheduled_at": "2026-09-29T04:30:00Z",
             **data,
         },
-        start_time=None,
-        end_time=None,
+        start_time=start_time,
+        end_time=end_time,
         created_at=datetime(2026, 9, 29, 4, 20, 5),
     )
 
@@ -344,7 +356,11 @@ async def _subscription_completed(orm) -> str:
     db = _Session(
         orm,
         meeting=_meeting(
-            orm, "stopping", auto_join_last_attempt="2026-09-29T04:25:00Z"
+            orm,
+            "stopping",
+            start_time=ACTIVE_AT,
+            end_time=ENDED_AT,
+            auto_join_last_attempt="2026-09-29T04:25:00Z",
         ),
         aw=_aw(orm, 8),
         entries=_entries(orm),
@@ -366,7 +382,10 @@ async def _subscription_bot_failed(orm) -> str:
     db = _Session(
         orm,
         meeting=_meeting(
-            orm, "awaiting_admission", auto_join_last_attempt="2026-09-29T04:25:00Z"
+            orm,
+            "awaiting_admission",
+            end_time=ENDED_AT,
+            auto_join_last_attempt="2026-09-29T04:25:00Z",
         ),
         aw=_aw(orm, 3),
         entries=_entries(orm),
@@ -395,7 +414,12 @@ async def _subscription_bot_retry(orm) -> str:
     aw.send_attempts = 0
     db = _Session(
         orm,
-        meeting=_meeting(orm, "active", auto_join_last_attempt="2026-09-29T04:25:00Z"),
+        meeting=_meeting(
+            orm,
+            "active",
+            start_time=ACTIVE_AT,
+            auto_join_last_attempt="2026-09-29T04:25:00Z",
+        ),
         aw=aw,
         entries=_entries(orm),
     )

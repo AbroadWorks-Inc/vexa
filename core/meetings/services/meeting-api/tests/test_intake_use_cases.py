@@ -62,6 +62,7 @@ async def test_2_6_1_one_off_created():
         "entry": {"external_id": "google:3n5kq8example", "user": A, "state": "active"},
         "meeting": {
             "id": uuid,
+            "upstream_id": h.meeting_id(uuid),
             "status": "scheduled",
             "completion_reason": None,
             "failure_stage": None,
@@ -74,6 +75,8 @@ async def test_2_6_1_one_off_created():
             "end": "2026-09-29T09:30:00Z",
             "time_zone": "Asia/Kolkata",
             "bot_joins_at": "2026-09-29T08:55:00Z",
+            "started_at": None,
+            "ended_at": None,
             "entries": [
                 {
                     "external_id": "google:3n5kq8example",

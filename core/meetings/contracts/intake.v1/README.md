@@ -24,10 +24,16 @@ responses against the same shapes.
   `previous_meeting_id`, `entry` (`ReplyEntry`), `meeting` (`Meeting`, always present —
   `project_meeting` never returns `null`, so every result carries the full projected meeting, even
   `removed`/`already_removed`).
-- **`Meeting`** — the §2.4 meeting object, exactly the 16 keys
+- **`Meeting`** — the §2.4 meeting object, exactly the 19 keys
   `meeting_api.intake.projection.project_meeting` renders, in this order:
-  `id, status, completion_reason, failure_stage, outcome, platform, room, meeting_url, title,
-  start, end, time_zone, bot_joins_at, entries, export, sequence`. `status` /
+  `id, upstream_id, status, completion_reason, failure_stage, outcome, platform, room,
+  meeting_url, title, start, end, time_zone, bot_joins_at, started_at, ended_at, entries, export,
+  sequence`. `id` is the meeting's UUID; `upstream_id` is its integer row id, the id the upstream
+  reads take (`GET /recordings?meeting_id=`, `GET /transcripts/by-id/{id}`) and the bot's
+  `signal/<user>/<meeting>/<session>/` files are keyed by, so a subscriber such as the exporter
+  can read the meeting's recordings from the webhook alone. `start`/`end` are the planned times;
+  `started_at` is when the bot first went `active` and `ended_at` when the meeting finished, each
+  `null` until then. `status` /
   `completion_reason` / `failure_stage` / `outcome.kind` / `export.state` are left as open strings
   here (not enumerated): `status` mirrors the sealed `lifecycle.v1` FSM plus intake's own
   pre-lifecycle `scheduled`, which this draft does not own or duplicate. A meeting waiting for a

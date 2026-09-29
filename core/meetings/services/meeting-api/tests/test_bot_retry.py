@@ -947,6 +947,7 @@ def test_the_intake_retry_golden_is_the_projection_of_a_waiting_meeting():
         p / rel for p in Path(__file__).resolve().parents if (p / rel).is_file()
     )
     meeting = {
+        "id": 11367,
         "uuid": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
         "status": "requested",
         "platform": "google_meet",

@@ -54,7 +54,8 @@ the full meeting (`data.meeting`); `webhook.test` carries none.
 }
 ```
 - **`data.meeting`** is the §2.4 meeting, exactly the `intake.v1` `Meeting` every `/v2` reply
-  carries: `id` is the meeting's UUID, `sequence` its event counter. There is no integer id, no
+  carries: `id` is the meeting's UUID, `upstream_id` its integer id for the upstream reads,
+  `started_at`/`ended_at` the bot's actual times, `sequence` its event counter. There is no
   `user_id` and no raw `data` blob.
 - **`data.change`** (`Change`: `from`, `to`, `reason`, `at`) is on every status change, whatever
   the event type, and on `meeting.scheduled` (`from: null`). Events that change no status

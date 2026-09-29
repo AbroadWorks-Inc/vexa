@@ -12,6 +12,7 @@
       "bot_joins_at": "2026-09-29T04:25:00Z",
       "completion_reason": "stopped",
       "end": "2026-09-29T05:00:00Z",
+      "ended_at": "2026-09-29T05:12:41Z",
       "entries": [
         {
           "attendees": [
@@ -35,9 +36,11 @@
       "room": "abc-defg-hij",
       "sequence": 9,
       "start": "2026-09-29T04:30:00Z",
+      "started_at": "2026-09-29T04:26:11Z",
       "status": "completed",
       "time_zone": "Asia/Kolkata",
-      "title": "Weekly sync"
+      "title": "Weekly sync",
+      "upstream_id": 11367
     }
   },
   "event_id": "evt_ef69c30038906cb161306e9e12261b439e1f66a7c5426a943b43f6ed880cf5a9",

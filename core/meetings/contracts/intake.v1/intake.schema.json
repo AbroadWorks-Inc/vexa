@@ -125,16 +125,17 @@
       }
     },
     "Meeting": {
-      "description": "The §2.4 meeting object — exactly the 16 keys meeting_api.intake.projection.project_meeting renders, in this order. Every reply, read and webhook ships a meeting through this one shape.",
+      "description": "The §2.4 meeting object — exactly the 19 keys meeting_api.intake.projection.project_meeting renders, in this order. Every reply, read and webhook ships a meeting through this one shape.",
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id", "status", "completion_reason", "failure_stage", "outcome", "platform", "room",
-        "meeting_url", "title", "start", "end", "time_zone", "bot_joins_at", "entries",
-        "export", "sequence"
+        "id", "upstream_id", "status", "completion_reason", "failure_stage", "outcome", "platform",
+        "room", "meeting_url", "title", "start", "end", "time_zone", "bot_joins_at", "started_at",
+        "ended_at", "entries", "export", "sequence"
       ],
       "properties": {
         "id": { "type": "string", "description": "str(meetings.uuid) — never the integer row id." },
+        "upstream_id": { "type": "integer", "minimum": 1, "description": "The integer row id: the id the upstream reads take (GET /recordings?meeting_id=, GET /transcripts/by-id/{id})." },
         "status": { "type": ["string", "null"] },
         "completion_reason": { "type": ["string", "null"] },
         "failure_stage": { "type": ["string", "null"] },
@@ -147,6 +148,8 @@
         "end": { "type": ["string", "null"] },
         "time_zone": { "type": ["string", "null"] },
         "bot_joins_at": { "type": ["string", "null"] },
+        "started_at": { "type": ["string", "null"], "description": "When the bot first went active; null until then." },
+        "ended_at": { "type": ["string", "null"], "description": "When the meeting finished; null until then." },
         "entries": { "type": "array", "items": { "$ref": "#/$defs/MeetingEntryRef" } },
         "export": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Export" }] },
         "sequence": { "type": "integer", "minimum": 0 }
