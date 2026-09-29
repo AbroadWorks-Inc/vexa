@@ -33,9 +33,9 @@ predecessors (the edge's `from` for the callback, the live statuses otherwise) a
 writer that knows the meeting by id); `tests/test_status_writers_all.py` fails on any other write.
 A `data` patch whose `completion_reason` is outside the sealed `lifecycle.v1` set is refused before
 anything is written (`check_completion_reason`; upstream's `start_failed` on a `failed` row is the
-one exception). `project_stored(db, meeting_id)` is the one projection of a stored meeting, which
-the legacy system and per-user webhooks' meeting block takes `uuid`, `entries`, `outcome` and
-`sequence` from (§1.8).
+one exception). `project_stored(db, meeting_id)` is the one projection of a stored meeting as a
+transaction sees it. The legacy system and per-user webhooks carry upstream's meeting block, not
+this one; the §2.4 meeting reaches receivers through `/v2/webhooks` (§1.8, §6.9 F-X).
 
 `rules.py` holds the R1 matching rules and the meeting windows (§1.1, R7, R10), pure: `overlaps`
 (half-open, a missing end is unbounded), `meeting_start`, `meeting_window`, `match_entry`,

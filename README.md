@@ -26,11 +26,11 @@ end up with the same kind of transcript.
    │                                                   joins before start, records audio,
    │                                                   writes speaker-activity.jsonl
    │  stores recordings + speaker activity in  s3://aw-bots/
-   │  every status change: signed webhook to each subscriber (e.g. the portal)
-   │  when the meeting ends: signed webhook  "meeting.completed" (or "bot.failed") to the exporter
+   │  every status change: signed webhook to each /v2/webhooks subscriber (the portal, the exporter)
+   │  the exporter acts on  "meeting.completed" (or "bot.failed")
    ▼
  exporter (our addition, integrations/out/aw-notetaker/)
-   │  reads the meeting through the gateway (its own key)
+   │  reads the meeting's recordings through the gateway (its own key)
    │  builds  s3://aw-chatworks-transcribe/recordings/<platform>_<meetingId>_<startUTC>/
    │          master.webm · audio.wav · speaker_timeline.json · participants.json · meeting.json …
    │  then calls  POST /process  (meeting UUID)  and reports the result to AW Bots
@@ -96,8 +96,9 @@ they are sealed as `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
   error come at 1 min, 5 min, 30 min and 2 h, then the delivery is `dead`; any other answer that
   isn't 2xx (including a redirect) is `failed`. **Receivers dedupe on `event_id` and ignore an event
   whose `sequence` is older than one they already applied.**
-- The exporter's system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) works as before and now carries the
-  meeting's `uuid`.
+- The exporter is a subscriber like the portal (its own subscription and secret). Upstream's
+  system webhook (`VEXA_SYSTEM_WEBHOOK_URL`) and the per-user `webhook_url` still work, with
+  upstream's meeting block; AW sets neither.
 
 ### Keys and signed identity
 
@@ -132,7 +133,7 @@ Everything else is upstream Vexa, unchanged.
 | Change | Where | Why |
 |---|---|---|
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
-| **Exporter.** A new small service. It reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. |
+| **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the §2.4 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
 | **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |
@@ -268,7 +269,7 @@ Every setting lives in configuration, not code:
 | Recording | `RECORDING_ENABLED` | `true` |
 | Storage | `MINIO_BUCKET` + `S3_ENDPOINT` (IAM role on EKS, no static keys) | bucket `aw-bots` |
 | meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
-| "Meeting finished" webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (+ `…_ALLOW_PRIVATE_HTTP=true`) | the exporter's in-cluster URL |
+| "Meeting finished" webhook | the exporter's `/v2/webhooks` subscription (`events: ["meeting.completed", "bot.failed"]`), secret = exporter env `EXPORTER_WEBHOOK_SECRET`; upstream's `VEXA_SYSTEM_WEBHOOK_URL` | subscription URL `http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa`; `VEXA_SYSTEM_WEBHOOK_URL` unset |
 | How early the bot joins | Helm `meetingApi.autoJoinLeadSeconds` → env `AUTO_JOIN_LEAD_S` (the chart's default is 120) | `300` |
 | Services on Karpenter | Helm `global.nodeSelector` / `global.tolerations` | the `aw-bots-services` NodePool |
 | Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the `aw-bots-meetings` NodePool |
@@ -281,11 +282,11 @@ Every setting lives in configuration, not code:
 | Where the exporter sends meetings | exporter env `NOTETAKER_URL` | `http://notetaker-api.notetaker.svc.cluster.local:8080` |
 | Exporter buckets | `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX` | `aw-bots`, `aw-chatworks-transcribe`, `recordings/` |
 | How long exported files are kept | the exporter tags each object `retention-class`; the bucket's lifecycle rules act on the tag | `master.webm` = `recording-mp4` (30 days), `audio.wav` = `audio` (7 days), JSON = `metadata` (365 days) |
-| Exporter ↔ AW Bots | `GATEWAY_URL` + `EXPORTER_API_KEY` (the `exporter` key, scopes `tx` + `export`); `VEXA_WEBHOOK_SECRET` (same value as `VEXA_SYSTEM_WEBHOOK_SECRET`) | the gateway's in-cluster URL; key from Secret `aw-bots-key-exporter` |
+| Exporter ↔ AW Bots | `GATEWAY_URL` + `EXPORTER_API_KEY` (the `exporter` key, scopes `tx` + `export`); `EXPORTER_WEBHOOK_SECRET` (the secret of its subscription) | the gateway's in-cluster URL; key from Secret `aw-bots-key-exporter` |
 | Signed identity | `GATEWAY_IDENTITY_KEYS` (a key ring in the webhook ring's format) on the gateway, meeting-api and admin-api (one value); `GATEWAY_IDENTITY_ACTIVE_KEY` (the kid it signs with) on the gateway | **required**: without them the gateway refuses to start and meeting-api and admin-api refuse every client request. Rotation: add the new key to the ring on all three and roll; switch the active kid on the gateway and roll; later drop the old key and roll |
 | Webhook secret encryption | `WEBHOOK_SECRET_ENC_KEYS` (a key ring) and `WEBHOOK_SECRET_ENC_ACTIVE_KEY`, on meeting-api and admin-api, read only from an existing Secret | required for webhook subscriptions; unset, subscriptions are off and the services log why |
 | Intake | `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES` (meeting-api); `INTAKE_RATE_LIMIT_PER_MIN` (gateway) | 30 days, 3600 s, `meet.abroadworks.com` until the Jitsi cutover, 100 000, 600 |
-| Webhooks | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (meeting-api, admin-api); `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS` (admin-api) | `portal.notetaker.svc.cluster.local`, 20, 30 days |
+| Webhooks | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (meeting-api, admin-api); `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS` (admin-api) | `portal.notetaker.svc.cluster.local,aw-exporter.aw-bots.svc.cluster.local`, 20, 30 days |
 
 The full list of exporter settings is in
 [`integrations/out/aw-notetaker/README.md`](integrations/out/aw-notetaker/README.md). Secret values
@@ -343,7 +344,8 @@ bots that write a speaker file.
 with no meeting in progress. In short: the database migration (`MIGRATION-0008`) first; the three new
 secret names into `aw-bots-secrets` before any `helm upgrade`; our gateway and admin-api images; the
 four keys; drain the exporter queue with the old exporter; then meeting-api and the bot, and only
-after them the new exporter (see its [README](integrations/out/aw-notetaker/README.md)).
+after them the new exporter, its subscription, and `VEXA_SYSTEM_WEBHOOK_URL` unset (see its
+[README](integrations/out/aw-notetaker/README.md)).
 
 ---
 
