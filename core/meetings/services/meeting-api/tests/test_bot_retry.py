@@ -1024,3 +1024,29 @@ def test_an_overdue_reason_never_names_a_missing_workload():
         "retry_not_sent",
         "no new bot was sent by 2026-09-29T09:21:00Z",
     )
+
+
+@pytest.mark.parametrize("since", [None, "not a time"])
+async def test_a_pending_teardown_without_a_readable_since_is_bounded(since):
+    """A 404 waits out the grace only from a known ``since``; without one it counts, and is
+    given up, rather than waiting forever."""
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
+    from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
+    repo = _waiting_repo(proven=True, status="failed")
+    pending = (
+        {"workload": "mtg-5-old"}
+        if since is None
+        else {"workload": "mtg-5-old", "since": since}
+    )
+    repo._meetings[5]["data"]["unproven_teardown"] = pending
+    failures = InMemoryItemFailures(max_failures=2)
+    runtime = FakeRuntimeClient(workloads={})  # 404
+    for _ in range(3):
+        await retry_unproven_teardowns(
+            repo, runtime, untracked_grace=600, log=_Log(), failures=failures
+        )
+    assert await failures.given_up("unproven-teardown", ["5:mtg-5-old"]) == {
+        "5:mtg-5-old"
+    }

@@ -513,7 +513,8 @@ async def retry_unproven_teardowns(
     ``sweeps.item_failures.run_item`` (item ``<meeting id>:<workload>``). The reap gate's own
     evidence clears it: the runtime reports the workload terminal, a delete it confirms, or a 404
     that has lasted past ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) since it was
-    recorded; a 404 inside the grace waits, and counts nothing. Anything else is one failure; the
+    recorded; a 404 inside the grace waits, and counts nothing (a missing or unreadable ``since``
+    counts, so it never waits forever). Anything else is one failure; the
     ``SWEEP_MAX_ITEM_FAILURES``-th gives the item up, logged at error level with both ids and
     counted (``aw_sweep_items_total{sweep="unproven-teardown",result="given_up"}``). Never
     raises. Returns how many were cleared."""
@@ -541,8 +542,10 @@ async def retry_unproven_teardowns(
         workload = row.get("workload")
         probe, _info = await _probe_bot_workload(runtime, workload, log=log)
         if probe == "untracked":
-            since = as_utc(row.get("since"))
-            if since is None or (now - since).total_seconds() <= untracked_grace:
+            since = as_utc(row.get("since"))  # an unparsable stamp raises: one failure
+            if since is None:
+                raise UnprovenTeardownFailed(f"no since recorded for {workload}: grace unknown")
+            if (now - since).total_seconds() <= untracked_grace:
                 return  # the kernel doesn't know it yet: not evidence, not a failure
         elif probe == "alive":
             verdict = await _teardown_verdict(runtime, workload, meeting_id=row["id"], log=log)
