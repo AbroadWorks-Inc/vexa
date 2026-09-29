@@ -763,7 +763,7 @@ Each is handled by the same rules; the platform comes from parsing `meeting_url`
 | `meeting.started` / `meeting.completed` / `bot.failed` | the existing typed events, enriched: the step to `active`, to `completed`, and to `failed` (`meeting.not_sent` instead when the outcome is `not_sent`) |
 | `export.handed_off` / `export.failed` | the exporter's result |
 | `webhook.test` | a test send |
-| `bot.retry` | reserved for the lobby-timeout retry (handoff §6 B9); not emitted by this work |
+| `bot.retry` | a bot failed while the meeting is on and a new bot will be sent on the same meeting (§6.9 F-K2); `data.change.reason` carries the failure reason |
 
 `DELETE /v2/meetings/{id}` sends no event. Transcription is not an aw-bots event: aw-bots' job ends at `export.handed_off`.
 
