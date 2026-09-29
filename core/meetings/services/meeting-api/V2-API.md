@@ -1,6 +1,6 @@
 # AW Bots `/v2` API reference
 
-- **Date:** 2026-09-28. Served by meeting-api (`src/meeting_api/intake/`, `src/meeting_api/webhooks/`) through the gateway; webhook subscriptions are stored by admin-api.
+- **Date:** 2026-09-29. Served by meeting-api (`src/meeting_api/intake/`, `src/meeting_api/webhooks/`) through the gateway; webhook subscriptions are stored by admin-api.
 - **For:** anyone who writes a client of aw-bots: the calendar module, the portal, or any other app.
 - **Where the rules come from:** the [meeting intake and webhooks design](../../../../integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md) Part 2, and the sealed contracts [`intake.v1`](../../../../core/meetings/contracts/intake.v1/) and [`webhook.v1`](../../../../core/meetings/contracts/webhook.v1/). When this page and a sealed contract disagree, the contract wins.
 
@@ -72,12 +72,14 @@ this time". A **meeting** is what the bot joins. aw-bots groups entries into mee
 - **A meeting is named by its UUID** (`meeting.id`) in every reply, read and webhook.
 - **A recurring series is one entry per occurrence**, each with its own `external_id`; aw-bots
   never expands a series. `series_id` is for display and filtering only.
-- A meeting's time runs from the earliest start to the latest end of its active entries. Once its
-  bot is live, the time is no longer recomputed.
+- A meeting's time runs from the earliest start to the latest end of its active entries. While
+  its bot is live, the time isn't recomputed.
 
-The bot is sent `AUTO_JOIN_LEAD_S` before the meeting starts (300 s in AW's deployment; 120 s by
-default) and a meeting still without a bot when its `end` passes ends `failed` with outcome
-`not_sent` and the reason. A meeting never stays `scheduled` forever.
+The bot is sent `AUTO_JOIN_LEAD_S` before the meeting starts (300 s in AW's deployment, which the
+examples on this page use; 120 s by default) and a meeting still without a bot when its `end`
+passes ends `failed` with outcome `not_sent` and the reason. A meeting never stays `scheduled`
+forever. A bot that fails while the meeting is on is replaced on the same meeting
+([`bot.retry`](#events)), up to the meeting's `BOT_SEND_MAX_ATTEMPTS` (3) sends.
 
 ### Conventions
 
@@ -140,6 +142,7 @@ Always **200** with the reply envelope, for every result:
   "entry": { "external_id": "google:3n5kq8example", "user": "a@abroadworks.com", "state": "active" },
   "meeting": {
     "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+    "upstream_id": 11367,
     "status": "scheduled",
     "completion_reason": null,
     "failure_stage": null,
@@ -152,6 +155,8 @@ Always **200** with the reply envelope, for every result:
     "end": "2026-09-29T09:30:00Z",
     "time_zone": "Asia/Kolkata",
     "bot_joins_at": "2026-09-29T08:55:00Z",
+    "started_at": null,
+    "ended_at": null,
     "entries": [
       { "external_id": "google:3n5kq8example", "user": "a@abroadworks.com",
         "attendees": ["a@abroadworks.com", "b@abroadworks.com", "c@client.com"],
@@ -175,7 +180,7 @@ Always **200** with the reply envelope, for every result:
 | `created` | A new meeting was made for this entry. |
 | `joined_existing` | The entry joined a meeting already there (same link, overlapping time): same UUID, no second bot. |
 | `updated` | The entry changed and its meeting was updated. If the entry moved to another meeting, `meeting` is the new one and `previous_meeting_id` the one it left. |
-| `unchanged` | Same content as stored (same `content_hash`); nothing done. Safe to send as often as you like. |
+| `unchanged` | An active entry sent again with the same content (same `content_hash`); nothing done. Safe to send as often as you like. A closed entry (its meeting finished) sent again unchanged is `not_changed_finished`. |
 | `not_changed_live` | The meeting's bot is live and the change doesn't move the entry to a future, non-overlapping time (a new title or attendees, a later end, a start that still overlaps). The change is stored on the entry; the meeting is left as it is. |
 | `not_changed_finished` | The meeting has finished and the change doesn't point to a new future time. The finished meeting is history. |
 
@@ -214,7 +219,8 @@ same entry). The bot is sent inside the call, so the reply already says what hap
 |---|---|
 | `created`, `meeting.status: "requested"` | The bot is on its way. |
 | `joined_existing` | The link already had a meeting (below): its UUID. A scheduled one's bot is sent now; a live one is left as it is. **Never a second bot.** |
-| `created`, `meeting.status: "failed"`, `outcome.kind: "not_sent"` | The bot couldn't be sent; `outcome.detail` is the typed code (`account_limit`, `spawn_error`, …) and `outcome.message` the exact reason. |
+| `created`, `meeting.status: "scheduled"` | This send failed; aw-bots sends again after `BOT_SEND_RETRY_BACKOFF_S` (60 s), up to `BOT_SEND_MAX_ATTEMPTS` (3) sends in all. Follow the meeting by webhook or `GET /v2/meetings/{id}`. |
+| `created`, `meeting.status: "failed"`, `outcome.kind: "not_sent"` | The last send failed; `outcome.detail` is the typed code (`account_limit`, `spawn_error`, …) and `outcome.message` the exact reason. |
 | `400 unrecognized_link` | Not a meeting link aw-bots knows. |
 
 A paste adopts the **earliest** unfinished meeting on the link whose `end` is after now and whose
@@ -231,7 +237,8 @@ error is recorded, and the meeting stays scheduled for the others (`joined_exist
 
 `400 invalid_request`, `400 unrecognized_link`, `400 platform_not_enabled`, `400 too_far_ahead`,
 `400 already_ended`, `401 unauthorized`, `403 forbidden`, `429 rate_limited`,
-`429 quota_exceeded`, `503 unavailable`. What to do about each is in [Errors](#errors).
+`429 quota_exceeded`, `500 internal_error`, `503 unavailable`. What to do about each is in
+[Errors](#errors).
 
 ### Remove an entry
 
@@ -259,7 +266,7 @@ The reply is the same envelope as `PUT`, with `entry.state: "removed"` and one o
 | `already_removed` | The entry was already removed. Nothing done. |
 
 Errors: `400 invalid_request`, `404 entry_not_found` (this entry was never sent — drop it),
-`401`, `403`, `429 rate_limited`, `503 unavailable`.
+`401`, `403`, `429 rate_limited`, `500 internal_error`, `503 unavailable`.
 
 To cancel a future meeting, remove its entries. Stop (below) is only for a bot that is live.
 
@@ -394,8 +401,9 @@ Scope `tx`. Returns one [meeting object](#the-meeting-object).
   owns or is invited to, through any of its entries in any state.
 - **Without `user=`**: any meeting of the account.
 
-Anything else, another account's meeting, or an id that isn't a UUID is `404 meeting_not_found`;
-the answer is the same in every case, so it tells nothing about meetings the caller can't see.
+Any other meeting, another account's, or an unknown UUID is `404 meeting_not_found`; the answer is
+the same in every case, so it tells nothing about meetings the caller can't see. An id that isn't a
+UUID is `400 invalid_request`, before anything is read (so on every `/v2/meetings/{id}` route).
 
 ### Stop the bot
 
@@ -417,9 +425,10 @@ Scope `bot`, no body. The live bot leaves now; the reply is the meeting (**200**
   future meeting, remove its entries.
 
 aw-bots doesn't decide *who* may press stop; that is the client's rule (the portal allows it only
-to a user who owns an active entry on the meeting). Errors: `404 meeting_not_found`,
-`409 no_live_bot`, `503 unavailable` (the stop is recorded but the leave command couldn't be sent
-yet; it reconciles on its own, and a retry is safe).
+to a user who owns an active entry on the meeting). Errors: `400 invalid_request` (the id isn't a
+UUID), `404 meeting_not_found`, `409 no_live_bot`, `503 unavailable` (the stop is recorded but the
+leave command couldn't be sent yet, and it reconciles on its own; or the meeting's link changed
+during the stop). A retry is safe.
 
 ### Erase a finished meeting
 
@@ -441,8 +450,9 @@ notetaker keeps in its own bucket are not aw-bots' and are not touched.
 }
 ```
 
-Errors: `404 meeting_not_found`, `409 meeting_not_finished`, `503 unavailable` (storage failed
-before any row was removed; retry the same call).
+Errors: `400 invalid_request` (the id isn't a UUID), `404 meeting_not_found`,
+`409 meeting_not_finished`, `503 unavailable` (storage failed before any row was removed; retry
+the same call).
 
 ### Report an export result (exporter only)
 
@@ -461,8 +471,8 @@ Scope `export`. Only the exporter calls this; other clients read the result from
 | `s3_path` | string | yes | 1–1024 characters. The export folder. |
 | `error` | string or null | no | At most 2000 characters. Why it failed. |
 
-Taken only for a finished meeting of the account (`404 meeting_not_found`, `409
-meeting_not_finished`). The reply is the meeting, whose `export` shows the result. The same
+Taken only for a finished meeting of the account (`400 invalid_request` for an id that isn't a
+UUID, `404 meeting_not_found`, `409 meeting_not_finished`). The reply is the meeting, whose `export` shows the result. The same
 `state` and `s3_path` again changes nothing and sends no event, so the exporter may repeat a report
 until it is accepted.
 
@@ -471,11 +481,12 @@ until it is accepted.
 ### The meeting object
 
 Every reply, read and webhook carries the meeting in this one shape (sealed as `intake.v1`
-`Meeting`): exactly these 16 keys.
+`Meeting`): exactly these 19 keys.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `id` | string (UUID) | The meeting's id. Use it in every `/v2/meetings/{id}` path. |
+| `upstream_id` | integer | The meeting's integer row id, for the upstream reads that take it (`GET /recordings?meeting_id=`, `GET /transcripts/by-id/{id}`). No `/v2` path takes it. |
 | `status` | string | See the status table below. |
 | `completion_reason` | string or null | Set when the meeting finished: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded` (and upstream's `start_failed` on some `failed` rows). |
 | `failure_stage` | string or null | On a `failed` meeting, the stage it failed at: `requested`, `joining`, `awaiting_admission`, `active`. |
@@ -484,9 +495,11 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 | `room` | string | The platform's room id: the Meet code, the Zoom numeric id, the Teams id, the lower-cased Jitsi room. |
 | `meeting_url` | string | The link the bot joins. |
 | `title` | string or null | The first title among the entries, in start order. |
-| `start`, `end` | string or null | UTC. `end` is `null` for an open-ended instant join. |
+| `start`, `end` | string or null | The planned times, UTC. `end` is `null` for an open-ended instant join. |
 | `time_zone` | string or null | Display only. |
 | `bot_joins_at` | string or null | While `scheduled`: when the bot will be sent (`start` − the lead). Waiting for a new bot after one failed (`requested`, after `bot.retry`): when that bot will be sent. Once sent: when it was sent. Otherwise `null`. |
+| `started_at` | string or null | When the bot first went `active`; `null` until then. |
+| `ended_at` | string or null | When the meeting finished; `null` until then. |
 | `entries` | array | A finished meeting lists its closed entries; any other meeting its active ones. Removed entries are never listed. Each is `{external_id, user, attendees, series_id, metadata}`. |
 | `export` | object or null | `{state, s3_path, error, at}` once the exporter reported: `state` is `handed_off` or `failed`. |
 | `sequence` | integer | The meeting's event counter: +1 with every webhook event of this meeting. Keep the highest you applied and ignore anything older. |
@@ -521,26 +534,28 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 
 ### Errors
 
-Every error body is `{ "error": { "code", "message" } }`, from aw-bots and from the gateway alike.
+Every error body is `{ "error": { "code", "message" } }`, from aw-bots and from the gateway alike
+(the sealed `intake.v1` `Error`).
 
 | HTTP | `code` | When | The client should |
 |---|---|---|---|
-| 400 | `invalid_request` | A missing or wrong field, an unknown field, a time without an offset, `end` ≤ `start`, `metadata` over 16 KB, a bad query value or cursor | Fix the request and resend. |
+| 400 | `invalid_request` | A missing or wrong field, an unknown field, a time without an offset, `end` ≤ `start`, `metadata` over 16 KB, a bad query value or cursor, an id in the path that isn't a UUID | Fix the request and resend. |
 | 400 | `unrecognized_link` | aw-bots can't parse `meeting_url` | Not retry until the link changes. |
 | 400 | `platform_not_enabled` | The link's host is on the deployment's blocked list (`ENTRY_BLOCKED_HOSTS`) | Not retry until that changes. |
 | 400 | `too_far_ahead` | `start` is more than 30 days ahead | Send it later. |
 | 400 | `already_ended` | `end` is not after now (without `join_now`) | Drop it. |
 | 401 | `unauthorized` | No key, or an unknown, revoked or expired key | Stop and fix the configuration; never mark entries rejected. |
-| 403 | `forbidden` | The key lacks the route's scope | Same as 401. |
+| 403 | `forbidden` | The key lacks the route's scope, or the gateway blocks the caller's address | Same as 401. |
 | 404 | `entry_not_found` | Remove of an entry never sent | Drop it. |
 | 404 | `meeting_not_found` | Unknown UUID, another account's meeting, or not visible to `user=` | Treat as "not found". |
+| 404 | `webhook_not_found` | A `/v2/webhooks/{id}` UUID that isn't one of the account's subscriptions | Treat as "not found". |
+| 404 | `account_not_found` | `POST /v2/webhooks` from an account aw-bots has no user row for | Fix the account. |
 | 409 | `meeting_not_finished` | `DELETE` or export on a scheduled or live meeting | Remove its entries or stop it first. |
 | 409 | `no_live_bot` | Stop on a meeting with no live bot | To cancel a future meeting, remove its entry. |
-| 429 | `rate_limited` | The account's write rate was hit (`Retry-After` set) | Wait `Retry-After` seconds, then resend. |
+| 429 | `rate_limited` | A rate was hit ([Rate limits](#rate-limits-and-quotas)); `Retry-After` is always set | Wait `Retry-After` seconds, then resend. |
 | 429 | `quota_exceeded` | A standing quota is full (no `Retry-After`) | Stop; free entries, or ask for a higher quota. |
-| 503 | `unavailable` | The database is down, a write raced another on the same entry, the gateway can't check the key, or a service behind it failed | Retry with backoff. |
-
-A 500 is a bug in aw-bots, not in the request: report it.
+| 500 | `internal_error` | A fault aw-bots couldn't resolve, among them an entry write that kept losing a race with another write on the same key after `INTAKE_CONFLICT_RETRIES` (3) more tries; logged with its stack | Report it; don't retry blindly. |
+| 503 | `unavailable` | The database is down; the meeting link kept changing during the write or the stop; a stop is recorded but its leave command couldn't be sent yet; the webhook secret key ring isn't configured, or a test send couldn't be queued; the gateway can't check the key, count entry writes or sign the request. When the gateway can't reach the service behind it, the same code comes with 502 (or 504 on a timeout) | Retry with backoff. |
 
 ### Rate limits and quotas
 
@@ -550,7 +565,7 @@ A rate says "slow down" and comes with `Retry-After`; a quota says "stop" and co
 |---|---|---|
 | Entry writes (`PUT /v2/entries` + `POST /v2/entries/remove` together), per account | 600 a minute (`INTAKE_RATE_LIMIT_PER_MIN`), in wall-clock minute windows shared by every gateway replica | `429 rate_limited`, `Retry-After` = seconds left in the window |
 | Requests per key (every route) | a burst of 120, refilled at 40 a second | `429 rate_limited`, `Retry-After: 1` |
-| Requests per address, from outside the deployment's own network | 600 a minute | `429` |
+| Requests per address, from outside the deployment's own network | 600 a minute (`GUARD_RATE_LIMIT_RPM` per `GUARD_RATE_LIMIT_WINDOW`, 60 s) | `429 rate_limited`, `Retry-After` = the window's seconds (60) |
 | Active entries (entries of unfinished meetings), per account | 100 000 (`INTAKE_MAX_ACTIVE_ENTRIES`), checked only when a write adds an active entry; concurrent writes can pass it by a few | `429 quota_exceeded` |
 | Webhook subscriptions, per account | 20 | `429 quota_exceeded` |
 | `metadata` per entry | 16 KB | `400 invalid_request` |
@@ -607,8 +622,10 @@ scope; the events carry the same [meeting object](#the-meeting-object) every
 export AW_BOTS_WEBHOOKS_KEY=vxa_webhooks_…   # placeholder; a key with the webhooks scope
 ```
 
-These subscriptions are separate from the per-account webhook in [Settings](../../../../docs/docs/webhooks.mdx)
-(`PUT /user/webhook`), which keeps its own older envelope.
+In AW's deployment the portal and the exporter are the subscribers; the exporter subscribes to
+`meeting.completed` and `bot.failed`. These subscriptions are separate from the per-account webhook
+in [Settings](../../../../docs/docs/webhooks.mdx) (`PUT /user/webhook`), which keeps upstream's
+envelope and meeting block.
 
 ### Subscriptions
 
@@ -641,7 +658,7 @@ A subscription object:
 **URL rules.** `http` or `https` with a host. The URL is checked when saved and again before
 every send: a host that is, or resolves to, a private, loopback, link-local or otherwise reserved
 address is refused (`400 invalid_request`), unless the deployment allow-lists it
-(`WEBHOOK_PRIVATE_HOST_ALLOWLIST`, which holds the portal's in-cluster host).
+(`WEBHOOK_PRIVATE_HOST_ALLOWLIST`, which holds the portal's and the exporter's in-cluster hosts).
 
 #### Add a subscription
 
@@ -758,7 +775,8 @@ final state are kept for 30 days (`WEBHOOK_DELIVERY_RETENTION_DAYS`).
 
 #### Errors
 
-The `/v2` error shape. `400 invalid_request` (a bad field, an unknown event type, a refused URL),
+The `/v2` error shape. `400 invalid_request` (a bad field, an unknown event type, a refused URL,
+an `{id}` that isn't a UUID),
 `401 unauthorized`, `403 forbidden`, `404 webhook_not_found` (not one of the account's
 subscriptions), `404 account_not_found`, `429 quota_exceeded`, `503 unavailable` (storage down, the
 deployment's secret key ring not configured, or the test couldn't be queued; retry).
@@ -802,6 +820,7 @@ Every delivery is one JSON object:
       "bot_joins_at": "2026-09-29T04:25:00Z",
       "completion_reason": "stopped",
       "end": "2026-09-29T05:00:00Z",
+      "ended_at": "2026-09-29T05:12:41Z",
       "entries": [
         { "attendees": ["a@abroadworks.com", "b@example.com"], "external_id": "google:3n5kq8example",
           "metadata": { "crm_id": "42" }, "series_id": "google:series-weekly", "user": "a@abroadworks.com" }
@@ -815,9 +834,11 @@ Every delivery is one JSON object:
       "room": "abc-defg-hij",
       "sequence": 9,
       "start": "2026-09-29T04:30:00Z",
+      "started_at": "2026-09-29T04:26:11Z",
       "status": "completed",
       "time_zone": "Asia/Kolkata",
-      "title": "Weekly sync"
+      "title": "Weekly sync",
+      "upstream_id": 11367
     }
   },
   "event_id": "evt_ef69c30038906cb161306e9e12261b439e1f66a7c5426a943b43f6ed880cf5a9",
@@ -915,7 +936,7 @@ export function verify(rawBody, headers, secret, toleranceS = 300) {
 Both snippets check out against the sealed `webhook.v1` goldens: the body is
 `MeetingEvent.meeting-completed.json` written compactly with sorted keys (exactly how aw-bots posts
 it), the secret `whsec_demo_secret`, the timestamp `1790658761`, giving
-`sha256=d4b79a595be48b0769c0e9a685672032fc9bb64275ae2ee05ec9ce237aeb98a4`
+`sha256=28cdd8ad6a643ec2695ceeeb85b19d02ed8606d98b8715f39fef7fac29e9594c`
 (`SignatureHeaders.subscription.json`). With `whsec_demo_previous_secret`, the match is on
 `X-Webhook-Signature-Previous` (`SignatureHeaders.rotated.json`). Test with the golden's own
 timestamp as "now", or the 300 s check refuses it.
