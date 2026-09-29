@@ -583,7 +583,8 @@ async def end_overdue_retries(
 ) -> int:
     """§6.9 F-K2's backstop: every meeting waiting for its next bot past its deadline
     (``intake.retry.deadline``: ``due_at`` + ``untracked_grace``) ends ``failed`` through
-    ``repo.end_retry``, whatever the retry driver did (it may have given the item up). Before its
+    ``repo.end_retry``, whatever the retry driver did (it may have given the item up), read a page
+    of ``SWEEP_BATCH_SIZE`` at a time by meeting id (§6.9 F-I). Before its
     deadline a waiting meeting is left to the driver: ``list_stale_nonterminal`` never lists one.
     Each one ended gets the meeting-level finish ``finish_meeting(meeting_id)`` (the app's).
     Best-effort: never raises. Returns how many ended."""
@@ -592,30 +593,40 @@ async def end_overdue_retries(
     from datetime import timezone
 
     from ..intake import retry
+    from ..sweeps.item_failures import sweep_batch_size
 
     now = datetime.now(timezone.utc)
+    page_size = sweep_batch_size()
     ended = 0
-    try:
-        waiting = await repo.list_retry_meetings()
-    except Exception:  # noqa: BLE001 — best-effort; retried next sweep
-        log.exception("nonterminal-reconcile: list_retry_meetings failed")
-        return 0
-    for row in waiting:
-        mark = retry.marker(row.get("data"))
-        limit = None if mark is None else retry.deadline(mark, untracked_grace)
-        if mark is None or limit is None or now < limit:
-            continue
-        code, message = retry.overdue(mark, limit)
+    after: Optional[int] = None
+    while True:
         try:
-            if await repo.end_retry(meeting_id=row["id"], change_reason=code, message=message) is None:
-                continue  # the driver or a stop ended it between the listing and the lock
-            ended += 1
-            log.warning("nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message)
-            if finish_meeting is not None:
-                await finish_meeting(row["id"])
+            waiting = await repo.list_retry_meetings(after=after, limit=page_size)
         except Exception:  # noqa: BLE001 — best-effort; retried next sweep
-            log.exception("nonterminal-reconcile: end_retry failed for meeting %s", row["id"])
-    return ended
+            log.exception("nonterminal-reconcile: list_retry_meetings failed")
+            return ended
+        for row in waiting:
+            mark = retry.marker(row.get("data"))
+            limit = None if mark is None else retry.deadline(mark, untracked_grace)
+            if mark is None or limit is None or now < limit:
+                continue
+            code, message = retry.overdue(mark, limit)
+            try:
+                if await repo.end_retry(
+                    meeting_id=row["id"], change_reason=code, message=message
+                ) is None:
+                    continue  # the driver or a stop ended it between the listing and the lock
+                ended += 1
+                log.warning(
+                    "nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message
+                )
+                if finish_meeting is not None:
+                    await finish_meeting(row["id"])
+            except Exception:  # noqa: BLE001 — best-effort; retried next sweep
+                log.exception("nonterminal-reconcile: end_retry failed for meeting %s", row["id"])
+        if len(waiting) < page_size:
+            return ended
+        after = waiting[-1]["id"]
 
 
 def _log_orphan_kill_failed(meeting_id, workload_id, err, *, unconfirmed: bool = False) -> None:

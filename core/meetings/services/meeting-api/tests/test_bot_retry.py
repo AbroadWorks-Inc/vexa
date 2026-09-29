@@ -1050,3 +1050,26 @@ async def test_a_pending_teardown_without_a_readable_since_is_bounded(since):
     assert await failures.given_up("unproven-teardown", ["5:mtg-5-old"]) == {
         "5:mtg-5-old"
     }
+
+
+async def test_the_sweep_reads_the_waiting_meetings_in_pages(monkeypatch):
+    import copy
+
+    from meeting_api.lifecycle.reconcile import end_overdue_retries
+
+    monkeypatch.setenv("SWEEP_BATCH_SIZE", "1")
+    repo = _waiting_repo(proven=False)
+    late = datetime.now(UTC) - timedelta(seconds=601)
+    repo._meetings[5]["data"]["bot_retry"]["due_at"] = late.isoformat()
+    repo._meetings[6] = copy.deepcopy({**repo._meetings[5], "id": 6})
+    reads: list[tuple] = []
+    real = repo.list_retry_meetings
+
+    async def paged(**kw):
+        reads.append((kw.get("after"), kw.get("limit")))
+        return await real(**kw)
+
+    repo.list_retry_meetings = paged
+    assert await end_overdue_retries(repo, untracked_grace=600, log=_Log()) == 2
+    assert reads[0] == (None, 1) and all(limit == 1 for _, limit in reads)
+    assert [repo._meetings[i]["status"] for i in (5, 6)] == ["failed", "failed"]
