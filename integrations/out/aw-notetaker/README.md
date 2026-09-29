@@ -36,6 +36,10 @@ Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.m
 ## Which meetings are exported (design §6.9 F-K2)
 The subscription carries two events the exporter acts on, and both are exported:
 - **`meeting.completed`**, as before. One with no audio recording is a failed export (`no_audio`).
+  One without a `started_at` never had its bot in the meeting (for example it was stopped in the
+  lobby): intake answers 200, exports nothing and logs the WARNING `completed_skipped
+  meeting_id=<uuid> reason=no_start_time`, the line to count. It is never a 400, which a
+  subscription would record as a permanent `failed` delivery.
 - **`bot.failed`**: the meeting ended `failed`, for example because its bot recorded part of the call,
   failed, and could not be replaced in time. It is exported and transcribed like a completed one,
   every session into the one folder. When it has no audio recording, it is skipped with the log line

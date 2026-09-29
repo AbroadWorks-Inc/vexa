@@ -12,9 +12,11 @@ final.
 
 A finished meeting is `meeting.completed`, or `bot.failed`: a meeting whose
 bot recorded part of the call and then failed is still exported (§6.9 F-K2);
-the job skips one that has no recording. A `bot.failed` without a
-`started_at` never had its bot in the meeting, so it is skipped here, and a
-`not_sent` meeting (no bot was ever sent) is never exported.
+the job skips one that has no recording. A `bot.failed` or
+`meeting.completed` without a `started_at` never had its bot in the meeting,
+so it is answered 200 and skipped here (a `meeting.completed` one logged at
+warning, `completed_skipped`), and a `not_sent` meeting (no bot was ever sent)
+is never exported.
 
 Delivery is at-least-once: an `event_id` already queued is answered 2xx as a
 duplicate. The event is recorded after its meeting is queued, so a failure
@@ -130,6 +132,21 @@ def create_app(
             logger.info(
                 "bot_failed_skipped meeting_id=%s reason=no_start_time; "
                 "nothing recorded",
+                meeting.get("id"),
+            )
+            return JSONResponse({"status": "ignored"})
+        if (
+            isinstance(meeting, dict)
+            and not meeting.get("started_at")
+            and _meeting_is_valid({**meeting, "started_at": "-"})
+        ):
+            # meeting.completed of a bot that was never in the meeting (e.g.
+            # stopped in the lobby): nothing to export, and no delivery fault,
+            # so never a 400 (a permanent `failed` delivery). A meeting that is
+            # invalid otherwise still is.
+            logger.warning(
+                "completed_skipped meeting_id=%s reason=no_start_time; "
+                "the bot was never in the meeting, nothing exported",
                 meeting.get("id"),
             )
             return JSONResponse({"status": "ignored"})

@@ -341,23 +341,35 @@ def test_missing_meeting_id_returns_400(storage: Storage) -> None:
     assert resp.status_code == 400
 
 
-def test_missing_start_time_returns_400_and_not_queued(storage: Storage) -> None:
-    settings = _settings()
-    queue = PendingQueue(storage, settings.vexa_bucket)
-    app = create_app(
-        settings,
-        queue,
-        _deps(storage, settings),
-        clock=_fixed_clock,
-        start_worker=False,
+@pytest.mark.parametrize("started_at", ["missing", None, ""])
+def test_a_completed_meeting_without_a_start_time_is_skipped_not_rejected(
+    storage: Storage, caplog: pytest.LogCaptureFixture, started_at: Any
+) -> None:
+    """The bot never got into the meeting (for example stopped in the
+    lobby), so there is nothing to export. It is answered 200: under a
+    subscription a 400 is a permanent `failed` delivery, and this is no
+    delivery fault. It is logged at warning, once per meeting, so it can be
+    counted."""
+    envelope = (
+        _envelope_missing("started_at")
+        if started_at == "missing"
+        else _envelope(started_at=started_at)
     )
-    envelope = _envelope_missing("started_at")
-    body = json.dumps(envelope).encode()
-    headers = _sign(body)
-    with TestClient(app) as client:
-        resp = client.post("/hooks/vexa", content=body, headers=headers)
-    assert resp.status_code == 400
+    with caplog.at_level(logging.INFO, logger="exporter"):
+        resp, queue = _post(storage, envelope)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored"}
     assert queue.pending_ids() == []
+    assert storage.list_keys(VEXA_BUCKET, "aw-exporter/") == []
+    skipped = [
+        r
+        for r in caplog.records
+        if r.getMessage()
+        == f"completed_skipped meeting_id={MEETING_UUID} reason=no_start_time; "
+        "the bot was never in the meeting, nothing exported"
+    ]
+    assert len(skipped) == 1 and skipped[0].levelno == logging.WARNING
 
 
 @pytest.mark.parametrize(
