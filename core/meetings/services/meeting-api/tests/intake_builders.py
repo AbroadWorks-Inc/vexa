@@ -64,6 +64,19 @@ class FakeClock:
         self.now = self.now + timedelta(**kwargs)
 
 
+def upcoming(*, days: float = 1, minutes: float = 30) -> dict[str, str]:
+    """``start``/``end`` for ``entry_body`` of a meeting ``days`` after the real clock's now, on a
+    whole minute. ``entry_body``'s default times suit a service on a ``FakeClock``; a service on
+    the real clock (the Postgres harnesses) takes these, so no test fails as the date moves.
+    """
+    start = (datetime.now(UTC) + timedelta(days=days)).replace(second=0, microsecond=0)
+    end = start + timedelta(minutes=minutes)
+    return {
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+    }
+
+
 def entry_body(
     external_id: str = "google:3n5kq8example",
     *,

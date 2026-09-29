@@ -524,7 +524,7 @@ async def test_pg_create_meeting_without_a_link_takes_no_link_lock(pg):
 
 
 async def test_pg_an_intake_created_meetings_first_event_records_its_status(pg):
-    from intake_builders import entry_body, make_settings
+    from intake_builders import entry_body, make_settings, upcoming
 
     from meeting_api.intake import IntakeService, PostgresIntakeStore
     from meeting_api.intake.fakes import NoStop
@@ -534,9 +534,7 @@ async def test_pg_an_intake_created_meetings_first_event_records_its_status(pg):
     service = IntakeService(
         store, _NoSpawnPort(), NoStop(), OutboxOnly(), make_settings()
     )
-    await service.put_entry(
-        USER, entry_body(start="2026-10-20T09:00:00Z", end="2026-10-20T09:30:00Z")
-    )
+    await service.put_entry(USER, entry_body(**upcoming()))
     mid = await pg.only_meeting()
     [first] = await pg.events(mid)
     assert (first["event_type"], first["sequence"]) == ("meeting.scheduled", 1)
@@ -1203,7 +1201,7 @@ async def test_pg_an_r5_stopped_meetings_terminal_event_carries_the_outcome(pg):
     """R5 end to end: the last entry of a live meeting is removed (``stopping`` + outcome), the bot
     completes through the lifecycle callback, and the TERMINAL outbox event carries
     ``cancelled_by_calendar`` with ``completion_reason: "stopped"``."""
-    from intake_builders import A, entry_body, make_settings
+    from intake_builders import A, entry_body, make_settings, upcoming
 
     from meeting_api.bot_spawn.fakes import FakeRuntimeClient
     from meeting_api.intake import IntakeService, IntakeStop, PostgresIntakeStore
@@ -1215,9 +1213,7 @@ async def test_pg_an_r5_stopped_meetings_terminal_event_carries_the_outcome(pg):
         store, InMemoryCommandPublisher(), FakeRuntimeClient(), publisher=OutboxOnly()
     )
     service = IntakeService(store, _NoSpawnPort(), stop, OutboxOnly(), make_settings())
-    reply = await service.put_entry(
-        USER, entry_body(start="2026-10-20T09:00:00Z", end="2026-10-20T09:30:00Z")
-    )
+    reply = await service.put_entry(USER, entry_body(**upcoming()))
     mid = int(
         await pg.scalar(
             "SELECT id FROM meetings WHERE uuid = CAST(:u AS uuid)",

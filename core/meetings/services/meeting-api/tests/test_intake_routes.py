@@ -28,6 +28,7 @@ from intake_builders import (
     instant_body,
     intake_app,
     make_harness,
+    upcoming,
 )
 from meeting_api.collector.app import build_router as build_collector_router
 from meeting_api.collector.fakes import InMemoryTranscriptStore
@@ -834,7 +835,9 @@ async def test_pg_a_database_that_cannot_be_reached_is_503():
         async with http(
             intake_app(service, PostgresIntakeReads(factory), _Unused())
         ) as client:
-            put = await client.put("/v2/entries", json=entry_body(), headers=ACCOUNT)
+            put = await client.put(
+                "/v2/entries", json=entry_body(**upcoming()), headers=ACCOUNT
+            )
             read = await client.get("/v2/meetings", params={"user": A}, headers=ACCOUNT)
     finally:
         await engine.dispose()

@@ -37,6 +37,7 @@ from intake_builders import (
     intake_app,
     make_harness,
     make_settings,
+    upcoming,
 )
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient
 from meeting_api.intake.fakes import FakePublisher, InMemoryIntakeReads
@@ -427,6 +428,8 @@ class _PgStack:
         self.stop = IntakeStop(
             self.store, self.commands, self.runtime, publisher=self.publisher
         )
+        #: The meeting ``live`` plans, a day ahead of the real clock the service runs on.
+        self.window = upcoming()
         self.service = IntakeService(
             self.store,
             _NoSpawn(),
@@ -449,9 +452,7 @@ class _PgStack:
 
     async def live(self, status: str, *, session_uid: str = "sess-r5") -> int:
         """A meeting entries manage whose bot reached ``status``, with its session."""
-        reply = await self.service.put_entry(
-            7, entry_body(start="2026-10-20T09:00:00Z", end="2026-10-20T09:30:00Z")
-        )
+        reply = await self.service.put_entry(7, entry_body(**self.window))
         mid = int(
             await self.scalar(
                 "SELECT id FROM meetings WHERE uuid = CAST(:u AS uuid)",
@@ -638,7 +639,7 @@ async def test_pg_r5_outcome_survives_the_bots_completion(pg_engine):
     event = {
         "connection_id": "sess-r5",
         "status": "completed",
-        "timestamp": "2026-10-20T09:20:00.000Z",
+        "timestamp": s.window["start"],  # the bot's report, inside the planned meeting
         "exit_code": 0,
         "completion_reason": "stopped",
         "bot_logs": ["[ACT] leave received"],
@@ -711,11 +712,7 @@ async def test_pg_a_put_after_the_removal_already_sees_the_stop(pg_engine):
         put = asyncio.create_task(
             s.service.put_entry(
                 7,
-                entry_body(
-                    "google:late-invite",
-                    start="2026-10-20T09:00:00Z",
-                    end="2026-10-20T09:30:00Z",
-                ),
+                entry_body("google:late-invite", **s.window),
             )
         )
         await _waiting_on(s, "Lock", "advisory", n=2)
