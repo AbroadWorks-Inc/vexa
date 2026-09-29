@@ -1574,3 +1574,44 @@ async def test_pg_a_post_spawn_failure_on_the_last_attempt_records_the_unproven_
     row = await pg.row(mid)
     assert row["status"] == "failed"
     assert row["data"]["unproven_teardown"]["workload"] == workload
+
+
+async def _unproven_waiting(pg: Pg, **kw: Any) -> tuple[int, str]:
+    """A meeting waiting for its next bot after a create that went unanswered."""
+    import httpx
+
+    mid = await pg.calendar_meeting(**kw)
+    runtime = _NoAnswer(httpx.ReadError("connection reset"))
+    await pg.port(runtime).spawn_exact(USER, mid)
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert marker["proven_gone"] is False
+    return mid, runtime.specs[0]["workloadId"]
+
+
+async def test_pg_a_stop_inside_the_backoff_records_the_unproven_teardown(pg):
+    from meeting_api.intake.stop import IntakeStop
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    mid, workload = await _unproven_waiting(pg)
+    await IntakeStop(
+        pg.store, InMemoryCommandPublisher(), FakeRuntimeClient()
+    ).stop_live(USER, mid, outcome=None)
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert row["data"]["unproven_teardown"]["workload"] == workload
+
+
+async def test_pg_the_planned_end_passing_while_unproven_records_the_teardown(pg):
+    mid, workload = await _unproven_waiting(pg, end_in=timedelta(seconds=90))
+    await pg.tick(_gone(), at=_later(91))
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert row["data"]["unproven_teardown"]["workload"] == workload
+
+
+async def test_pg_a_waiting_meeting_proven_gone_ends_without_a_teardown(pg):
+    mid, session = await pg.sent(status="active", end_in=timedelta(minutes=3))
+    await _fail(pg, session, "completed", "left_alone", "runtime_destroy")
+    await pg.tick(_gone(), at=_later(181))
+    row = await pg.row(mid)
+    assert row["status"] == "failed" and "unproven_teardown" not in row["data"]

@@ -282,8 +282,12 @@ async def end(
     """End a meeting waiting for its next bot ``failed``: ``completion_reason`` (else the
     marker's), the marker's stage as ``failure_stage`` and ``message`` (else the marker's) as
     ``failure_reason``, the marker cleared, with ``outcome`` when given; the change reason is
-    ``change_reason``, else the completion reason. ``None``, having written nothing, when the
-    meeting isn't waiting."""
+    ``change_reason``, else the completion reason. A failed workload not proven gone is left
+    for the reconcile sweep to delete (``bot_spawn.ports.unproven_teardown``, the one record):
+    the ending frees the link while it may still run. ``None``, having written nothing, when
+    the meeting isn't waiting."""
+    from ..bot_spawn.ports import unproven_teardown
+
     meeting = await tx.meeting(meeting_id)
     mark = marker(meeting.data)
     if mark is None or meeting.status != "requested":
@@ -293,6 +297,8 @@ async def end(
         MARKER: None,
         "failure_reason": message or mark.get("message"),
     }
+    if not mark.get("proven_gone") and mark.get("workload"):
+        patch.update(unproven_teardown(str(mark["workload"])))
     if reason is not None:
         patch["completion_reason"] = reason
     if mark.get("stage") is not None:

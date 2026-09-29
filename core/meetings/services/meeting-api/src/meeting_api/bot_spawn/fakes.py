@@ -450,6 +450,10 @@ class InMemoryMeetingRepo:
             row["data"]["completion_reason"] = mark["reason"]
         if mark.get("stage") is not None:
             row["data"]["failure_stage"] = mark["stage"]
+        if not mark.get("proven_gone") and mark.get("workload"):
+            from .ports import unproven_teardown
+
+            row["data"].update(unproven_teardown(str(mark["workload"])))
         return f"evt_retry_end_{meeting_id}"
 
     async def list_retry_meetings(self, *, after=None, limit=None) -> list:
