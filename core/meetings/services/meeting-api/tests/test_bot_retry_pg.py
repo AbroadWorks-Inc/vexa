@@ -1366,3 +1366,31 @@ async def test_pg_an_unproven_create_that_is_retried_leaves_the_workload_to_the_
     await pg.port(runtime).spawn_exact(USER, mid)
     assert (await pg.row(mid))["data"]["bot_retry"]["proven_gone"] is False
     assert runtime.deleted == []
+
+
+async def test_pg_a_cancelled_create_leaves_the_meeting_bounded(pg):
+    import asyncio
+
+    mid = await pg.calendar_meeting()
+    runtime = _NoAnswer(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await pg.port(runtime).spawn_exact(USER, mid)
+    marker = (await pg.row(mid))["data"]["bot_retry"]
+    assert (marker["workload"], marker["proven_gone"]) == (
+        runtime.specs[0]["workloadId"],
+        False,
+    )  # unproven: the F-K2 proof and deadline bound it
+
+
+async def test_pg_a_cancelled_create_on_the_last_attempt_ends_and_deletes(pg):
+    import asyncio
+
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+    runtime = _NoAnswer(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await pg.port(runtime).spawn_exact(USER, mid)
+    assert (await pg.row(mid))["status"] == "failed"
+    assert runtime.deleted == [runtime.specs[0]["workloadId"]]

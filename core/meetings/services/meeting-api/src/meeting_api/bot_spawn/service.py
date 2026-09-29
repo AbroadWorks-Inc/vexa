@@ -23,6 +23,7 @@ The flow (parent ``meetings.py`` lines ~1010-1403, reduced to the standard-bot b
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import uuid
@@ -934,10 +935,11 @@ async def request_bot(
             fields={"reason": reason},
         )
         raise
-    except Exception as e:
-        # No answer from the kernel (a timeout, a dropped connection, a protocol error): it may
-        # have started the workload, so the row is failed with the workload named and NOT proven
-        # gone (§6.9 F-K2).
+    except (Exception, asyncio.CancelledError) as e:
+        # No answer from the kernel (a timeout, a dropped connection, a protocol error, the
+        # request cancelled mid-create): it may have started the workload, so the row is failed
+        # with the workload named and NOT proven gone (§6.9 F-K2), which bounds it, and the error
+        # is re-raised.
         await _fail_unproven(
             f"the runtime did not answer the workload create ({type(e).__name__})", e
         )
