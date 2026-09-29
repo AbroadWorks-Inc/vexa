@@ -137,10 +137,13 @@ of the meeting's sends (`record_send_failure`), then `requested` through `write_
 waits. Three writers call it: the session-keyed lifecycle write (`update_meeting_status`; a lost bot
 on the last attempt ends `failed`; a session with no recorded workload is known by
 `workload_id_for`), `fail_meeting` and `ExactRowSpawn`'s post-claim ending. A workload is recorded
-proven gone only on evidence: the runtime refused it (429, 4xx, a dead body) or its teardown was
-confirmed. A create the runtime did not answer (a timeout, a transport error, a 5xx) or a
-post-spawn write failure with an unconfirmed teardown names the workload unproven, and the
-spawn port's own ending (which knows no workload) never records one gone. The last failure ends `failed` with
+proven gone only on evidence: the runtime refused it (429, 4xx, a dead body), its teardown was
+confirmed, or the failure came before the create was called (the token, the invocation, the spec:
+no workload is named). A create the runtime did not answer (a timeout, a transport error, a 5xx,
+the request cancelled mid-create) or a post-spawn write failure with an unconfirmed teardown names
+the workload unproven; when that failure ends the meeting instead of retrying it, the workload is
+deleted best-effort through the reconcile sweeps' teardown. The spawn port's own ending (which
+knows no workload) never records one gone. The last failure ends `failed` with
 `bot.failed` and `aw_meetings_failed_total`; on a meeting that already had a bot session its
 `not_sent` outcome is dropped. A row waiting for its next bot takes no status write from a session
 (data-only writes still land), a session that isn't the meeting's newest writes nothing, and the
