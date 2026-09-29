@@ -526,7 +526,7 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 
 | `outcome.kind` | Set when | `detail` |
 |---|---|---|
-| `not_sent` | The meeting ended with no bot: its end passed, or an instant join failed. `status: "failed"`. | A typed code: `account_limit`, `already_live`, `meeting_stopped`, `spawn_error`, `authority_denied`, `authority_unavailable`, `auth_session`, `transcription_config`, `internal_error`, `room_busy` (the link was still busy at the meeting's end), `ended_before_sent`. `message` is the exact reason. |
+| `not_sent` | The meeting ended with no bot: its end passed, or an instant join failed. `status: "failed"`. | A typed code: `account_limit`, `already_live`, `meeting_stopped`, `spawn_error`, `authority_denied`, `authority_unavailable`, `auth_session`, `transcription_config`, `internal_error` (also an instant join with no end whose send kept failing until the scheduler gave it up), `room_busy` (the link was still busy at the meeting's end), `ended_before_sent`. `message` is the exact reason. |
 | `cancelled_by_calendar` | The last entry was removed, or moved to another meeting. | The remove `reason`, or `entry_moved`. |
 | `merged_into_live` | The meeting was due while an open-ended instant-join bot was on its link: its entries moved onto that live meeting, so there is one bot and one recording. `status: "failed"`, webhook `meeting.removed` with `data.merged_into`. | The live meeting's UUID. |
 
@@ -950,13 +950,13 @@ secret can go.
 | Your answer | Result |
 |---|---|
 | 2xx | `delivered` |
-| 5xx, 429, a timeout (10 s per attempt) or a connection error | retried after 1 min, 5 min, 30 min and 2 h, then `dead` |
+| 5xx, 429, a timeout (the operator's `WEBHOOK_SEND_TIMEOUT_S`, default 10 s per attempt) or a connection error | retried after 1 min, 5 min, 30 min and 2 h, then `dead` |
 | anything else: 4xx, a redirect (redirects are never followed) | `failed`, not retried |
 
 - The retry waits are the operator's setting `WEBHOOK_RETRY_SCHEDULE_S` (default
   `60,300,1800,7200`, in seconds); the number of entries is the number of retries.
 - **Answer 2xx fast.** Verify, store or queue the event, answer, and do slow work afterwards. An
-  answer later than 10 s counts as a timeout and is sent again.
+  answer later than the send timeout (10 s by default) counts as a timeout and is sent again.
 - Answer 5xx (or 503) when you can't take the event right now, so it comes back; answer 4xx only for
   a request you will never accept.
 - A URL the guard refuses at send time is `failed`. A delivery aw-bots can't sign or resolve yet
@@ -969,7 +969,7 @@ secret can go.
 2. Read the raw body; verify either signature header; reject more than 300 s of skew.
 3. Skip an `event_id` already seen (kept 48 h); skip an event whose `sequence` is lower than the
    one you applied for that meeting.
-4. Apply the event (or queue it), then mark the `event_id` seen, then answer 2xx within 10 s.
+4. Apply the event (or queue it), then mark the `event_id` seen, then answer 2xx within the send timeout (10 s by default).
    Answer 503 if your store is down, so aw-bots retries.
 5. Answer a verified `webhook.test` with 200 and do nothing else. Use `POST …/test` after setup
    and check the delivery log.

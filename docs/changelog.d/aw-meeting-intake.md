@@ -55,3 +55,18 @@
   provenance, the per-user webhook, flows, and copilot reap. A redundancy audit and cleanup wave
   removed in-service duplicates (the paged-sweep loop, key-ring parsers, the gone-proof check, the
   finished-meeting lock and others) and brought code, contracts and docs into agreement.
+- **aw-bots: every identity header is signed; outages never give work up (final fix round).**
+  The gateway's v2 signature covers all eight `x-user-*` headers it forwards (15 fields), a
+  request that carries one twice is refused, and the replay window is the setting
+  `GATEWAY_IDENTITY_MAX_SKEW_S` (60 s) on meeting-api and admin-api. A runtime that doesn't answer
+  is never a sweep item's failure: pending teardowns and upstream's reconcile loops (now paged and
+  bounded as `stale-stopping` and `stale-nonterminal`) wait for it, counted
+  `aw_sweep_items_total{result="runtime_unreachable"}`, and give an item up by its age
+  (`UNPROVEN_TEARDOWN_MAX_AGE_S`, 6 h). A given-up record is kept while its item is listed and
+  pruned after `SWEEP_ITEM_FAILURES_RETENTION_S`; an open-ended meeting the scheduler gives up ends
+  `not_sent` (`internal_error`). admin-api's webhook retention deletes in batches
+  (`WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE`, `WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES`) and counts
+  each run in `aw_sweep_runs_total`. The first send and a `join_now` send get the one finish, and
+  each end is finished once (`data.finished_end`, kept out of every webhook). The webhook sender's
+  timeout, lease and claim limit, the stop's link reruns and the conflict pause are settings, and
+  every setting this work adds is a Helm chart value.

@@ -147,7 +147,9 @@ evidence: the runtime refused it (429, 4xx, a dead body), its teardown was confi
 failure (a cancel included) came before the create was called (the token, the invocation, the
 spawn fence, the spec: no workload is named). A create the runtime did not answer (a timeout, a
 transport error, a 5xx, the request cancelled mid-create) names the workload unproven, and the
-spawn port's own ending (which knows no workload) never records one gone. One rule covers every
+spawn port's own ending (`ExactRowSpawn._end_not_sent`) never records one gone: it names the
+workload its spawn planned (`workload_id_for(meeting, data.spawn_session.session)`) on the retry
+marker, and records it when its end frees the link. One rule covers every
 end that frees the link while a workload may still run: it records `data.unproven_teardown`
 (`{workload, since}`, built only by `bot_spawn.ports.unproven_teardown`). `request_bot`'s
 `_teardown_or_record` deletes the workload through the reconcile sweeps' teardown and records it
@@ -161,8 +163,12 @@ sweep retries every recorded one each pass, whatever the meeting's status (a reo
 meeting keeps its list), bounded by §6.9 F-I (`retry_unproven_teardowns`, sweep
 `unproven-teardown`, item `<meeting id>:<workload>`, a page of `SWEEP_BATCH_SIZE`): cleared on a
 confirmed delete, the runtime reporting it gone, or a 404 past `MEETING_UNTRACKED_GRACE_SEC` since
-`since` (a missing or unreadable `since` counts as a failure); given up and counted after
-`SWEEP_MAX_ITEM_FAILURES`. Every link-freeing end records this way but one: the bot's own terminal
+`since`. A runtime that doesn't answer (a probe that errors, a delete with a 5xx or no answer) is
+no failure of the item: it is logged, counted `runtime_unreachable` and tried next pass, and given
+up at once when `UNPROVEN_TEARDOWN_MAX_AGE_S` (6 h) past its `since`
+(`lifecycle.reconcile.runtime_bound`). A delete the runtime refuses, or a missing or unreadable
+`since`, counts as a failure, and the item is given up after `SWEEP_MAX_ITEM_FAILURES`. Every
+link-freeing end records this way but one: the bot's own terminal
 callback on its last attempt (`update_meeting_status`, transition source `bot_callback`), where the bot reports that
 it is exiting. Both reconcile sweeps reach a session's workload when no container is recorded
 (`reconcile.session_workload`: the recorded `bot_container_id`, else `workload_id_for`), and end
@@ -191,7 +197,8 @@ unproven, or still without its new bot, ends `failed` (`workload_not_proven` / `
 by the retry driver (`retry.overdue`, the one rule) or, if the driver gave the item up, by the
 reconcile backstop (`end_overdue_retries`, `repo.end_retry`), which reads its meetings a page of
 `SWEEP_BATCH_SIZE` at a time through `run_pages` and runs each through `run_item` under its own
-sweep name `retry-overdue`, so one it can't end is counted and given up after
+sweep name `retry-overdue` (item `waiting:<id>`; the unfinished spawns below are
+`unfinished-spawn:<id>`), so one it can't end is counted and given up after
 `SWEEP_MAX_ITEM_FAILURES`. The backstop also ends an unfinished spawn
 (`retry.unfinished_spawn`: a `requested` row with no marker and no container whose planned
 `spawn_session` has no session row): past `at` + `MEETING_UNTRACKED_GRACE_SEC` it ends `failed`,
@@ -199,11 +206,17 @@ a claimed retry with the failed bot's reason as `retry_not_sent`, any other spaw
 `start_failed`, with the planned workload recorded for the teardown sweep
 (`repo.end_unfinished_spawn`, under the link and row locks, which recheck). It finishes only a
 meeting its own end ended. A meeting the retry ends this way (its planned end, a stop, its
-deadline, its last send, or its new bot's claimed spawn failing on the last attempt) gets the same
-finish as a lifecycle end, once: the app's `finish_meeting` runs the one `_finish` (§6.9 F-FIN:
+deadline, its last send, or its new bot's claimed spawn failing on the last attempt), and a meeting
+whose first send claimed the row and whose spawn flow then ended it (the auto-join tick's
+`_finish_claimed_end`, and the `join_now` send in `IntakeService._spawn_now`, both through the one
+rule `status.finish_owed`), gets the same finish as a lifecycle end, once: the app's `finish_meeting` runs the one `_finish` (§6.9 F-FIN:
 transcript finalized, service provenance, the typed event, the flows edge, the system hook when
 one is set, the per-user `webhook_url`, the copilot reap), keyed by its last bot session; the
 per-user URL gets the typed `bot.failed` / `meeting.completed`, not a `meeting.status_change`.
+`finish_meeting` first claims the end (`repo.claim_finish`: under the row lock it writes
+`data.finished_end = {status, session}` to a finished row whose end hasn't had its finish), so one
+end is finished once whoever reaches it, and a continued meeting's later end, with a newer
+session, is finished again. `finished_end` is an internal key no webhook payload carries.
 Every `bot.retry` moves `aw_bot_retries_total{reason,user_id}` once its transaction commits.
 
 The two rules for "which bot failure gets another try" (F-K2 here, upstream's
@@ -258,13 +271,18 @@ seen or cancels what was inserted. A page whose transaction fails is published r
 row that keeps failing is given up (below). `webhook.test` rows are never fanned out.
 
 Every sweep that works through items is bounded the same way (§6.9 F-I, `sweeps/item_failures.py`):
-the auto-join tick (`auto-join`), the not-sent sweep (`not-sent`), the publisher
-(`webhook-publisher`) and the reconcile sweep's `unproven-teardown` and `retry-overdue`. Each reads
+the auto-join tick (`auto-join`, items `due:<id>` and `retry:<id>`), the not-sent sweep
+(`not-sent`), the publisher (`webhook-publisher`), the reconcile sweep's `unproven-teardown` and
+`retry-overdue`, and upstream's reconcile loops `stale-stopping` and `stale-nonterminal`. Each reads
 pages of at most `SWEEP_BATCH_SIZE` in a stable order through `run_pages` (the publisher publishes a
 whole page in one transaction and falls back to `run_item` row by row), and runs each item through
 `run_item`, so one item's failure is logged with its id and stack, counted in
 `aw_sweep_items_total{sweep,result}`, and never stops the rest; after `SWEEP_MAX_ITEM_FAILURES`
-(counted per sweep in `sweep_item_failures`, shared by the replicas) the item is given up.
+(counted per sweep in `sweep_item_failures`, shared by the replicas) the item is given up; in the
+teardown and reconcile sweeps a runtime that doesn't answer is bounded by age instead (above). An
+open-ended meeting the auto-join tick gives up ends `failed`/`not_sent` with `internal_error`
+(`sweeps.end_given_up`, under its link lock, through the status writer), so it reports
+`meeting.not_sent`; one with an end is left to the not-sent sweep.
 `PostgresWebhookTests` backs `POST /internal/webhooks/test` (the route is
 `webhooks/internal_router.py`, internal secret): one `webhook.test` outbox row (sequence 0, `evt_test_<uuid4 hex>`, already published) and
 one delivery for that subscription, in one transaction; the reply is `{event_id}`.
