@@ -65,6 +65,26 @@ def _require_config(env: "os._Environ | dict | None" = None) -> None:
     preflight(env)
 
 
+def _check_settings() -> None:
+    """Read every number setting a sweep, an item or a request reads after boot (§1.11, §6.9),
+    so a value meeting-api can't run on refuses to start (``settings.SettingsError``, naming the
+    key) instead of failing each item that reads it. The settings read at boot itself go through
+    the same reader where they are read (``MEETING_UNTRACKED_GRACE_SEC``)."""
+    from .intake.settings import IntakeSettings
+    from .lifecycle.reconcile import unproven_teardown_max_age_s
+    from .sweeps.item_failures import (
+        sweep_batch_size,
+        sweep_item_failures_retention_s,
+        sweep_max_item_failures,
+    )
+
+    IntakeSettings.from_env()
+    unproven_teardown_max_age_s()
+    sweep_batch_size()
+    sweep_max_item_failures()
+    sweep_item_failures_retention_s()
+
+
 # How many users a calendar sweep syncs at once. Users are independent, so the tick's wall time
 # tracks concurrency rather than the number of connected feeds; the bound keeps the DB pool and
 # the outbound feed fetches inside the budget a handful of users would already use.
@@ -102,6 +122,7 @@ async def _sync_user_calendars(store, redis_client, user_id: int, configs: list,
 def build_production_app():
     """Wire the unified meeting-api with the real adapters + the lifespan-driven loops."""
     _require_config()  # A4: refuse to boot a misconfigured deploy (no ADMIN_TOKEN → every spawn 500s).
+    _check_settings()  # §6.9: a setting a sweep reads later refuses to boot now when it's bad.
 
     import redis.asyncio as aioredis
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -374,7 +395,9 @@ def _attach_background_loops(
     # (runtime 404) CONTINUOUSLY past this window — no runtime re-adoption, no bot callback — is
     # presumed lost (runtime restart on the process backend / external removal) and advanced to
     # `failed` with the evidence note, instead of retrying an error + dead DELETE every sweep forever.
-    untracked_grace = float(os.getenv("MEETING_UNTRACKED_GRACE_SEC", "600"))
+    from .settings import seconds
+
+    untracked_grace = seconds("MEETING_UNTRACKED_GRACE_SEC", "600")
     service_authority_interval = float(
         os.getenv("SERVICE_AUTHORITY_SWEEP_INTERVAL_S", "15")
     )

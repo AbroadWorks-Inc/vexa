@@ -31,7 +31,6 @@ SQLAlchemy is imported inside the Postgres methods, so this module imports witho
 
 from __future__ import annotations
 
-import os
 import time
 import traceback
 from functools import partial
@@ -48,6 +47,7 @@ from typing import (
 
 from ..metrics import sweep_item
 from ..obs import log_event
+from ..settings import seconds, whole
 
 __all__ = [
     "InMemoryItemFailures",
@@ -66,17 +66,17 @@ __all__ = [
 
 def sweep_batch_size() -> int:
     """``SWEEP_BATCH_SIZE``: the most items a sweep reads at once."""
-    return int(os.getenv("SWEEP_BATCH_SIZE", "200"))
+    return whole("SWEEP_BATCH_SIZE", "200")
 
 
 def sweep_max_item_failures() -> int:
     """``SWEEP_MAX_ITEM_FAILURES``: the failures after which a sweep gives an item up."""
-    return int(os.getenv("SWEEP_MAX_ITEM_FAILURES", "5"))
+    return whole("SWEEP_MAX_ITEM_FAILURES", "5")
 
 
 def sweep_item_failures_retention_s() -> float:
     """``SWEEP_ITEM_FAILURES_RETENTION_S``: how long a failure record untouched is kept."""
-    return float(os.getenv("SWEEP_ITEM_FAILURES_RETENTION_S", "604800"))
+    return seconds("SWEEP_ITEM_FAILURES_RETENTION_S", "604800")
 
 
 class ItemDeferred(Exception):

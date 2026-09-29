@@ -24,12 +24,12 @@ port (prod = HttpRuntimeClient; tests = FakeRuntimeClient). Best-effort per meet
 """
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NoReturn, Optional
 
 from ..bot_spawn.ports import SpawnFailed, WorkloadUnknown
+from ..settings import seconds
 from ..sweeps.item_failures import ItemDeferred, ItemExpired
 from .machine import dominant_completion_reason
 
@@ -669,7 +669,7 @@ def unproven_teardown_max_age_s() -> float:
     chased while the runtime doesn't answer, before it is given up (6 h, longer than any
     meeting): a pending teardown since it was recorded, a stale reconcile row since its
     ``updated_at`` (``runtime_bound``)."""
-    return float(os.getenv("UNPROVEN_TEARDOWN_MAX_AGE_S", "21600"))
+    return seconds("UNPROVEN_TEARDOWN_MAX_AGE_S", "21600")
 
 
 async def retry_unproven_teardowns(

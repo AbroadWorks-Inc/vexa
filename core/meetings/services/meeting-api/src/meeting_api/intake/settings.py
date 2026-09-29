@@ -14,13 +14,16 @@ meeting ends ``not_sent``. ``INTAKE_CONFLICT_RETRIES`` is how many more times an
 entry write that lost a constraint race is run again (§6.9 F-D), after a random pause between
 ``INTAKE_CONFLICT_DELAY_MIN_S`` and ``INTAKE_CONFLICT_DELAY_MAX_S`` times the try's number.
 ``INTAKE_STOP_LINK_RETRIES`` is how many more times a stop whose meeting moved to another link
-between the read and the lock is run again (§1.7).
+between the read and the lock is run again (§1.7). Each of these is read through
+``meeting_api.settings``, so a value the service can't run on raises ``SettingsError``.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+from ..settings import SettingsError, seconds, whole
 
 __all__ = [
     "IntakeSettings",
@@ -68,7 +71,15 @@ class IntakeSettings:
 
     @classmethod
     def from_env(cls) -> IntakeSettings:
+        """The settings from the environment; a value the entry service can't run on raises
+        ``SettingsError`` (checked when meeting-api boots)."""
         blocked = os.getenv("ENTRY_BLOCKED_HOSTS", "meet.abroadworks.com")
+        delay_min_s = seconds("INTAKE_CONFLICT_DELAY_MIN_S", "0.01", zero=True)
+        delay_max_s = seconds("INTAKE_CONFLICT_DELAY_MAX_S", "0.05")
+        if delay_min_s > delay_max_s:
+            raise SettingsError(
+                "INTAKE_CONFLICT_DELAY_MIN_S must not be more than INTAKE_CONFLICT_DELAY_MAX_S"
+            )
         return cls(
             max_days_ahead=int(os.getenv("ENTRY_MAX_DAYS_AHEAD", "30")),
             join_now_adopt_ahead_s=join_now_adopt_ahead_s(),
@@ -77,14 +88,10 @@ class IntakeSettings:
                 h.strip().lower() for h in blocked.split(",") if h.strip()
             ),
             max_active_entries=int(os.getenv("INTAKE_MAX_ACTIVE_ENTRIES", "100000")),
-            send_max_attempts=int(os.getenv("BOT_SEND_MAX_ATTEMPTS", "3")),
-            send_retry_backoff_s=int(os.getenv("BOT_SEND_RETRY_BACKOFF_S", "60")),
-            conflict_retries=int(os.getenv("INTAKE_CONFLICT_RETRIES", "3")),
-            stop_link_retries=int(os.getenv("INTAKE_STOP_LINK_RETRIES", "1")),
-            conflict_delay_min_s=float(
-                os.getenv("INTAKE_CONFLICT_DELAY_MIN_S", "0.01")
-            ),
-            conflict_delay_max_s=float(
-                os.getenv("INTAKE_CONFLICT_DELAY_MAX_S", "0.05")
-            ),
+            send_max_attempts=whole("BOT_SEND_MAX_ATTEMPTS", "3"),
+            send_retry_backoff_s=whole("BOT_SEND_RETRY_BACKOFF_S", "60"),
+            conflict_retries=whole("INTAKE_CONFLICT_RETRIES", "3", zero=True),
+            stop_link_retries=whole("INTAKE_STOP_LINK_RETRIES", "1", zero=True),
+            conflict_delay_min_s=delay_min_s,
+            conflict_delay_max_s=delay_max_s,
         )
