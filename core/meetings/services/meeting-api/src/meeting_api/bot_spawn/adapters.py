@@ -312,12 +312,14 @@ class SqlAlchemyMeetingRepo:
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
-        change_reason=None, expected_from=None,
-    ) -> None:
+        change_reason=None, expected_from=None, transition_source=None,
+    ) -> Optional[dict]:
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
-        from ..intake.adapters import lock_meeting_on_its_link
+        from ..intake import retry
+        from ..intake.adapters import PostgresIntakeTx, lock_meeting_on_its_link
+        from ..intake.settings import IntakeSettings
         from ..intake.status import FINISHED_STATUSES, project_stored, write_status
         from ..obs import log_event
         from ..sessions.models import MeetingSession
@@ -328,24 +330,27 @@ class SqlAlchemyMeetingRepo:
                 await db.execute(select(MeetingSession).where(MeetingSession.session_uid == session_uid))
             ).scalars().first()
             if sess is None:
-                return  # unknown session (e.g. a self-host bot) — nothing to persist
+                return None  # unknown session (e.g. a self-host bot) — nothing to persist
             # The link lock, then FOR UPDATE: db-writer/recordings/docs all lock before
             # read-modify-write of data JSONB; without it a concurrent db-writer merge commit is
             # clobbered (#53 review).
             m = await lock_meeting_on_its_link(db, sess.meeting_id)
             if m is None:
-                return
+                return None
             # §1.4's conditional write: the status changes only from one of the caller's
             # predecessors (the live statuses by default), and a finished meeting never changes
             # status again. A refused write changes nothing (a stale stop, a stale replica's edge).
+            # A meeting waiting for its next bot (§6.9 F-K2, `data.bot_retry`) takes no status
+            # from a session: only the retry driver and its claim move it.
             predecessors = set(LIVE_STATUSES if expected_from is None else expected_from)
             predecessors -= set(FINISHED_STATUSES)
-            if m.status != status and m.status not in predecessors:
+            pending = retry.marker(m.data) is not None
+            if m.status != status and (pending or m.status not in predecessors):
                 log_event(
                     "lifecycle_status_refused", audience="system", level="warning",
                     span="lifecycle.persist", meeting_id=str(m.id),
                     fields={"status": m.status, "to": status,
-                            "expected_from": sorted(predecessors)},
+                            "expected_from": sorted(predecessors), "retry_pending": pending},
                 )
                 return None
             merged = {}
@@ -369,6 +374,36 @@ class SqlAlchemyMeetingRepo:
                         select(_func.count()).select_from(Transcription).where(Transcription.meeting_id == m.id)
                     )
                 ).scalar() or 0
+            if status in FINISHED_STATUSES and m.status != status:
+                # §6.9 F-K2: the session ended; a bot failure while the meeting is on sends the
+                # meeting back to `requested` for a new bot instead. A lost bot is a `completed`
+                # the runtime drove (its workload vanished), not one the bot reported.
+                runtime_destroy = transition_source == "runtime_destroy"
+                failure = retry.Failure(
+                    status=status,
+                    reason=completion_reason,
+                    message=str(merged.get("reason") or change_reason or completion_reason
+                                or status),
+                    stage=failure_stage,
+                    lost=status == "completed" and runtime_destroy and m.status != "stopping",
+                    session=session_uid,
+                    workload=m.bot_container_id,
+                    proven_gone=runtime_destroy,
+                )
+                await db.flush()
+                tx = PostgresIntakeTx(db)
+                written = await retry.retry(
+                    tx, m.id, failure, now=datetime.now(timezone.utc),
+                    settings=IntakeSettings.from_env(), data_patch=merged,
+                )
+                if written is not None:
+                    projected = await project_stored(db, m.id)
+                    await db.commit()
+                    await db.refresh(m)
+                    return _with_projection(_row_to_dict(m), projected)
+                if failure.lost and retry.is_last(await tx.meeting(m.id), failure):
+                    # The last attempt's lost bot ends the meeting `failed`, not `completed`.
+                    status = "failed"
             # Naive UTC into the naive time columns (tz-aware → asyncpg DataError, per set_bot_container).
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if status == "active" and m.start_time is None:
@@ -1066,6 +1101,7 @@ class SqlAlchemyMeetingRepo:
     async def fail_meeting(
         self, *, meeting_id, reason, failure_stage="requested",
         completion_reason="start_failed", data=None, outcome=None,
+        workload_id=None, workload_gone=True,
     ) -> Optional[dict]:
         """Mark a meeting ``failed`` BY ID (no session needed) — the spawn-time failure path (#718).
 
@@ -1074,19 +1110,28 @@ class SqlAlchemyMeetingRepo:
         directly, stamping the reason into ``data`` so ``GET /meetings`` and the terminal show WHY
         instead of leaving a ``requested`` row for the 5-minute reaper to flip reason-less. Link- and
         row-locked; a missing row is a no-op, and so is a row that already finished (its terminal is
-        written once). Through the status writer, with ``outcome`` when one is given and the
-        meeting has none yet (an outcome recorded before, such as R5's ``cancelled_by_calendar``,
-        stands); the writer types the event (``meeting.not_sent`` for a ``not_sent`` outcome, else
-        ``bot.failed``)."""
-        from ..intake.adapters import lock_meeting_on_its_link
+        written once) or one waiting for its next bot. Through the status writer, with ``outcome``
+        when one is given and the meeting has none yet (an outcome recorded before, such as R5's
+        ``cancelled_by_calendar``, stands); the writer types the event (``meeting.not_sent`` for a
+        ``not_sent`` outcome, else ``bot.failed``).
+
+        §6.9 F-K2: a failure while the meeting is on is retried instead (``intake.retry``), the
+        workload ``workload_id`` (else the row's) recorded with ``workload_gone``. The last one on
+        a meeting that already had a bot session is a failed bot, not a bot never sent: its
+        ``not_sent`` outcome is dropped."""
+        from sqlalchemy import exists, select
+
+        from ..intake import retry
+        from ..intake.adapters import PostgresIntakeTx, lock_meeting_on_its_link
+        from ..intake.settings import IntakeSettings
         from ..intake.status import FINISHED_STATUSES, write_status
-        from ..sessions.models import MeetingAwState
+        from ..sessions.models import MeetingAwState, MeetingSession
 
         async with self._session_factory() as db:
             m = await lock_meeting_on_its_link(db, meeting_id)
             if m is None:
                 return None
-            if m.status in FINISHED_STATUSES:
+            if m.status in FINISHED_STATUSES or retry.marker(m.data) is not None:
                 return _row_to_dict(m)
             merged = {**dict(data or {})}
             # A PLANNED row cancelled before any bot existed has NO stage — inventing one would
@@ -1099,6 +1144,29 @@ class SqlAlchemyMeetingRepo:
                 completion_reason,
                 stop_requested=bool({**current, **merged}.get("stop_requested")),
             )
+            written = await retry.retry(
+                PostgresIntakeTx(db),
+                m.id,
+                retry.Failure(
+                    status="failed",
+                    reason=merged["completion_reason"],
+                    message=str(reason),
+                    stage=failure_stage,
+                    workload=workload_id or m.bot_container_id,
+                    proven_gone=workload_gone,
+                ),
+                now=datetime.now(timezone.utc),
+                settings=IntakeSettings.from_env(),
+                data_patch=merged,
+            )
+            if written is not None:
+                await db.commit()
+                await db.refresh(m)
+                return _row_to_dict(m)
+            if outcome is not None and (await db.execute(
+                select(exists().where(MeetingSession.meeting_id == m.id))
+            )).scalar():
+                outcome = None
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if m.end_time is None:
                 m.end_time = now

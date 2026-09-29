@@ -26,8 +26,16 @@ from pathlib import Path
 # Package source root (…/meeting-api/src/meeting_api).
 SRC = Path(__file__).resolve().parent.parent / "src" / "meeting_api"
 
-# Reviewed exceptions: "<relpath>:<lineno>" → one-line justification. Empty by design at ship.
-ALLOWLIST: dict[str, str] = {}
+# Reviewed exceptions: "<relpath>:<lineno>" → one-line justification.
+_RETRY_TX = (
+    "§6.9 F-K2 retry writer: PostgresIntakeTx(db) wraps this same session, so every await on it "
+    "is DB work under the caller's link and row locks"
+)
+ALLOWLIST: dict[str, str] = {
+    "src/meeting_api/bot_spawn/adapters.py:395": _RETRY_TX,  # update_meeting_status → retry.retry
+    "src/meeting_api/bot_spawn/adapters.py:404": _RETRY_TX,  # update_meeting_status → tx.meeting
+    "src/meeting_api/bot_spawn/adapters.py:1147": _RETRY_TX,  # fail_meeting → retry.retry
+}
 
 # Param is a live DB session if named one of these OR annotated with a name ending in "Session".
 _SESSION_PARAM_NAMES = {"db", "session", "conn", "connection"}

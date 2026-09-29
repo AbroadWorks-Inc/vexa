@@ -1088,9 +1088,13 @@ async def test_pg_post_claim_token_failure_ends_not_sent(pg_engine, monkeypatch)
     ]
 
 
-async def test_pg_post_claim_failure_of_a_new_instant_join_replies_created(pg_engine):
+async def test_pg_post_claim_failure_of_a_new_instant_join_replies_created(
+    pg_engine, monkeypatch
+):
+    """With one send allowed (§6.9 F-K2 retries a failure while there are sends left)."""
     from intake_builders import ZOOM, instant_body
 
+    monkeypatch.setenv("BOT_SEND_MAX_ATTEMPTS", "1")
     pg = PgBackend(pg_engine)
     service, publisher = _pg_intake(pg, FakeRuntimeClient(fail=True))
     reply = await service.put_entry(USER, instant_body("paste:3", ZOOM))
@@ -1111,12 +1115,14 @@ async def test_pg_post_claim_failure_of_a_new_instant_join_replies_created(pg_en
 
 
 async def test_pg_post_claim_failure_of_an_adopted_meeting_replies_joined_existing(
-    pg_engine,
+    pg_engine, monkeypatch
 ):
     """R12 keeps an adopted meeting scheduled only for a failure BEFORE the claim; after the
-    claim the meeting itself ended not_sent, and the reply names it."""
+    claim the meeting itself ended not_sent, and the reply names it. With one send allowed
+    (§6.9 F-K2 retries a failure while there are sends left)."""
     from intake_builders import GMEET, entry_body, instant_body
 
+    monkeypatch.setenv("BOT_SEND_MAX_ATTEMPTS", "1")
     pg = PgBackend(pg_engine)
     service, _ = _pg_intake(pg, FakeRuntimeClient(fail=True))
     now = _now()
@@ -1298,12 +1304,13 @@ async def test_pg_post_claim_stop_fence_ends_not_sent(pg_engine):
 
 
 async def test_post_claim_failure_of_a_new_instant_join_replies_created():
+    """With one send allowed (§6.9 F-K2 retries a failure while there are sends left)."""
     from intake_builders import make_harness
 
     failure = SpawnOutcome(
         "failed", "spawn_error", "kernel could not start the workload"
     )
-    h = make_harness(spawn_failure=failure)
+    h = make_harness(spawn_failure=failure, send_max_attempts=1)
     h.spawn.after_claim = True
     reply = await h.instant("manual:1")
     m = reply["meeting"]
@@ -1318,12 +1325,13 @@ async def test_post_claim_failure_of_a_new_instant_join_replies_created():
 
 
 async def test_post_claim_failure_of_an_adopted_meeting_replies_joined_existing():
+    """With one send allowed (§6.9 F-K2 retries a failure while there are sends left)."""
     from intake_builders import GMEET, make_harness
 
     failure = SpawnOutcome(
         "failed", "spawn_error", "kernel could not start the workload"
     )
-    h = make_harness("2026-09-29T09:00:00Z", spawn_failure=failure)
+    h = make_harness("2026-09-29T09:00:00Z", spawn_failure=failure, send_max_attempts=1)
     h.spawn.after_claim = True
     uuid = (await h.put(start="2026-09-29T10:00:00Z", end="2026-09-29T10:30:00Z"))[
         "meeting"

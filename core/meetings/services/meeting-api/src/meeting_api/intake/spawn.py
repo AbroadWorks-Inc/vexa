@@ -27,6 +27,12 @@ was recorded) is left alone too, and logged: its bot is live and the lifecycle e
 stop already tore that workload down, the nonterminal reconcile sweep ends the row. The events
 are handed to ``publisher`` after the commit, when one is given; the outbox holds them either way.
 
+While an entry-managed meeting is on, a failure after the claim is retried instead (§6.9 F-K2,
+``retry.retry``): the row goes back to ``requested`` with ``bot.retry`` and the retry driver sends
+another bot. A row the spawn flow already sent back (``data.bot_retry``) is left alone. The last
+failure of a meeting that already had a bot session ends ``failed`` (``bot.failed``) without the
+``not_sent`` outcome: a bot was sent.
+
 A row whose link changed between the read and the claim (``ClaimTargetMoved``) is read again and
 spawned once more. The spawn context (the per-user bot limit and webhook settings) comes from
 ``fetch_bot_context(user_id)``, as for the auto-join sweep; the limit is never guessed, so a
@@ -44,6 +50,7 @@ scheduler): the code, and a message that is the exception's own text wherever it
 from __future__ import annotations
 
 import traceback
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence, cast
 
 from ..bot_spawn.auto_join import DueWindow, _calendar_bot_name
@@ -65,7 +72,9 @@ from ..bot_spawn.ports import (
 from ..bot_spawn.service import request_bot
 from ..obs import log_event
 from ..service_authority import ServiceAuthorityDenied, ServiceAuthorityUnavailable
+from . import retry
 from .ports import EventPublisher, IntakeStore, Room, SpawnOutcome
+from .settings import IntakeSettings
 from .status import Outcome
 
 __all__ = [
@@ -284,18 +293,24 @@ class ExactRowSpawn:
     async def _end_not_sent(
         self, user_id: int, meeting_id: int, code: str, message: str
     ) -> None:
-        """Ruling R17: the claimed row ends ``not_sent`` with the code and message. Best effort:
-        a failure here is logged with its stack, and the spawn's answer stands."""
-        outcome = Outcome("not_sent", code, message)
+        """Ruling R17: the claimed row ends ``not_sent`` with the code and message, or, while the
+        meeting is on, goes back to ``requested`` for another bot (§6.9 F-K2, ``retry.retry``;
+        nothing was started, so no workload is left to prove gone). The last failure of a meeting
+        that already had a bot session ends ``failed`` without the ``not_sent`` outcome. A row the
+        spawn flow already sent back (``data.bot_retry``) is left alone. Best effort: a failure
+        here is logged with its stack, and the spawn's answer stands."""
         events: list[str] = []
         try:
             row = await self._repo.get_meeting(meeting_id)
             if row is None:
                 raise LookupError(f"meeting {meeting_id} not found")
             room = Room(row["platform"], row["native_meeting_id"])
+            had_bot = bool(await self._repo.list_sessions(meeting_id=meeting_id))
             async with self._store.room_lock(user_id, [room]) as tx:
                 current = await tx.meeting(meeting_id)
-                if current.status == "requested" and current.row.get(
+                if retry.marker(current.data) is not None:
+                    pass
+                elif current.status == "requested" and current.row.get(
                     "bot_container_id"
                 ):
                     log_event(
@@ -308,14 +323,24 @@ class ExactRowSpawn:
                         fields={"code": code},
                     )
                 elif current.status == "requested":
-                    written = await tx.status(
-                        meeting_id,
-                        "failed",
-                        expected_from={"requested"},
-                        outcome=outcome,
-                        change_reason=code,
-                        event_type="meeting.not_sent",
+                    failure = retry.Failure(
+                        "failed", None, message, stage="requested", code=code,
+                        proven_gone=True,
                     )
+                    written = await retry.retry(
+                        tx, meeting_id, failure, now=datetime.now(timezone.utc),
+                        settings=IntakeSettings.from_env(),
+                    )
+                    if written is None:
+                        outcome = None if had_bot else Outcome("not_sent", code, message)
+                        written = await tx.status(
+                            meeting_id,
+                            "failed",
+                            expected_from={"requested"},
+                            outcome=outcome,
+                            change_reason=code,
+                            event_type=None if outcome is None else "meeting.not_sent",
+                        )
                     events.append(written.event_id)
         except Exception as exc:
             log_event(

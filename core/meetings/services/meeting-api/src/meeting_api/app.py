@@ -624,6 +624,8 @@ def _mount_lifecycle(
                         if change.transition_source is TransitionSource.RUNTIME_DESTROY
                         else persisted_statuses_for(change.old_status)
                     ),
+                    # §6.9 F-K2: a `completed` the runtime drove is a lost bot, not a normal end.
+                    transition_source=change.transition_source.value,
                 )
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",

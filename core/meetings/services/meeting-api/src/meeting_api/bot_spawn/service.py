@@ -374,6 +374,14 @@ async def _stop_requested_on(repo: MeetingRepo, meeting_id: Any) -> bool:
     return bool(((row or {}).get("data") or {}).get("stop_requested"))
 
 
+def _create_timeouts() -> tuple[type[BaseException], ...]:
+    """The exceptions a workload create that timed out raises: the kernel may have started the
+    workload without answering, so the workload is not proven gone."""
+    import httpx
+
+    return (TimeoutError, httpx.TimeoutException)
+
+
 def _not_sent(exc: BaseException) -> Any:
     """The ``not_sent`` outcome a spawn failure ends its meeting with: the §1.5 typed code and exact
     message (``intake.spawn.spawn_failure``), the same the caller reports."""
@@ -848,16 +856,32 @@ async def request_bot(
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
         )
         raise
+    except _create_timeouts() as e:
+        # The kernel may have started the workload without answering in time: the row is failed
+        # with the workload named and NOT proven gone (§6.9 F-K2), so a retry proves it gone first.
+        reason = f"the runtime did not answer the workload create in time ({type(e).__name__})"
+        try:
+            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
+                                    outcome=_not_sent(e), workload_id=workload_id,
+                                    workload_gone=False)
+        except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
+            log_event(
+                "bot_spawn_fail_row_error", audience="system", level="error",
+                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                fields={"error": str(fail_err)},
+            )
+        raise
     except SpawnFailed as e:
         # No workload came up. Mark the just-inserted meeting row `failed` with the reason so no
         # `requested` row lingers for the 5-minute reaper to flip reason-less (#718): the failure and
         # its cause are on the row NOW, and POST /bots answers 502 with the same reason. The row is
         # failed BY ID — the MeetingSession is not created until after a successful spawn, so the
-        # session-keyed update_meeting_status cannot reach it yet.
+        # session-keyed update_meeting_status cannot reach it yet. The kernel's refusal proves the
+        # workload gone (§6.9 F-K2).
         reason = str(e) or "bot workload failed to start"
         try:
             await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested",
-                                    outcome=_not_sent(e))
+                                    outcome=_not_sent(e), workload_id=workload_id)
         except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
             log_event(
                 "bot_spawn_fail_row_error", audience="system", level="error",

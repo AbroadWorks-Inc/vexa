@@ -153,6 +153,8 @@ class MeetingRepo(Protocol):
         completion_reason: str = "start_failed",
         data: Optional[dict] = None,
         outcome: Any = None,
+        workload_id: Optional[str] = None,
+        workload_gone: bool = True,
     ) -> Optional[dict]:
         """Mark a meeting ``failed`` BY ID (no session_uid), stamping ``reason``/``failure_stage`` into
         ``meeting.data`` — the spawn-time failure path (#718). A workload dead on arrival is refused
@@ -171,7 +173,14 @@ class MeetingRepo(Protocol):
 
         ``outcome`` (an ``intake.status.Outcome``) is the ``not_sent`` outcome the spawn failure
         ends the meeting with; a meeting that already has an outcome keeps it. A row that already
-        finished is left as it is: its terminal is written once."""
+        finished is left as it is: its terminal is written once.
+
+        §6.9 F-K2: on a meeting entries manage that is still on, the failure is retried instead
+        (``intake.retry``): the row goes back to ``requested`` with ``bot.retry``, recording the
+        workload ``workload_id`` (else the row's) and whether it is already gone
+        (``workload_gone``: the runtime refused it; a timed-out create is not proof). A row
+        waiting for its next bot is left as it is. The last failure of a meeting that already had
+        a bot session drops the ``not_sent`` outcome: a bot was sent."""
         ...
 
     async def get_meeting(self, meeting_id: int) -> Optional[dict]:
@@ -256,6 +265,7 @@ class MeetingRepo(Protocol):
         data: Optional[dict] = None,
         change_reason: Optional[str] = None,
         expected_from: Optional[Any] = None,
+        transition_source: Optional[str] = None,
     ) -> Optional[dict]:
         """Persist a bot ``lifecycle.v1`` advance to the DB meeting row + RETURN the updated row dict
         (incl. ``data`` — so the lifecycle callback can deliver the per-user webhook from
@@ -267,7 +277,14 @@ class MeetingRepo(Protocol):
         in-process ``MeetingStore``. A status change is recorded through the status writer (§1.4),
         its event's ``change.reason`` being ``change_reason``. The status changes only from one of
         ``expected_from`` (default: the live statuses), and a finished meeting never changes
-        status again: such a write changes nothing and returns ``None``."""
+        status again: such a write changes nothing and returns ``None``.
+
+        §6.9 F-K2: a session's terminal that is a bot failure while the meeting is on sends the
+        meeting back to ``requested`` with ``bot.retry`` (``intake.retry``) and returns that row.
+        ``transition_source`` is what drove the edge (``lifecycle.machine.TransitionSource``): a
+        ``completed`` the runtime drove (``runtime_destroy``) is a lost bot, and its workload is
+        proven gone. A lost bot on the meeting's last attempt ends it ``failed``. A meeting
+        waiting for its next bot takes no status write (data-only writes still land)."""
         ...
 
 

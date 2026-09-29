@@ -326,11 +326,12 @@ class InMemoryMeetingRepo:
     async def fail_meeting(
         self, *, meeting_id, reason, failure_stage="requested",
         completion_reason="start_failed", data=None, outcome=None,
+        workload_id=None, workload_gone=True,
     ) -> Optional[dict]:
         row = self._meetings.get(meeting_id)
         if row is None:
             return None
-        if row["status"] in ("completed", "failed"):
+        if row["status"] in ("completed", "failed") or row["data"].get("bot_retry"):
             return dict(row)
         row["status"] = "failed"
         row["data"].update(dict(data or {}))
@@ -379,7 +380,7 @@ class InMemoryMeetingRepo:
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
-        change_reason=None, expected_from=None,
+        change_reason=None, expected_from=None, transition_source=None,
     ) -> None:
         sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
         if sess is None:
@@ -392,7 +393,8 @@ class InMemoryMeetingRepo:
 
         predecessors = set(LIVE_STATUSES if expected_from is None else expected_from)
         predecessors -= {"completed", "failed"}
-        if row["status"] != status and row["status"] not in predecessors:
+        pending = bool(row["data"].get("bot_retry"))  # §6.9 F-K2: waiting for its next bot
+        if row["status"] != status and (pending or row["status"] not in predecessors):
             return None
         row["status"] = status
         if completion_reason is not None:

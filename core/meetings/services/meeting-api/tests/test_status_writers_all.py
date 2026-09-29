@@ -1365,7 +1365,8 @@ async def _history_holds(pg: _Pg, live: int, new_uuid: str) -> None:
     [
         (_finish_by_callback, True, "completed", "meeting.completed"),
         (_finish_by_runtime_destroy, True, "completed", "meeting.completed"),
-        (_finish_by_fail_meeting, False, "failed", "meeting.not_sent"),
+        # The bot had a session, so its failure is a failed bot, not one never sent (§6.9 F-K2).
+        (_finish_by_fail_meeting, False, "failed", "bot.failed"),
     ],
     ids=["lifecycle_callback", "runtime_destroy", "fail_meeting"],
 )
@@ -1414,12 +1415,15 @@ class _MoveThenFail:
         return None
 
 
-async def test_pg_a_move_while_a_join_now_bot_starts_survives_its_failure(pg):
+async def test_pg_a_move_while_a_join_now_bot_starts_survives_its_failure(pg, monkeypatch):
     """The join_now writer path: a pasted link adopts the calendar meeting under way and claims
     it; while its bot starts, the calendar entry moves to tomorrow (it leaves at once, R7); then
-    the workload fails, which ends the meeting ``not_sent``. The new meeting is untouched and the
-    failed one keeps the calendar entry as history."""
+    the workload fails, which ends the meeting ``not_sent`` (one send allowed: §6.9 F-K2 retries a
+    failure while there are sends left). The new meeting is untouched and the failed one keeps
+    the calendar entry as history."""
     from datetime import timedelta
+
+    monkeypatch.setenv("BOT_SEND_MAX_ATTEMPTS", "1")
 
     from intake_builders import GMEET, entry_body, instant_body
 

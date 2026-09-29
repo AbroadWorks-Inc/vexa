@@ -70,6 +70,7 @@ from urllib.parse import urlparse
 
 from ..collector.meeting_link import parse_meeting_url
 from ..obs import log_event
+from . import retry
 from .ports import (
     ConstraintRace,
     EntryView,
@@ -563,10 +564,11 @@ class IntakeService:
         the backoff, and the last attempt ends the meeting ``not_sent``; the reply keeps
         ``done.result``.
 
-        A failure AFTER the claim finds the meeting finished: the spawn port already ended it
-        ``not_sent`` (Ruling R17), and the reply is ``done.result`` with that meeting (``created``
-        for a new one, ``joined_existing`` for an adopted one). A meeting that is live got its bot
-        from the scheduler meanwhile (``joined_existing``)."""
+        A failure AFTER the claim finds the meeting finished, or waiting for another bot: the spawn
+        port already ended it ``not_sent`` (Ruling R17) or sent it back to ``requested`` (§6.9
+        F-K2), and the reply is ``done.result`` with that meeting (``created`` for a new one,
+        ``joined_existing`` for an adopted one). A meeting that is live got its bot from the
+        scheduler meanwhile (``joined_existing``)."""
         meeting = done.meeting
         code = outcome.code or "internal_error"
         message = outcome.message or "the bot was not sent"
@@ -579,9 +581,10 @@ class IntakeService:
                 if mine is None or e.id != mine.id
             ]
             current = await tx.meeting(meeting.id)
-            if current.status in FINISHED_STATUSES:
+            if current.status in FINISHED_STATUSES or retry.marker(current.data) is not None:
                 # The spawn claimed the row and failed after the claim: the port ended the meeting
-                # not_sent itself. The reply is the meeting as it ended.
+                # not_sent itself, or sent it back for another bot (§6.9 F-K2). The reply is the
+                # meeting as it stands.
                 return done.result
             if current.status != "scheduled":
                 return "joined_existing"

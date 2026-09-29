@@ -125,6 +125,22 @@ workload exists (`bot_container_id` set) is left to its bot and logged. The entr
 replies with that meeting (R12 applies only to a failure before the claim). The per-user bot limit comes from `fetch_bot_context`, as for the auto-join sweep, and is
 never guessed: without it, or without `max_concurrent` in it, the spawn fails `internal_error`
 (the one exception is the sweep's `AUTO_JOIN_ALLOW_UNCAPPED` opt-in with no identity edge).
+`retry.py` is §6.9 F-K2: a bot that fails while its meeting is on gets a new bot on the SAME
+meeting. `due_at` is the decision: a bot failure (a `failed` session whatever its reason but
+`stopped`, `evicted` and `startup_alone`, or a `completed` the runtime drove, a lost bot) on a
+meeting entries manage that nobody ended (no `stop_requested`, no outcome, live and not
+`stopping`), within `BOT_SEND_MAX_ATTEMPTS` (`send_attempts`, shared with F-K) and with the next bot
+`BOT_SEND_RETRY_BACKOFF_S` from now before the planned end. `retry(tx, …)` is the one writer: one
+of the meeting's sends (`record_send_failure`), then `requested` through `write_status` with
+`bot.retry` and the marker `data.bot_retry` (`reason`, `stage`, `message`, `after_session`,
+`workload`, `at`, `due_at`, `proven_gone`); the row's `completion_reason` stays empty while it
+waits. Three writers call it: the session-keyed lifecycle write (`update_meeting_status`; a lost bot
+on the last attempt ends `failed`), `fail_meeting` (a timed-out workload create is recorded as not
+proven gone) and `ExactRowSpawn`'s post-claim ending. The last failure ends `failed` with
+`bot.failed` and `aw_meetings_failed_total`; on a meeting that already had a bot session its
+`not_sent` outcome is dropped. A row waiting for its next bot takes no status write from a session
+(data-only writes still land), and the entry service answers a new instant join sent back this way
+`created`.
 `IntakeStop` (`stop.py`) is the production `StopPort` (§1.7), behind `POST /v2/meetings/{id}/stop`
 (no outcome: the meeting ends with upstream's `stopped`) and R5 (outcome `cancelled_by_calendar`
 with the remove reason). Under the meeting's link lock it locks the meeting row, then
@@ -187,6 +203,7 @@ one delivery for that subscription, in one transaction; the reply is `{event_id}
 - `IntakeService` — `service.py`; `IntakeSettings` — `settings.py`.
 - `ExactRowSpawn`, `spawn_failure` — `spawn.py`.
 - `IntakeStop`, `record_stop` — `stop.py`.
+- `retry`, `due_at`, `Failure`, `marker` (§6.9 F-K2) — `retry.py`.
 - `IntakeStore`, `IntakeTx`, `EntryView`, `MeetingView`, `Room`, `SpawnOutcome`, `SpawnPort`,
   `StopPort`, `EventPublisher` — `ports.py`; the in-memory fakes — `fakes.py`.
 - `PostgresIntakeStore` — `adapters.py`.
