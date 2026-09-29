@@ -231,7 +231,9 @@ class ExactRowSpawn:
             code, message = spawn_failure(exc, user_id=user_id, meeting_id=meeting_id)
             if watch.claimed:
                 await self._end_not_sent(user_id, meeting_id, code, message)
-            return self._failed(user_id, meeting_id, code, message, claimed=watch.claimed)
+            return self._failed(
+                user_id, meeting_id, code, message, claimed=watch.claimed
+            )
         return SpawnOutcome("sent")
 
     async def _spawn(
@@ -299,7 +301,8 @@ class ExactRowSpawn:
         names no workload, and it is never recorded as gone. The last failure of a meeting
         entries manage that already had a bot session ends ``failed`` without the ``not_sent``
         outcome. A row the spawn flow already sent back (``data.bot_retry``) is left alone. Best
-        effort: a failure here is logged with its stack, and the spawn's answer stands."""
+        effort: a failure here is logged with its stack, and the spawn's answer stands.
+        """
         events: list[str] = []
         try:
             row = await self._repo.get_meeting(meeting_id)
@@ -326,17 +329,26 @@ class ExactRowSpawn:
                 elif current.status == "requested":
                     # Nothing says whether a workload was started: never recorded gone.
                     failure = retry.Failure(
-                        "failed", None, message, stage="requested", code=code,
+                        "failed",
+                        None,
+                        message,
+                        stage="requested",
+                        code=code,
                         proven_gone=False,
                     )
                     written = await retry.retry(
-                        tx, meeting_id, failure, now=datetime.now(timezone.utc),
+                        tx,
+                        meeting_id,
+                        failure,
+                        now=datetime.now(timezone.utc),
                         settings=IntakeSettings.from_env(),
                     )
                     if written is None:
                         managed = bool(current.active_entries())
                         outcome = (
-                            None if had_bot and managed else Outcome("not_sent", code, message)
+                            None
+                            if had_bot and managed
+                            else Outcome("not_sent", code, message)
                         )
                         written = await tx.status(
                             meeting_id,

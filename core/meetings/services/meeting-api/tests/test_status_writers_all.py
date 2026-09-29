@@ -1414,7 +1414,9 @@ class _MoveThenFail:
         return None
 
 
-async def test_pg_a_move_while_a_join_now_bot_starts_survives_its_failure(pg, monkeypatch):
+async def test_pg_a_move_while_a_join_now_bot_starts_survives_its_failure(
+    pg, monkeypatch
+):
     """The join_now writer path: a pasted link adopts the calendar meeting under way and claims
     it; while its bot starts, the calendar entry moves to tomorrow (it leaves at once, R7); then
     the workload fails, which ends the meeting ``not_sent`` (one send allowed: §6.9 F-K2 retries a

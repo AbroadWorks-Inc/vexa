@@ -582,7 +582,10 @@ class IntakeService:
                 if mine is None or e.id != mine.id
             ]
             current = await tx.meeting(meeting.id)
-            if current.status in FINISHED_STATUSES or retry.marker(current.data) is not None:
+            if (
+                current.status in FINISHED_STATUSES
+                or retry.marker(current.data) is not None
+            ):
                 # The spawn claimed the row and failed after the claim: the port ended the meeting
                 # not_sent itself, or sent it back for another bot (§6.9 F-K2). The reply is the
                 # meeting as it stands.

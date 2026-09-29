@@ -470,7 +470,10 @@ async def test_a_normal_end_still_reaches_every_sink_once(monkeypatch):
 
 @pytest.mark.parametrize(
     ("status", "event", "flows"),
-    [("failed", "bot.failed", []), ("completed", "meeting.completed", ["meeting.completed"])],
+    [
+        ("failed", "bot.failed", []),
+        ("completed", "meeting.completed", ["meeting.completed"]),
+    ],
 )
 async def test_a_meeting_ended_outside_the_lifecycle_runs_every_finish_step(
     monkeypatch, status, event, flows
@@ -890,7 +893,12 @@ async def test_the_reconcile_sweep_leaves_a_waiting_meeting_to_the_retry():
 
     runtime = FakeRuntimeClient(workloads={"mtg-5-old": {"state": "destroyed"}})
     await reconcile_stale_nonterminal_sweep(
-        repo, runtime, post, stop_grace=0, active_grace=0, log=_Log(),
+        repo,
+        runtime,
+        post,
+        stop_grace=0,
+        active_grace=0,
+        log=_Log(),
         item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert posted == [] and runtime.deleted == []
@@ -1022,7 +1030,10 @@ async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
     repo = overdue_repo()
     assert (
         await end_overdue_retries(
-            repo, untracked_grace=600, log=_Log(), finish_meeting=finish,
+            repo,
+            untracked_grace=600,
+            log=_Log(),
+            finish_meeting=finish,
             failures=InMemoryItemFailures(max_failures=5),
         )
         == 1
@@ -1038,7 +1049,10 @@ async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
     finished.clear()
     assert (
         await end_overdue_retries(
-            raced, untracked_grace=600, log=_Log(), finish_meeting=finish,
+            raced,
+            untracked_grace=600,
+            log=_Log(),
+            finish_meeting=finish,
             failures=InMemoryItemFailures(max_failures=5),
         )
         == 0
@@ -1083,7 +1097,9 @@ def test_an_overdue_reason_never_names_a_missing_workload():
     )
     early = limit - timedelta(seconds=1)
     assert retry.overdue({"due_at": due, "workload": "w"}, 600, early) is None
-    assert retry.overdue({"workload": "w"}, 600, limit) is None  # no due_at: no deadline
+    assert (
+        retry.overdue({"workload": "w"}, 600, limit) is None
+    )  # no due_at: no deadline
 
 
 @pytest.mark.parametrize("since", [None, "not a time"])
@@ -1129,9 +1145,15 @@ async def test_the_sweep_reads_the_waiting_meetings_in_pages(monkeypatch):
         return await real(**kw)
 
     repo.list_retry_meetings = paged
-    assert await end_overdue_retries(
-        repo, untracked_grace=600, log=_Log(), failures=InMemoryItemFailures(max_failures=5)
-    ) == 2
+    assert (
+        await end_overdue_retries(
+            repo,
+            untracked_grace=600,
+            log=_Log(),
+            failures=InMemoryItemFailures(max_failures=5),
+        )
+        == 2
+    )
     assert reads[0] == (None, 1) and all(limit == 1 for _, limit in reads)
     assert [repo._meetings[i]["status"] for i in (5, 6)] == ["failed", "failed"]
 
@@ -1155,7 +1177,9 @@ async def test_a_waiting_meeting_the_sweep_cannot_end_is_given_up():
     await failures.failed("auto-join", "5", RuntimeError("the driver gave it up"))
     await failures.failed("auto-join", "5", RuntimeError("the driver gave it up"))
     for _ in range(3):
-        await end_overdue_retries(repo, untracked_grace=600, log=_Log(), failures=failures)
+        await end_overdue_retries(
+            repo, untracked_grace=600, log=_Log(), failures=failures
+        )
     assert tries == [5, 5]
     assert await failures.given_up(OVERDUE_RETRY_SWEEP, ["5"]) == {"5"}
 
@@ -1170,7 +1194,8 @@ class _QuietLog:
 
 def _containerless(status: str):
     """A stale row with a session and no ``bot_container_id`` (a cancel between the session
-    write and the container write); returns the repo, the meeting id and that workload's id."""
+    write and the container write); returns the repo, the meeting id and that workload's id.
+    """
     from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
     from meeting_api.bot_spawn.ports import workload_id_for
 
@@ -1202,8 +1227,14 @@ async def _general_sweep(repo, runtime):
         posted.append(body)
 
     await reconcile_stale_nonterminal_sweep(
-        repo, runtime, post, stop_grace=0, active_grace=0, log=_QuietLog(),
-        untracked_grace=600, untracked_since={},
+        repo,
+        runtime,
+        post,
+        stop_grace=0,
+        active_grace=0,
+        log=_QuietLog(),
+        untracked_grace=600,
+        untracked_since={},
         item_failures=InMemoryItemFailures(max_failures=5),
     )
     return posted
@@ -1251,7 +1282,9 @@ async def test_a_containerless_stopping_row_has_its_workload_deleted_before_it_c
     async def post(body):
         posted.append(body)
 
-    await reconcile_stale_stopping_sweep(repo, runtime, post, stop_grace=0, log=_QuietLog())
+    await reconcile_stale_stopping_sweep(
+        repo, runtime, post, stop_grace=0, log=_QuietLog()
+    )
     assert runtime.deleted == [workload]
     assert [p["status"] for p in posted] == ["completed"]
 
@@ -1261,12 +1294,19 @@ def test_an_unfinished_spawn_names_its_workload_past_its_deadline():
     plan = {"session": "new-sess-1", "at": "2026-09-29T09:11:00Z"}
     claimed = {
         "spawn_session": plan,
-        "completion_history": [{"completion_reason": "left_alone", "after_session": "old"}],
+        "completion_history": [
+            {"completion_reason": "left_alone", "after_session": "old"}
+        ],
     }
 
     def ending(data, *, written=False, newest="old", now=at):
         return retry.unfinished_spawn(
-            5, data, written=written, newest_session=newest, untracked_grace=600, now=now
+            5,
+            data,
+            written=written,
+            newest_session=newest,
+            untracked_grace=600,
+            now=now,
         )
 
     code, patch = ending(claimed)
