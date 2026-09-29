@@ -8,7 +8,9 @@ Offline, on the in-memory fakes:
   * the newest-session guard of the in-memory repo;
   * the claim of a waiting meeting (the in-memory repo, the same rules as the SQL one), the
     workload-gone proof (``reconcile.prove_workload_gone``) and the runtime callback marking a
-    waiting meeting's workload gone instead of driving a terminal.
+    waiting meeting's workload gone instead of driving a terminal;
+  * a waiting meeting stopped or losing its last entry ends at once, with no leave command; its
+    ``bot_joins_at`` is the retry's ``due_at``; the reconcile sweep leaves it to the retry.
 
 The Postgres wiring (the lifecycle write, ``fail_meeting``, the spawn port) is in
 ``test_bot_retry_pg.py``.
@@ -486,7 +488,7 @@ def _waiting_repo(*, proven: bool, status: str = "requested"):
         "start_time": None,
         "end_time": None,
         "created_at": "2026-09-29T09:00:00Z",
-        "updated_at": "2026-09-29T09:00:00Z",
+        "updated_at": "2026-09-01T09:00:00Z",
         "data": {
             "title": "standup",
             "bot_retry": {
@@ -671,3 +673,99 @@ async def test_proving_gone_needs_the_marker_on_that_workload():
     assert await repo.prove_retry_gone(meeting_id=5, workload="mtg-5-old")
     del repo._meetings[5]["data"]["bot_retry"]
     assert not await repo.prove_retry_gone(meeting_id=5, workload="mtg-5-old")
+
+
+# ── a waiting meeting: stop, removal, projection, reconcile ─────────────────────────────────
+
+
+async def _waiting_intake():
+    """A calendar meeting whose bot failed in the call and now waits for its next bot, behind the
+    real ``IntakeStop``."""
+    from intake_builders import entry_body, make_harness
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.intake.service import IntakeService
+    from meeting_api.intake.stop import IntakeStop
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    h = make_harness("2026-09-29T09:00:00Z")
+    commands, runtime = InMemoryCommandPublisher(), FakeRuntimeClient()
+    stop = IntakeStop(h.store, commands, runtime, publisher=h.publisher)
+    service = IntakeService(
+        h.store, h.spawn, stop, h.publisher, h.settings, clock=h.clock
+    )
+    reply = await service.put_entry(
+        1, entry_body(start="2026-09-29T08:55:00Z", end="2026-09-29T09:30:00Z")
+    )
+    uuid = reply["meeting"]["id"]
+    mid = h.meeting_id(uuid)
+    h.set_status(uuid, "active")
+    h.store.meetings[mid] = {**h.store.meetings[mid], "bot_container_id": "wl-old"}
+    async with h.store.room_lock(1, [ROOM]) as tx:
+        await retry.retry(
+            tx,
+            mid,
+            _failed("left_alone", stage="active", workload="wl-old"),
+            now=h.clock(),
+            settings=h.settings,
+        )
+    assert h.store.meetings[mid]["status"] == "requested"
+    return h, service, stop, commands, runtime, mid
+
+
+async def test_a_stop_on_a_waiting_meeting_ends_it_at_once_without_a_leave():
+    h, _, stop, commands, runtime, mid = await _waiting_intake()
+    await stop.stop_live(1, mid, outcome=None)
+    view = h.store.view(mid)
+    assert (view.status, view.data["completion_reason"]) == ("failed", "stopped")
+    assert view.data["failure_stage"] == "active" and not view.data.get("bot_retry")
+    assert view.aw["outcome_kind"] is None
+    assert h.store.events[-1].event_type == "bot.failed"
+    assert h.store.events[-1].change["reason"] == "stopped"
+    assert commands.published == [] and runtime.deleted == []
+
+
+async def test_removing_the_last_entry_of_a_waiting_meeting_ends_it_cancelled():
+    from intake_builders import A
+
+    h, service, _, commands, runtime, mid = await _waiting_intake()
+    reply = await service.remove_entry(
+        1, {"external_id": "google:3n5kq8example", "user": A, "reason": "deleted"}
+    )
+    assert reply["result"] == "removed"
+    meeting = reply["meeting"]
+    assert (meeting["status"], meeting["completion_reason"]) == ("failed", "stopped")
+    assert (meeting["outcome"]["kind"], meeting["outcome"]["detail"]) == (
+        "cancelled_by_calendar",
+        "deleted",
+    )
+    assert [e.event_type for e in h.store.events[-2:]] == [
+        "meeting.updated",
+        "bot.failed",
+    ]
+    assert commands.published == [] and runtime.deleted == []
+
+
+async def test_a_waiting_meeting_shows_when_its_next_bot_goes():
+    h, *_, mid = await _waiting_intake()
+    projected = h.store.view(mid).project(lead_s=300)
+    assert projected["status"] == "requested"
+    assert projected["bot_joins_at"] == "2026-09-29T09:01:00Z"
+
+
+async def test_the_reconcile_sweep_leaves_a_waiting_meeting_to_the_retry():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    repo = _waiting_repo(proven=False)
+    await repo.create_session(meeting_id=5, session_uid="sess-old")
+    assert await repo.list_stale_nonterminal(stop_grace=0, active_grace=0) == []
+    posted: list[dict] = []
+
+    async def post(body):
+        posted.append(body)
+
+    runtime = FakeRuntimeClient(workloads={"mtg-5-old": {"state": "destroyed"}})
+    await reconcile_stale_nonterminal_sweep(
+        repo, runtime, post, stop_grace=0, active_grace=0, log=_Log()
+    )
+    assert posted == [] and runtime.deleted == []

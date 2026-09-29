@@ -26,7 +26,8 @@ meeting whose bot was sent (it changes from a live status) that ends ``failed`` 
 outcome moves ``aw_meetings_failed_total{reason,user_id}`` (§6.9 F-B) once, when the caller's
 transaction commits (``after_commit``): a rolled-back write counts nothing, and a repeated one is
 refused before it counts. The reason is ``data.completion_reason``, else the change's typed code
-(``change_reason``), else ``unknown``.
+(``change_reason``), else ``unknown``. A ``bot.retry`` (§6.9 F-K2: the meeting sent back for
+another bot) moves ``aw_bot_retries_total{reason,user_id}`` the same way, by its change reason.
 
 Lock order (§1.4): the caller takes the link's advisory lock first, then ``write_status`` locks the
 meeting row, then ``meeting_aw_state``. ``meeting_aw_state`` is always reached through its meeting
@@ -47,7 +48,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional, Sequence
 
-from ..metrics import meeting_failed, meeting_not_sent
+from ..metrics import bot_retried, meeting_failed, meeting_not_sent
 from .projection import iso_utc, project_meeting
 from .rules import FINISHED_STATUSES, is_live
 from .settings import auto_join_lead_s
@@ -59,6 +60,7 @@ __all__ = [
     "API_VERSION",
     "FINISHED_STATUSES",
     "after_commit",
+    "RETRY_EVENT",
     "STATUS_CHANGE_EVENT",
     "Outcome",
     "StatusConflict",
@@ -80,6 +82,8 @@ __all__ = [
 
 API_VERSION = "2026-09-25"
 STATUS_CHANGE_EVENT = "meeting.status_change"
+#: The event of a meeting sent back for another bot after one failed (§6.9 F-K2).
+RETRY_EVENT = "bot.retry"
 
 #: The typed §2.7 event of a status change, where one exists (Ruling R25).
 _TYPED_EVENTS = {"active": "meeting.started", "completed": "meeting.completed"}
@@ -388,6 +392,9 @@ async def write_status(
         reason = data.get("completion_reason") or change_reason or "unknown"
         user_id = meeting.user_id
         after_commit(db, lambda: meeting_failed(user_id, reason))
+    if event_type == RETRY_EVENT:
+        retried_by, retried_for = meeting.user_id, change_reason
+        after_commit(db, lambda: bot_retried(retried_by, retried_for))
     return WrittenEvent(event_id, int(aw.event_seq))
 
 

@@ -34,7 +34,7 @@ _RETRY_TX = (
 ALLOWLIST: dict[str, str] = {
     "src/meeting_api/bot_spawn/adapters.py:463": _RETRY_TX,  # update_meeting_status → retry.retry
     "src/meeting_api/bot_spawn/adapters.py:472": _RETRY_TX,  # update_meeting_status → tx.meeting
-    "src/meeting_api/bot_spawn/adapters.py:1249": _RETRY_TX,  # fail_meeting → retry.retry
+    "src/meeting_api/bot_spawn/adapters.py:1252": _RETRY_TX,  # fail_meeting → retry.retry
 }
 
 # Param is a live DB session if named one of these OR annotated with a name ending in "Session".

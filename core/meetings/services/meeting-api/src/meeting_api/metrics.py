@@ -16,6 +16,10 @@ metric                                                moved by
                                                       sent bot's meeting ``failed`` (not
                                                       ``not_sent``), once its transaction
                                                       commits
+``aw_bot_retries_total{reason,user_id}``              ``intake.status.write_status`` sending a
+                                                      meeting back for another bot after one
+                                                      failed (``bot.retry``, §6.9 F-K2), once
+                                                      its transaction commits
 ``aw_autojoin_lag_seconds``                           the auto-join sweep, per bot sent: the tick's
                                                       time minus (``scheduled_at`` − lead)
 ``aw_webhook_deliveries_total{event_type,outcome,     the subscription sender, per claimed delivery
@@ -67,6 +71,7 @@ __all__ = [
     "MetricsSource",
     "PostgresMetricsSource",
     "autojoin_lag",
+    "bot_retried",
     "export_recorded",
     "intake_request",
     "meeting_failed",
@@ -122,6 +127,12 @@ class _Metrics:
         self.failed = Counter(
             "aw_meetings_failed_total",
             "Meetings whose bot was sent that ended failed (not not_sent), by reason.",
+            ["reason", "user_id"],
+            registry=r,
+        )
+        self.retries = Counter(
+            "aw_bot_retries_total",
+            "Bots sent again to the same meeting after one failed, by reason.",
             ["reason", "user_id"],
             registry=r,
         )
@@ -190,6 +201,10 @@ def meeting_not_sent(user_id: Any, detail: Optional[str]) -> None:
 
 def meeting_failed(user_id: Any, reason: Optional[str]) -> None:
     _metrics().failed.labels(reason=reason or "", user_id=_account(user_id)).inc()
+
+
+def bot_retried(user_id: Any, reason: Optional[str]) -> None:
+    _metrics().retries.labels(reason=reason or "", user_id=_account(user_id)).inc()
 
 
 def autojoin_lag(seconds: float) -> None:

@@ -16,7 +16,9 @@ is ``FakeRuntimeClient``). Groups:
     session once the old workload is proven gone → ``active``; the last failure; a live pod
     deleted and confirmed first; a 404 waits out ``MEETING_UNTRACKED_GRACE_SEC``; the planned end
     or a stop ends a waiting meeting; the link stays held; the exporter's ``meeting.completed``
-    fires once; ``sequence`` only grows across sessions.
+    fires once; ``sequence`` only grows across sessions;
+  * the reconcile listing leaves a waiting meeting out; each retry counts once in
+    ``aw_bot_retries_total{reason,user_id}``.
 
 Skips cleanly unless ``MEETING_API_TEST_DATABASE_URL`` is set; see ``test_intake_pg_schema.py``'s
 docstring for the ephemeral SQLAlchemy/asyncpg install.
@@ -818,3 +820,40 @@ async def test_pg_the_exporters_meeting_completed_fires_once_and_sequence_grows(
     assert sequences == sorted(sequences) and len(set(sequences)) == len(sequences)
     types = await pg.types(mid)
     assert types.count("meeting.started") == 2 and types[-1] == "meeting.completed"
+
+
+# ── the reconcile listing and the retry counter ─────────────────────────────────────────────
+
+
+async def test_pg_the_reconcile_listing_leaves_a_waiting_meeting_out(pg):
+    mid, session = await pg.sent(status="active")
+    await pg.execute(
+        "UPDATE meetings SET updated_at = now() - interval '1 hour' WHERE id = :m",
+        m=mid,
+    )
+    assert [
+        r[0] for r in await pg.repo.list_stale_nonterminal(stop_grace=0, active_grace=0)
+    ] == [mid]
+    await _fail(pg, session, "completed", "left_alone", "runtime_destroy")
+    await pg.execute(
+        "UPDATE meetings SET updated_at = now() - interval '1 hour' WHERE id = :m",
+        m=mid,
+    )
+    assert await pg.repo.list_stale_nonterminal(stop_grace=0, active_grace=0) == []
+
+
+def _retries(reason: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_bot_retries_total", {"reason": reason, "user_id": str(USER)}
+    )
+    return value or 0.0
+
+
+async def test_pg_each_retry_counts_once_by_its_reason(pg):
+    mid, session = await pg.sent(status="awaiting_admission")
+    before = _retries("awaiting_admission_timeout")
+    for _ in range(2):  # the bot's retried callback is refused the second time
+        await _fail(pg, session, "failed", "awaiting_admission_timeout", "bot_callback")
+    assert _retries("awaiting_admission_timeout") == before + 1

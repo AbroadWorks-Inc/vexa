@@ -55,6 +55,8 @@ def _bot_joins_at(
 
     * Still ``scheduled`` with a known time (``data.scheduled_at``): ``scheduled_at - lead_s`` —
       the bot hasn't been sent, this is the forward projection.
+    * Waiting for its next bot after one failed (§6.9 F-K2: ``requested`` with
+      ``data.bot_retry``): when that bot is due, the retry's ``due_at``.
     * Sent (any other status): the auto-join sweep's own dispatch stamp
       (``data.auto_join_last_attempt``) if one was recorded, else ``None``.
     * Neither (an unsent instant join with no schedule, or a ``scheduled_at`` that isn't a time):
@@ -63,6 +65,9 @@ def _bot_joins_at(
     scheduled_at = scheduled_time(data)
     if meeting.get("status") == "scheduled" and scheduled_at is not None:
         return iso_utc(scheduled_at - timedelta(seconds=lead_s))
+    retry = data.get("bot_retry")
+    if meeting.get("status") == "requested" and isinstance(retry, Mapping):
+        return iso_utc(retry.get("due_at"))
     return iso_utc(data.get("auto_join_last_attempt"))
 
 

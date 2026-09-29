@@ -148,7 +148,11 @@ or untracked for `MEETING_UNTRACKED_GRACE_SEC` since the failure; a runtime dest
 it too) and a new session is spawned on the row through `ExactRowSpawn`. The claim takes a
 `requested` row whose marker is proven, with no status change (`retry.claimed` moves the failure
 into `completion_history`), leaving the row out of its own duplicate check, bot limit and signed-in
-session check. A new bot that fails before its claim is one more bounded send.
+session check. A new bot that fails before its claim is one more bounded send. A stop of a
+waiting meeting (`record_stop`: the `/v2` stop, R5) ends it at once, `failed` with `stopped` and
+the outcome, and sends no leave command; a removal of its last entry answers `removed`. Its
+`bot_joins_at` is the retry's `due_at`, the reconcile sweep's listing leaves it out, and every
+`bot.retry` moves `aw_bot_retries_total{reason,user_id}` once its transaction commits.
 `IntakeStop` (`stop.py`) is the production `StopPort` (§1.7), behind `POST /v2/meetings/{id}/stop`
 (no outcome: the meeting ends with upstream's `stopped`) and R5 (outcome `cancelled_by_calendar`
 with the remove reason). Under the meeting's link lock it locks the meeting row, then

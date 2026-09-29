@@ -253,7 +253,7 @@ The reply is the same envelope as `PUT`, with `entry.state: "removed"` and one o
 
 | `result` | Meaning |
 |---|---|
-| `removed` | It was the meeting's last entry and no bot had been sent: the meeting ends `failed`, `completion_reason: "stopped"`, outcome `cancelled_by_calendar` (`meeting.removed` webhook). The row is kept as history. |
+| `removed` | It was the meeting's last entry and no bot had been sent: the meeting ends `failed`, `completion_reason: "stopped"`, outcome `cancelled_by_calendar` (`meeting.removed` webhook). The row is kept as history. Also the answer for a meeting waiting for a new bot after one failed: it ends the same way at once (`bot.failed` webhook). |
 | `entry_removed` | Other entries remain, so the meeting stays (re-planned around them) and the bot still goes for them. Also the answer when the meeting had already finished: only the entry goes. |
 | `bot_stopping` | It was the last entry of a live meeting: the bot is leaving. What was recorded so far is kept and processed; the meeting ends `stopped`, outcome `cancelled_by_calendar`. |
 | `already_removed` | The entry was already removed. Nothing done. |
@@ -410,6 +410,8 @@ Scope `bot`, no body. The live bot leaves now; the reply is the meeting (**200**
   What was recorded is processed as usual.
 - A bot **still joining** (`requested`, `joining`, `awaiting_admission`) keeps its status until it
   ends; it is told to stop and its workload is removed.
+- A meeting **waiting for a new bot** after one failed (`requested`, `bot_joins_at` in the future)
+  has no bot to tell: it ends `failed` with `completion_reason: "stopped"` at once.
 - A user's stop sets no `outcome`: it is the user's own `stopped`.
 - A meeting with **no live bot** (still `scheduled`, or finished) → `409 no_live_bot`. To cancel a
   future meeting, remove its entries.
@@ -484,7 +486,7 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 | `title` | string or null | The first title among the entries, in start order. |
 | `start`, `end` | string or null | UTC. `end` is `null` for an open-ended instant join. |
 | `time_zone` | string or null | Display only. |
-| `bot_joins_at` | string or null | While `scheduled`: when the bot will be sent (`start` − the lead). Once sent: when it was sent. Otherwise `null`. |
+| `bot_joins_at` | string or null | While `scheduled`: when the bot will be sent (`start` − the lead). Waiting for a new bot after one failed (`requested`, after `bot.retry`): when that bot will be sent. Once sent: when it was sent. Otherwise `null`. |
 | `entries` | array | A finished meeting lists its closed entries; any other meeting its active ones. Removed entries are never listed. Each is `{external_id, user, attendees, series_id, metadata}`. |
 | `export` | object or null | `{state, s3_path, error, at}` once the exporter reported: `state` is `handed_off` or `failed`. |
 | `sequence` | integer | The meeting's event counter: +1 with every webhook event of this meeting. Keep the highest you applied and ignore anything older. |
@@ -492,7 +494,7 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 | `status` | Meaning |
 |---|---|
 | `scheduled` | Planned; no bot sent yet. |
-| `requested` | The bot is being started. |
+| `requested` | The bot is being started, or a new bot is on its way after one failed (`bot.retry`). |
 | `joining` | The bot is opening the meeting. |
 | `awaiting_admission` | The bot is in the lobby, waiting to be let in. |
 | `active` | The bot is in the call and recording. |

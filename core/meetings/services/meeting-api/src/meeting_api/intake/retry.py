@@ -52,7 +52,7 @@ from typing import Any, Mapping, Optional
 from .ports import IntakeTx, MeetingView
 from .projection import iso_utc
 from .settings import IntakeSettings
-from .status import Outcome, WrittenEvent
+from .status import RETRY_EVENT, Outcome, WrittenEvent
 
 __all__ = [
     "BOT_FAILED",
@@ -72,7 +72,6 @@ __all__ = [
     "retry",
 ]
 
-RETRY_EVENT = "bot.retry"
 MARKER = "bot_retry"
 #: The typed code a failed bot session's send is recorded with (``last_error_code``).
 BOT_FAILED = "bot_failed"

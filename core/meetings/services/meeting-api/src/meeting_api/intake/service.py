@@ -46,7 +46,8 @@ Only a write that adds an active entry checks the quota (429 ``quota_exceeded``)
 ``remove``: the entry becomes ``removed``. Others remain → the meeting is re-planned
 (``entry_removed``). It was the last one → a scheduled meeting ends ``failed`` with
 ``completion_reason: "stopped"`` and outcome ``cancelled_by_calendar`` (``removed``, R8); a live
-one is stopped with that outcome (``bot_stopping``, R5). The status change is conditional, so a
+one is stopped with that outcome (``bot_stopping``, R5), and one waiting for its next bot (§6.9
+F-K2) ends the same way at once (``removed``). The status change is conditional, so a
 meeting that went live meanwhile takes the live branch. When the meeting has already finished,
 only the entry goes (``entry_removed``) and the finished meeting is left as history.
 
@@ -688,7 +689,9 @@ class IntakeService:
             ended = await self._end_planned(w, meeting, outcome)
         else:
             await w.stop(meeting.id, outcome)
-            ended = "stopping"
+            # A meeting waiting for its next bot (§6.9 F-K2) ends at once: it is removed.
+            finished = (await tx.meeting(meeting.id)).status in FINISHED_STATUSES
+            ended = "removed" if finished else "stopping"
         return _Done(_REMOVE_RESULT[ended], await tx.meeting(meeting.id))
 
     # ── shared ──────────────────────────────────────────────────────────────────────────────

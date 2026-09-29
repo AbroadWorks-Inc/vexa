@@ -632,6 +632,8 @@ class InMemoryMeetingRepo:
             row = self._meetings.get(mid)
             if row is None or row["status"] not in non_terminal:
                 continue
+            if isinstance(row.get("data", {}).get("bot_retry"), dict):
+                continue  # §6.9 F-K2: waiting for its next bot (the SQL adapter's rule)
             upd = row.get("updated_at")
             try:
                 u = datetime.fromisoformat(str(upd).replace("Z", "+00:00")) if upd else None

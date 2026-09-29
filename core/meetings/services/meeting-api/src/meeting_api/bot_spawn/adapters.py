@@ -567,7 +567,8 @@ class SqlAlchemyMeetingRepo:
         PRE-ACTIVE row (`requested`/`joining`/`awaiting_admission` — the bot has not reached the
         meeting yet, and holds the lobby budget the control plane handed it) uses ``preactive_grace``,
         everything else ``active_grace`` (a longer idle so a momentarily-quiet live bot is not
-        reaped). Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested), …]`` with
+        reaped). A meeting waiting for its next bot (§6.9 F-K2, ``data.bot_retry``) is left out:
+        the auto-join tick's retry driver owns it. Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested), …]`` with
         the LATEST session_uid per meeting (mirrors ``list_stale_stopping``)."""
         from datetime import datetime, timezone
 
@@ -593,6 +594,8 @@ class SqlAlchemyMeetingRepo:
         for mid, status, upd, sid, bcid, data in rows:
             if mid in out or upd is None or not sid:
                 continue
+            if isinstance(data, dict) and isinstance(data.get("bot_retry"), dict):
+                continue  # §6.9 F-K2: waiting for its next bot; the retry driver owns it
             u = upd if upd.tzinfo else upd.replace(tzinfo=timezone.utc)
             grace = reconcile_grace_for_status(status, stop_grace, active_grace, preactive_grace)
             if (now - u).total_seconds() >= grace:
