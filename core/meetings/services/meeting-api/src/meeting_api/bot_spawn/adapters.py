@@ -387,6 +387,83 @@ class SqlAlchemyMeetingRepo:
             await db.commit()
             return written.event_id
 
+    async def list_claimed_meetings(self, *, after=None, limit=None) -> list[dict]:
+        """The ``requested`` meetings a new bot may have claimed (no ``data.bot_retry``, no
+        ``bot_container_id``), by id, one page of ``limit`` after ``after``, each with its
+        ``newest_session``: the read ``reconcile.end_overdue_retries`` checks with
+        ``intake.retry.unsent_claim``."""
+        from sqlalchemy import func, select, text
+
+        from ..sessions.models import Meeting, MeetingSession
+
+        newest = (
+            select(MeetingSession.session_uid)
+            .where(MeetingSession.meeting_id == Meeting.id)
+            .order_by(MeetingSession.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(Meeting, newest)
+            .where(
+                text("meetings.status = 'requested'"),
+                Meeting.bot_container_id.is_(None),
+                Meeting.data["bot_retry"].astext.is_(None),
+                func.jsonb_typeof(Meeting.data["completion_history"]) == "array",
+            )
+            .order_by(Meeting.id)
+        )
+        if after is not None:
+            stmt = stmt.where(Meeting.id > after)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        async with self._session_factory() as db:
+            rows = (await db.execute(stmt)).all()
+            return [{**_row_to_dict(m), "newest_session": s} for m, s in rows]
+
+    async def end_unsent_claim(self, *, meeting_id, untracked_grace) -> Optional[str]:
+        """§6.9 F-K2: end ``failed`` a claimed meeting whose spawn never wrote its session, past
+        its deadline (``intake.retry.unsent_claim``, checked again under the link lock and the row
+        lock), with the failed bot's reason and stage; the event's id, or ``None`` when it isn't
+        such a meeting (a session was written, or it ended)."""
+        from sqlalchemy import select
+
+        from ..intake import retry
+        from ..intake.adapters import lock_meeting_on_its_link
+        from ..intake.status import write_status
+        from ..sessions.models import MeetingSession
+
+        async with self._session_factory() as db:
+            m = await lock_meeting_on_its_link(db, meeting_id)
+            if m is None or m.status != "requested" or m.bot_container_id is not None:
+                return None
+            data = dict(m.data) if isinstance(m.data, dict) else {}
+            newest = (
+                await db.execute(
+                    select(MeetingSession.session_uid)
+                    .where(MeetingSession.meeting_id == meeting_id)
+                    .order_by(MeetingSession.id.desc())
+                    .limit(1)
+                )
+            ).scalar()
+            ending = retry.unsent_claim(
+                data, newest, untracked_grace, datetime.now(timezone.utc)
+            )
+            if retry.marker(data) is not None or ending is None:
+                return None
+            code, message = ending
+            last = (data.get("completion_history") or [{}])[-1]
+            patch = {"failure_reason": message}
+            for key in ("completion_reason", "failure_stage"):
+                if last.get(key) is not None:
+                    patch[key] = last[key]
+            written = await write_status(
+                db, meeting_id, "failed", expected_from={"requested"}, data_patch=patch,
+                change_reason=code,
+            )
+            await db.commit()
+            return written.event_id
+
     async def list_retry_meetings(self, *, after=None, limit=None) -> list[dict]:
         """The meetings waiting for their next bot (§6.9 F-K2: ``requested`` with
         ``data.bot_retry``), by id, one page of ``limit`` after ``after``, each with its

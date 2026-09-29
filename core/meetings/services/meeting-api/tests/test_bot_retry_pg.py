@@ -1420,6 +1420,54 @@ async def test_pg_the_last_new_bot_failing_after_its_claim_is_finished_like_any_
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
 
 
+# ── a claimed retry whose spawn died before its session is bounded ──────────────────────────
+
+
+class _Died(BaseException):
+    """The spawning process dying: nothing in the spawn catches it."""
+
+
+async def test_pg_a_claim_whose_spawn_died_before_its_session_ends_at_the_deadline(pg):
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    class DiesAtTheSession(SqlAlchemyMeetingRepo):
+        async def create_session(self, **kw):
+            raise _Died()
+
+    mid, session = await pg.sent(status="active")
+    workload = (await pg.row(mid))["bot_container_id"]
+    app, sink, _, _ = await _finishing_app(pg)
+    await app.state.apply_lifecycle_event(
+        {
+            "connection_id": session,
+            "status": "completed",
+            "completion_reason": "left_alone",
+        },
+        transition_source=TransitionSource.RUNTIME_DESTROY,
+        force_terminal_on_destroy=True,
+    )
+    with pytest.raises(_Died):
+        await pg.tick(
+            _gone(workload), at=_later(), repo=DiesAtTheSession(pg.session_factory)
+        )
+    row = await pg.row(mid)
+    assert (row["status"], row["data"].get("bot_retry")) == ("requested", None)
+    assert await pg.sessions(mid) == [session]  # only the retired one
+    await pg.execute(
+        "UPDATE meetings SET data = jsonb_set(data, '{auto_join_last_attempt}', "
+        "'\"2026-01-01T00:00:00+00:00\"'), updated_at = now() - interval '2 hours' "
+        "WHERE id = :m",
+        m=mid,
+    )
+    await _sweep(pg, _gone(), InMemoryItemFailures(max_failures=5), finish=app)
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert row["data"]["failure_reason"].startswith("no new bot was sent by ")
+    assert (await pg.types(mid))[-1] == "bot.failed"
+    assert sink.events == ["bot.failed"]
+
+
 # ── an unproven workload's failed delete is retried, bounded (F-I) ──────────────────────────
 
 
@@ -1458,7 +1506,11 @@ async def _ended_with_a_pending_teardown(pg: Pg) -> tuple[int, str]:
 
 
 async def _sweep(
-    pg: Pg, runtime: FakeRuntimeClient, failures: Any, grace: float = 600
+    pg: Pg,
+    runtime: FakeRuntimeClient,
+    failures: Any,
+    grace: float = 600,
+    finish: Any = None,
 ) -> None:
     from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
 
@@ -1474,6 +1526,7 @@ async def _sweep(
         log=_SilentLog(),
         untracked_grace=grace,
         item_failures=failures,
+        finish_meeting=None if finish is None else finish.state.finish_meeting,
     )
 
 

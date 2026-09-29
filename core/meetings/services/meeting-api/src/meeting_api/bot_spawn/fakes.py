@@ -461,6 +461,42 @@ class InMemoryMeetingRepo:
             row["data"].update(unproven_teardown(row["data"], str(mark["workload"])))
         return f"evt_retry_end_{meeting_id}"
 
+    async def list_claimed_meetings(self, *, after=None, limit=None) -> list:
+        """The real adapter's read of ``requested`` rows with no marker and no container, each
+        with its ``newest_session``."""
+        rows = []
+        for mid, m in sorted(self._meetings.items()):
+            data = m.get("data") or {}
+            if (m["status"] != "requested" or m.get("bot_container_id")
+                    or data.get("bot_retry") or not isinstance(data.get("completion_history"), list)
+                    or (after is not None and mid <= after)):
+                continue
+            newest = next((s["session_uid"] for s in reversed(self.sessions)
+                           if s["meeting_id"] == mid), None)
+            rows.append({**m, "newest_session": newest})
+        return rows if limit is None else rows[:limit]
+
+    async def end_unsent_claim(self, *, meeting_id, untracked_grace) -> Optional[str]:
+        """The real adapter's end of a claimed meeting whose spawn never wrote its session."""
+        from ..intake import retry
+
+        row = self._meetings.get(meeting_id)
+        if row is None or row["status"] != "requested" or row.get("bot_container_id"):
+            return None
+        newest = next((s["session_uid"] for s in reversed(self.sessions)
+                       if s["meeting_id"] == meeting_id), None)
+        ending = retry.unsent_claim(row["data"], newest, untracked_grace,
+                                    datetime.now(timezone.utc))
+        if retry.marker(row["data"]) is not None or ending is None:
+            return None
+        last = (row["data"].get("completion_history") or [{}])[-1]
+        row["status"] = "failed"
+        row["data"]["failure_reason"] = ending[1]
+        for key in ("completion_reason", "failure_stage"):
+            if last.get(key) is not None:
+                row["data"][key] = last[key]
+        return f"evt_unsent_claim_{meeting_id}"
+
     async def list_retry_meetings(self, *, after=None, limit=None) -> list:
         """The real adapter's retry read: ``requested`` rows with ``data.bot_retry``, by id, each
         with its ``scheduled_end_at`` (an ISO string, as the adapter renders it)."""

@@ -187,6 +187,20 @@ def overdue(
     )
 
 
+def unsent_claim(
+    data: Any, newest_session: Optional[str], untracked_grace: float, now: datetime
+) -> Optional[tuple[str, str]]:
+    """A meeting a new bot claimed (``claimed``) whose spawn never wrote its session: its newest
+    session is still the retired one. Past the claim's send time (``auto_join_last_attempt``)
+    plus ``untracked_grace`` it ends like a waiting meeting whose new bot was not sent
+    (``overdue``: ``retry_not_sent``, the old workload was proven gone before the claim); the
+    change reason and message, or ``None`` while the spawn may still write it."""
+    if not newest_session or newest_session not in retired_sessions(data):
+        return None
+    sent = data.get("auto_join_last_attempt") if isinstance(data, Mapping) else None
+    return overdue({"due_at": sent, "proven_gone": True}, untracked_grace, now)
+
+
 def is_bot_failure(failure: Failure) -> bool:
     """A failed bot (not a stop, a host removal, nobody joining, or a normal end)."""
     if failure.reason in NOT_RETRIED:

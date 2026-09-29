@@ -608,9 +608,12 @@ async def end_overdue_retries(
     ``repo.end_retry``, whatever the retry driver did (it may have given the item up), read a page
     of ``SWEEP_BATCH_SIZE`` at a time by meeting id, each through ``run_item`` under its own sweep
     name (§6.9 F-I, ``sweeps.item_failures.run_pages``). Before its deadline a waiting meeting is
-    left to the driver: ``list_stale_nonterminal`` never lists one. Each one ended gets the
-    meeting-level finish ``finish_meeting(meeting_id)`` (the app's). Best-effort: never raises.
-    Returns how many ended."""
+    left to the driver: ``list_stale_nonterminal`` never lists one. A meeting a new bot claimed
+    whose spawn never wrote its session (``intake.retry.unsent_claim``: its newest session is
+    the retired one, which writes nothing) ends the same way past the claim's send time plus
+    ``untracked_grace`` (``repo.end_unsent_claim``). Each one ended gets the meeting-level finish
+    ``finish_meeting(meeting_id)`` (the app's). Best-effort: never raises. Returns how many
+    ended."""
     if not hasattr(repo, "list_retry_meetings") or not hasattr(repo, "end_retry"):
         return 0
     from datetime import timezone
@@ -641,6 +644,23 @@ async def end_overdue_retries(
         if finish_meeting is not None:
             await finish_meeting(row["id"])
 
+    def unsent(row: dict) -> bool:
+        return retry.unsent_claim(
+            row.get("data"), row.get("newest_session"), untracked_grace, now
+        ) is not None
+
+    async def end_claim(row: dict) -> None:
+        nonlocal ended
+        if await repo.end_unsent_claim(
+            meeting_id=row["id"], untracked_grace=untracked_grace
+        ) is None:
+            return  # its session was written, or it ended, since the listing
+        ended += 1
+        log.warning("nonterminal-reconcile: claimed meeting %s ended — its new bot never "
+                    "wrote its session", row["id"])
+        if finish_meeting is not None:
+            await finish_meeting(row["id"])
+
     try:
         await run_pages(
             failures, OVERDUE_RETRY_SWEEP,
@@ -649,8 +669,17 @@ async def end_overdue_retries(
             item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row.get("user_id"),
             action=end, select=lambda rows: [row for row in rows if ending(row)],
         )
+        if hasattr(repo, "list_claimed_meetings"):
+            await run_pages(
+                failures, OVERDUE_RETRY_SWEEP,
+                lambda after: repo.list_claimed_meetings(after=after, limit=page_size),
+                limit=page_size, after_of=lambda row: row["id"],
+                item_id_of=lambda row: str(row["id"]),
+                user_id_of=lambda row: row.get("user_id"),
+                action=end_claim, select=lambda rows: [row for row in rows if unsent(row)],
+            )
     except Exception:  # noqa: BLE001 — best-effort; retried next sweep
-        log.exception("nonterminal-reconcile: list_retry_meetings failed")
+        log.exception("nonterminal-reconcile: the overdue-retry reads failed")
     return ended
 
 

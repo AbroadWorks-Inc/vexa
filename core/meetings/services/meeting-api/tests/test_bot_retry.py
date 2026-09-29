@@ -1253,3 +1253,18 @@ async def test_a_containerless_stopping_row_has_its_workload_deleted_before_it_c
     await reconcile_stale_stopping_sweep(repo, runtime, post, stop_grace=0, log=_QuietLog())
     assert runtime.deleted == [workload]
     assert [p["status"] for p in posted] == ["completed"]
+
+
+def test_an_unsent_claim_is_only_one_whose_newest_session_is_retired_past_its_deadline():
+    data = {
+        "completion_history": [{"completion_reason": "left_alone", "after_session": "old"}],
+        "auto_join_last_attempt": "2026-09-29T09:11:00Z",
+    }
+    at = datetime(2026, 9, 29, 9, 21, tzinfo=UTC)  # the claim + 600 s
+    assert retry.unsent_claim(data, "old", 600, at) == (
+        "retry_not_sent",
+        "no new bot was sent by 2026-09-29T09:21:00Z",
+    )
+    assert retry.unsent_claim(data, "old", 600, at - timedelta(seconds=1)) is None
+    assert retry.unsent_claim(data, "new", 600, at) is None  # its session was written
+    assert retry.unsent_claim({}, "old", 600, at) is None  # never claimed
