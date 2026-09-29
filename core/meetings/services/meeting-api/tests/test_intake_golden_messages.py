@@ -149,3 +149,16 @@ async def test_the_golden_message_is_the_one_meeting_api_sends(code, monkeypatch
             h.store.on_lock = on_lock
         reply = await scenario(client)
     assert reply.json()["error"] == GOLDENS[code], reply.text
+
+
+def test_the_status_table_holds_every_contract_code_the_meeting_routes_answer():
+    from meeting_api.intake.validation import IntakeError
+
+    schema = json.loads((_golden_dir().parent / "intake.schema.json").read_text())
+    codes = set(
+        schema["$defs"]["Error"]["properties"]["error"]["properties"]["code"]["enum"]
+    )
+    assert set(IntakeError.HTTP_STATUS) == codes - {
+        "webhook_not_found",
+        "account_not_found",
+    }

@@ -133,12 +133,13 @@ def error_body(code: str, message: str) -> dict[str, Any]:
 class IntakeError(Exception):
     """One §2.5 error, carrying its own HTTP status. ``parse_entry``/``parse_remove`` raise only
     the validation-order codes below (``invalid_request``, ``already_ended``, ``too_far_ahead``),
-    always with ``retry_after_s=None`` — but the FULL §2.5 code -> status table lives here so a
-    later route handler raises this SAME class for every other code (``unauthorized``,
-    ``entry_not_found``, ``meeting_not_finished``, ``rate_limited``, ...) without re-deriving it.
+    always with ``retry_after_s=None``; the route handlers raise this same class for every other
+    code (``entry_not_found``, ``meeting_not_finished``, ...).
     """
 
-    #: §2.5, verbatim.
+    #: The §2.5 code → status table of the meeting routes: every ``intake.v1`` ``Error`` code but
+    #: ``webhook_not_found`` and ``account_not_found``, which only admin-api's ``/v2/webhooks``
+    #: routes answer.
     HTTP_STATUS: dict[str, int] = {
         "invalid_request": 400,
         "unrecognized_link": 400,
