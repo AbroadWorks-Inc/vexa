@@ -21,7 +21,9 @@ limit can't be read, is one of the meeting's bounded sends (§6.9 F-K,
 ``IntakeService.send_failed``): counted on ``meeting_aw_state.send_attempts`` with its typed code
 (``last_error_code`` / ``last_error_message``), tried again ``BOT_SEND_RETRY_BACKOFF_S`` later,
 and the ``BOT_SEND_MAX_ATTEMPTS``-th ends the meeting ``not_sent``; the not-sent sweep
-(``intake.sweeps``) ends it at its end if no bot ever went.
+(``intake.sweeps``) ends it at its end if no bot ever went. A due row the tick itself gives up
+(§6.9 F-I) is the not-sent sweep's at its end, and an open-ended one, which has none, ends
+``not_sent`` (``internal_error``) at once (``intake.sweeps.end_given_up``).
 
 Defense in depth behind that dedup for an entry-less row: before spawning, the tick asks the repo
 which (user, platform, native) tuples a bot ALREADY owns (``list_live_meetings`` over
@@ -325,7 +327,7 @@ async def auto_join_tick(
     )
     from ..intake.rules import FINISHED_STATUSES, is_overdue
     from ..intake.sweeps import _publish as publish_events
-    from ..intake.sweeps import check_room
+    from ..intake.sweeps import check_room, end_given_up
     from ..sweeps.item_failures import run_pages, sweep_batch_size
     from .ports import TranscriptionNotConfigured
 
@@ -655,13 +657,25 @@ async def auto_join_tick(
         counters["due"] += len(due)
         return due
 
+    async def _gave_up(row: dict, error: BaseException) -> None:
+        """A due row given up: an open-ended entry-managed meeting has no end for the not-sent
+        sweep to pass, so it ends ``not_sent`` now (``intake.sweeps.end_given_up``)."""
+        if not row.get("has_entries") or store is None:
+            return
+        await end_given_up(
+            store, publisher, row["user_id"], row["id"],
+            Room(row["platform"], row["native_meeting_id"]),
+            message="the scheduler gave this meeting up: sending its bot kept failing "
+            f"({type(error).__name__})",
+        )
+
     # Each read keeps its own give-up record: a meeting one gives up the other still works.
     await run_pages(
         item_failures, AUTO_JOIN,
         lambda after: repo.list_due_meetings(now, lead_s, after=after, limit=limit),
         limit=limit, after_of=lambda row: (row["event_time"], row["id"]),
         item_id_of=lambda row: f"due:{row['id']}", user_id_of=lambda row: row["user_id"],
-        action=_one, select=_due,
+        action=_one, select=_due, on_given_up=_gave_up,
     )
     if hasattr(repo, "list_retry_meetings"):
         await run_pages(

@@ -140,6 +140,30 @@ async def test_an_expired_item_is_given_up_at_once(capsys):
     assert (line["event"], line["level"]) == ("sweep_item_given_up", "error")
 
 
+async def test_the_give_up_action_runs_once_right_after_the_give_up(capsys):
+    failures = InMemoryItemFailures(max_failures=2)
+    ended: list[str] = []
+
+    async def boom() -> None:
+        raise RuntimeError("poison row")
+
+    async def end(error: BaseException) -> None:
+        ended.append(type(error).__name__)
+
+    for _ in range(2):
+        await run_item(failures, "probe", "4", boom, on_given_up=end)
+    assert ended == ["RuntimeError"]
+
+    async def broken_end(error: BaseException) -> None:
+        raise ConnectionRefusedError("database is down")
+
+    capsys.readouterr()
+    assert await run_item(failures, "probe", "5", boom, on_given_up=broken_end) is False
+    assert await run_item(failures, "probe", "5", boom, on_given_up=broken_end) is False
+    events = [json.loads(x)["event"] for x in capsys.readouterr().out.splitlines()]
+    assert events[-2:] == ["sweep_item_given_up", "sweep_item_give_up_action_failed"]
+
+
 # ── Postgres ─────────────────────────────────────────────────────────────────────────────────
 
 pg_only = pytest.mark.skipif(

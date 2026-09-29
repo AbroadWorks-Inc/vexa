@@ -27,6 +27,11 @@ detail and message:
   * else ``room_busy`` when ``meeting.waiting_for_room`` went out;
   * else ``ended_before_sent``.
 
+``end_given_up(store, publisher, user_id, meeting_id, room, *, message)`` ends an open-ended
+entry-managed meeting the auto-join tick gave up (§6.9 F-I) the same way, detail
+``internal_error`` and ``message``: it has no end for this sweep to pass, and would otherwise stay
+``scheduled`` for good. A meeting with an end is left to this sweep.
+
 The overdue read is paged (``SWEEP_BATCH_SIZE``, id order) and every page is worked in the tick
 (``sweeps.item_failures.run_pages``). Each meeting runs through ``run_item`` (§6.9 F-I): one
 meeting's failure is logged with its id and stack, counted, and never stops the rest; after
@@ -41,7 +46,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Mapping, Optional, Sequence
+from typing import Callable, Literal, Mapping, Optional, Sequence
 
 from ..obs import log_event
 from ..sweeps.item_failures import ItemFailures, run_pages, sweep_batch_size
@@ -55,6 +60,7 @@ __all__ = [
     "OutboxOnly",
     "RoomCheck",
     "check_room",
+    "end_given_up",
     "not_sent_cause",
     "not_sent_tick",
 ]
@@ -179,19 +185,51 @@ async def _end_not_sent(
     *,
     now: datetime,
 ) -> bool:
-    user_id, room = view.user_id, view.room
+    def cause(current: MeetingView) -> Optional[tuple[str, str]]:
+        return not_sent_cause(current.aw) if is_overdue(current.end, now=now) else None
+
+    return await _end(store, publisher, view.user_id, view.id, view.room, cause)
+
+
+async def end_given_up(
+    store: IntakeStore,
+    publisher: Optional[EventPublisher],
+    user_id: int,
+    meeting_id: int,
+    room: Room,
+    *,
+    message: str,
+) -> bool:
+    """End the open-ended entry-managed meeting the auto-join tick gave up ``not_sent``
+    (``internal_error``, ``message``); ``False`` for any other meeting."""
+
+    def cause(current: MeetingView) -> Optional[tuple[str, str]]:
+        return ("internal_error", message) if current.end is None else None
+
+    return await _end(store, publisher, user_id, meeting_id, room, cause)
+
+
+async def _end(
+    store: IntakeStore,
+    publisher: Optional[EventPublisher],
+    user_id: int,
+    meeting_id: int,
+    room: Room,
+    cause: Callable[[MeetingView], Optional[tuple[str, str]]],
+) -> bool:
+    """End the ``scheduled`` entry-managed meeting on ``room`` ``failed``/``not_sent`` under its
+    link lock with ``cause(meeting)``'s detail and message; ``False`` when it is no longer
+    such a meeting or ``cause`` gives none."""
     async with store.room_lock(user_id, [room]) as tx:
-        current = await tx.meeting(view.id)
-        if (
-            current.status != "scheduled"
-            or current.room != room
-            or not current.entries
-            or not is_overdue(current.end, now=now)
-        ):
+        current = await tx.meeting(meeting_id)
+        if current.status != "scheduled" or current.room != room or not current.entries:
             return False
-        detail, message = not_sent_cause(current.aw)
+        ending = cause(current)
+        if ending is None:
+            return False
+        detail, message = ending
         written = await tx.status(
-            view.id,
+            meeting_id,
             "failed",
             expected_from={"scheduled"},
             outcome=Outcome("not_sent", detail, message),
@@ -204,7 +242,7 @@ async def _end_not_sent(
         level="warning",
         span="meetings.auto_join",
         user_id=user_id,
-        meeting_id=str(view.id),
+        meeting_id=str(meeting_id),
         fields={"detail": detail, "message": message},
     )
     await _publish(publisher, [written.event_id])

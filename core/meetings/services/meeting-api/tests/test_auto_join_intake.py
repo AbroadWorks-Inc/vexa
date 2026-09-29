@@ -1394,3 +1394,75 @@ async def test_pg_the_not_sent_read_pages_by_id_and_a_given_up_meeting_is_skippe
         "scheduled",
         "failed",
     ]
+
+
+def _not_sent_count(detail: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_meetings_not_sent_total", {"detail": detail, "user_id": str(USER)}
+    )
+    return value or 0.0
+
+
+@pg_only
+async def test_pg_an_open_ended_meeting_the_tick_gives_up_ends_not_sent(pg):
+    """M3: an open-ended scheduled meeting has no end for the not-sent sweep to pass; when the
+    tick gives it up it ends ``failed``/``not_sent`` at once, with the typed reason, the event
+    and the counter."""
+    from intake_builders import instant_body
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    async def unavailable(_user_id: int) -> None:
+        return None  # the instant join's send fails before its claim
+
+    spawn = pg.service._spawn
+    spawn._fetch_bot_context = unavailable
+    reply = await pg.service.put_entry(USER, instant_body("paste:1", GMEET))
+    spawn._fetch_bot_context = _ctx
+    mid = await pg.id_of(reply["meeting"]["id"])
+    assert (await pg.row(mid))["status"] == "scheduled"  # open-ended: no end to pass
+    now = _now()
+
+    class Poison(SqlAlchemyMeetingRepo):
+        async def merge_meeting_data(self, meeting_id, patch):
+            raise RuntimeError("poison row")  # every send's first write
+
+    pg.repo = Poison(pg.session_factory)
+    before = _not_sent_count("internal_error")
+    failures = InMemoryItemFailures(max_failures=1)
+    await pg.tick(
+        now + timedelta(hours=1), item_failures=failures
+    )  # past the send backoff
+    assert failures.gave_up == {("auto-join", f"due:{mid}")}
+    row = await pg.row(mid)
+    assert (row["status"], row["outcome_kind"], row["outcome_detail"]) == (
+        "failed",
+        "not_sent",
+        "internal_error",
+    )
+    assert "gave this meeting up" in row["outcome_message"]
+    assert "RuntimeError" in row["outcome_message"]
+    assert (await pg.events(mid))[-1] == "meeting.not_sent"
+    assert _not_sent_count("internal_error") == before + 1
+    assert pg.runtime.specs == []
+
+
+@pg_only
+async def test_pg_a_meeting_with_an_end_the_tick_gives_up_is_left_to_the_not_sent_sweep(
+    pg,
+):
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    now = _now()
+    mid = await pg.put("cal", now - timedelta(minutes=1), now + timedelta(minutes=30))
+
+    class Poison(SqlAlchemyMeetingRepo):
+        async def merge_meeting_data(self, meeting_id, patch):
+            raise RuntimeError("poison row")
+
+    pg.repo = Poison(pg.session_factory)
+    failures = InMemoryItemFailures(max_failures=1)
+    await pg.tick(now, item_failures=failures)
+    assert failures.gave_up == {("auto-join", f"due:{mid}")}
+    assert (await pg.row(mid))["status"] == "scheduled"

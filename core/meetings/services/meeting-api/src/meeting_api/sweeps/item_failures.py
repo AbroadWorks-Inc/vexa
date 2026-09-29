@@ -10,7 +10,9 @@ gives it up (``given_up``, logged at error level), and the sweep skips it from t
 action that couldn't get an answer for a reason that isn't the item's failure (a dependency that
 didn't answer) raises ``ItemDeferred``: logged at warning level and counted under its own
 ``result``, it records nothing, and the item runs again on the next pass. One item's failure never
-stops the rest of its page. ``run_item`` never raises: a failure that can't even be recorded (the
+stops the rest of its page. A sweep whose given-up item must still end (a meeting that would
+otherwise stay open for good) passes ``on_given_up``, run once, right after the give-up; its own
+failure is logged. ``run_item`` never raises: a failure that can't even be recorded (the
 database is down) is logged and the item is tried again on the next tick, since nothing was
 counted.
 
@@ -26,7 +28,16 @@ from __future__ import annotations
 import os
 import traceback
 from functools import partial
-from typing import Any, Awaitable, Callable, Collection, Protocol, Sequence, TypeVar
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Collection,
+    Optional,
+    Protocol,
+    Sequence,
+    TypeVar,
+)
 
 from ..metrics import sweep_item
 from ..obs import log_event
@@ -88,6 +99,7 @@ async def run_item(
     action: Callable[[], Awaitable[Any]],
     *,
     user_id: Any = None,
+    on_given_up: Optional[Callable[[BaseException], Awaitable[Any]]] = None,
 ) -> bool:
     """Run one item of ``sweep``; ``True`` when it ran to its end (see the module docstring)."""
     try:
@@ -137,6 +149,27 @@ async def run_item(
             fields=fields,
         )
         sweep_item(sweep, result)
+        if gave_up and on_given_up is not None:
+            try:
+                await on_given_up(exc)
+            except Exception as after:
+                log_event(
+                    "sweep_item_give_up_action_failed",
+                    audience="operator",
+                    level="error",
+                    span="sweeps",
+                    user_id=user_id,
+                    fields={
+                        "sweep": sweep,
+                        "item_id": item_id,
+                        "error": type(after).__name__,
+                        "traceback": "".join(
+                            traceback.format_exception(
+                                type(after), after, after.__traceback__
+                            )
+                        ),
+                    },
+                )
         return False
 
 
@@ -158,12 +191,13 @@ async def run_pages(
     user_id_of: Callable[[T], Any],
     action: Callable[[T], Awaitable[Any]],
     select: Callable[[Sequence[T]], Sequence[T]] = _every,
+    on_given_up: Optional[Callable[[T, BaseException], Awaitable[Any]]] = None,
 ) -> None:
     """Run ``sweep`` over all its work, a page at a time: ``read_page(after)`` reads at most
     ``limit`` items in a stable order after the cursor ``after`` (``None`` first, then
     ``after_of`` of the page's last item), until a short page. Each item of ``select(page)`` the
-    sweep hasn't given up runs ``action(item)`` through ``run_item`` as ``item_id_of(item)``. A
-    failing read raises."""
+    sweep hasn't given up runs ``action(item)`` through ``run_item`` as ``item_id_of(item)``, and
+    ``on_given_up(item, error)`` when that run gives it up. A failing read raises."""
     after: Any = None
     while True:
         page = await read_page(after)
@@ -178,6 +212,9 @@ async def run_pages(
                     item_id,
                     partial(action, item),
                     user_id=user_id_of(item),
+                    on_given_up=(
+                        None if on_given_up is None else partial(on_given_up, item)
+                    ),
                 )
         if len(page) < limit:
             return
