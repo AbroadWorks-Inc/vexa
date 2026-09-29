@@ -282,16 +282,16 @@ def _upload(client, bearer, media_type="audio"):
 def test_the_upload_compares_the_internal_secret_in_constant_time(
     monkeypatch, media_type
 ):
-    import meeting_api.recordings.router as router
+    import meeting_api.callback_auth as auth
 
     calls = []
-    real = router.hmac.compare_digest
+    real = auth.hmac.compare_digest
 
     def spy(a, b):
         calls.append((type(a), type(b)))
         return real(a, b)
 
-    monkeypatch.setattr(router.hmac, "compare_digest", spy)
+    monkeypatch.setattr(auth.hmac, "compare_digest", spy)
     client = TestClient(create_app())
     # The internal secret passes auth; the upload itself then fails on its content.
     assert _upload(client, INTERNAL_SECRET, media_type).status_code not in (401, 500)

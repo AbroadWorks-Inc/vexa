@@ -9,13 +9,12 @@ gateway routes nothing here.
 
 from __future__ import annotations
 
-import hmac
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ..callback_auth import INTERNAL_SECRET_HEADER, internal_secret, secret_matches
 from ..intake.outbox import SubscriptionNotFound, WebhookTests
 
 __all__ = ["build_webhook_test_router"]
@@ -37,11 +36,10 @@ def build_webhook_test_router(tests: Optional[WebhookTests]) -> APIRouter:
 
     @router.post("/internal/webhooks/test", include_in_schema=False)
     async def queue_webhook_test(request: Request) -> JSONResponse:
-        secret = os.getenv("INTERNAL_API_SECRET") or ""
+        secret = internal_secret()
         if not secret:
             return _error(503, "unavailable", "INTERNAL_API_SECRET is not configured")
-        given = request.headers.get("X-Internal-Secret", "")
-        if not hmac.compare_digest(given.encode(), secret.encode()):
+        if not secret_matches(request.headers.get(INTERNAL_SECRET_HEADER), secret):
             return _error(403, "forbidden", "invalid internal secret")
         if tests is None:
             return _error(503, "unavailable", "webhook tests need Postgres")
