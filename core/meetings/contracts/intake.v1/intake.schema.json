@@ -237,7 +237,7 @@
       }
     },
     "Error": {
-      "description": "Every error meeting-api returns on the /v2 routes (§2.5); the gateway's own /v2 auth and rate refusals take this shape once the gateway adopts it (task A18). `message` never echoes `metadata` or the URL query string (validation.py never builds one from either).",
+      "description": "Every error on the /v2 routes (§2.5): meeting-api's, and the refusals the gateway itself answers on a /v2 path (a bad key, a missing scope, a rate limit, a service it can't reach). `message` never echoes `metadata` or the URL query string (validation.py never builds one from either).",
       "type": "object",
       "additionalProperties": false,
       "required": ["error"],
