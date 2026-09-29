@@ -1,6 +1,6 @@
 {
   "error": {
     "code": "unavailable",
-    "message": "database unavailable; retry with backoff"
+    "message": "storage is unavailable; retry"
   }
 }

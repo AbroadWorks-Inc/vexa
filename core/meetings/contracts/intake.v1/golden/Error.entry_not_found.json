@@ -1,6 +1,6 @@
 {
   "error": {
     "code": "entry_not_found",
-    "message": "no entry for this external_id/user"
+    "message": "no entry with this external_id for this user"
   }
 }

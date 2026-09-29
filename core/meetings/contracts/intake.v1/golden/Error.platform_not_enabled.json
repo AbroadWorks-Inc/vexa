@@ -1,6 +1,6 @@
 {
   "error": {
     "code": "platform_not_enabled",
-    "message": "this host is blocked (ENTRY_BLOCKED_HOSTS)"
+    "message": "meeting links on meet.google.com are not enabled"
   }
 }

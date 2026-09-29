@@ -1,6 +1,6 @@
 {
   "error": {
     "code": "rate_limited",
-    "message": "the account's write rate was hit; retry after the given delay"
+    "message": "Entry write rate limit exceeded"
   }
 }
