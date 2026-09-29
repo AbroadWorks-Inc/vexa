@@ -54,6 +54,10 @@ unrecorded while manual ones recorded — a split default nobody chose.
 Each bot sent moves ``aw_autojoin_lag_seconds`` (§1.13) by the tick's time minus
 (``scheduled_at`` − lead): how long after the bot became due it went.
 
+The tick also drives the meetings waiting for a new bot after one failed (§6.9 F-K2,
+``intake.retry``): once the retry is due and the failed workload is proven gone, a new bot session
+is spawned on the same row (see ``auto_join_tick``).
+
 The tick is a pure-ish function over injected ports (repo, runtime, context fetcher, clock) — the
 entrypoint (``__main__``) wraps it in the standard poll loop; tests drive single ticks offline.
 """
@@ -253,6 +257,7 @@ async def auto_join_tick(
     allow_uncapped: bool = False,
     item_failures=None,
     batch_size: Optional[int] = None,
+    untracked_grace: float = 600.0,
 ) -> dict:
     """One sweep: spawn every due scheduled meeting. Returns counters for observability:
     ``{"due": n, "spawned": n, "already": n, "errors": n, "skipped_uncapped": n,
@@ -286,7 +291,19 @@ async def auto_join_tick(
     id) and every page is worked in the tick. Each row runs through
     ``sweeps.item_failures.run_item`` over ``item_failures`` (the entrypoint's Postgres one): a row
     that raises fails alone, logged with its id and stack and counted, and after
-    ``SWEEP_MAX_ITEM_FAILURES`` it is given up and skipped."""
+    ``SWEEP_MAX_ITEM_FAILURES`` it is given up and skipped.
+
+    §6.9 F-K2: the tick then drives every meeting waiting for its next bot (``requested`` with
+    ``data.bot_retry``, ``list_retry_meetings``, paged by id, each through ``run_item`` too). One
+    carrying ``stop_requested`` ends ``failed``/``stopped``; one past its planned end ends
+    ``failed`` with the kept reason (``retry.end``). Once its ``due_at`` has passed, the failed
+    workload is proven gone (``reconcile.prove_workload_gone``: the runtime reports it terminal,
+    a delete is confirmed, or it has been untracked for ``untracked_grace`` —
+    ``MEETING_UNTRACKED_GRACE_SEC`` — since the failure) and marked so (``prove_retry_gone``),
+    and a new bot session is spawned on the row through ``ExactRowSpawn`` (counted in
+    ``spawned``). A failure after the claim goes back through ``retry``; one before it (the claim
+    never ran) is one more of the meeting's bounded sends, and the last one ends it ``failed``
+    (counted in ``errors``)."""
     from ..intake.ports import Room
     from ..intake.spawn import (
         IDENTITY_UNAVAILABLE,
@@ -294,6 +311,7 @@ async def auto_join_tick(
         ExactRowSpawn,
         spawn_failure,
     )
+    from ..intake.sweeps import _publish as publish_events
     from ..intake.sweeps import check_room
     from ..sweeps.item_failures import (
         InMemoryItemFailures,
@@ -484,6 +502,95 @@ async def auto_join_tick(
                   user_id=user_id, meeting_id=str(row["id"]),
                   fields={"platform": row["platform"], "native": row["native_meeting_id"]})
 
+    async def _end_waiting(row: dict, *, stopped: bool) -> None:
+        """A waiting meeting that was stopped, or whose planned end passed: ``failed`` with the
+        kept reason (``stopped`` for a stop), under its link lock."""
+        from ..intake import retry
+
+        room = Room(row["platform"], row["native_meeting_id"])
+        async with store.room_lock(row["user_id"], [room]) as tx:
+            written = await retry.end(
+                tx, row["id"], completion_reason="stopped" if stopped else None
+            )
+        if written is not None:
+            await publish_events(publisher, [written.event_id])
+        log_event("auto_join_retry_ended", audience="user", level="warning",
+                  span="meetings.auto_join", user_id=row["user_id"],
+                  meeting_id=str(row["id"]), fields={"stopped": stopped})
+
+    async def _failed_before_claim(row: dict, mark: dict, code: str, message: str) -> None:
+        """A new bot that failed before its claim: one more of the meeting's bounded sends
+        (``retry.retry``), and the last one ends the meeting ``failed`` with the kept reason."""
+        from ..intake import retry
+        from ..intake.settings import IntakeSettings
+
+        room = Room(row["platform"], row["native_meeting_id"])
+        failure = retry.Failure(
+            "failed", mark.get("reason"), message, stage=mark.get("stage"), code=code,
+            session=mark.get("after_session"), workload=mark.get("workload"),
+            proven_gone=True,
+        )
+        async with store.room_lock(row["user_id"], [room]) as tx:
+            written = await retry.retry(
+                tx, row["id"], failure, now=now, settings=IntakeSettings.from_env()
+            )
+            if written is None:
+                written = await retry.end(tx, row["id"], change_reason=code)
+        if written is not None:
+            await publish_events(publisher, [written.event_id])
+
+    async def _retry_one(row: dict) -> None:
+        """One meeting waiting for its next bot (§6.9 F-K2)."""
+        import logging
+
+        from ..intake import retry
+        from ..lifecycle.reconcile import prove_workload_gone
+
+        raw = row.get("data")
+        data: dict = raw if isinstance(raw, dict) else {}
+        mark = retry.marker(data)
+        if mark is None or row.get("status") != "requested":
+            return
+        end = _instant(row.get("scheduled_end_at"))
+        if data.get("stop_requested") or (end is not None and now >= end):
+            await _end_waiting(row, stopped=bool(data.get("stop_requested")))
+            return
+        due = _parse_iso(mark.get("due_at"))
+        if due is not None and now < due:
+            return
+        if not mark.get("proven_gone"):
+            if not await prove_workload_gone(
+                runtime, mark.get("workload"), meeting_id=row["id"],
+                failed_at=_parse_iso(mark.get("at")), now=now,
+                untracked_grace=untracked_grace,
+                log=logging.getLogger("meeting_api.auto_join.retry"),
+            ):
+                log_event("auto_join_retry_waiting_for_workload", audience="system",
+                          span="meetings.auto_join", user_id=row["user_id"],
+                          meeting_id=str(row["id"]), fields={"workload": mark.get("workload")})
+                return
+            if not await repo.prove_retry_gone(meeting_id=row["id"], workload=mark.get("workload")):
+                return
+            mark = {**mark, "proven_gone": True}
+        outcome = await spawn.spawn_exact(row["user_id"], row["id"])
+        if outcome.result == "sent":
+            counters["spawned"] += 1
+            await repo.merge_meeting_data(row["id"], {
+                "auto_join_error": None, "auto_join_next_retry": None,
+            })
+            log_event("auto_join_retry_spawned", audience="user", span="meetings.auto_join",
+                      user_id=row["user_id"], meeting_id=str(row["id"]),
+                      fields={"after_session": mark.get("after_session")})
+            return
+        if outcome.result != "failed":
+            return
+        counters["errors"] += 1
+        current = await repo.get_meeting(row["id"])
+        still = retry.marker((current or {}).get("data"))
+        if still is not None and still.get("at") == mark.get("at"):
+            await _failed_before_claim(row, mark, outcome.code or "internal_error",
+                                       outcome.message or "the bot was not sent")
+
     limit = batch_size or sweep_batch_size()
     failures = item_failures or InMemoryItemFailures(max_failures=sweep_max_item_failures())
     after = None
@@ -500,5 +607,18 @@ async def auto_join_tick(
         if len(rows) < limit:
             break
         after = (rows[-1]["event_time"], rows[-1]["id"])
+
+    if hasattr(repo, "list_retry_meetings"):
+        retry_after: Optional[int] = None
+        while True:
+            waiting = await repo.list_retry_meetings(after=retry_after, limit=limit)
+            skip = await failures.given_up(AUTO_JOIN, [str(row["id"]) for row in waiting])
+            for row in waiting:
+                if str(row["id"]) not in skip:
+                    await run_item(failures, AUTO_JOIN, str(row["id"]),
+                                   partial(_retry_one, row), user_id=row["user_id"])
+            if len(waiting) < limit:
+                break
+            retry_after = waiting[-1]["id"]
 
     return counters

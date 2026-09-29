@@ -149,6 +149,35 @@ async def _probe_bot_workload(
     return "gone", info
 
 
+async def prove_workload_gone(
+    runtime: Optional[Any],
+    workload_id: Optional[str],
+    *,
+    meeting_id: Any,
+    failed_at: Optional[datetime],
+    now: datetime,
+    untracked_grace: float,
+    log: Any,
+) -> bool:
+    """§6.9 F-K2: whether a failed bot's workload is proven gone, so a new bot may go to its
+    meeting. The reap gate's own evidence: ``gone`` (the kernel reports it terminal) is proof; an
+    ``alive`` workload is torn down and proof only once the kernel confirms the delete; a 404
+    (``untracked``) counts only once ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) has
+    passed since the failure (``failed_at``); anything else (no runtime, a probe error) is not
+    proof. No workload at all has nothing to prove."""
+    if not workload_id:
+        return True
+    probe, _info = await _probe_bot_workload(runtime, workload_id, log=log)
+    if probe == "gone":
+        return True
+    if probe == "alive":
+        verdict = await _teardown_verdict(runtime, workload_id, meeting_id=meeting_id, log=log)
+        return verdict == "confirmed"
+    if probe == "untracked":
+        return failed_at is not None and (now - failed_at).total_seconds() > untracked_grace
+    return False
+
+
 def _workload_evidence(bot_container_id: Optional[str], info: Optional[dict]) -> str:
     """The probe's answer, rendered for the terminal transition's ``reason``. This is what replaces
     the manufactured "bot gone while {status}": a reader learns WHAT the kernel reported (state,
@@ -565,6 +594,8 @@ async def synthesize_terminal_for_dead_workload(
         never will (image-pull fail, OOM, crash on boot, or a stop that killed it in the waiting room
         before it sent its own terminal callback) → synthetic ``failed`` attributed to the stage it died in
         (CC5).
+      * WAITING FOR A NEW BOT (§6.9 F-K2, ``data.bot_retry``) — the failed bot's workload is proven gone
+        (``prove_retry_gone``) and no terminal is driven: the meeting is not over.
       * WAS-ACTIVE (``stopping``/``active``/``needs_help``) — the bot reached the meeting, but its workload
         is now confirmed gone WITHOUT its own terminal callback having landed (e.g. it was SIGKILLed at
         teardown before it could POST ``completed``). This is exactly the reaper-loop incident: DELETE
@@ -584,6 +615,16 @@ async def synthesize_terminal_for_dead_workload(
         log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
         return False
     if not info or not info.get("session_uid"):
+        return False
+    mark = info.get("bot_retry")
+    if mark is not None:
+        # §6.9 F-K2: the meeting already waits for its next bot. The failed bot's workload is now
+        # runtime-confirmed gone — the proof the retry waits for — and no terminal is driven.
+        if mark.get("workload") == workload_id:
+            try:
+                await repo.prove_retry_gone(meeting_id=info["meeting_id"], workload=workload_id)
+            except Exception as e:  # noqa: BLE001 — best-effort; the retry driver probes too
+                log.warning("runtime-callback: prove_retry_gone failed for %s: %s", workload_id, e)
         return False
     status = info.get("status")
     stop_requested = bool(info.get("stop_requested"))

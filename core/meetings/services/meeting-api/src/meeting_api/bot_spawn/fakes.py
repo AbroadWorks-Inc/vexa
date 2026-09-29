@@ -120,6 +120,7 @@ class InMemoryMeetingRepo:
         advisory lock + unique partial index). A row may carry ``scheduled_end_at`` (the
         ``meeting_aw_state`` column the real adapter's claim reads) and ``has_entries`` (whether a
         ``meeting_entries`` row points at it)."""
+        from ..intake import retry
         from .auto_join import LIVE_STATUSES
 
         # 0. depleted — a cap <= 0 means NO bots allowed (0 is "depleted", never "unlimited");
@@ -139,8 +140,17 @@ class InMemoryMeetingRepo:
                         target["data"], managed=bool(target.get("has_entries")),
                         scheduled_end_at=target.get("scheduled_end_at"))):
                 raise ClaimNotDue(claim_meeting_id)
+        # A meeting waiting for its next bot whose failed workload is proven gone (§6.9 F-K2)
+        # holds its own link and bot slot: its own row is left out of both checks.
+        waiting: Optional[dict] = None
+        if (target is not None and target["status"] == "requested"
+                and retry.proven(target["data"])):
+            waiting = target
+            exclude_meeting_id = target["id"]
         # 1. dedup — a LIVE row for (user, platform, native) blocks the spawn (409).
         for m in self._meetings.values():
+            if waiting is not None and m["id"] == waiting["id"]:
+                continue
             if (
                 m["user_id"] == user_id
                 and m["platform"] == platform
@@ -161,6 +171,16 @@ class InMemoryMeetingRepo:
             )
             if active >= max_concurrent:
                 raise MaxBotsExceeded(user_id, max_concurrent, active=active)
+        # 2a'. the waiting meeting is claimed without a status change: the marker's failure goes
+        #      into the completion history, the failed workload is forgotten.
+        if waiting is not None:
+            waiting["data"] = {
+                **retry.claimed(waiting["data"]), **dict(data or {}),
+                "auto_join_last_attempt": datetime.now(timezone.utc).isoformat(),
+            }
+            waiting["bot_container_id"] = None
+            waiting["end_time"] = None
+            return dict(waiting)
         # 2a. the exact row moves `scheduled` → `requested` (any other status → MeetingStopped),
         #     the spawn keys merged over its data and the send time stamped (Ruling R7).
         if target is not None:
@@ -371,12 +391,41 @@ class InMemoryMeetingRepo:
         sid = next(
             (s["session_uid"] for s in reversed(self.sessions) if s["meeting_id"] == row["id"]), None
         )
+        from ..intake import retry
+
         return {
             "meeting_id": row["id"],
             "status": row["status"],
             "session_uid": sid,
             "stop_requested": bool((row.get("data") or {}).get("stop_requested")),
+            "bot_retry": retry.marker(row.get("data")),
         }
+
+    async def prove_retry_gone(self, *, meeting_id, workload) -> bool:
+        from ..intake import retry
+
+        row = self._meetings.get(meeting_id)
+        if row is None:
+            return False
+        mark = retry.marker(row.get("data"))
+        if mark is None or row["status"] != "requested" or mark.get("workload") != workload:
+            return False
+        row["data"][retry.MARKER] = {**mark, "proven_gone": True}
+        return True
+
+    async def list_retry_meetings(self, *, after=None, limit=None) -> list:
+        """The real adapter's retry read: ``requested`` rows with ``data.bot_retry``, by id, each
+        with its ``scheduled_end_at`` (an ISO string, as the adapter renders it)."""
+        from ..intake import retry
+        from ..intake.projection import iso_utc
+
+        rows = [
+            {**m, "scheduled_end_at": iso_utc(m.get("scheduled_end_at"))}
+            for mid, m in sorted(self._meetings.items())
+            if m["status"] == "requested" and retry.marker(m.get("data")) is not None
+            and (after is None or mid > after)
+        ]
+        return rows if limit is None else rows[:limit]
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,

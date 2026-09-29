@@ -635,7 +635,10 @@ async def request_bot(
     #     replica deployment ever witnesses it.
     if authenticated and auth_userdata_path:
         conflict = await repo.find_active_by_userdata(auth_userdata_path)
-        if conflict is not None and (reused_row is None or conflict["id"] != reused_row["id"]):
+        # The row this spawn reuses or claims (a meeting waiting for its next bot, §6.9 F-K2) is
+        # not a conflict with itself.
+        own = {reused_row["id"] if reused_row is not None else None, claim_meeting_id}
+        if conflict is not None and conflict["id"] not in own:
             log_event(
                 "bot_spawn_auth_session_busy", audience="user", level="warning",
                 span="bots.create", user_id=user_id,

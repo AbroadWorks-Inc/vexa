@@ -35,6 +35,12 @@ reason (else the code), and ``data.bot_retry``::
 marker while the meeting is live (the row's own ``completion_reason`` stays empty until it ends);
 ``workload`` is the failed bot's workload and ``proven_gone`` whether it is already proven gone.
 It returns ``None``, having written nothing, when the failure isn't retried.
+
+A waiting meeting leaves ``requested`` one of two ways. A new bot claims it once ``proven``: the
+claim writes ``claimed(data)`` (the marker's failure moved into ``completion_history``, the marker
+removed) and no status change. Or ``end(tx, meeting_id, …)`` ends it ``failed`` (``bot.failed``,
+``aw_meetings_failed_total``) with the marker's reason and stage, or the reason given (a stop's
+``stopped``): its planned end passed, it was stopped, or its last send failed before the claim.
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ from typing import Any, Mapping, Optional
 from .ports import IntakeTx, MeetingView
 from .projection import iso_utc
 from .settings import IntakeSettings
-from .status import WrittenEvent
+from .status import Outcome, WrittenEvent
 
 __all__ = [
     "BOT_FAILED",
@@ -54,12 +60,15 @@ __all__ = [
     "MARKER",
     "NOT_RETRIED",
     "RETRY_EVENT",
+    "claimed",
     "due_at",
+    "end",
     "in_scope",
     "is_bot_failure",
     "is_last",
     "marker",
     "pending_from",
+    "proven",
     "retry",
 ]
 
@@ -104,6 +113,27 @@ def marker(data: Any) -> Optional[dict[str, Any]]:
     """The pending retry a row's ``data`` carries, else ``None``."""
     value = data.get(MARKER) if isinstance(data, Mapping) else None
     return dict(value) if isinstance(value, Mapping) else None
+
+
+def proven(data: Any) -> bool:
+    """A pending retry whose failed workload is proven gone: a new bot may claim the row."""
+    mark = marker(data)
+    return mark is not None and mark.get("proven_gone") is True
+
+
+def claimed(data: Any) -> dict[str, Any]:
+    """The row's ``data`` once a new bot claims it: the marker's reason, stage and message moved
+    into ``data.completion_history`` (``bot_spawn.ports._archive_completion``, as a reopened row's
+    are), the marker removed."""
+    from ..bot_spawn.ports import _archive_completion
+
+    out = dict(data) if isinstance(data, Mapping) else {}
+    mark = marker(out) or {}
+    out.pop(MARKER, None)
+    out["completion_reason"] = mark.get("reason")
+    out["failure_stage"] = mark.get("stage")
+    out["failure_reason"] = mark.get("message")
+    return _archive_completion(out)
 
 
 def is_bot_failure(failure: Failure) -> bool:
@@ -187,4 +217,37 @@ async def retry(
         data_patch=patch,
         change_reason=failure.reason or failure.code,
         event_type=RETRY_EVENT,
+    )
+
+
+async def end(
+    tx: IntakeTx,
+    meeting_id: int,
+    *,
+    completion_reason: Optional[str] = None,
+    change_reason: Optional[str] = None,
+    outcome: Optional[Outcome] = None,
+) -> Optional[WrittenEvent]:
+    """End a meeting waiting for its next bot ``failed``: ``completion_reason`` (else the
+    marker's), the marker's stage and message as ``failure_stage`` / ``failure_reason``, the
+    marker cleared, with ``outcome`` when given; the change reason is ``change_reason``, else the
+    completion reason. ``None``, having written nothing, when the meeting isn't waiting.
+    """
+    meeting = await tx.meeting(meeting_id)
+    mark = marker(meeting.data)
+    if mark is None or meeting.status != "requested":
+        return None
+    reason = completion_reason or mark.get("reason")
+    patch: dict[str, Any] = {MARKER: None, "failure_reason": mark.get("message")}
+    if reason is not None:
+        patch["completion_reason"] = reason
+    if mark.get("stage") is not None:
+        patch["failure_stage"] = mark["stage"]
+    return await tx.status(
+        meeting_id,
+        "failed",
+        expected_from={"requested"},
+        data_patch=patch,
+        outcome=outcome,
+        change_reason=change_reason or reason,
     )

@@ -276,13 +276,15 @@ class SqlAlchemyMeetingRepo:
     async def find_by_container(self, *, bot_container_id) -> Optional[dict]:
         """The meeting + latest session for a workload id — used by the runtime callback (CC5) to drive a
         synthetic ``failed`` for a workload that died before the bot reported. ``{meeting_id, status,
-        session_uid, stop_requested}`` or ``None``.
+        session_uid, stop_requested, bot_retry}`` or ``None`` (``bot_retry``: the meeting's pending
+        retry, §6.9 F-K2, else ``None``).
 
         ``stop_requested`` carries the user's intent so the synthetic terminal can tell a bot the USER
         abandoned from one that timed out on its own — the two earn different completion reasons, and
         only the latter may be retried."""
         from sqlalchemy import select
 
+        from ..intake import retry
         from ..sessions.models import Meeting, MeetingSession
 
         async with self._session_factory() as db:
@@ -308,7 +310,56 @@ class SqlAlchemyMeetingRepo:
                 "status": status,
                 "session_uid": sid,
                 "stop_requested": bool((data or {}).get("stop_requested")),
+                "bot_retry": retry.marker(data),
             }
+
+    async def prove_retry_gone(self, *, meeting_id, workload) -> bool:
+        """§6.9 F-K2: mark the pending retry's failed workload proven gone (``data.bot_retry.
+        proven_gone``), under the link lock and the row lock, only while the row still carries a
+        marker for that ``workload``. Returns whether it did."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from ..intake import retry
+        from ..intake.adapters import lock_meeting_on_its_link
+
+        async with self._session_factory() as db:
+            m = await lock_meeting_on_its_link(db, meeting_id)
+            if m is None:
+                return False
+            mark = retry.marker(m.data)
+            if mark is None or m.status != "requested" or mark.get("workload") != workload:
+                return False
+            m.data = {**m.data, retry.MARKER: {**mark, "proven_gone": True}}
+            flag_modified(m, "data")
+            await db.commit()
+            return True
+
+    async def list_retry_meetings(self, *, after=None, limit=None) -> list[dict]:
+        """The meetings waiting for their next bot (§6.9 F-K2: ``requested`` with
+        ``data.bot_retry``), by id, one page of ``limit`` after ``after``, each with its
+        ``meeting_aw_state.scheduled_end_at``: the retry driver's read."""
+        from sqlalchemy import select, text
+
+        from ..sessions.models import Meeting, MeetingAwState
+
+        stmt = (
+            select(Meeting, MeetingAwState.scheduled_end_at)
+            .outerjoin(MeetingAwState, MeetingAwState.meeting_id == Meeting.id)
+            .where(
+                text("meetings.status = 'requested'"),
+                Meeting.data["bot_retry"].astext.isnot(None),
+            )
+            .order_by(Meeting.id)
+        )
+        if after is not None:
+            stmt = stmt.where(Meeting.id > after)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        async with self._session_factory() as db:
+            rows = (await db.execute(stmt)).all()
+            return [
+                {**_row_to_dict(m), "scheduled_end_at": _iso_utc(end)} for m, end in rows
+            ]
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
@@ -590,6 +641,7 @@ class SqlAlchemyMeetingRepo:
         from sqlalchemy import bindparam, exists, func, select, text
         from sqlalchemy.exc import IntegrityError
 
+        from ..intake import retry
         from ..intake.adapters import take_link_lock
         from ..intake.ports import Room
         from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting, write_status
@@ -635,18 +687,27 @@ class SqlAlchemyMeetingRepo:
                         target.data, managed=bool(managed), scheduled_end_at=end
                     ):
                         raise ClaimNotDue(claim_meeting_id)
+            # A meeting waiting for its next bot (§6.9 F-K2) whose failed workload is proven gone:
+            # it holds its own link and bot slot, so its own row is left out of both checks.
+            waiting = (
+                target
+                if target is not None and target.status == "requested"
+                and retry.proven(target.data)
+                else None
+            )
+            if waiting is not None:
+                exclude_meeting_id = waiting.id
             # 1. dedup — under the locks, a LIVE row for (user, platform, native) blocks the spawn:
             #    whatever its status, a bot already owns the room.
-            dup = (
-                await db.execute(
-                    select(Meeting.id).where(
-                        Meeting.user_id == user_id,
-                        Meeting.platform == platform,
-                        Meeting.platform_specific_id == native_meeting_id,
-                        Meeting.status.in_(LIVE_STATUSES),
-                    )
-                )
-            ).scalars().first()
+            dup_stmt = select(Meeting.id).where(
+                Meeting.user_id == user_id,
+                Meeting.platform == platform,
+                Meeting.platform_specific_id == native_meeting_id,
+                Meeting.status.in_(LIVE_STATUSES),
+            )
+            if waiting is not None:
+                dup_stmt = dup_stmt.where(Meeting.id != waiting.id)
+            dup = (await db.execute(dup_stmt)).scalars().first()
             if dup is not None:
                 raise DuplicateMeeting(
                     f"An active meeting already exists for {platform}/{native_meeting_id}"
@@ -668,6 +729,8 @@ class SqlAlchemyMeetingRepo:
                 n_active = int((await db.execute(count_stmt)).scalar() or 0)
                 if n_active >= max_concurrent:
                     raise MaxBotsExceeded(user_id, max_concurrent, active=n_active)
+            if waiting is not None:
+                return await self._claim_retry(db, waiting, data)
             if target is not None:
                 return await self._claim_exact(db, target, data)
             # 2b. claim — the PLANNED row (intent status `idle`/`scheduled`, created by POST /meetings,
@@ -763,6 +826,28 @@ class SqlAlchemyMeetingRepo:
                 raise
             await db.rollback()
             raise DuplicateMeeting(f"An active meeting already exists for {room}") from e
+        await db.refresh(target)
+        return _row_to_dict(target)
+
+    async def _claim_retry(self, db, target, data) -> dict:
+        """§6.9 F-K2: a new bot claims the meeting waiting for it. No status change (it is already
+        ``requested``): the marker's failure moves into ``data.completion_history``
+        (``intake.retry.claimed``), the spawn keys merge over the data with the send time as
+        ``data.auto_join_last_attempt`` (Ruling R7), and the failed workload is forgotten. Commits
+        the caller's transaction."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from ..intake import retry
+
+        target.data = {
+            **retry.claimed(target.data),
+            **dict(data or {}),
+            "auto_join_last_attempt": datetime.now(timezone.utc).isoformat(),
+        }
+        flag_modified(target, "data")
+        target.bot_container_id = None
+        target.end_time = None
+        await db.commit()
         await db.refresh(target)
         return _row_to_dict(target)
 

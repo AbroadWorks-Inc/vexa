@@ -4,7 +4,11 @@ Offline, on the in-memory fakes:
   * the decision (``retry.due_at``) and the one writer (``retry.retry``);
   * the lifecycle callback (``app._apply_lifecycle_event``) on a session whose terminal the repo
     turned into a retry, into the last lost bot's ``failed``, or refused as stale: the meeting-level
-    side effects follow the row's persisted status, not the session's.
+    side effects follow the row's persisted status, not the session's;
+  * the newest-session guard of the in-memory repo;
+  * the claim of a waiting meeting (the in-memory repo, the same rules as the SQL one), the
+    workload-gone proof (``reconcile.prove_workload_gone``) and the runtime callback marking a
+    waiting meeting's workload gone instead of driving a terminal.
 
 The Postgres wiring (the lifecycle write, ``fail_meeting``, the spawn port) is in
 ``test_bot_retry_pg.py``.
@@ -462,3 +466,208 @@ async def test_a_session_that_is_not_the_meetings_newest_writes_nothing():
     assert "x" not in repo._meetings[meeting["id"]]["data"]
     row = await repo.update_meeting_status(session_uid="sess-new", status="joining")
     assert row["status"] == "joining"
+
+
+# ── the claim of a waiting meeting ──────────────────────────────────────────────────────────
+
+
+def _waiting_repo(*, proven: bool, status: str = "requested"):
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    repo = InMemoryMeetingRepo()
+    repo._meetings[5] = {
+        "id": 5,
+        "user_id": USER,
+        "platform": "google_meet",
+        "native_meeting_id": "kxo-misr-avz",
+        "platform_specific_id": "kxo-misr-avz",
+        "status": status,
+        "bot_container_id": "mtg-5-old",
+        "start_time": None,
+        "end_time": None,
+        "created_at": "2026-09-29T09:00:00Z",
+        "updated_at": "2026-09-29T09:00:00Z",
+        "data": {
+            "title": "standup",
+            "bot_retry": {
+                "reason": "join_failure",
+                "stage": "joining",
+                "message": "no page",
+                "workload": "mtg-5-old",
+                "due_at": "2026-09-29T09:11:00Z",
+                "proven_gone": proven,
+            },
+        },
+    }
+    return repo
+
+
+async def _claim(repo, **kw):
+    return await repo.create_meeting_guarded(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="kxo-misr-avz",
+        data={"k": "v"},
+        claim_meeting_id=5,
+        **kw,
+    )
+
+
+async def test_the_claim_takes_a_waiting_meeting_whose_workload_is_proven_gone():
+    repo = _waiting_repo(proven=True)
+    row = await _claim(repo, max_concurrent=1)  # the row does not count against itself
+    assert row["id"] == 5 and row["status"] == "requested"
+    assert row["bot_container_id"] is None
+    data = row["data"]
+    assert "bot_retry" not in data and data["k"] == "v" and data["title"] == "standup"
+    assert "auto_join_last_attempt" in data
+    archived = data["completion_history"][-1]
+    assert (archived["completion_reason"], archived["failure_stage"]) == (
+        "join_failure",
+        "joining",
+    )
+    assert archived["failure_reason"] == "no page"
+    assert "completion_reason" not in data
+
+
+async def test_the_claim_refuses_a_waiting_meeting_not_proven_gone():
+    from meeting_api.bot_spawn.ports import DuplicateMeeting
+
+    repo = _waiting_repo(proven=False)
+    with pytest.raises(DuplicateMeeting):
+        await _claim(repo)
+    assert repo._meetings[5]["data"]["bot_retry"]["proven_gone"] is False
+
+
+async def test_a_waiting_meeting_holds_a_bot_slot_for_every_other_spawn():
+    from meeting_api.bot_spawn.ports import MaxBotsExceeded
+
+    repo = _waiting_repo(proven=True)
+    with pytest.raises(MaxBotsExceeded):
+        await repo.create_meeting_guarded(
+            user_id=USER,
+            platform="google_meet",
+            native_meeting_id="abc-defg-hij",
+            data={},
+            max_concurrent=1,
+        )
+
+
+async def test_a_signed_in_bot_is_not_busy_with_the_meeting_it_retries(monkeypatch):
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.bot_spawn.service import request_bot
+
+    for name, value in {
+        "BOT_AUTHENTICATED": "true",
+        "BOT_USERDATA_S3_PATH": "s3://userdata/bot",
+        "BOT_S3_ENDPOINT": "http://s3",
+        "BOT_S3_BUCKET": "userdata",
+    }.items():
+        monkeypatch.setenv(name, value)
+    repo = _waiting_repo(proven=True)
+    repo._meetings[5]["data"]["auth_userdata_path"] = "s3://userdata/bot"
+    runtime = FakeRuntimeClient()
+    await request_bot(
+        repo,
+        runtime,
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="kxo-misr-avz",
+        token_secret="s",
+        redis_url="redis://r",
+        claim_meeting_id=5,
+    )
+    assert len(runtime.specs) == 1
+    assert "bot_retry" not in repo._meetings[5]["data"]
+
+
+# ── the workload-gone proof ─────────────────────────────────────────────────────────────────
+
+
+class _Log:
+    def warning(self, *a, **k): ...
+
+    def error(self, *a, **k): ...
+
+
+async def _proven(runtime, workload="w-1", *, failed_s_ago=60.0, grace=600.0) -> bool:
+    from meeting_api.lifecycle.reconcile import prove_workload_gone
+
+    return await prove_workload_gone(
+        runtime,
+        workload,
+        meeting_id=5,
+        failed_at=NOW - timedelta(seconds=failed_s_ago),
+        now=NOW,
+        untracked_grace=grace,
+        log=_Log(),
+    )
+
+
+async def test_a_workload_the_kernel_reports_terminal_is_gone():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    assert await _proven(FakeRuntimeClient(workloads={"w-1": {"state": "destroyed"}}))
+
+
+async def test_a_live_workload_is_gone_once_its_delete_is_confirmed():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    runtime = FakeRuntimeClient(workloads={"w-1": {"state": "running"}})
+    assert await _proven(runtime) and runtime.deleted == ["w-1"]
+
+    class Refuses(FakeRuntimeClient):
+        async def delete_workload(self, workload_id):
+            raise RuntimeError("down")
+
+    assert not await _proven(Refuses(workloads={"w-1": {"state": "running"}}))
+
+
+async def test_a_404_is_gone_only_after_the_untracked_grace():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    runtime = FakeRuntimeClient(workloads={})
+    assert not await _proven(runtime, failed_s_ago=600)
+    assert await _proven(runtime, failed_s_ago=601)
+
+
+async def test_an_unknown_answer_is_not_proof_and_no_workload_needs_none():
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    class Broken(FakeRuntimeClient):
+        async def get_workload(self, workload_id):
+            raise RuntimeError("timeout")
+
+    assert not await _proven(Broken())
+    assert not await _proven(None)
+    assert await _proven(Broken(), workload=None)
+
+
+# ── the runtime callback on a waiting meeting ───────────────────────────────────────────────
+
+
+async def test_a_runtime_destroy_of_a_waiting_meetings_workload_proves_it_gone():
+    from meeting_api.lifecycle.reconcile import synthesize_terminal_for_dead_workload
+
+    repo = _waiting_repo(proven=False)
+    await repo.create_session(meeting_id=5, session_uid="sess-old")
+    driven: list[dict] = []
+
+    async def drive(body):
+        driven.append(body)
+
+    assert not await synthesize_terminal_for_dead_workload(
+        repo, "mtg-5-old", "destroyed", drive, log=_Log()
+    )
+    assert driven == []
+    assert repo._meetings[5]["data"]["bot_retry"]["proven_gone"] is True
+    assert repo._meetings[5]["status"] == "requested"
+
+
+async def test_proving_gone_needs_the_marker_on_that_workload():
+    repo = _waiting_repo(proven=False)
+    assert not await repo.prove_retry_gone(meeting_id=5, workload="mtg-5-other")
+    assert repo._meetings[5]["data"]["bot_retry"]["proven_gone"] is False
+    assert await repo.prove_retry_gone(meeting_id=5, workload="mtg-5-old")
+    del repo._meetings[5]["data"]["bot_retry"]
+    assert not await repo.prove_retry_gone(meeting_id=5, workload="mtg-5-old")

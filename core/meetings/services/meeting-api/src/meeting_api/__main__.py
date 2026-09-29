@@ -649,6 +649,7 @@ def _attach_background_loops(
                 allow_uncapped=auto_join_allow_uncapped,
                 item_failures=item_failures,
                 batch_size=sweep_batch,
+                untracked_grace=untracked_grace,
             )
 
         while True:

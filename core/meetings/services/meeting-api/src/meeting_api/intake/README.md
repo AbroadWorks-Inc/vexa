@@ -139,8 +139,16 @@ on the last attempt ends `failed`), `fail_meeting` (a timed-out workload create 
 proven gone) and `ExactRowSpawn`'s post-claim ending. The last failure ends `failed` with
 `bot.failed` and `aw_meetings_failed_total`; on a meeting that already had a bot session its
 `not_sent` outcome is dropped. A row waiting for its next bot takes no status write from a session
-(data-only writes still land), and the entry service answers a new instant join sent back this way
-`created`.
+(data-only writes still land), a session that isn't the meeting's newest writes nothing, and the
+entry service answers a new instant join sent back this way `created`. The auto-join tick drives
+the waiting meetings (`list_retry_meetings`): a stop (`stop_requested`) or a passed planned end
+ends one `failed` (`retry.end`, the kept reason, or `stopped`); after `due_at` the failed workload
+is proven gone (`lifecycle.reconcile.prove_workload_gone`: reported terminal, a confirmed delete,
+or untracked for `MEETING_UNTRACKED_GRACE_SEC` since the failure; a runtime destroy callback proves
+it too) and a new session is spawned on the row through `ExactRowSpawn`. The claim takes a
+`requested` row whose marker is proven, with no status change (`retry.claimed` moves the failure
+into `completion_history`), leaving the row out of its own duplicate check, bot limit and signed-in
+session check. A new bot that fails before its claim is one more bounded send.
 `IntakeStop` (`stop.py`) is the production `StopPort` (§1.7), behind `POST /v2/meetings/{id}/stop`
 (no outcome: the meeting ends with upstream's `stopped`) and R5 (outcome `cancelled_by_calendar`
 with the remove reason). Under the meeting's link lock it locks the meeting row, then
