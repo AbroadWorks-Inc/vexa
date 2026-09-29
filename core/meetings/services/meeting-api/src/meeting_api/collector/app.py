@@ -572,7 +572,7 @@ def build_router(
 
     # --- an entry-managed meeting is edited only through /v2/entries (§1.6): the upstream PATCH and
     # DELETE, by row id or native pair, answer 409 `managed_by_entries`. This is the fast path; the
-    # store refuses the same row under its row lock (Ruling R21). An unknown or unowned id is not
+    # store refuses the same row under its row lock. An unknown or unowned id is not
     # managed here, so it still reaches the store's 404. ---
     async def _refuse_managed(user_id: int, meeting_id: int) -> None:
         from ..intake.resolver import ManagedByEntries

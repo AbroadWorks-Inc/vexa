@@ -1534,7 +1534,7 @@ class SqlAlchemyTranscriptStore:
                 return None
             if (meeting.platform, meeting.platform_specific_id) != tuple(link):
                 return {"error": "conflict"}
-            # Entries manage it: edited only through /v2/entries (§1.6, Ruling R21).
+            # Entries manage it: edited only through /v2/entries (§1.6).
             if await self._has_entries(db, meeting.id):
                 return {"error": "managed_by_entries"}
             if meeting.status not in ("idle", "scheduled"):
@@ -1647,7 +1647,7 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
-            # Entries manage it: edited only through /v2/entries (§1.6, Ruling R21).
+            # Entries manage it: edited only through /v2/entries (§1.6).
             if await self._has_entries(db, meeting.id):
                 raise ManagedByEntries(meeting.id)
             if meeting.status not in ("idle", "scheduled"):

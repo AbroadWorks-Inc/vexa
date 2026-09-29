@@ -398,7 +398,7 @@ async def test_opposite_lock_sets_taken_sorted_never_deadlock(make_pg, holder):
 
 
 async def test_room_meetings_returns_live_or_entry_managed_rows_only(make_pg):
-    """Ruling R15: the link's live rows, plus its non-finished rows that entries manage. An
+    """§1.5 (V12 item 11): the link's live rows, plus its non-finished rows that entries manage. An
     entry-less upstream-planned row, a finished row and another link's row are never returned.
     """
     h = make_pg()

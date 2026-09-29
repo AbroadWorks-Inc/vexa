@@ -85,12 +85,12 @@ STATUS_CHANGE_EVENT = "meeting.status_change"
 #: The event of a meeting sent back for another bot after one failed (§6.9 F-K2).
 RETRY_EVENT = "bot.retry"
 
-#: The typed §2.7 event of a status change, where one exists (Ruling R25).
+#: The typed §2.7 event of a status change, where one exists.
 _TYPED_EVENTS = {"active": "meeting.started", "completed": "meeting.completed"}
 
 
 def typed_event(to_status: str, outcome_kind: Optional[str]) -> str:
-    """The event type of a change to ``to_status`` (Ruling R25): ``meeting.started`` on ``active``,
+    """The event type of a change to ``to_status`` (§2.7): ``meeting.started`` on ``active``,
     ``meeting.completed`` on ``completed``, and on ``failed`` ``meeting.not_sent`` when the
     meeting's outcome (the one written with the change, else the one stored) is ``not_sent``, else
     ``bot.failed``. Every other step is ``meeting.status_change``."""
@@ -327,7 +327,7 @@ async def write_status(
 ) -> WrittenEvent:
     """Move meeting ``meeting_id`` to ``to_status`` if it is currently in ``expected_from`` and
     record the event (§1.4 steps 1–5). Raises ``StatusConflict`` otherwise, having written
-    nothing. The event type is ``event_type``, else ``typed_event`` of the change (Ruling R25);
+    nothing. The event type is ``event_type``, else ``typed_event`` of the change (§2.7);
     its ``change`` is ``{from, to, reason, at}``. ``event_data`` adds keys to the envelope's ``data`` next to
     ``meeting`` and ``change`` (``merged_into``, §2.7); it may not name either of those. A
     ``data_patch`` whose ``completion_reason`` is outside the sealed set raises ``ValueError``

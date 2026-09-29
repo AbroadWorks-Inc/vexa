@@ -537,8 +537,8 @@ async def test_join_now_adopting_a_shared_meeting_keeps_it_when_the_spawn_fails(
 
 
 async def test_join_now_never_adopts_an_entry_less_upstream_meeting():
-    """Ruling R15: an entry-less upstream-planned row on the link is left to upstream; the paste
-    gets its own meeting, which ends ``not_sent`` when its last send fails."""
+    """§1.5 (V12 item 11): an entry-less upstream-planned row on the link is left to upstream;
+    the paste gets its own meeting, which ends ``not_sent`` when its last send fails."""
     h = make_harness(
         "2026-09-29T09:45:00Z", spawn_failure=ACCOUNT_LIMIT, send_max_attempts=1
     )

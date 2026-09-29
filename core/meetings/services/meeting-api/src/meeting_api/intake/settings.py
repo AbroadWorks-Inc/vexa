@@ -7,9 +7,10 @@ use it for ``bot_joins_at``.
 entry and upstream ``POST /bots`` both adopt by (§1.1 R1, §1.5). ``auto_join_grace_s`` is the one
 reader of the sweep's ``AUTO_JOIN_GRACE_S``, with the sweep's default: the entrypoint hands it to
 the sweep, and the link resolver ignores a timed, entry-less ``scheduled`` plan past its
-``scheduled_at`` plus this grace, which the sweep will never send (§1.6, Ruling R22). ``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of
-an entry-managed meeting's bot (§6.9 F-K): that many failed sends in total, this many seconds
-apart, then the meeting ends ``not_sent``. ``INTAKE_CONFLICT_RETRIES`` is how many more times an
+``scheduled_at`` plus this grace, which the sweep will never send (§1.6).
+``BOT_SEND_MAX_ATTEMPTS`` / ``BOT_SEND_RETRY_BACKOFF_S`` bound the sends of an entry-managed
+meeting's bot (§6.9 F-K): that many failed sends in total, this many seconds apart, then the
+meeting ends ``not_sent``. ``INTAKE_CONFLICT_RETRIES`` is how many more times an
 entry write that lost a constraint race is run again (§6.9 F-D).
 """
 

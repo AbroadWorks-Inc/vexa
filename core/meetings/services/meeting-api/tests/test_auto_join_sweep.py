@@ -381,7 +381,7 @@ async def test_attempt_stamp_survives_a_failed_spawn_and_holds_the_next_tick(cap
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient(fail=True)
     mid = _seed(repo)
     assert (await _tick(repo, runtime))["errors"] == 1
-    # §1.5 Ruling R17: the spawn port ends a claimed row not_sent through the intake store; this
+    # §1.5: the spawn port ends a claimed row not_sent through the intake store; this
     # rig's store holds no copy of the repo's row, so that best-effort write logs and moves on.
     logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()
               if line.startswith("{")]

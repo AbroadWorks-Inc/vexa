@@ -21,7 +21,7 @@ Inside the transaction the lock order is the link lock, then the ``meetings`` ro
 Reads return fresh rows (``populate_existing``), as column-name mappings (``status.row_mapping``),
 so the views and the projection read exactly what is stored. ``room_meetings`` returns the link's
 live meetings and the non-finished meetings entries manage; an entry-less upstream-planned row is
-never offered to an entry (Ruling R15). ``count_active_entries`` counts on the partial index
+never offered to an entry (§1.5, V12 item 11). ``count_active_entries`` counts on the partial index
 ``ix_meeting_entries_active_user``, index-only; the ``state = 'active'`` predicate is a literal so a
 cached generic plan still matches the index.
 

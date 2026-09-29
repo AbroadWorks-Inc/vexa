@@ -521,7 +521,7 @@ class PlannedRow:
 
 
 def planned_claim(rows: list[PlannedRow], *, now: datetime) -> Optional[int]:
-    """The planned row upstream ``POST /bots`` claims (§1.5, Ruling R18); ``None`` means insert.
+    """The planned row upstream ``POST /bots`` claims (§1.5); ``None`` means insert.
 
       1. Among entry-managed rows, the R1 ``join_now`` rule (``intake.rules.join_now_target`` with
          ``JOIN_NOW_ADOPT_AHEAD_S``): the earliest one not yet ended starting within the window.

@@ -9,7 +9,7 @@ Three groups:
     future occurrence. A live row on the link (``needs_help`` and ``stopping`` included) blocks;
   * the production ``SpawnPort`` (``intake/spawn.py``) — ``spawn_exact`` answers ``sent`` /
     ``already_live`` / ``failed`` with the §1.5 code and exact message, stamps
-    ``data.auto_join_last_attempt`` in the claim (Ruling R7), and never lets an exception out;
+    ``data.auto_join_last_attempt`` in the claim (§2.4), and never lets an exception out;
   * Postgres only — the lock order (link lock, then the per-user lock, then the row), no deadlock
     between the exact-row claim and upstream ``POST /bots`` on one link, and an instant join driven
     through the real ``IntakeService`` with the real port.
@@ -963,7 +963,7 @@ async def test_pg_instant_join_at_the_bot_limit_ends_not_sent_on_its_last_send(
     assert meeting["bot_joins_at"] is None
 
 
-# ── post-claim failures end not_sent (Ruling R17), driven through the real request_bot ──────
+# ── post-claim failures end not_sent (§1.5), driven through the real request_bot ──────
 
 
 async def _outcome_row(pg: PgBackend, mid: int) -> dict:

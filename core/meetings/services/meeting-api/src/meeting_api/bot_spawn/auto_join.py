@@ -463,7 +463,7 @@ async def auto_join_tick(
         # succeeds and a bot that then fails to join (the row goes terminal, and calendar sync
         # recreates it), or a process death mid-spawn. The stamp is what ``due_rows`` and calendar
         # sync both read to hold the next dispatch for one backoff interval; the claim restamps it
-        # with the send time (Ruling R7).
+        # with the send time (§2.4 ``bot_joins_at``).
         await repo.merge_meeting_data(row["id"], {"auto_join_last_attempt": now.isoformat()})
         outcome = await spawn.spawn_exact(
             user_id, row["id"], due=DueWindow(now, lead_s, grace_s)

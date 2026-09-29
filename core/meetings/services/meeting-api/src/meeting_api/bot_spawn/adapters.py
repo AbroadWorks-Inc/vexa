@@ -864,7 +864,7 @@ class SqlAlchemyMeetingRepo:
     async def _claim_exact(self, db, target, data) -> dict:
         """§1.5: the exact row ``scheduled`` → ``requested`` through the one status writer
         (conditional, so a row that is no longer scheduled is never claimed), the spawn keys merged
-        over its data and the send time stamped as ``data.auto_join_last_attempt`` (Ruling R7:
+        over its data and the send time stamped as ``data.auto_join_last_attempt`` (§2.4:
         ``bot_joins_at`` reads it). Commits the caller's transaction."""
         from sqlalchemy.exc import IntegrityError
 
@@ -898,8 +898,8 @@ class SqlAlchemyMeetingRepo:
         """§6.9 F-K2: a new bot claims the meeting waiting for it. No status change (it is already
         ``requested``): the marker's failure moves into ``data.completion_history``
         (``intake.retry.claimed``), the spawn keys merge over the data with the send time as
-        ``data.auto_join_last_attempt`` (Ruling R7), and the failed workload is forgotten. Commits
-        the caller's transaction."""
+        ``data.auto_join_last_attempt`` (§2.4 ``bot_joins_at``), and the failed workload is
+        forgotten. Commits the caller's transaction."""
         from sqlalchemy.orm.attributes import flag_modified
 
         from ..intake import retry

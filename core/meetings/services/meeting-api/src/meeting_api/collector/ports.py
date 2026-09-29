@@ -250,8 +250,8 @@ class TranscriptStore(Protocol):
         parsed ``meeting_url``), ``workspace_id`` (None unbinds), ``auto_join`` (bool).
 
         Returns the updated row (``list_meetings`` shape), ``None`` when the user owns no such
-        row (→ 404), ``{"error": "managed_by_entries"}`` when entries manage the row (§1.6,
-        Ruling R21; → 409), ``{"error": "conflict"}`` when the row advanced into the FSM (→ 409),
+        row (→ 404), ``{"error": "managed_by_entries"}`` when entries manage the row (§1.6;
+        → 409), ``{"error": "conflict"}`` when the row advanced into the FSM (→ 409),
         or ``{"error": "duplicate"}`` when a new native id collides with another non-terminal row."""
         ...
 
@@ -349,7 +349,7 @@ class TranscriptStore(Protocol):
         """OWNER-scoped delete of a PLANNED (``idle``/``scheduled``) row. Returns ``True`` on
         delete, ``None`` when the user owns no such row (→ 404), ``False`` when the row is
         FSM-owned (→ 409). An FSM row is never deletable from here, and a row entries manage
-        raises ``intake.resolver.ManagedByEntries`` (§1.6, Ruling R21)."""
+        raises ``intake.resolver.ManagedByEntries`` (§1.6)."""
         ...
 
     async def prepare_completed_artifact_deletion(

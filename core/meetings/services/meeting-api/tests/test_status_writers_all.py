@@ -21,7 +21,7 @@ Four groups:
   * Postgres: each writer — the bot-spawn repo (create, guarded insert and claim, reopen, the
     session-keyed lifecycle write, ``fail_meeting``, the service-authority stop), the collector
     store (planned create, ``set_intent``, planned edit) and the lifecycle callback — records one
-    outbox row per change, sequence + 1, typed where a typed event exists (Ruling R25), and nothing
+    outbox row per change, sequence + 1, typed where a typed event exists (§2.7), and nothing
     for a write that doesn't change the status; ``requested`` and ``stopping`` reach the outbox;
     each writer takes the link lock first; the lifecycle write changes the status only from its
     caller's predecessors and never off a finished status (a stale stop or replica writes nothing).
@@ -294,7 +294,7 @@ def test_the_sealed_set_is_the_schemas():
 def test_a_status_changes_event_is_typed_where_a_typed_event_exists(
     to, outcome_kind, expected
 ):
-    """Ruling R25: one event per change, typed where §2.7 has a typed event."""
+    """§2.7: one event per change, typed where §2.7 has a typed event."""
     from meeting_api.intake.status import typed_event
 
     assert typed_event(to, outcome_kind) == expected
@@ -459,7 +459,7 @@ async def _before(pg: _Pg, mid: int) -> _Before:
     return _Before(len(await pg.events(mid)), await pg.seq(mid))
 
 
-#: Ruling R25: the event type of a status change without an explicit one (``failed`` with a
+#: §2.7: the event type of a status change without an explicit one (``failed`` with a
 #: ``not_sent`` outcome is ``meeting.not_sent``, passed explicitly by those tests).
 TYPED = {
     "active": "meeting.started",

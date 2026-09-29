@@ -138,7 +138,7 @@ def test_planned_edit_counts_an_idle_plan_as_planned():
 
 
 def test_an_untimed_plan_never_goes_stale():
-    """Ruling R22 (refined): only a timed plan (``scheduled`` with a parseable
+    """§1.6: only a timed plan (``scheduled`` with a parseable
     ``data.scheduled_at``) goes stale. An idle row, or a scheduled one whose ``scheduled_at`` is
     absent or not a time, is an untimed plan and stays editable by link however old it is.
     """
@@ -179,7 +179,7 @@ def test_read_counts_a_meeting_that_left_planning_as_started_whatever_its_schedu
 
 
 def test_planned_edit_ignores_a_stale_entry_less_plan():
-    """Ruling R22: an entry-less ``scheduled`` plan past its ``scheduled_at`` +
+    """§1.6: an entry-less ``scheduled`` plan past its ``scheduled_at`` +
     ``AUTO_JOIN_GRACE_S`` can never be sent; it is a leftover, so it neither counts as the plan nor
     makes the link ambiguous."""
     rows = [
@@ -491,7 +491,7 @@ def test_transcript_of_a_meeting_that_ran_ahead_of_its_slot_is_the_recent_one():
 
 
 def test_planned_edit_skips_a_stale_entry_less_plan():
-    """Ruling R22 through the route: a missed entry-less occurrence (2 h ago) next to the next
+    """§1.6 through the route: a missed entry-less occurrence (2 h ago) next to the next
     plan does not make the link ambiguous; PATCH edits the next plan."""
     now = _real_now()
     store = InMemoryTranscriptStore()
@@ -521,7 +521,7 @@ def test_planned_edit_skips_a_stale_entry_less_plan():
 
 def test_planned_edit_reaches_a_long_past_idle_plan_next_to_a_newer_finished_meeting():
     """An untimed idle plan created long ago is still the link's plan: a native PATCH edits it,
-    not the finished meeting held on the same link since (Ruling R22, refined)."""
+    not the finished meeting held on the same link since (§1.6)."""
     now = _real_now()
     store = InMemoryTranscriptStore()
     idle = store.seed_meeting(

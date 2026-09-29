@@ -5,7 +5,7 @@ that turns every spawn failure into its typed code and exact message.
 ``bot_spawn.request_bot`` flow ``POST /bots`` and the auto-join sweep run, with
 ``claim_meeting_id``: the spawn claims exactly that row (``scheduled`` → ``requested`` through the
 status writer, under the link lock) and stamps ``data.auto_join_last_attempt`` with the send time
-(Ruling R7), so ``bot_joins_at`` shows it. The answer is always a ``SpawnOutcome``, never an
+(§2.4), so ``bot_joins_at`` shows it. The answer is always a ``SpawnOutcome``, never an
 exception:
 
   * ``sent`` — the bot was spawned on the row;
@@ -17,7 +17,7 @@ exception:
 
 A failure after the claim (the token or invocation, the runtime, the post-spawn writes, a stop
 that won the race) would leave a claimed meeting with no bot and no reason, so the port ends it
-``not_sent`` itself (Ruling R17), under the link lock: a row still ``requested`` goes ``failed``
+``not_sent`` itself (§1.5), under the link lock: a row still ``requested`` goes ``failed``
 through the status writer with the outcome (``meeting.not_sent``). A row the spawn flow already
 ended (a runtime spawn failure, the stop fence) is left alone: the flow wrote its ``failed``
 through the status writer with that same outcome, in one terminal event (``meeting.not_sent``; or
@@ -293,7 +293,7 @@ class ExactRowSpawn:
     async def _end_not_sent(
         self, user_id: int, meeting_id: int, code: str, message: str
     ) -> None:
-        """Ruling R17: the claimed row ends ``not_sent`` with the code and message, or, while the
+        """§1.5: the claimed row ends ``not_sent`` with the code and message, or, while the
         meeting is on, goes back to ``requested`` for another bot (§6.9 F-K2, ``retry.retry``). The
         spawn flow fails the row itself wherever a workload may exist, so a row that reaches here
         names no workload, and it is never recorded as gone. The last failure of a meeting

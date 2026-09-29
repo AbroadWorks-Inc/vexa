@@ -182,7 +182,7 @@ class InMemoryMeetingRepo:
             waiting["end_time"] = None
             return dict(waiting)
         # 2a. the exact row moves `scheduled` → `requested` (any other status → MeetingStopped),
-        #     the spawn keys merged over its data and the send time stamped (Ruling R7).
+        #     the spawn keys merged over its data and the send time stamped (§2.4).
         if target is not None:
             if target["status"] != "scheduled":
                 raise MeetingStopped(

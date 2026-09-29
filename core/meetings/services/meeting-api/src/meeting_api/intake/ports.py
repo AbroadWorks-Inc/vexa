@@ -238,7 +238,7 @@ class IntakeTx(Protocol):
     async def room_meetings(self, user_id: int, room: Room) -> list[MeetingView]:
         """The account's meetings on this link that entries can join, by id: every live one, and
         every other non-finished one that entries manage (it has at least one entry row). An
-        entry-less upstream-planned row is never returned (Ruling R15)."""
+        entry-less upstream-planned row is never returned (§1.5, V12 item 11)."""
         ...
 
     async def meeting(self, meeting_id: int) -> MeetingView:
@@ -285,7 +285,7 @@ class IntakeTx(Protocol):
     ) -> None:
         """Store a spawn failure on ``meeting_aw_state`` (``last_error_code``,
         ``last_error_message``) without changing the meeting's status or counting a send: the
-        failed send was a pasted entry's, not the meeting's own (Ruling R12)."""
+        failed send was a pasted entry's, not the meeting's own (V12 item 9)."""
         ...
 
     async def record_send_failure(

@@ -656,7 +656,7 @@ class InMemoryTranscriptStore:
         if m is None or m["user_id"] != user_id:
             return None
         if m.get("has_entries"):
-            return {"error": "managed_by_entries"}  # §1.6, Ruling R21 — mirrors the adapter
+            return {"error": "managed_by_entries"}  # §1.6 — mirrors the adapter
         if m["status"] not in ("idle", "scheduled"):
             return {"error": "conflict"}
         data = m["data"]
@@ -737,7 +737,7 @@ class InMemoryTranscriptStore:
         if m is None or m["user_id"] != user_id:
             return None
         if m.get("has_entries"):
-            raise ManagedByEntries(meeting_id)  # §1.6, Ruling R21 — mirrors the adapter
+            raise ManagedByEntries(meeting_id)  # §1.6 — mirrors the adapter
         if m["status"] not in ("idle", "scheduled"):
             return False
         del self._meetings[meeting_id]

@@ -1,10 +1,8 @@
 """§1.2 — the mirror proof: `meeting_api.sessions.models` must build the SAME physical schema as
 the SSOT (`admin_api.schema.models`) for every intake/webhook table plus the `meetings` additions.
 
-Ruling R4 (this task's brief): first check whether the test-isolation gate
-(`node scripts/gates.mjs test-isolation`) forbids a meeting-api test importing `admin_api` — if it
-did, this test would fall back to comparing against `schema.seal.json`. It does NOT forbid it:
-`scripts/check-isolation-py.mjs`'s `ALLOWED_EDGES` already pre-allows `meeting_api → admin_api`
+The test-isolation gate (`node scripts/gates.mjs test-isolation`) lets a meeting-api test import
+`admin_api`: `scripts/check-isolation-py.mjs`'s `ALLOWED_EDGES` allows `meeting_api → admin_api`
 verbatim for "shared SQLAlchemy models — admin_api.schema.models is the DB source-of-truth", so this
 file takes that edge and compares the two live model modules directly — a stronger proof than a
 frozen seal snapshot, and it fails immediately (not at the next `pnpm seal:schema`) if a future edit

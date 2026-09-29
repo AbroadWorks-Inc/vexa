@@ -3,9 +3,9 @@
   * ``InMemoryIntakeStore`` — ``IntakeStore`` over dicts. ``room_lock`` checks the lock order
     (distinct rooms, sorted), records every acquisition in ``lock_log``, and gives a transaction
     that commits on a normal exit and rolls back when the block raises. ``room_meetings`` returns
-    the link's live meetings and the non-finished ones that have an entry (Ruling R15). Its status
-    and event writes behave as ``write_status`` / ``write_event`` (§1.4): the status change is
-    conditional (``StatusConflict``, nothing written), each event adds 1 to the meeting's
+    the link's live meetings and the non-finished ones that have an entry (§1.5, V12 item 11). Its
+    status and event writes behave as ``write_status`` / ``write_event`` (§1.4): the status change
+    is conditional (``StatusConflict``, nothing written), each event adds 1 to the meeting's
     sequence, a finished status closes the active entries, and every event is recorded in order in
     ``events`` with the meeting as projected at that moment. An entry's rows are found as the
     Postgres store finds them: its one row that isn't ``closed``, else its newest closed row; a

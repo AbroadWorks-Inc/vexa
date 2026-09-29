@@ -14,7 +14,7 @@ Postgres and ``fakes.link_rows_in`` is its in-memory twin, so both stores choose
     …/workspace``, ``POST …/share``): the live meeting, else the single planned one (``scheduled``
     or ``idle``) that is not stale; two or more raise ``AmbiguousRoom``. A plan is stale only when
     it is entry-less, ``scheduled`` and timed (a parseable ``data.scheduled_at``, ``planned_at``)
-    and that time plus ``AUTO_JOIN_GRACE_S`` has passed: the sweep will never send it (Ruling R22).
+    and that time plus ``AUTO_JOIN_GRACE_S`` has passed: the sweep will never send it (§1.6).
     An ``idle`` row or any untimed plan never goes stale and stays editable by link; an
     entry-managed plan never does either (the not-sent sweep ends it). A link with neither resolves
     as ``READ`` does, so a finished meeting stays addressable.

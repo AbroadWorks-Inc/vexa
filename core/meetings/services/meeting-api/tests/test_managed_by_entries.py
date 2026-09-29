@@ -5,7 +5,7 @@ through an upstream route would be undone by the next recomputation, and a hard 
 orphan the entries (``ON DELETE RESTRICT``). So upstream ``PATCH``/``DELETE /meetings/{id}``, their
 native forms and ``PUT …/intent`` answer 409 with ``managed_by_entries`` as upstream's ``detail``.
 Reads, ``annotate`` and ``share`` stay open. The planned-meeting store itself refuses them under
-the row lock (Ruling R21), so upstream calendar sync skips such a row instead of editing it.
+the row lock (§1.6), so upstream calendar sync skips such a row instead of editing it.
 
 Drives the SHIPPED collector app over the in-memory fake (a row seeded with ``has_entries``), then
 the SQLAlchemy store against real Postgres with a real ``meeting_entries`` row (skips cleanly
@@ -199,7 +199,7 @@ async def test_pg_set_intent_refuses_an_entry_managed_meeting(link_pg_engine):
     assert status == "scheduled"
 
 
-# ── the store is the guarantee (Ruling R21): upstream calendar sync skips the row ────────────
+# ── the store is the guarantee (§1.6): upstream calendar sync skips the row ────────────
 
 
 def _feed(summary: str, when: datetime) -> dict:

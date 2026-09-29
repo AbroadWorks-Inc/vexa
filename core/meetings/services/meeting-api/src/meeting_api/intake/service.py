@@ -39,8 +39,8 @@ and spawns run after the commit, each through its own port.
      attempt ends it ``not_sent``. When other active entries share the meeting (it was adopted),
      only the pasted entry is removed instead (reason ``not_sent``), the failure is recorded on
      the meeting, which stays ``scheduled`` with its time back to the remaining entries
-     (``joined_existing``, Ruling R12). A failure after the claim has already ended the meeting
-     ``not_sent`` (Ruling R17): the reply keeps the result with that meeting.
+     (``joined_existing``, V12 item 9). A failure after the claim has already ended the meeting
+     ``not_sent`` (§1.5): the reply keeps the result with that meeting.
 Only a write that adds an active entry checks the quota (429 ``quota_exceeded``).
 
 ``remove``: the entry becomes ``removed``. Others remain → the meeting is re-planned
@@ -558,7 +558,7 @@ class IntakeService:
         """A real spawn failure for a ``join_now`` entry.
 
         A failure BEFORE the claim leaves the meeting ``scheduled``. When other active entries
-        share it (an adopted meeting, Ruling R12) only the pasted entry goes (``removed``, reason
+        share it (an adopted meeting, V12 item 9) only the pasted entry goes (``removed``, reason
         ``not_sent``), the failure is recorded on the meeting, its time returns to the remaining
         entries, and it stays ``scheduled`` for them (``joined_existing``). Otherwise the failure
         is one of the meeting's bounded sends (``_send_failed``): the scheduler tries again after
@@ -566,7 +566,7 @@ class IntakeService:
         ``done.result``.
 
         A failure AFTER the claim finds the meeting finished, or waiting for another bot: the spawn
-        port already ended it ``not_sent`` (Ruling R17) or sent it back to ``requested`` (§6.9
+        port already ended it ``not_sent`` (§1.5) or sent it back to ``requested`` (§6.9
         F-K2), and the reply is ``done.result`` with that meeting (``created`` for a new one,
         ``joined_existing`` for an adopted one). A meeting that is live got its bot from the
         scheduler meanwhile (``joined_existing``)."""

@@ -235,7 +235,7 @@ def sweep_intake(**tick_kw: Any) -> dict[str, Any]:
 
 def send_clock(at: datetime) -> Any:
     """Pin the in-memory repo's clock, which the exact-row claim stamps as the send time
-    (``data.auto_join_last_attempt``, Ruling R7), to ``at``: the sweep's own clock in a test.
+    (``data.auto_join_last_attempt``, §2.4), to ``at``: the sweep's own clock in a test.
     """
     from unittest import mock
 
