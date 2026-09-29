@@ -59,6 +59,11 @@ one transcript with speaker names:
   `_export.json.speaker_activity` is the worst session's (`missing` > `invalid` > `capped` > `ok`),
   and each session's problem is logged with its `session_uid`. The export waits
   (`ActivityNotReady`) while any session's file is not uploaded yet.
+- **Every recording, bounded.** `GET /recordings?meeting_id=` is read page by page (`limit`/`offset`,
+  until `has_more` is false); a recording seen on two pages is listed once. More than
+  `EXPORT_MAX_RECORDINGS` fails the export and exports nothing: the ERROR
+  `too_many_recordings vexa_meeting_id=… max_recordings=…`, `_export.json {state:"too_many_recordings",
+  error}` and the export result `failed` with `more than <n> recordings (EXPORT_MAX_RECORDINGS)`.
 - **Unchanged files.** `meeting.json` stays the webhook's meeting row as sent (a copy of
   `webhook.v1`, not ours to extend), and `recordings.json` lists every recording as meeting-api
   returned it. A recording with no audio file (the bot failed before it recorded) is skipped with
@@ -72,7 +77,9 @@ one transcript with speaker names:
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`,
-`ACTIVITY_WAIT_SECONDS`, `AWS_REGION`. S3 access is via IRSA (no static keys).
+`ACTIVITY_WAIT_SECONDS`, `EXPORT_MAX_RECORDINGS` (default 50: the meeting's recordings are read
+page by page up to this many; past it the export fails, see below), `AWS_REGION`. S3 access is via
+IRSA (no static keys).
 
 ## Retention tagging (see spec §3/§7)
 `EXPORT_BUCKET` expires objects by the `retention-class` S3 object tag

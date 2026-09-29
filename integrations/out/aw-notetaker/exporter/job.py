@@ -8,7 +8,7 @@ a UUID raises `MissingMeetingUuid` before anything is read or written.
 
 The outcome is reported through the gateway (`export_result.py`) after it is
 recorded in `_export.json`: `handed_off` after `/process`, `failed` when the
-meeting has no audio. A re-run of a handed-off folder only reports again.
+meeting has no audio or more recordings than `EXPORT_MAX_RECORDINGS`. A re-run of a handed-off folder only reports again.
 
 A meeting can have several bot sessions (a bot failed and a new one joined,
 §6.9 F-K2); each session with audio has its own recording. They make ONE
@@ -43,7 +43,7 @@ from exporter.naming import folder_name, parse_utc
 from exporter.notetaker import Notetaker
 from exporter.retention import AUDIO, METADATA, RECORDING_MP4
 from exporter.storage import Storage
-from exporter.vexa_client import MeetingApi
+from exporter.vexa_client import MeetingApi, TooManyRecordings
 
 logger = logging.getLogger("exporter")
 
@@ -53,7 +53,7 @@ EMPTY_ACTIVITY_AUDIO_S = 180.0
 
 ACTIVITY_FILE = "speaker-activity.jsonl"
 
-State = Literal["handed_off", "no_audio", "already_done"]
+State = Literal["handed_off", "no_audio", "too_many_recordings", "already_done"]
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 # A meeting's `speaker_activity` is its worst session's, in this order.
 _ACTIVITY_SEVERITY: tuple[ActivityState, ...] = ("ok", "capped", "invalid", "missing")
@@ -313,7 +313,34 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     user_id = m["user_id"]
     platform = m["platform"]
 
-    recs = deps.meeting_api.list_recordings(vexa_meeting_id)
+    try:
+        recs = deps.meeting_api.list_recordings(
+            vexa_meeting_id, settings.max_recordings
+        )
+    except TooManyRecordings:
+        error = (
+            f"more than {settings.max_recordings} recordings (EXPORT_MAX_RECORDINGS)"
+        )
+        logger.error(
+            "too_many_recordings vexa_meeting_id=%s max_recordings=%d; "
+            "nothing exported",
+            vexa_meeting_id,
+            settings.max_recordings,
+        )
+        storage.put_json(
+            settings.export_bucket,
+            base + "_export.json",
+            {
+                "state": "too_many_recordings",
+                "meeting_id": meeting_uuid,
+                "vexa_meeting_id": vexa_meeting_id,
+                "max_recordings": settings.max_recordings,
+                "error": error,
+            },
+            retention=METADATA,
+        )
+        deps.export_result.report(meeting_uuid, "failed", s3_path, error)
+        return ExportResult("too_many_recordings", folder)
     audio_recs = _audio_recordings(recs, vexa_meeting_id)
     if not audio_recs:
         storage.put_json(

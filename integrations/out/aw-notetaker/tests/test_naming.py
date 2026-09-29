@@ -53,6 +53,12 @@ def test_settings_defaults() -> None:
     assert s.rms_speech_threshold == 0.026
     assert s.record_chunk_timeslice_ms == 15000
     assert s.activity_wait_seconds == 120.0
+    assert s.max_recordings == 50
+
+
+def test_settings_max_recordings_env_override() -> None:
+    s = Settings.from_env({**BASE, "EXPORT_MAX_RECORDINGS": "7"})
+    assert s.max_recordings == 7
 
 
 def test_settings_activity_env_overrides() -> None:

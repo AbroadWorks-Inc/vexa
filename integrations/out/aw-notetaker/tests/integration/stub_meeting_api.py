@@ -30,7 +30,7 @@ def create_app(
         x_api_key: str | None = Header(default=None),
     ) -> dict[str, Any]:
         check(x_api_key)
-        return {"recordings": recordings}
+        return {"recordings": recordings, "has_more": False}
 
     @app.get("/recordings/{recording_id}/master")
     async def master(

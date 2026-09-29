@@ -33,6 +33,9 @@ class Settings:
     # meeting.completed (spec §4.2 step 5): wait this long past end_time
     # before "missing".
     activity_wait_seconds: float = 120.0
+    # A meeting's recordings are read page by page up to this many; past it
+    # the export fails rather than export part of the meeting.
+    max_recordings: int = 50
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
@@ -62,4 +65,5 @@ class Settings:
                 env.get("RECORD_CHUNK_TIMESLICE_MS", "15000")
             ),
             activity_wait_seconds=float(env.get("ACTIVITY_WAIT_SECONDS", "120")),
+            max_recordings=int(env.get("EXPORT_MAX_RECORDINGS", "50")),
         )

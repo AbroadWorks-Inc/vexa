@@ -15,7 +15,12 @@ import pytest
 
 from exporter.audio import join_wavs, join_webm, webm_to_wav
 from exporter.notetaker import Notetaker, NotetakerError
-from exporter.vexa_client import MeetingApi, MeetingApiError
+from exporter.vexa_client import (
+    MeetingApi,
+    MeetingApiError,
+    RecordingsPagingStalled,
+    TooManyRecordings,
+)
 from tests.builders import wav_samples, write_constant_wav
 
 
@@ -33,12 +38,102 @@ def test_meeting_api_reads_through_the_gateway_with_the_exporter_key() -> None:
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(req)
-        return httpx.Response(200, json={"recordings": [{"id": 7}]})
+        return httpx.Response(200, json={"recordings": [{"id": 7}], "has_more": False})
 
-    assert _api(handler).list_recordings(meeting_id=9) == [{"id": 7}]
-    assert str(seen[0].url) == "http://gateway/recordings?meeting_id=9"
+    assert _api(handler).list_recordings(meeting_id=9, max_recordings=50) == [{"id": 7}]
+    assert str(seen[0].url) == (
+        "http://gateway/recordings?meeting_id=9&limit=50&offset=0"
+    )
     assert seen[0].headers["X-API-Key"] == KEY
     assert seen[0].url.params["meeting_id"] == "9"
+
+
+def _paged(rows: list[dict[str, Any]], seen: list[httpx.Request]) -> Any:
+    """meeting-api's `GET /recordings` paging: `limit`/`offset` in,
+    `has_more` out."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        limit = int(req.url.params["limit"])
+        offset = int(req.url.params["offset"])
+        page = rows[offset : offset + limit]
+        return httpx.Response(
+            200,
+            json={
+                "recordings": page,
+                "total": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + len(page) < len(rows),
+            },
+        )
+
+    return handler
+
+
+def test_list_recordings_reads_every_page_and_merges_them() -> None:
+    rows = [{"id": i} for i in range(70)]
+    seen: list[httpx.Request] = []
+
+    got = _api(_paged(rows, seen)).list_recordings(meeting_id=9, max_recordings=100)
+
+    assert got == rows
+    assert [(r.url.params["offset"], r.url.params["limit"]) for r in seen] == [
+        ("0", "50"),
+        ("50", "50"),
+    ]
+    assert {r.url.params["meeting_id"] for r in seen} == {"9"}
+
+
+def test_a_recording_seen_on_two_pages_is_listed_once() -> None:
+    pages = [
+        {"recordings": [{"id": 1}, {"id": 2}], "has_more": True},
+        {"recordings": [{"id": 2}, {"id": 3}], "has_more": False},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages.pop(0))
+
+    got = _api(handler).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert got == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+
+def test_list_recordings_over_the_cap_raises_after_a_bounded_read() -> None:
+    rows = [{"id": i} for i in range(500)]
+    seen: list[httpx.Request] = []
+
+    with pytest.raises(TooManyRecordings) as exc_info:
+        _api(_paged(rows, seen)).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert exc_info.value.max_recordings == 50
+    assert "more than 50 recordings" in str(exc_info.value)
+    assert len(seen) == 2
+
+
+def test_a_page_that_adds_nothing_while_more_is_promised_stops_the_read() -> None:
+    """A gateway that ignores `offset` and always says `has_more`: the read
+    stops at the second page instead of looping."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(
+            200, json={"recordings": [{"id": 1}, {"id": 2}], "has_more": True}
+        )
+
+    with pytest.raises(RecordingsPagingStalled, match="offset 2"):
+        _api(handler).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert len(seen) == 2
+
+
+def test_list_recordings_at_the_cap_is_every_recording() -> None:
+    rows = [{"id": i} for i in range(50)]
+
+    got = _api(_paged(rows, [])).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert got == rows
 
 
 def test_meeting_api_never_sends_a_user_id_or_the_internal_secret() -> None:
@@ -51,7 +146,7 @@ def test_meeting_api_never_sends_a_user_id_or_the_internal_secret() -> None:
         return httpx.Response(200, json={"storage_path": "x"})
 
     api = _api(handler)
-    api.list_recordings(meeting_id=1)
+    api.list_recordings(meeting_id=1, max_recordings=50)
     api.master(recording_id=2)
     api.transcript(meeting_id=3)
     assert len(seen) == 3

@@ -33,6 +33,7 @@ from exporter.job import (
 from exporter.export_result import ExportReportError
 from exporter.queue import PendingQueue, sweep_once
 from exporter.storage import Storage
+from exporter.vexa_client import TooManyRecordings
 from tests.builders import (
     capped,
     frame,
@@ -98,8 +99,12 @@ class FakeMeetingApi:
         self.master_calls: list[int] = []
         self.transcript_calls: list[int] = []
 
-    def list_recordings(self, meeting_id: int) -> list[dict[str, Any]]:
+    def list_recordings(
+        self, meeting_id: int, max_recordings: int
+    ) -> list[dict[str, Any]]:
         self.list_recordings_calls.append(meeting_id)
+        if len(self.recordings) > max_recordings:
+            raise TooManyRecordings(meeting_id, max_recordings)
         return self.recordings
 
     def master(self, recording_id: int) -> dict[str, Any]:
@@ -1513,3 +1518,67 @@ def test_debug_copies_each_sessions_signal_files_under_its_session_uid(
     assert (
         storage.get_bytes(EXPORT_BUCKET, BASE + "signal/uid-b/botlog.txt") == b"uid-b"
     )
+
+
+def test_a_meeting_over_the_recordings_cap_is_a_failed_export(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Never a folder from part of the meeting: past EXPORT_MAX_RECORDINGS
+    nothing is exported, the failure is logged and reported."""
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B, SESSION_C])
+    notetaker = FakeNotetaker()
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage,
+        meeting_api,
+        notetaker,
+        settings=_settings(max_recordings=2),
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+        export_result=export_result,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="exporter"):
+        result = export_meeting(_envelope(), deps)
+
+    assert result == ExportResult("too_many_recordings", FOLDER)
+    error = "more than 2 recordings (EXPORT_MAX_RECORDINGS)"
+    assert export_result.calls == [(MEETING_UUID, "failed", S3_PATH, error)]
+    assert notetaker.calls == []
+    assert meeting_api.master_calls == []
+    assert storage.list_keys(EXPORT_BUCKET, BASE) == [BASE + "_export.json"]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker == {
+        "state": "too_many_recordings",
+        "meeting_id": MEETING_UUID,
+        "vexa_meeting_id": 11367,
+        "max_recordings": 2,
+        "error": error,
+    }
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.getMessage().startswith("too_many_recordings")
+    ] == [
+        (
+            logging.ERROR,
+            "too_many_recordings vexa_meeting_id=11367 max_recordings=2; "
+            "nothing exported",
+        )
+    ]
+
+
+def test_a_meeting_at_the_recordings_cap_is_exported(storage: Storage) -> None:
+    meeting_api, transcode = _seed_sessions(storage, [SESSION_A, SESSION_B])
+    for uid in ("uid-a", "uid-b"):
+        _put_activity(storage, uid, [header()])
+    deps = _deps(
+        storage,
+        meeting_api,
+        FakeNotetaker(),
+        settings=_settings(max_recordings=2),
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+    )
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"

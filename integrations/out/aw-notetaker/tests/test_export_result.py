@@ -176,7 +176,9 @@ class _MeetingApi:
     def __init__(self, storage_path: str) -> None:
         self._storage_path = storage_path
 
-    def list_recordings(self, meeting_id: int) -> list[dict[str, Any]]:
+    def list_recordings(
+        self, meeting_id: int, max_recordings: int
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "id": 3,

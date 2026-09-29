@@ -222,7 +222,9 @@ fallback to the tape (§4.2 step 5, [speaker-activity design](2026-09-23-speaker
 (aw-chatworks-transcribe), `EXPORT_PREFIX` (recordings/), `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS` (default 15000),
-`ACTIVITY_WAIT_SECONDS` (default 120, replaces `TAPE_WAIT_SECONDS`), `AWS_REGION`. S3 via IRSA
+`ACTIVITY_WAIT_SECONDS` (default 120, replaces `TAPE_WAIT_SECONDS`), `EXPORT_MAX_RECORDINGS`
+(default 50; every page of the meeting's recordings is read up to it, past it the export fails —
+`README.md` "Several bot sessions"), `AWS_REGION`. S3 via IRSA
 (no static keys). aw-bots' own safety ceiling for `speaker-activity.jsonl`,
 `VEXA_SPEAKER_ACTIVITY_MAX_BYTES` (default 128 MiB — about 3× the ~40 MB upper estimate for a
 3-hour meeting, and small enough to upload inside the bot's 8 s teardown bound in-cluster), is a
