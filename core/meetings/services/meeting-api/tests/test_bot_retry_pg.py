@@ -182,6 +182,7 @@ class Pg:
         at: datetime,
         untracked_grace: float = 600.0,
         finish_meeting: Any = None,
+        fetch_bot_context: Any = _ctx,
     ) -> dict:
         """One auto-join tick at ``at``: the due rows and the meetings waiting for a new bot."""
         from meeting_api.bot_spawn.auto_join import auto_join_tick
@@ -191,7 +192,7 @@ class Pg:
             runtime,
             store=self.store,
             intake=self.service(runtime),
-            fetch_bot_context=_ctx,
+            fetch_bot_context=fetch_bot_context,
             transcribe_gate=lambda: None,
             now=at,
             token_secret="s",
@@ -1233,3 +1234,34 @@ async def test_pg_a_waiting_meeting_the_sweep_ends_is_finished_like_any_end(pg):
     )
     assert (await pg.row(mid))["status"] == "failed"
     assert sink.events == ["bot.failed"] and finalized == [mid]
+
+
+# ── the driver's new bot failing before its claim ───────────────────────────────────────────
+
+
+async def test_pg_a_new_bot_failing_before_its_claim_is_one_more_bounded_send(pg):
+    async def unavailable(_user_id: int) -> None:
+        return None  # identity down: the spawn is refused before it claims the row
+
+    mid, session = await pg.sent(status="active")
+    workload = (await pg.row(mid))["bot_container_id"]
+    await _fail(pg, session, "completed", "left_alone", "runtime_destroy")
+    runtime = _gone(workload)
+    counters = await pg.tick(runtime, at=_later(), fetch_bot_context=unavailable)
+    assert (counters["spawned"], counters["errors"]) == (0, 1) and runtime.specs == []
+    row, aw = await pg.row(mid), await pg.aw(mid)
+    assert row["status"] == "requested"
+    assert (aw["send_attempts"], aw["last_error_code"]) == (2, "internal_error")
+    marker = row["data"]["bot_retry"]
+    assert (marker["reason"], marker["proven_gone"]) == ("left_alone", True)
+    assert (await pg.types(mid)).count("bot.retry") == 2
+    # the third send fails before its claim as well: the meeting's last
+    before = _failed_count("left_alone")
+    await pg.tick(runtime, at=_later(125), fetch_bot_context=unavailable)
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == ("failed", "left_alone")
+    events = await pg.events(mid)
+    assert events[-1]["event_type"] == "bot.failed"
+    assert events[-1]["data"]["change"]["reason"] == "internal_error"
+    assert _failed_count("left_alone") == before + 1
+    assert runtime.specs == []
