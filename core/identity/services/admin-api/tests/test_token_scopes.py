@@ -100,6 +100,12 @@ def client(monkeypatch):
         pass
     finally:
         loop.close()
+    # User 1 was inserted by id past a restarted sequence: remove it, so a later test that
+    # inserts a user by the sequence (test_metrics) never collides with it.
+    engine = create_engine(PG_URL.replace("+asyncpg", "+psycopg"))
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE api_tokens, users RESTART IDENTITY CASCADE"))
+    engine.dispose()
 
 
 def _mint(client, **kwargs):

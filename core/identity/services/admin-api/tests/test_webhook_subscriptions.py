@@ -394,11 +394,7 @@ def env(sync_engine, monkeypatch):
     from admin_api.app import db as app_db
     from admin_api.app.main import create_app
 
-    _sql(
-        sync_engine,
-        "TRUNCATE webhook_delivery_attempts, webhook_deliveries, webhook_outbox, "
-        "webhook_subscriptions, api_tokens, users RESTART IDENTITY CASCADE",
-    )
+    _sql(sync_engine, _RESET)
     for uid in (1, 2):
         _sql(
             sync_engine,
@@ -428,6 +424,16 @@ def env(sync_engine, monkeypatch):
             "engine": sync_engine,
         }
     _dispose(app_db)
+    # Users 1 and 2 were inserted by id past a restarted sequence: remove them, so a later test
+    # that inserts a user by the sequence (test_metrics) never collides with them.
+    _sql(sync_engine, _RESET)
+
+
+#: Every table the ``env`` fixture writes, emptied before and after each test.
+_RESET = (
+    "TRUNCATE webhook_delivery_attempts, webhook_deliveries, webhook_outbox, "
+    "webhook_subscriptions, api_tokens, users RESTART IDENTITY CASCADE"
+)
 
 
 def _dispose(app_db) -> None:
