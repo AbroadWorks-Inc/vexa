@@ -180,7 +180,8 @@ class MeetingRepo(Protocol):
         workload ``workload_id`` (else the row's) and whether it is already gone
         (``workload_gone``: the runtime refused it; a timed-out create is not proof). A row
         waiting for its next bot is left as it is. The last failure of a meeting that already had
-        a bot session drops the ``not_sent`` outcome: a bot was sent."""
+        a bot session drops the ``not_sent`` outcome on a meeting entries manage: a bot was
+        sent."""
         ...
 
     async def get_meeting(self, meeting_id: int) -> Optional[dict]:

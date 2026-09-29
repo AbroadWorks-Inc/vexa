@@ -1265,3 +1265,45 @@ async def test_pg_a_new_bot_failing_before_its_claim_is_one_more_bounded_send(pg
     assert events[-1]["data"]["change"]["reason"] == "internal_error"
     assert _failed_count("left_alone") == before + 1
     assert runtime.specs == []
+
+
+# ── an entry-less meeting keeps its not_sent ending ─────────────────────────────────────────
+
+
+async def _entry_less_with_a_session(pg: Pg) -> int:
+    now = _now()
+    await pg.execute(
+        "INSERT INTO meetings (user_id, platform, platform_specific_id, status, data) "
+        "VALUES (:u, 'google_meet', 'abc-defg-hij', 'scheduled', CAST(:d AS jsonb))",
+        u=USER,
+        d=json.dumps({"scheduled_at": _iso(now), "auto_join": True}),
+    )
+    mid = int(await pg.scalar("SELECT max(id) FROM meetings"))
+    await pg.repo.create_session(meeting_id=mid, session_uid="sess-earlier")
+    return mid
+
+
+async def test_pg_an_entry_less_meetings_last_failure_keeps_not_sent(pg, monkeypatch):
+    from meeting_api.intake.fakes import FakePublisher
+    from meeting_api.intake.spawn import ExactRowSpawn
+
+    refused = await _entry_less_with_a_session(pg)
+    await pg.port(FakeRuntimeClient(quota_exceeded=True)).spawn_exact(USER, refused)
+    assert (await pg.aw(refused))["outcome_kind"] == "not_sent"
+    assert (await pg.types(refused))[-1] == "meeting.not_sent"
+
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    await pg.execute("UPDATE meetings SET status = 'failed' WHERE id = :m", m=refused)
+    unsent = await _entry_less_with_a_session(pg)
+    port = ExactRowSpawn(
+        pg.repo,
+        FakeRuntimeClient(),
+        store=pg.store,
+        fetch_bot_context=_ctx,
+        publisher=FakePublisher(),
+        token_secret=None,
+        redis_url="redis://r",
+    )
+    await port.spawn_exact(USER, unsent)
+    assert (await pg.aw(unsent))["outcome_kind"] == "not_sent"
+    assert (await pg.types(unsent))[-1] == "meeting.not_sent"

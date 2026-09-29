@@ -1365,8 +1365,7 @@ async def _history_holds(pg: _Pg, live: int, new_uuid: str) -> None:
     [
         (_finish_by_callback, True, "completed", "meeting.completed"),
         (_finish_by_runtime_destroy, True, "completed", "meeting.completed"),
-        # The bot had a session, so its failure is a failed bot, not one never sent (§6.9 F-K2).
-        (_finish_by_fail_meeting, False, "failed", "bot.failed"),
+        (_finish_by_fail_meeting, False, "failed", "meeting.not_sent"),
     ],
     ids=["lifecycle_callback", "runtime_destroy", "fail_meeting"],
 )

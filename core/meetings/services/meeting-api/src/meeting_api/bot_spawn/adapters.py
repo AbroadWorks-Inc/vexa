@@ -1263,15 +1263,15 @@ class SqlAlchemyMeetingRepo:
 
         §6.9 F-K2: a failure while the meeting is on is retried instead (``intake.retry``), the
         workload ``workload_id`` (else the row's) recorded with ``workload_gone``. The last one on
-        a meeting that already had a bot session is a failed bot, not a bot never sent: its
-        ``not_sent`` outcome is dropped."""
-        from sqlalchemy import select
+        a meeting entries manage that already had a bot session is a failed bot, not a bot never
+        sent: its ``not_sent`` outcome is dropped."""
+        from sqlalchemy import exists, select
 
         from ..intake import retry
         from ..intake.adapters import PostgresIntakeTx, lock_meeting_on_its_link
         from ..intake.settings import IntakeSettings
         from ..intake.status import FINISHED_STATUSES, write_status
-        from ..sessions.models import MeetingAwState, MeetingSession
+        from ..sessions.models import MeetingAwState, MeetingEntry, MeetingSession
 
         async with self._session_factory() as db:
             m = await lock_meeting_on_its_link(db, meeting_id)
@@ -1319,7 +1319,12 @@ class SqlAlchemyMeetingRepo:
                 await db.commit()
                 await db.refresh(m)
                 return _row_to_dict(m)
-            if outcome is not None and newest is not None:
+            if outcome is not None and newest is not None and (await db.execute(
+                select(exists().where(
+                    MeetingEntry.meeting_id == m.id, MeetingEntry.state == "active"
+                ))
+            )).scalar():
+                # A bot was sent to a meeting entries manage: its last failure is a failed bot.
                 outcome = None
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if m.end_time is None:
