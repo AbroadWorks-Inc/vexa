@@ -14,7 +14,8 @@ and the other identity headers (``IDENTITY_HEADERS``) and signs them with the ac
 
 - parses as ``kid=<1-64 of A-Z a-z 0-9 . _ ->,t=<digits>,v2=<64 lower-case hex digits>``,
 - names a ``kid`` in this service's ring,
-- was made at most ``MAX_SKEW_S`` seconds before or after this service's clock, and
+- was made at most ``GATEWAY_IDENTITY_MAX_SKEW_S`` seconds (default 60) before or after this
+  service's clock, and
 - matches, in constant time, the HMAC under that kid's key over the kid, that ``t``, that
   ``x-user-id``, the value of each of ``IDENTITY_HEADERS`` in order (empty when absent), the
   request's method, the SHA-256 of its body, its raw query (``scope["query_string"]``) and its
@@ -63,7 +64,7 @@ IDENTITY_HEADERS = (
     "x-user-webhook-secret",
     "x-user-webhook-events",
 )
-MAX_SKEW_S = 60
+MAX_SKEW_ENV = "GATEWAY_IDENTITY_MAX_SKEW_S"
 KEYS_ENV = "GATEWAY_IDENTITY_KEYS"
 KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
@@ -97,11 +98,26 @@ def identity_ring() -> Mapping[str, bytes]:
     return _ring(keys_json) if keys_json else {}
 
 
+def max_skew_s() -> int:
+    """``GATEWAY_IDENTITY_MAX_SKEW_S`` (default 60): the most seconds a signature's ``t`` may be
+    before or after this service's clock; ``ValueError`` unless a positive whole number.
+    """
+    raw = os.getenv("GATEWAY_IDENTITY_MAX_SKEW_S", "60")
+    try:
+        skew = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{MAX_SKEW_ENV} must be a whole number of seconds") from exc
+    if skew < 1:
+        raise ValueError(f"{MAX_SKEW_ENV} must be at least 1")
+    return skew
+
+
 def precheck(
     ring: Mapping[str, bytes],
     user_id: Optional[str],
     header: Optional[str],
     now: float,
+    max_skew: int,
 ) -> Optional[str]:
     """Why ``header`` can't vouch for anything, found without the body; ``None`` if it may."""
     if not ring:
@@ -113,7 +129,7 @@ def precheck(
         return "malformed"
     if match.group(1) not in ring:
         return "unknown_key"
-    if abs(now - int(match.group(2))) > MAX_SKEW_S:
+    if abs(now - int(match.group(2))) > max_skew:
         return "expired"
     return None
 
@@ -128,11 +144,12 @@ def verify_signature(
     query: str,
     body: bytes,
     now: float,
+    max_skew: int,
 ) -> Optional[str]:
     """``None`` when ``header`` vouches for ``user_id`` and ``identity`` (each of
     ``IDENTITY_HEADERS`` → its value, ``""`` when absent) on this request, else why it doesn't.
     """
-    reason = precheck(ring, user_id, header, now)
+    reason = precheck(ring, user_id, header, now, max_skew)
     if reason is not None:
         return reason
     match = _SIGNATURE.fullmatch(header or "")
@@ -215,6 +232,7 @@ class IdentityGuard:
     def __init__(self, app, clock: Callable[[], float] = time.time) -> None:
         self.app = app
         self.clock = clock
+        self.max_skew = max_skew_s()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or is_exempt(scope["path"]):
@@ -234,7 +252,11 @@ class IdentityGuard:
         identity = {name: value for name, value in found.items() if value is not None}
         header = _single(headers, SIGNATURE_HEADER.encode())
         now = self.clock()
-        reason = "ring_invalid" if fault else precheck(ring, user_id, header, now)
+        reason = (
+            "ring_invalid"
+            if fault
+            else precheck(ring, user_id, header, now, self.max_skew)
+        )
         if reason is None and len(identity) < len(found):
             reason = "duplicated"
         if reason is None:
@@ -251,6 +273,7 @@ class IdentityGuard:
                 scope.get("query_string", b"").decode("latin-1"),
                 body,
                 now,
+                self.max_skew,
             )
             if reason is None:
                 await self.app(scope, _replay(body, receive), send)

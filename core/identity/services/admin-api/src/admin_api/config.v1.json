@@ -22,7 +22,7 @@
    "class": "defaulted",
    "default": "(unset — every client route answers 401; /admin/*, /internal/*, /health and /metrics are unaffected)",
    "secret": true,
-   "description": "§1.10, §6.9 F-E: the key ring the gateway signs x-user-id with, the same ring the gateway holds, in the webhook secret encryption ring's format: JSON {\"<kid>\": \"<exactly 32 bytes, base64>\"}, a kid being 1-64 of A-Z a-z 0-9 . _ -. app/identity_guard.py checks x-gateway-signature: kid=<kid>,t=<unix>,v2=<hex HMAC-SHA256> under the key its kid names, over the kid, t, x-user-id and every other identity header the gateway forwards (email, scopes, limits, workspaces, webhook url, secret and events), method, body SHA-256, raw query and path (core/gateway/contracts/gateway-identity), and refuses with 401 a signature that is missing, malformed, under a kid not in this ring, wrong for any of those, or more than 60 s from this clock. Unset or malformed, every client request is refused and the rejection log names the fault, never a key.",
+   "description": "§1.10, §6.9 F-E: the key ring the gateway signs x-user-id with, the same ring the gateway holds, in the webhook secret encryption ring's format: JSON {\"<kid>\": \"<exactly 32 bytes, base64>\"}, a kid being 1-64 of A-Z a-z 0-9 . _ -. app/identity_guard.py checks x-gateway-signature: kid=<kid>,t=<unix>,v2=<hex HMAC-SHA256> under the key its kid names, over the kid, t, x-user-id and every other identity header the gateway forwards (email, scopes, limits, workspaces, webhook url, secret and events), method, body SHA-256, raw query and path (core/gateway/contracts/gateway-identity), and refuses with 401 a signature that is missing, malformed, under a kid not in this ring, wrong for any of those, or more than GATEWAY_IDENTITY_MAX_SKEW_S seconds from this clock. Unset or malformed, every client request is refused and the rejection log names the fault, never a key.",
    "forbidden_values": [
     "vexa-internal-secret",
     "lite-internal-secret",
@@ -34,6 +34,13 @@
     "<REPLACE_ME>"
    ],
    "targets": ["compose", "helm", "lite"]
+  },
+  {
+   "key": "GATEWAY_IDENTITY_MAX_SKEW_S",
+   "class": "defaulted",
+   "default": "60",
+   "description": "§1.10, §6.9 F-E: app/identity_guard.py refuses with 401 a gateway signature whose t is more than this many seconds before or after this service's clock (the replay window); the same setting on meeting-api and admin-api. Not a positive whole number, the guard is not built (a ValueError naming the setting) and no client request is served.",
+   "targets": []
   },
   {
    "key": "ADMIN_API_TOKEN",

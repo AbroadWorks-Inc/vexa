@@ -37,10 +37,10 @@ from gateway_identity import (
 from meeting_api import create_app
 from meeting_api.identity_guard import (
     IDENTITY_HEADERS,
-    MAX_SKEW_S,
     IdentityGuard,
     KeyRingError,
     is_exempt,
+    max_skew_s,
     parse_ring,
     verify_signature,
 )
@@ -73,6 +73,7 @@ def test_the_verifier_agrees_with_the_shared_vectors(case):
         case["query"],
         case["body"].encode("utf-8"),
         case["now"],
+        VECTORS["max_skew_s"],
     )
     assert (reason is None) is case["valid"], reason
 
@@ -83,7 +84,27 @@ def test_the_identity_headers_are_the_shared_ones():
 
 
 def test_the_shared_skew_is_the_guards():
-    assert VECTORS["max_skew_s"] == MAX_SKEW_S
+    assert VECTORS["max_skew_s"] == max_skew_s()
+
+
+def test_the_skew_is_the_setting(monkeypatch):
+    monkeypatch.setenv("GATEWAY_IDENTITY_MAX_SKEW_S", "5")
+    assert max_skew_s() == 5
+    client = TestClient(create_app())
+    for age, status in ((3, 200), (8, 401), (-3, 200), (-8, 401)):
+        sig = signature("7", "GET", "/meetings", t=int(time.time()) - age)
+        r = client.get(
+            "/meetings", headers={"x-user-id": "7", "x-gateway-signature": sig}
+        )
+        assert r.status_code == status, (age, r.text)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "soon", "1.5"])
+def test_a_skew_that_is_not_a_positive_number_of_seconds_is_refused(monkeypatch, value):
+    monkeypatch.setenv("GATEWAY_IDENTITY_MAX_SKEW_S", value)
+    with pytest.raises(ValueError) as ei:
+        max_skew_s()
+    assert "GATEWAY_IDENTITY_MAX_SKEW_S" in str(ei.value)
 
 
 @pytest.fixture
@@ -132,7 +153,9 @@ def test_a_signature_made_with_another_key_is_401(client):
 
 
 @pytest.mark.parametrize(
-    "offset", [-(MAX_SKEW_S + 1), MAX_SKEW_S + 1], ids=["stale", "future"]
+    "offset",
+    [-(VECTORS["max_skew_s"] + 1), VECTORS["max_skew_s"] + 1],
+    ids=["stale", "future"],
 )
 def test_a_signature_outside_the_window_is_401(client, offset):
     sig = signature("7", "GET", "/meetings", t=int(time.time()) + offset)

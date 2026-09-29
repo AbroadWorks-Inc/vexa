@@ -35,7 +35,9 @@ message = "v2" LF <kid> LF <t> LF <user_id> LF <email> LF <scopes> LF <limits> L
   so the join is unambiguous.
 - The version is in both the header label (`v2=`) and the message's first field. Only v2 is
   accepted.
-- A signature more than 60 s older or newer than the verifier's clock is refused.
+- A signature more than `GATEWAY_IDENTITY_MAX_SKEW_S` seconds (default 60, the same setting on
+  meeting-api and admin-api) older or newer than the verifier's clock is refused. The vectors'
+  `max_skew_s` is that default.
 
 ## The key ring
 
