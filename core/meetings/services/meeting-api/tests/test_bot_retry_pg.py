@@ -1556,3 +1556,21 @@ async def test_pg_a_404_inside_the_grace_is_not_cleared_and_after_it_is(pg):
     )
     await _sweep(pg, unknown, failures)
     assert "unproven_teardown" not in (await pg.row(mid))["data"]
+
+
+# ── every end that frees a link over a possibly-running workload records it ─────────────────
+
+
+async def test_pg_a_post_spawn_failure_on_the_last_attempt_records_the_unproven_teardown(
+    pg,
+):
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+    runtime = _DeleteFails()
+    await pg.port(runtime, repo=_session_write_fails(pg)).spawn_exact(USER, mid)
+    workload = runtime.specs[0]["workloadId"]
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert row["data"]["unproven_teardown"]["workload"] == workload

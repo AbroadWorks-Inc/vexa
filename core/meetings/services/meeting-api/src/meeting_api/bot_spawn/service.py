@@ -53,7 +53,7 @@ from .ports import (
     SpawnFailed,
     TranscriptionNotConfigured,
     _stopped_reopen_detail,
-    UNPROVEN_TEARDOWN,
+    unproven_teardown,
     workload_id_for,
 )
 
@@ -789,19 +789,24 @@ async def request_bot(
     async def _fail_unproven(reason: str, exc: BaseException) -> None:
         """A create the runtime did not refuse: the workload may exist. A meeting that retries
         proves it gone before its next bot (§6.9 F-K2); one that ends instead (its last attempt,
-        its planned end too close, no entries) frees its link, so the workload is deleted now
-        through the reconcile sweeps' teardown and the verdict logged. A delete not confirmed is
-        left on the finished row (``data.unproven_teardown``: the workload and since when) for
-        the reconcile sweep to retry, bounded (``reconcile.retry_unproven_teardowns``, §6.9
-        F-I)."""
-        import logging
-
+        its planned end too close, no entries) frees its link, so the workload goes through
+        ``_teardown_or_record``."""
         from ..intake import retry
-        from ..lifecycle.reconcile import _teardown_verdict
 
         failed_row = await _fail_row(reason, exc, gone=False)
         if failed_row is not None and retry.marker(failed_row.get("data")) is not None:
             return
+        await _teardown_or_record()
+
+    async def _teardown_or_record() -> str:
+        """Delete this spawn's workload, which may still run while its meeting ends or frees its
+        link, through the reconcile sweeps' teardown, and log the verdict. A delete not confirmed
+        is recorded on the row (``ports.unproven_teardown``, the one record) for the reconcile
+        sweep to retry, bounded (§6.9 F-K2, F-I). Returns the verdict; never raises."""
+        import logging
+
+        from ..lifecycle.reconcile import _teardown_verdict
+
         verdict = await _teardown_verdict(
             runtime, workload_id, meeting_id=meeting_id,
             log=logging.getLogger("meeting_api.bot_spawn"),
@@ -814,20 +819,16 @@ async def request_bot(
         )
         merge = getattr(repo, "merge_meeting_data", None)
         if verdict == "confirmed" or merge is None:
-            return
-        from datetime import datetime, timezone
-
+            return verdict
         try:
-            await merge(meeting_id, {UNPROVEN_TEARDOWN: {
-                "workload": workload_id,
-                "since": datetime.now(timezone.utc).isoformat(),
-            }})
+            await merge(meeting_id, unproven_teardown(workload_id))
         except Exception as record_err:  # noqa: BLE001 — logged above; never masks the spawn error
             log_event(
                 "bot_spawn_unproven_teardown_unrecorded", audience="system", level="error",
                 span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
                 fields={"workload_id": workload_id, "error": type(record_err).__name__},
             )
+        return verdict
 
     # 4–5a. Everything before the workload create. A failure here cannot have started a pod —
     #       `create_workload` has not been called — so on a claimed row it is recorded with the
@@ -998,7 +999,10 @@ async def request_bot(
             if torn_down
             else f"post-spawn DB write failed; workload {workload_id} not torn down"
         )
-        await _fail_row(str(failed), failed, gone=torn_down)
+        if torn_down:
+            await _fail_row(str(failed), failed, gone=True)
+        else:
+            await _fail_unproven(str(failed), failed)
         raise failed from e
 
     # THE INTERLOCK — the half of the fence that has no TOCTOU hole (F2).
