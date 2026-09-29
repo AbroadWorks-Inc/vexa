@@ -53,6 +53,7 @@ from .ports import (
     SpawnFailed,
     TranscriptionNotConfigured,
     _stopped_reopen_detail,
+    UNPROVEN_TEARDOWN,
     workload_id_for,
 )
 
@@ -788,8 +789,11 @@ async def request_bot(
     async def _fail_unproven(reason: str, exc: BaseException) -> None:
         """A create the runtime did not refuse: the workload may exist. A meeting that retries
         proves it gone before its next bot (§6.9 F-K2); one that ends instead (its last attempt,
-        its planned end too close, no entries) frees its link, so the workload is deleted now,
-        best-effort, through the reconcile sweeps' teardown, and the verdict logged."""
+        its planned end too close, no entries) frees its link, so the workload is deleted now
+        through the reconcile sweeps' teardown and the verdict logged. A delete not confirmed is
+        left on the finished row (``data.unproven_teardown``: the workload and since when) for
+        the reconcile sweep to retry, bounded (``reconcile.retry_unproven_teardowns``, §6.9
+        F-I)."""
         import logging
 
         from ..intake import retry
@@ -808,6 +812,22 @@ async def request_bot(
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
             fields={"workload_id": workload_id, "verdict": verdict},
         )
+        merge = getattr(repo, "merge_meeting_data", None)
+        if verdict == "confirmed" or merge is None:
+            return
+        from datetime import datetime, timezone
+
+        try:
+            await merge(meeting_id, {UNPROVEN_TEARDOWN: {
+                "workload": workload_id,
+                "since": datetime.now(timezone.utc).isoformat(),
+            }})
+        except Exception as record_err:  # noqa: BLE001 — logged above; never masks the spawn error
+            log_event(
+                "bot_spawn_unproven_teardown_unrecorded", audience="system", level="error",
+                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                fields={"workload_id": workload_id, "error": type(record_err).__name__},
+            )
 
     # 4–5a. Everything before the workload create. A failure here cannot have started a pod —
     #       `create_workload` has not been called — so on a claimed row it is recorded with the

@@ -142,7 +142,11 @@ confirmed, or the failure came before the create was called (the token, the invo
 no workload is named). A create the runtime did not answer (a timeout, a transport error, a 5xx,
 the request cancelled mid-create) or a post-spawn write failure with an unconfirmed teardown names
 the workload unproven; when that failure ends the meeting instead of retrying it, the workload is
-deleted best-effort through the reconcile sweeps' teardown. The spawn port's own ending (which
+deleted through the reconcile sweeps' teardown, and a delete not confirmed stays on the finished
+row (`data.unproven_teardown`) for the reconcile sweep to retry each pass, bounded by §6.9 F-I
+(`retry_unproven_teardowns`, sweep `unproven-teardown`: cleared on a confirmed delete, the runtime
+reporting it gone, or a 404 past `MEETING_UNTRACKED_GRACE_SEC`; given up and counted after
+`SWEEP_MAX_ITEM_FAILURES`). The spawn port's own ending (which
 knows no workload) never records one gone. The last failure ends `failed` with
 `bot.failed` and `aw_meetings_failed_total`; on a meeting that already had a bot session its
 `not_sent` outcome is dropped. A row waiting for its next bot takes no status write from a session

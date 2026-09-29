@@ -353,6 +353,37 @@ class SqlAlchemyMeetingRepo:
                 return None
             return _with_projection(_row_to_dict(m), await project_stored(db, m.id))
 
+    async def list_unproven_teardowns(self, *, after=None, limit=None) -> list[dict]:
+        """The finished meetings whose unproven workload still waits for its delete
+        (``data.unproven_teardown``, §6.9 F-K2), by id, one page of ``limit`` after ``after``:
+        ``{id, user_id, workload, since}`` each. The reconcile sweep's read."""
+        from sqlalchemy import select
+
+        from ..intake.status import FINISHED_STATUSES
+        from ..sessions.models import Meeting
+        from .ports import UNPROVEN_TEARDOWN
+
+        stmt = (
+            select(Meeting.id, Meeting.user_id, Meeting.data[UNPROVEN_TEARDOWN])
+            .where(
+                Meeting.status.in_(FINISHED_STATUSES),
+                Meeting.data[UNPROVEN_TEARDOWN].astext.isnot(None),
+            )
+            .order_by(Meeting.id)
+        )
+        if after is not None:
+            stmt = stmt.where(Meeting.id > after)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        async with self._session_factory() as db:
+            rows = (await db.execute(stmt)).all()
+        return [
+            {"id": mid, "user_id": uid, "workload": (t or {}).get("workload"),
+             "since": (t or {}).get("since")}
+            for mid, uid, t in rows
+            if isinstance(t, dict)
+        ]
+
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
         """§6.9 F-K2: end a meeting waiting for its next bot ``failed`` (``intake.retry.end``)
         under the link lock and the row lock; the event's id, or ``None`` when it isn't waiting."""

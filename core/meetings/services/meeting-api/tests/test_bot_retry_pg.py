@@ -1420,3 +1420,139 @@ async def test_pg_the_last_new_bot_failing_after_its_claim_is_finished_like_any_
     assert (await pg.row(mid))["status"] == "failed"
     assert sink.events == ["bot.failed"]
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
+
+
+# ── an unproven workload's failed delete is retried, bounded (F-I) ──────────────────────────
+
+
+class _SilentLog:
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+class _DeleteFails(FakeRuntimeClient):
+    async def delete_workload(self, workload_id):
+        self.deleted.append(f"failed:{workload_id}")
+        raise RuntimeError("the kernel is down")
+
+
+async def _ended_with_a_pending_teardown(pg: Pg) -> tuple[int, str]:
+    """A last attempt whose create went unanswered and whose delete failed."""
+    import httpx
+
+    mid = await pg.calendar_meeting()
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+
+    class NoAnswerDeleteFails(_DeleteFails):
+        async def create_workload(self, spec):
+            self.specs.append(spec)
+            raise httpx.ReadError("connection reset")
+
+    runtime = NoAnswerDeleteFails()
+    await pg.port(runtime).spawn_exact(USER, mid)
+    workload = runtime.specs[0]["workloadId"]
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert row["data"]["unproven_teardown"]["workload"] == workload
+    return mid, workload
+
+
+async def _sweep(
+    pg: Pg, runtime: FakeRuntimeClient, failures: Any, grace: float = 600
+) -> None:
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    async def post(body):
+        raise AssertionError("no lifecycle terminal expected")
+
+    await reconcile_stale_nonterminal_sweep(
+        pg.repo,
+        runtime,
+        post,
+        stop_grace=45,
+        active_grace=300,
+        log=_SilentLog(),
+        untracked_grace=grace,
+        item_failures=failures,
+    )
+
+
+def _sweep_items(result: str) -> float:
+    from meeting_api.metrics import registry
+
+    value = registry().get_sample_value(
+        "aw_sweep_items_total", {"sweep": "unproven-teardown", "result": result}
+    )
+    return value or 0.0
+
+
+async def test_pg_a_failed_delete_is_retried_on_the_next_pass_then_cleared(pg):
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    mid, workload = await _ended_with_a_pending_teardown(pg)
+    failures = PostgresItemFailures(pg.session_factory, max_failures=5)
+    down = _DeleteFails(workloads={workload: {"state": "running"}})
+    before = _sweep_items("failed")
+    await _sweep(pg, down, failures)
+    assert down.deleted == [f"failed:{workload}"]
+    assert "unproven_teardown" in (await pg.row(mid))["data"]
+    assert _sweep_items("failed") == before + 1
+    up = FakeRuntimeClient(workloads={workload: {"state": "running"}})
+    await _sweep(pg, up, failures)
+    assert up.deleted == [workload]
+    assert "unproven_teardown" not in (await pg.row(mid))["data"]
+
+
+async def test_pg_a_workload_the_runtime_reports_gone_is_cleared(pg):
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    mid, workload = await _ended_with_a_pending_teardown(pg)
+    gone = FakeRuntimeClient(workloads={workload: {"state": "destroyed"}})
+    await _sweep(pg, gone, PostgresItemFailures(pg.session_factory, max_failures=5))
+    assert "unproven_teardown" not in (await pg.row(mid))["data"]
+    assert gone.deleted == []
+
+
+async def test_pg_a_failed_delete_is_given_up_after_the_max_failures_and_counted(pg):
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    mid, workload = await _ended_with_a_pending_teardown(pg)
+    failures = PostgresItemFailures(pg.session_factory, max_failures=2)
+    down = _DeleteFails(workloads={workload: {"state": "running"}})
+    before = _sweep_items("given_up")
+    for _ in range(3):
+        await _sweep(pg, down, failures)
+    assert down.deleted == [f"failed:{workload}"] * 2  # the third pass skips it
+    assert _sweep_items("given_up") == before + 1
+    item = f"{mid}:{workload}"
+    assert await pg.scalar(
+        "SELECT gave_up_at IS NOT NULL FROM sweep_item_failures "
+        "WHERE sweep = 'unproven-teardown' AND item_id = :i",
+        i=item,
+    )
+
+
+async def test_pg_a_404_inside_the_grace_is_not_cleared_and_after_it_is(pg):
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    mid, workload = await _ended_with_a_pending_teardown(pg)
+    failures = PostgresItemFailures(pg.session_factory, max_failures=2)
+    unknown = FakeRuntimeClient(workloads={})  # 404: the kernel doesn't know it
+    for _ in range(3):
+        await _sweep(pg, unknown, failures)
+    assert "unproven_teardown" in (await pg.row(mid))["data"]
+    assert (
+        await pg.scalar(
+            "SELECT count(*) FROM sweep_item_failures WHERE sweep = 'unproven-teardown'"
+        )
+        == 0
+    )  # waiting out the grace is not a failure
+    await pg.execute(
+        "UPDATE meetings SET data = jsonb_set(data, '{unproven_teardown,since}', "
+        "'\"2026-01-01T00:00:00Z\"') WHERE id = :m",
+        m=mid,
+    )
+    await _sweep(pg, unknown, failures)
+    assert "unproven_teardown" not in (await pg.row(mid))["data"]

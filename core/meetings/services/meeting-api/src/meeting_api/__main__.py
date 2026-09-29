@@ -522,6 +522,7 @@ def _attach_background_loops(
                     stop_grace=stop_grace, active_grace=active_grace, log=log,
                     preactive_grace=preactive_grace, untracked_grace=untracked_grace,
                     finish_meeting=getattr(app.state, "finish_meeting", None),
+                    item_failures=item_failures,  # §6.9 F-I, shared with the intake sweeps
                 )
             await reconcile_stale_stopping_sweep(
                 meeting_repo, runtime, _post_lifecycle, stop_grace=stop_grace, log=log,

@@ -419,6 +419,19 @@ class InMemoryMeetingRepo:
             return None
         return dict(row)
 
+    async def list_unproven_teardowns(self, *, after=None, limit=None) -> list:
+        """The real adapter's read of finished rows carrying ``data.unproven_teardown``."""
+        from .ports import UNPROVEN_TEARDOWN
+
+        rows = []
+        for mid, m in sorted(self._meetings.items()):
+            pending = (m.get("data") or {}).get(UNPROVEN_TEARDOWN)
+            if (m["status"] in _TERMINAL_STATUSES and isinstance(pending, dict)
+                    and (after is None or mid > after)):
+                rows.append({"id": mid, "user_id": m["user_id"],
+                             "workload": pending.get("workload"), "since": pending.get("since")})
+        return rows if limit is None else rows[:limit]
+
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
         """The real adapter's ``retry.end`` on a waiting row (no outbox here): an event id when it
         ended the meeting, ``None`` when the meeting wasn't waiting."""

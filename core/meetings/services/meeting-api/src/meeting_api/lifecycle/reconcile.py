@@ -337,6 +337,7 @@ async def reconcile_stale_nonterminal_sweep(
     untracked_grace: float = 600.0,
     untracked_since: Optional[dict] = None,
     finish_meeting: Optional[Callable[..., Awaitable[Any]]] = None,
+    item_failures: Optional[Any] = None,
 ) -> int:
     """The GENERAL backstop: any meeting hung in a non-terminal status whose bot is GONE (its row has
     been quiet — no status change, no segment/heartbeat — past the grace window) converges to a
@@ -360,6 +361,9 @@ async def reconcile_stale_nonterminal_sweep(
         return 0
     ended = await end_overdue_retries(
         repo, untracked_grace=untracked_grace, log=log, finish_meeting=finish_meeting
+    )
+    await retry_unproven_teardowns(
+        repo, runtime, untracked_grace=untracked_grace, log=log, failures=item_failures
     )
     try:
         stale = await repo.list_stale_nonterminal(
@@ -484,6 +488,87 @@ async def reconcile_stale_nonterminal_sweep(
     for mid in [m for m in tracker if m not in seen_untracked]:
         tracker.pop(mid, None)
     return reconciled + ended
+
+
+#: The unproven-teardown retry's name in ``sweep_item_failures`` and ``aw_sweep_items_total``.
+UNPROVEN_TEARDOWN_SWEEP = "unproven-teardown"
+
+
+class UnprovenTeardownFailed(Exception):
+    """An unproven workload's delete was not confirmed this pass (one of its bounded tries)."""
+
+
+async def retry_unproven_teardowns(
+    repo: Any,
+    runtime: Optional[Any],
+    *,
+    untracked_grace: float,
+    log: Any,
+    failures: Optional[Any] = None,
+    batch_size: Optional[int] = None,
+) -> int:
+    """§6.9 F-K2 with F-I's bound: every finished meeting whose unproven workload's delete wasn't
+    confirmed (``data.unproven_teardown``, written by ``bot_spawn.request_bot``) is tried again,
+    a page of ``SWEEP_BATCH_SIZE`` at a time by meeting id, each through
+    ``sweeps.item_failures.run_item`` (item ``<meeting id>:<workload>``). The reap gate's own
+    evidence clears it: the runtime reports the workload terminal, a delete it confirms, or a 404
+    that has lasted past ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) since it was
+    recorded; a 404 inside the grace waits, and counts nothing. Anything else is one failure; the
+    ``SWEEP_MAX_ITEM_FAILURES``-th gives the item up, logged at error level with both ids and
+    counted (``aw_sweep_items_total{sweep="unproven-teardown",result="given_up"}``). Never
+    raises. Returns how many were cleared."""
+    if not hasattr(repo, "list_unproven_teardowns") or not hasattr(repo, "merge_meeting_data"):
+        return 0
+    from datetime import timezone
+    from functools import partial
+
+    from ..bot_spawn.ports import UNPROVEN_TEARDOWN
+    from ..intake.rules import as_utc
+    from ..sweeps.item_failures import (
+        InMemoryItemFailures,
+        run_item,
+        sweep_batch_size,
+        sweep_max_item_failures,
+    )
+
+    tracker = failures or InMemoryItemFailures(max_failures=sweep_max_item_failures())
+    limit = batch_size or sweep_batch_size()
+    now = datetime.now(timezone.utc)
+    cleared = 0
+
+    async def one(row: dict) -> None:
+        nonlocal cleared
+        workload = row.get("workload")
+        probe, _info = await _probe_bot_workload(runtime, workload, log=log)
+        if probe == "untracked":
+            since = as_utc(row.get("since"))
+            if since is None or (now - since).total_seconds() <= untracked_grace:
+                return  # the kernel doesn't know it yet: not evidence, not a failure
+        elif probe == "alive":
+            verdict = await _teardown_verdict(runtime, workload, meeting_id=row["id"], log=log)
+            if verdict != "confirmed":
+                raise UnprovenTeardownFailed(f"delete of {workload} not confirmed ({verdict})")
+        elif probe != "gone":
+            raise UnprovenTeardownFailed(f"no runtime answer about {workload} ({probe})")
+        await repo.merge_meeting_data(row["id"], {UNPROVEN_TEARDOWN: None})
+        cleared += 1
+
+    after: Optional[int] = None
+    try:
+        while True:
+            page = await repo.list_unproven_teardowns(after=after, limit=limit)
+            items = {f"{row['id']}:{row.get('workload')}": row for row in page}
+            skip = await tracker.given_up(UNPROVEN_TEARDOWN_SWEEP, list(items))
+            for item_id, row in items.items():
+                if item_id not in skip:
+                    await run_item(tracker, UNPROVEN_TEARDOWN_SWEEP, item_id,
+                                   partial(one, row), user_id=row.get("user_id"))
+            if len(page) < limit:
+                break
+            after = page[-1]["id"]
+    except Exception:  # noqa: BLE001 — best-effort; retried next sweep
+        log.exception("nonterminal-reconcile: list_unproven_teardowns failed")
+    return cleared
 
 
 async def end_overdue_retries(

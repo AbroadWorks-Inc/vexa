@@ -401,6 +401,11 @@ class TranscriptionNotConfigured(Exception):
 
 
 
+#: ``meetings.data`` key of a finished meeting whose unproven workload's delete wasn't confirmed:
+#: ``{workload, since}``. The reconcile sweep retries it (§6.9 F-K2, F-I).
+UNPROVEN_TEARDOWN = "unproven_teardown"
+
+
 def workload_id_for(meeting_id: Any, session_uid: str) -> str:
     """The workload id a spawn asks the runtime for: the meeting and the session's first eight
     characters (``request_bot``). A session with no recorded workload is known by it (§6.9 F-K2)."""
