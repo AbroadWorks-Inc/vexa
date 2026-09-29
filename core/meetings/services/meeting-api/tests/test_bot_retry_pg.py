@@ -2268,3 +2268,44 @@ async def test_pg_a_runtime_outage_never_gives_a_stale_row_up(pg, sweep):
     runtime.down = False
     await sweep_once()
     assert posted == ["sess-0"] and runtime.deleted == [f"mtg-{mid}-w"]
+
+
+async def test_pg_a_given_up_teardown_still_pending_is_kept_until_it_is_cleared(
+    pg, monkeypatch
+):
+    """M8: the reconcile pass prunes ``sweep_item_failures``, but never the record of a
+    given-up teardown that is still pending on its meeting; once the teardown is cleared, the
+    record goes after the retention."""
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    mid, workload = await _ended_with_a_pending_teardown(pg)
+    failures = PostgresItemFailures(pg.session_factory, max_failures=1)
+    down = _DeleteFails(workloads={workload: {"state": "running"}})  # a refusal
+    await _sweep(pg, down, failures)  # given up
+    item = f"{mid}:{workload}"
+    assert await failures.given_up("unproven-teardown", [item]) == {item}
+
+    async def age() -> None:
+        await pg.execute(
+            "UPDATE sweep_item_failures SET updated_at = now() - interval '8 days'"
+        )
+
+    await age()
+    await _sweep(pg, down, failures)  # lists it (skipped, refreshed), then prunes
+    assert (
+        await pg.scalar(
+            "SELECT count(*) FROM sweep_item_failures WHERE item_id = :i", i=item
+        )
+        == 1
+    )
+    await pg.execute(
+        "UPDATE meetings SET data = data - 'unproven_teardown' WHERE id = :m", m=mid
+    )
+    await age()
+    await _sweep(pg, down, failures)
+    assert (
+        await pg.scalar(
+            "SELECT count(*) FROM sweep_item_failures WHERE item_id = :i", i=item
+        )
+        == 0
+    )

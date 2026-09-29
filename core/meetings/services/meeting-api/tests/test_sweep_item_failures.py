@@ -166,6 +166,42 @@ async def test_the_give_up_action_runs_once_right_after_the_give_up(capsys):
     assert events[-2:] == ["sweep_item_given_up", "sweep_item_give_up_action_failed"]
 
 
+async def test_a_given_up_item_its_sweep_still_lists_is_never_pruned(monkeypatch):
+    """Every read that finds an item given up (the sweep still lists it) refreshes its
+    record, so the prune takes only the given-up items no sweep has listed for the retention:
+    their meeting is gone, finished, or their work was cleared."""
+    import time
+
+    from meeting_api.sweeps.item_failures import run_pages
+
+    monkeypatch.setenv("SWEEP_ITEM_FAILURES_RETENTION_S", "3600")
+    failures = InMemoryItemFailures(max_failures=1)
+    for item in ("listed", "gone"):
+        await failures.failed("probe", item, RuntimeError("x"))
+        failures.updated[("probe", item)] = time.time() - 3601
+    ran: list[str] = []
+
+    async def read(after):
+        return [] if after else ["listed"]
+
+    async def act(item: str) -> None:
+        ran.append(item)
+
+    await run_pages(
+        failures,
+        "probe",
+        read,
+        limit=10,
+        after_of=lambda i: i,
+        item_id_of=lambda i: i,
+        user_id_of=lambda i: None,
+        action=act,
+    )
+    assert ran == []  # still given up
+    assert await prune_item_failures(failures, log=_Log()) == 1
+    assert failures.gave_up == {("probe", "listed")}
+
+
 def test_the_retention_defaults_to_seven_days(monkeypatch):
     monkeypatch.delenv("SWEEP_ITEM_FAILURES_RETENTION_S", raising=False)
     assert sweep_item_failures_retention_s() == 604800.0
@@ -289,3 +325,29 @@ async def test_pg_records_older_than_the_retention_are_pruned_a_page_at_a_time(
             await conn.execute(text("SELECT item_id FROM sweep_item_failures"))
         ).scalars()
         assert list(left) == ["fresh"]
+
+
+@pg_only
+async def test_pg_a_given_up_record_its_sweep_still_reads_survives_the_prune(
+    link_pg_engine,
+):
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    factory = async_sessionmaker(link_pg_engine, expire_on_commit=False)
+    failures = PostgresItemFailures(factory, max_failures=1)
+    for item in ("listed", "gone", "failing"):
+        await failures.failed("probe", item, RuntimeError("x"))
+    async with link_pg_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE sweep_item_failures SET updated_at = now() - interval '8 days'"
+            )
+        )
+    assert await failures.given_up("probe", ["listed"]) == {
+        "listed"
+    }  # a read that lists it
+    assert await failures.prune(older_than_s=7 * 86400, limit=10) == 2
+    assert await failures.given_up("probe", ["listed", "gone", "failing"]) == {"listed"}

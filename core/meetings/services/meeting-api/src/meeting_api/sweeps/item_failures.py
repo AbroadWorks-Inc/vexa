@@ -20,7 +20,11 @@ counted.
 so every replica and every tick shares them; ``InMemoryItemFailures`` is its fake. The row stores
 the error's type, never its text: a database error's text can carry the values it was given.
 ``prune_item_failures`` deletes the records untouched for ``SWEEP_ITEM_FAILURES_RETENTION_S``
-(7 days), a page of ``SWEEP_BATCH_SIZE`` at a time; the reconcile sweep runs it every pass.
+(7 days), a page of ``SWEEP_BATCH_SIZE`` at a time; the reconcile sweep runs it every pass. A
+given-up item is never brought back while it is pending: every read that finds it given up
+(``ItemFailures.given_up``, which its sweep makes whenever it lists the item) touches its record,
+so only the given-up items no sweep has listed for the retention go (their meeting is gone or
+finished, or their work was cleared), with the records of items that stopped failing.
 
 SQLAlchemy is imported inside the Postgres methods, so this module imports without it.
 """
@@ -98,7 +102,8 @@ class ItemFailures(Protocol):
         ...
 
     async def given_up(self, sweep: str, item_ids: Collection[str]) -> set[str]:
-        """Which of ``item_ids`` the sweep has given up."""
+        """Which of ``item_ids`` the sweep has given up; each one's record is touched, since
+        its sweep still lists it (so ``prune`` keeps it)."""
         ...
 
     async def prune(self, *, older_than_s: float, limit: int) -> int:
@@ -277,7 +282,10 @@ class InMemoryItemFailures:
         return True
 
     async def given_up(self, sweep: str, item_ids: Collection[str]) -> set[str]:
-        return {i for i in item_ids if (sweep, i) in self.gave_up}
+        found = {i for i in item_ids if (sweep, i) in self.gave_up}
+        for item_id in found:
+            self.updated[(sweep, item_id)] = time.time()
+        return found
 
     async def prune(self, *, older_than_s: float, limit: int) -> int:
         cutoff = time.time() - older_than_s
@@ -340,10 +348,10 @@ class PostgresItemFailures:
         if not item_ids:
             return set()
         stmt = text(
-            "SELECT item_id FROM sweep_item_failures WHERE sweep = :sweep "
-            "AND item_id IN :items AND gave_up_at IS NOT NULL"
+            "UPDATE sweep_item_failures SET updated_at = now() WHERE sweep = :sweep "
+            "AND item_id IN :items AND gave_up_at IS NOT NULL RETURNING item_id"
         ).bindparams(bindparam("items", expanding=True))
-        async with self._session_factory() as db:
+        async with self._session_factory() as db, db.begin():
             rows = await db.execute(stmt, {"sweep": sweep, "items": list(item_ids)})
             return {str(r[0]) for r in rows}
 
