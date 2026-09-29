@@ -2,8 +2,8 @@
 
 Cursors are opaque to clients: URL-safe base64 of a small JSON value.
 
-  * ``GET /v2/entries`` pages by ``external_id`` (a JSON string). The unique index
-    ``uq_meeting_entries_user_source_external`` (``user_id, source_user, external_id``) serves the
+  * ``GET /v2/entries`` pages by ``external_id`` (a JSON string). The index
+    ``ix_meeting_entries_user_source_external`` (``user_id, source_user, external_id``) serves the
     order: equality on the first two columns, the range and the order on the third.
   * ``GET /v2/meetings`` pages by ``(meeting time, id)``, newest first (a JSON ``[time, id]``, the
     time as naive UTC ISO-8601 at full precision). The meeting time is ``meeting_event_time(data,
