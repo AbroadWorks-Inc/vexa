@@ -464,6 +464,51 @@ async def test_a_normal_end_still_reaches_every_sink_once(monkeypatch):
     assert sinks.finalized == [row["id"]]
 
 
+# ── a meeting the retry ends runs every finish step the lifecycle runs ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("status", "event", "flows"),
+    [("failed", "bot.failed", []), ("completed", "meeting.completed", ["meeting.completed"])],
+)
+async def test_a_meeting_ended_outside_the_lifecycle_runs_every_finish_step(
+    monkeypatch, status, event, flows
+):
+    from meeting_api import create_app
+    from meeting_api import events as events_mod
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    sinks = _Sinks()
+
+    async def publish(event_type, source_event_id, refs, **kw):
+        sinks.published.append(event_type)
+        return True
+
+    monkeypatch.setattr(events_mod, "publish", publish)
+    repo = InMemoryMeetingRepo()
+    meeting = await repo.create_meeting(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="kxo-misr-avz",
+        data={"webhook_url": "https://hooks.example/aw"},
+    )
+    await repo.create_session(meeting_id=meeting["id"], session_uid="sess-1")
+    repo._meetings[meeting["id"]]["status"] = status
+    app = create_app(
+        meeting_repo=repo,
+        system_webhook_sink=sinks,
+        webhook_sink=_UserSink(sinks),
+        transcript_finalizer=sinks.finalize,
+        redis=sinks,
+    )
+    await app.state.finish_meeting(meeting["id"])
+    assert sinks.finalized == [meeting["id"]]
+    assert sinks.system == [event]
+    assert sinks.user == [event]
+    assert sinks.published == flows
+    assert sinks.reaped == [f"tc:meeting:{meeting['id']}"]
+
+
 # ── the newest session speaks for the meeting ───────────────────────────────────────────────
 
 
