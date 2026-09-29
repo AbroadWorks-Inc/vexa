@@ -21,7 +21,7 @@ from typing import Any, Optional
 import httpx
 import pytest
 from fastapi import FastAPI
-from guard import SecurityConfig
+from guard import SecurityConfig, SecurityMiddleware
 from httpx import ASGITransport
 from starlette.websockets import WebSocketDisconnect
 
@@ -40,7 +40,7 @@ from gateway.ratelimit import PerUserRateLimiter
 def _guard_middleware(app: FastAPI) -> Any:
     """Return the SecurityMiddleware entry on ``app`` if present, else None."""
     for mw in app.user_middleware:
-        if getattr(mw.cls, "__name__", "") == "SecurityMiddleware":
+        if isinstance(mw.cls, type) and issubclass(mw.cls, SecurityMiddleware):
             return mw
     return None
 
@@ -245,6 +245,63 @@ class TestGuardBehavior:
             assert (
                 await ac.get("/", headers={"X-Forwarded-For": "10.0.0.99"})
             ).status_code == 429
+
+
+def _make_v2_app(config: SecurityConfig) -> FastAPI:
+    """An isolated app with one ``/v2/`` route and one upstream route, guard applied."""
+    app = FastAPI()
+    app.add_api_route("/v2/meetings", _root_handler, methods=["GET"])
+    app.add_api_route("/bots", _root_handler, methods=["GET"])
+    apply_guard(app, config=config)
+    return app
+
+
+class TestGuardV2Shape:
+    """§2.5: the guard's own refusals on a ``/v2/`` path carry ``{"error": {code, message}}``;
+    every other path keeps the guard's own body. Unique XFF IPs keep the process-wide
+    ``RateLimitManager`` buckets apart from the other tests'."""
+
+    @pytest.mark.asyncio
+    async def test_a_per_ip_429_on_v2_has_the_error_shape(self) -> None:
+        app = _make_v2_app(_enforcing_config(rate_limit=2, trusted_proxies=["127.0.0.1"]))
+        headers = {"X-Forwarded-For": "10.0.0.71"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            for _ in range(2):
+                assert (await ac.get("/v2/meetings", headers=headers)).status_code == 200
+            resp = await ac.get("/v2/meetings", headers=headers)
+        assert resp.status_code == 429
+        assert resp.headers["content-type"] == "application/json"
+        assert resp.json() == {
+            "error": {"code": "rate_limited", "message": "Too many requests"}
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_address_on_v2_has_the_error_shape(self) -> None:
+        app = _make_v2_app(
+            _enforcing_config(
+                rate_limit=1000, trusted_proxies=["127.0.0.1"], blacklist=["10.0.0.72"]
+            )
+        )
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/v2/meetings", headers={"X-Forwarded-For": "10.0.0.72"})
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "forbidden"
+
+    @pytest.mark.asyncio
+    async def test_a_per_ip_429_off_v2_keeps_the_guard_body(self) -> None:
+        app = _make_v2_app(_enforcing_config(rate_limit=1, trusted_proxies=["127.0.0.1"]))
+        headers = {"X-Forwarded-For": "10.0.0.73"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            assert (await ac.get("/bots", headers=headers)).status_code == 200
+            resp = await ac.get("/bots", headers=headers)
+        assert resp.status_code == 429
+        assert resp.text == "Too many requests"
 
 
 # ── WS guard hook ──────────────────────────────────────────────────────────────

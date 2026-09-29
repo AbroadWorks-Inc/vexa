@@ -35,10 +35,15 @@ import ipaddress
 import os
 import time
 from collections import defaultdict, deque
-from typing import TYPE_CHECKING, Iterable, Optional
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, Optional
 
-from guard import SecurityConfig, SecurityMiddleware
+from guard import GuardResponse, SecurityConfig, SecurityMiddleware
+from guard.adapters import StarletteGuardResponse
+from starlette.requests import Request
+from starlette.responses import Response
 
+from .app import _V2_ERROR_CODES, _V2_PREFIX, _refusal
 from .ratelimit import env_truthy
 
 if TYPE_CHECKING:
@@ -164,8 +169,41 @@ def build_guard_config() -> SecurityConfig:
     )
 
 
+#: The path of the request the guard is checking, so its refusal knows whether it is on ``/v2/``.
+_REQUEST_PATH: ContextVar[str] = ContextVar("edge_guard_request_path", default="")
+
+
+class EdgeGuardMiddleware(SecurityMiddleware):
+    """fastapi-guard's ``SecurityMiddleware``, with its own refusals on a ``/v2/`` path in the
+    §2.5 body ``{"error": {"code", "message"}}`` (429 ``rate_limited``, 403 ``forbidden``), as
+    every other refusal the gateway itself answers there. Any other path keeps the guard's body.
+
+    Only the guard's refusals are reshaped: every check builds its refusal through
+    ``create_error_response``; the responses it passes through from the routes never are.
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        token = _REQUEST_PATH.set(request.url.path)
+        try:
+            return await super().dispatch(request, call_next)
+        finally:
+            _REQUEST_PATH.reset(token)
+
+    async def create_error_response(
+        self, status_code: int, default_message: str
+    ) -> GuardResponse:
+        response = await super().create_error_response(status_code, default_message)
+        path = _REQUEST_PATH.get()
+        if not path.startswith(_V2_PREFIX) or status_code not in _V2_ERROR_CODES:
+            return response
+        message = (response.body or b"").decode("utf-8", "replace") or default_message
+        return StarletteGuardResponse(_refusal(path, status_code, message))
+
+
 def apply_guard(app: FastAPI, config: SecurityConfig | None = None) -> None:
-    """Add fastapi-guard's ``SecurityMiddleware`` to the gateway.
+    """Add fastapi-guard's ``SecurityMiddleware`` (as ``EdgeGuardMiddleware``) to the gateway.
 
     No-op when ``GUARD_ENABLED=false`` (operator kill switch). When ``config`` is
     omitted it is built from env via :func:`build_guard_config`.
@@ -180,7 +218,7 @@ def apply_guard(app: FastAPI, config: SecurityConfig | None = None) -> None:
         return
     if config is None:
         config = build_guard_config()
-    app.add_middleware(SecurityMiddleware, config=config)
+    app.add_middleware(EdgeGuardMiddleware, config=config)
 
 
 # ── WS guard hook ─────────────────────────────────────────────────────────────
