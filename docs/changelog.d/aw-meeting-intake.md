@@ -26,3 +26,32 @@
   its own key, names every file and `/process` call by the meeting's UUID, and reports its result
   with `POST /v2/meetings/{id}/export`. The database schema, `webhook.v1`, `intake.v1`,
   `identity.v1` and the architecture model are re-sealed.
+- **aw-bots: a bot that fails mid-meeting is retried on the same meeting (F-K2).** The row holds
+  its link and gets a new bot session on the same meeting once the failed pod is proven gone
+  (a runtime `gone`, a confirmed delete, a terminal callback, or a 404 that has lasted
+  `MEETING_UNTRACKED_GRACE_SEC`), bounded by `BOT_SEND_MAX_ATTEMPTS`/`BOT_SEND_RETRY_BACKOFF_S` and
+  the meeting's planned end; past that it ends `failed`. A user's stop, a calendar removal, the
+  host removing the bot, and nobody joining are never retried.
+- **aw-bots: bounded work everywhere (F-K, F-I, F-D).** Sending a bot for an entry-managed meeting
+  is tried a bounded number of times with a fixed gap, then the meeting ends `not_sent`
+  (`BOT_SEND_MAX_ATTEMPTS`, `BOT_SEND_RETRY_BACKOFF_S`). Every intake sweep and background job reads
+  its work in bounded, paged batches, and an item that keeps failing is logged, counted and dropped
+  rather than retried forever (`SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`). An entry write that
+  loses a database-constraint race is retried a bounded number of times inside aw-bots; still
+  losing, it answers `500 internal_error`, never `503` (`INTAKE_CONFLICT_RETRIES`).
+- **aw-bots: the exporter is a `/v2` webhook subscriber (F-X).** It moves off upstream's
+  Redis-backed system webhook onto its own `/v2/webhooks` subscription (Postgres delivery, bounded
+  retries), and the system webhook is switched off for AW. The meeting gains its actual
+  `started_at`/`ended_at`, and the legacy second meeting projection is gone.
+- **aw-bots: the identity key ring and signature v2 (F-E); webhook sender settings
+  (F-A/C/H).** The gateway's signature over a forwarded request now also covers the query string,
+  a body hash and the forwarded scope/limit headers, signed with an active key from a rotatable key
+  ring (`GATEWAY_IDENTITY_KEYS`, `GATEWAY_IDENTITY_ACTIVE_KEY`) instead of one static secret. The
+  webhook sender's retry schedule, DNS pool size and per-lookup timeout are settings
+  (`WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S`) instead of constants,
+  and it always signs with the subscription's current secret, never a stale cached one.
+- **aw-bots: one finish path (F-FIN); the cleanup wave (F-L).** Every way a meeting ends — a stop,
+  a calendar removal, a normal end, a failure — runs the same finish steps: transcript finalize,
+  provenance, the per-user webhook, flows, and copilot reap. A redundancy audit and cleanup wave
+  removed in-service duplicates (the paged-sweep loop, key-ring parsers, the gone-proof check, the
+  finished-meeting lock and others) and brought code, contracts and docs into agreement.
