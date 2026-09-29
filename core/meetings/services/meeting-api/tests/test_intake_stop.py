@@ -689,7 +689,7 @@ async def test_pg_r5_a_failed_leave_leaves_the_stop_to_the_reconcile_sweep(pg_en
         == "cancelled_by_calendar"
     )
     stale = await s.repo.list_stale_stopping(older_than_seconds=0)
-    assert (mid, "sess-r5", "wl-r5") in stale
+    assert (mid, "sess-r5", "wl-r5") in [r[:3] for r in stale]
     again = await s.service.remove_entry(7, REMOVE)
     assert again["result"] == "already_removed"
 

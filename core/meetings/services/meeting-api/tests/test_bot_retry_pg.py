@@ -2012,12 +2012,14 @@ async def test_pg_the_stale_listings_read_a_page_by_meeting_id(pg):
     rest = await pg.repo.list_stale_stopping(
         older_than_seconds=45, after=stopping[1], limit=2
     )
-    assert rest == [(stopping[2], "sess-2", f"mtg-{stopping[2]}-w")]
+    assert [r[:3] for r in rest] == [(stopping[2], "sess-2", f"mtg-{stopping[2]}-w")]
+    quiet = (datetime.now(timezone.utc) - rest[0][3]).total_seconds()
+    assert 3500 < quiet < 3700  # its updated_at, an hour ago, in UTC
     assert await pg.repo.list_stale_stopping(older_than_seconds=7200) == []
     general = await pg.repo.list_stale_nonterminal(
         stop_grace=45, active_grace=300, after=stopping[0], limit=1
     )
-    assert general == [
+    assert [r[:5] for r in general] == [
         (stopping[1], "stopping", "sess-1", f"mtg-{stopping[1]}-w", False)
     ]
 
@@ -2064,16 +2066,16 @@ async def test_pg_the_reconcile_sweeps_work_every_page(pg, monkeypatch):
     assert posted == ["sess-0", "sess-1", "sess-2"]
 
 
-class _DeleteNoAnswer(FakeRuntimeClient):
+class _DeleteRefused(FakeRuntimeClient):
     async def delete_workload(self, workload_id):
         from meeting_api.bot_spawn.ports import SpawnFailed
 
         self.deleted.append(workload_id)
-        raise SpawnFailed("runtime kernel delete_workload returned 503", refused=False)
+        raise SpawnFailed("runtime kernel delete_workload returned 409", refused=True)
 
 
 @pytest.mark.parametrize("sweep", ["stale-stopping", "stale-nonterminal"])
-async def test_pg_a_stale_row_whose_delete_keeps_failing_is_given_up(pg, sweep):
+async def test_pg_a_stale_row_whose_delete_is_refused_is_given_up(pg, sweep):
     from meeting_api.lifecycle.reconcile import (
         reconcile_stale_nonterminal_sweep,
         reconcile_stale_stopping_sweep,
@@ -2083,7 +2085,7 @@ async def test_pg_a_stale_row_whose_delete_keeps_failing_is_given_up(pg, sweep):
 
     (mid,) = await _stale_rows(pg, "stopping", 1)
     failures = PostgresItemFailures(pg.session_factory, max_failures=2)
-    runtime = _DeleteNoAnswer()
+    runtime = _DeleteRefused()
 
     async def post(body):
         raise AssertionError("an unconfirmed teardown never completes the meeting")
@@ -2202,3 +2204,67 @@ async def test_pg_two_finishes_of_one_end_run_its_steps_once(pg):
         "status": "failed",
         "session": session,
     }
+
+
+class _DeleteOutage(FakeRuntimeClient):
+    """Every delete gets a 503 while ``down``; confirmed after."""
+
+    down = True
+
+    async def delete_workload(self, workload_id):
+        from meeting_api.bot_spawn.ports import SpawnFailed
+
+        if self.down:
+            raise SpawnFailed(
+                "runtime kernel delete_workload returned 503", refused=False
+            )
+        await super().delete_workload(workload_id)
+
+
+@pytest.mark.parametrize("sweep", ["stale-stopping", "stale-nonterminal"])
+async def test_pg_a_runtime_outage_never_gives_a_stale_row_up(pg, sweep):
+    """Two minutes of runtime outage (eight passes) are never the row's failure, over the
+    shared record; the row completes once the runtime answers."""
+    from meeting_api.lifecycle.reconcile import (
+        reconcile_stale_nonterminal_sweep,
+        reconcile_stale_stopping_sweep,
+    )
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+
+    (mid,) = await _stale_rows(pg, "stopping", 1)
+    failures = PostgresItemFailures(pg.session_factory, max_failures=2)
+    runtime = _DeleteOutage()
+    posted: list[str] = []
+
+    async def post(body):
+        posted.append(body["connection_id"])
+        return 200
+
+    async def sweep_once() -> None:
+        if sweep == "stale-stopping":
+            await reconcile_stale_stopping_sweep(
+                pg.repo,
+                runtime,
+                post,
+                stop_grace=45,
+                log=_SilentLog(),
+                item_failures=failures,
+            )
+        else:
+            await reconcile_stale_nonterminal_sweep(
+                pg.repo,
+                runtime,
+                post,
+                stop_grace=45,
+                active_grace=300,
+                log=_SilentLog(),
+                item_failures=failures,
+            )
+
+    for _ in range(8):
+        await sweep_once()
+    assert await pg.scalar("SELECT count(*) FROM sweep_item_failures") == 0
+    assert posted == []
+    runtime.down = False
+    await sweep_once()
+    assert posted == ["sess-0"] and runtime.deleted == [f"mtg-{mid}-w"]

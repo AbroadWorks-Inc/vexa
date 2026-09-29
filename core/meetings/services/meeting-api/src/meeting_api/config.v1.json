@@ -752,7 +752,7 @@
    "key": "UNPROVEN_TEARDOWN_MAX_AGE_S",
    "class": "defaulted",
    "default": "21600",
-   "description": "§6.9 F-K2/F-I: how long (s) after its since a pending teardown (data.unproven_teardown) is retried before it is given up; a runtime that doesn't answer is never one of the item's failures, so this age is its only bound. Longer than any meeting (6 h)",
+   "description": "§6.9 F-K2/F-I: how long (s) a workload's teardown is chased while the runtime doesn't answer before it is given up: a pending teardown (data.unproven_teardown) from its since, a stale-stopping or stale-nonterminal reconcile row from its updated_at. A runtime that doesn't answer is never one of the item's failures, so this age is its only bound; a refused delete still counts toward SWEEP_MAX_ITEM_FAILURES. Longer than any meeting (6 h)",
    "targets": []
   },
   {

@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NoReturn, Optional
 
 from ..bot_spawn.ports import SpawnFailed, WorkloadUnknown
 from ..sweeps.item_failures import ItemDeferred, ItemExpired
@@ -98,6 +98,44 @@ class TeardownNotConfirmed(Exception):
     """A stale meeting's workload delete was not confirmed this pass (one of its bounded tries)."""
 
 
+class StaleRowExpired(ItemExpired):
+    """A stale meeting the runtime never answered about, stuck longer than
+    ``UNPROVEN_TEARDOWN_MAX_AGE_S``: given up."""
+
+
+def runtime_bound(
+    why: str,
+    *,
+    unreachable: bool,
+    since: Optional[datetime],
+    now: datetime,
+    failed: type[Exception],
+    expired: type[ItemExpired],
+) -> NoReturn:
+    """The one rule for a sweep item the runtime's answer didn't settle (§6.9 F-I, F-K2), raised
+    for ``run_item``: past ``UNPROVEN_TEARDOWN_MAX_AGE_S`` since ``since`` it is ``expired``
+    (given up at once); a runtime that didn't answer (``unreachable``) is no failure of the item,
+    only logged and counted ``runtime_unreachable`` (``ItemDeferred``) and tried next pass; a
+    definite answer that isn't a proof (a refusal, a 404 with no grace to wait out) is one of its
+    ``SWEEP_MAX_ITEM_FAILURES`` tries (``failed``). With no ``since`` the age is unknown, so an
+    unreachable runtime counts too: nothing waits forever."""
+    max_age = unproven_teardown_max_age_s()
+    if since is not None and (now - since).total_seconds() > max_age:
+        raise expired(
+            f"{why}; pending since {since.isoformat()}, past UNPROVEN_TEARDOWN_MAX_AGE_S "
+            f"({max_age:g} s)"
+        )
+    if unreachable and since is not None:
+        raise ItemDeferred("runtime_unreachable", why)
+    raise failed(why)
+
+
+def _row_since(row: tuple, index: int) -> Optional[datetime]:
+    """The listing's ``updated_at`` at ``index``, when the row carries one."""
+    value = row[index] if len(row) > index else None
+    return value if isinstance(value, datetime) else None
+
+
 class UntrackedEscalationFailed(Exception):
     """A continuously untracked meeting's ``failed`` could not be posted this pass (one of its
     bounded tries)."""
@@ -113,18 +151,22 @@ async def reconcile_stale_stopping_sweep(
     item_failures: "ItemFailures",
 ) -> int:
     """Run ONE sweep, a page of ``SWEEP_BATCH_SIZE`` stale ``stopping`` meetings at a time by id,
-    each through ``run_item`` (§6.9 F-I, ``sweeps.item_failures.run_pages``): a delete not
-    confirmed, or a completion that raises, is one of the row's ``SWEEP_MAX_ITEM_FAILURES``
-    tries. A 404 is not: the general sweep's bounded untracked escalation owns it. Returns the
-    number of stale ``stopping`` meetings reconciled."""
+    each through ``run_item`` (§6.9 F-I, ``sweeps.item_failures.run_pages``). A delete the
+    runtime doesn't answer follows ``runtime_bound`` (retried, bounded by the row's age since its
+    ``updated_at``); a refused delete, or a completion that raises, is one of the row's
+    ``SWEEP_MAX_ITEM_FAILURES`` tries. A 404 is neither: the general sweep's bounded untracked
+    escalation owns it. Returns the number of stale ``stopping`` meetings reconciled."""
+    from datetime import timezone
+
     from ..sweeps.item_failures import run_pages, sweep_batch_size
 
     limit = sweep_batch_size()
     reconciled = 0
+    wall = datetime.now(timezone.utc)
 
     async def one(row: tuple) -> None:
         nonlocal reconciled
-        meeting_id, session_uid, bot_container_id = row
+        meeting_id, session_uid, bot_container_id = row[:3]
         bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         # 1. GUARANTEE teardown FIRST — and require confirmation. Completing before a confirmed
         #    kill is how the incident produced a `completed` meeting with a live ghost bot.
@@ -133,8 +175,10 @@ async def reconcile_stale_stopping_sweep(
         if verdict == "untracked":
             return  # stays `stopping` (truthful); the general sweep escalates it, bounded
         if verdict != "confirmed":
-            raise TeardownNotConfirmed(
-                f"delete of {bot_container_id} for meeting {meeting_id} not confirmed ({verdict})"
+            runtime_bound(
+                f"delete of {bot_container_id} for meeting {meeting_id} not confirmed ({verdict})",
+                unreachable=verdict == "failed", since=_row_since(row, 3), now=wall,
+                failed=TeardownNotConfirmed, expired=StaleRowExpired,
             )
         # 2. Complete it through the bot's own lifecycle callback.
         status = await post_lifecycle(
@@ -423,9 +467,10 @@ async def reconcile_stale_nonterminal_sweep(
     budget from the control plane — our patience must OUTLAST the deadline we issued, #862), and
     ``active_grace`` for everything else (a longer idle so a momentarily-quiet live bot is not reaped).
     Read a page of ``SWEEP_BATCH_SIZE`` meetings at a time by id, each through ``run_item`` (§6.9
-    F-I, ``sweeps.item_failures.run_pages``): a delete not confirmed (other than a 404, which the
-    untracked window bounds) or a terminal that can't be posted is one of the row's
-    ``SWEEP_MAX_ITEM_FAILURES`` tries. Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
+    F-I, ``sweeps.item_failures.run_pages``). A probe or delete the runtime doesn't answer follows
+    ``runtime_bound`` (retried, bounded by the row's age since its ``updated_at``); a refused
+    delete or a terminal that can't be posted is one of the row's ``SWEEP_MAX_ITEM_FAILURES``
+    tries; a 404 is bounded by the untracked window. Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
     ``list_stale_nonterminal``, and a redelivered terminal is an idempotent 200 no-op at the callback.
 
     Returns the number of meetings reconciled."""
@@ -447,10 +492,14 @@ async def reconcile_stale_nonterminal_sweep(
     tracker = _UNTRACKED_SINCE if untracked_since is None else untracked_since
     seen_untracked: set = set()
     now = time.monotonic()
+    from datetime import timezone
+
+    wall = datetime.now(timezone.utc)
 
     async def one(row: tuple) -> None:
         nonlocal reconciled
-        meeting_id, status, session_uid, bot_container_id, stop_requested = row
+        meeting_id, status, session_uid, bot_container_id, stop_requested = row[:5]
+        since = _row_since(row, 5)
         bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         probe, probe_info = "unknown", None
         # LIVENESS GATE (the correctness fix): for a status where a bot may be alive and legitimately
@@ -483,6 +532,13 @@ async def reconcile_stale_nonterminal_sweep(
                     await escalate(meeting_id, status, session_uid, bot_container_id,
                                    stop_requested, grace=untracked_grace)
                 return
+            if probe == "unknown" and runtime is not None and hasattr(runtime, "get_workload"):
+                # The runtime didn't answer the probe: never a reap, and never the row's failure.
+                runtime_bound(
+                    f"no runtime answer about {bot_container_id} for meeting {meeting_id}",
+                    unreachable=True, since=since, now=wall,
+                    failed=TeardownNotConfirmed, expired=StaleRowExpired,
+                )
             if probe != "gone":
                 # ALIVE or UNKNOWN → do not reap a possibly-live, bot-present meeting.
                 # (No bot_container_id at all falls through to the time-based reap — there is no
@@ -509,9 +565,11 @@ async def reconcile_stale_nonterminal_sweep(
             # A 404 is bounded by that window, never an item failure; any other unconfirmed delete
             # is one of the row's bounded tries (§6.9 F-I).
             if verdict != "untracked":
-                raise TeardownNotConfirmed(
+                runtime_bound(
                     f"delete of {bot_container_id} for meeting {meeting_id} not confirmed "
-                    f"({verdict})"
+                    f"({verdict})",
+                    unreachable=verdict == "failed", since=since, now=wall,
+                    failed=TeardownNotConfirmed, expired=StaleRowExpired,
                 )
             esc_grace = stop_grace if status == "stopping" else untracked_grace
             if _untracked_window_elapsed(
@@ -607,8 +665,10 @@ class UnprovenTeardownExpired(ItemExpired):
 
 
 def unproven_teardown_max_age_s() -> float:
-    """``UNPROVEN_TEARDOWN_MAX_AGE_S``: how long after its ``since`` a pending teardown is tried
-    before it is given up (6 h, longer than any meeting)."""
+    """``UNPROVEN_TEARDOWN_MAX_AGE_S``: how long after its ``since`` a workload's teardown is
+    chased while the runtime doesn't answer, before it is given up (6 h, longer than any
+    meeting): a pending teardown since it was recorded, a stale reconcile row since its
+    ``updated_at`` (``runtime_bound``)."""
     return float(os.getenv("UNPROVEN_TEARDOWN_MAX_AGE_S", "21600"))
 
 
@@ -646,7 +706,6 @@ async def retry_unproven_teardowns(
     from ..sweeps.item_failures import run_pages, sweep_batch_size
 
     limit = batch_size or sweep_batch_size()
-    max_age = unproven_teardown_max_age_s()
     now = datetime.now(timezone.utc)
     cleared = 0
 
@@ -663,14 +722,10 @@ async def retry_unproven_teardowns(
         if verdict == "wait":
             return
         if verdict != "proven":
-            if since is not None and (now - since).total_seconds() > max_age:
-                raise UnprovenTeardownExpired(
-                    f"{why}; pending since {since.isoformat()}, past "
-                    f"UNPROVEN_TEARDOWN_MAX_AGE_S ({max_age:g} s)"
-                )
-            if verdict == "unreachable" and since is not None:
-                raise ItemDeferred("runtime_unreachable", why)
-            raise UnprovenTeardownFailed(why)
+            runtime_bound(
+                why, unreachable=verdict == "unreachable", since=since, now=now,
+                failed=UnprovenTeardownFailed, expired=UnprovenTeardownExpired,
+            )
         await repo.merge_meeting_data(
             row["id"], lambda data: teardown_done(data, row.get("workload"))
         )

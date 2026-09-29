@@ -675,13 +675,15 @@ class SqlAlchemyMeetingRepo:
 
     async def list_stale_stopping(
         self, *, older_than_seconds: float, after=None, limit=None
-    ) -> list[tuple[int, str, Optional[str]]]:
+    ) -> list[tuple[int, str, Optional[str], datetime]]:
         """Meetings stuck in ``stopping`` longer than ``older_than_seconds`` — with their latest
-        session_uid AND ``bot_container_id``. The stop-reconcile backstop completes these (the bot was
+        session_uid, ``bot_container_id`` AND ``updated_at`` (UTC). The stop-reconcile backstop completes these (the bot was
         told to leave but never sent its own terminal callback) AND kills the workload (CC6), since an
         ACTIVE bot that missed the fire-and-forget leave is an orphan until torn down. One page of
         ``limit`` meetings by id after ``after`` (§6.9 F-I). Returns
-        ``[(meeting_id, session_uid, bot_container_id), …]`` (bot_container_id may be ``None``)."""
+        ``[(meeting_id, session_uid, bot_container_id, updated_at), …]`` (bot_container_id may be
+        ``None``); ``updated_at`` is how long the row has been stuck, the bound on a runtime that
+        doesn't answer (``reconcile.runtime_bound``)."""
         from ..sessions.models import Meeting
 
         return await self._stale(
@@ -689,13 +691,13 @@ class SqlAlchemyMeetingRepo:
             {"stopping": older_than_seconds},
             after=after,
             limit=limit,
-            shape=lambda mid, status, sid, bcid, data: (mid, sid, bcid),
+            shape=lambda mid, status, sid, bcid, data, upd: (mid, sid, bcid, upd),
         )
 
     async def list_stale_nonterminal(
         self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None,
         after=None, limit=None,
-    ) -> list[tuple[int, str, str, Optional[str], bool]]:
+    ) -> list[tuple[int, str, str, Optional[str], bool, datetime]]:
         """Meetings stuck in ANY non-terminal status whose row has gone quiet past its grace window —
         a bot that exited (or vanished) without ever sending its terminal lifecycle callback leaves the
         row hung here forever. ``updated_at`` is bumped on every status change AND on segment/heartbeat
@@ -710,8 +712,9 @@ class SqlAlchemyMeetingRepo:
         reaped). A meeting waiting for its next bot (§6.9 F-K2, ``data.bot_retry``) is left out:
         the auto-join tick's retry driver owns it, and past its deadline the sweep ends it
         (``reconcile.end_overdue_retries``). One page of ``limit`` meetings by id after ``after``
-        (§6.9 F-I). Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested), …]`` with
-        the LATEST session_uid per meeting (mirrors ``list_stale_stopping``)."""
+        (§6.9 F-I). Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested,
+        updated_at), …]`` with the LATEST session_uid per meeting and ``updated_at`` in UTC
+        (mirrors ``list_stale_stopping``)."""
         from sqlalchemy import func
 
         from ..sessions.models import Meeting
@@ -730,17 +733,17 @@ class SqlAlchemyMeetingRepo:
             },
             after=after,
             limit=limit,
-            shape=lambda mid, status, sid, bcid, data: (
+            shape=lambda mid, status, sid, bcid, data, upd: (
                 mid, status, sid, bcid,
-                bool(isinstance(data, dict) and data.get("stop_requested")),
+                bool(isinstance(data, dict) and data.get("stop_requested")), upd,
             ),
         )
 
     async def _stale(self, where, grace_by_status, *, after, limit, shape) -> list:
         """The reconcile listings' one read: the meetings matching ``where`` whose ``updated_at``
         is at least their status's grace old and whose newest session has a uid, by id, one page
-        of ``limit`` after ``after``, each ``shape(id, status, newest session, container, data)``.
-        """
+        of ``limit`` after ``after``, each ``shape(id, status, newest session, container, data,
+        updated_at)`` (``updated_at`` in UTC)."""
         from datetime import datetime, timedelta, timezone
 
         from sqlalchemy import and_, or_, select
@@ -765,7 +768,10 @@ class SqlAlchemyMeetingRepo:
             )
         )
         stmt = (
-            select(Meeting.id, Meeting.status, newest, Meeting.bot_container_id, Meeting.data)
+            select(
+                Meeting.id, Meeting.status, newest, Meeting.bot_container_id, Meeting.data,
+                Meeting.updated_at,
+            )
             .where(*where, quiet, newest.isnot(None), newest != "")
             .order_by(Meeting.id)
         )
@@ -775,7 +781,10 @@ class SqlAlchemyMeetingRepo:
             stmt = stmt.limit(limit)
         async with self._session_factory() as db:
             rows = (await db.execute(stmt)).all()
-        return [shape(*row) for row in rows]
+        return [
+            shape(mid, status, sid, bcid, data, upd.replace(tzinfo=upd.tzinfo or timezone.utc))
+            for mid, status, sid, bcid, data, upd in rows
+        ]
 
     async def create_meeting(self, *, user_id, platform, native_meeting_id, data) -> dict:
         from ..intake.adapters import take_link_lock

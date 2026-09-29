@@ -753,11 +753,11 @@ class InMemoryMeetingRepo:
             if (now - u).total_seconds() < grace:
                 continue
             stop_req = bool(row.get("data", {}).get("stop_requested"))
-            out[mid] = (row["status"], s["session_uid"], row.get("bot_container_id"), stop_req)
+            out[mid] = (
+                row["status"], s["session_uid"], row.get("bot_container_id"), stop_req, u,
+            )
         page = [
-            (mid, st, sid, bcid, sr)
-            for mid, (st, sid, bcid, sr) in sorted(out.items())
-            if after is None or mid > after
+            (mid, *rest) for mid, rest in sorted(out.items()) if after is None or mid > after
         ]
         return page if limit is None else page[:limit]
 

@@ -1428,7 +1428,8 @@ class _PagedStopping:
 
 
 class _DeleteDown:
-    """A runtime whose every delete gets a 5xx; its workloads report ``state``."""
+    """A runtime that refuses every delete (a 409: a definite answer); its workloads report
+    ``state``."""
 
     def __init__(self, state: str = "running") -> None:
         self.state = state
@@ -1441,7 +1442,36 @@ class _DeleteDown:
         from meeting_api.bot_spawn.ports import SpawnFailed
 
         self.deleted.append(workload_id)
-        raise SpawnFailed("runtime kernel delete_workload returned 503", refused=False)
+        raise SpawnFailed("runtime kernel delete_workload returned 409", refused=True)
+
+
+class _Outage:
+    """A runtime that doesn't answer while ``down`` (connection refused on the probe, a 503 on
+    the delete), then answers: every workload reports ``state`` and its delete is confirmed.
+    """
+
+    def __init__(self, state: str = "running") -> None:
+        self.down = True
+        self.state = state
+        self.deleted: list[str] = []
+
+    async def get_workload(self, workload_id):
+        if self.down:
+            raise OSError("connection refused")
+        return {"workloadId": workload_id, "state": self.state}
+
+    async def delete_workload(self, workload_id):
+        from meeting_api.bot_spawn.ports import SpawnFailed
+
+        if self.down:
+            raise SpawnFailed(
+                "runtime kernel delete_workload returned 503", refused=False
+            )
+        self.deleted.append(workload_id)
+
+
+def _minutes_ago(minutes: float) -> datetime:
+    return datetime.now(UTC) - timedelta(minutes=minutes)
 
 
 async def _ok(body):
@@ -1468,9 +1498,9 @@ async def test_the_stale_stopping_sweep_reads_its_rows_in_pages(monkeypatch):
 
 
 async def test_a_stopping_row_whose_delete_keeps_failing_is_given_up_and_counted():
-    """I2: a stuck ``stopping`` row whose delete keeps failing is one of the sweep's bounded
-    items: counted each pass, given up after ``SWEEP_MAX_ITEM_FAILURES``, skipped after.
-    """
+    """I2: a stuck ``stopping`` row whose delete the runtime keeps refusing is one of the
+    sweep's bounded items: counted each pass, given up after ``SWEEP_MAX_ITEM_FAILURES``,
+    skipped after."""
     from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
 
     repo = _PagedStopping([(9, "sess-9", "mtg-9-x")])
@@ -1516,7 +1546,7 @@ async def test_a_stopping_row_the_runtime_404s_is_left_to_the_general_escalation
     assert failures.counts == {}
 
 
-def _stale_repo(n: int = 1):
+def _stale_repo(n: int = 1, *, statuses=("stopping",), quiet_min: float = 10):
     from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
 
     repo = InMemoryMeetingRepo()
@@ -1527,10 +1557,10 @@ def _stale_repo(n: int = 1):
             "platform": "google_meet",
             "native_meeting_id": f"kxo-misr-av{i}",
             "platform_specific_id": f"kxo-misr-av{i}",
-            "status": "stopping",
+            "status": statuses[(i - 1) % len(statuses)],
             "bot_container_id": f"mtg-{i}-w",
             "data": {},
-            "updated_at": "2026-09-01T09:00:00Z",
+            "updated_at": _minutes_ago(quiet_min).isoformat(),
         }
         repo.sessions.append({"meeting_id": i, "session_uid": f"sess-{i}"})
     return repo
@@ -1596,8 +1626,8 @@ async def test_the_general_reconcile_sweep_prunes_old_failure_records(monkeypatc
 
 
 async def test_a_stale_row_whose_delete_keeps_failing_is_given_up_and_counted():
-    """I2: the general sweep's row whose delete keeps failing is counted each pass and given
-    up after ``SWEEP_MAX_ITEM_FAILURES``, under its own sweep name."""
+    """I2: the general sweep's row whose delete the runtime keeps refusing is counted each pass
+    and given up after ``SWEEP_MAX_ITEM_FAILURES``, under its own sweep name."""
     from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
 
     repo = _stale_repo()
@@ -1618,6 +1648,116 @@ async def test_a_stale_row_whose_delete_keeps_failing_is_given_up_and_counted():
     assert failures.gave_up == {("stale-nonterminal", "1")}
     assert _reconcile_items("stale-nonterminal", "given_up") == given_up + 1
     assert repo._meetings[1]["status"] == "stopping"
+
+
+# ── a runtime outage is never a reconcile row's failure (I1's rule, §6.9 F-I) ──────────────
+
+
+async def test_a_runtime_outage_never_gives_a_stale_stopping_row_up():
+    """Two minutes without the runtime (eight passes at 15 s) count nothing against the row;
+    each pass is logged and counted ``runtime_unreachable``, and the row completes once the
+    runtime answers."""
+    from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
+
+    repo = _PagedStopping([(9, "sess-9", "mtg-9-x", _minutes_ago(2))])
+    runtime = _Outage()
+    failures = InMemoryItemFailures(max_failures=5)
+    before = _reconcile_items("stale-stopping", "runtime_unreachable")
+    for _ in range(8):
+        await reconcile_stale_stopping_sweep(
+            repo, runtime, _ok, stop_grace=45, log=_Log(), item_failures=failures
+        )
+    assert failures.counts == {} and failures.gave_up == set()
+    assert _reconcile_items("stale-stopping", "runtime_unreachable") == before + 8
+    runtime.down = False
+    assert (
+        await reconcile_stale_stopping_sweep(
+            repo, runtime, _ok, stop_grace=45, log=_Log(), item_failures=failures
+        )
+        == 1
+    )
+    assert runtime.deleted == ["mtg-9-x"]
+
+
+async def test_a_runtime_outage_never_gives_a_stale_general_row_up():
+    """The general sweep, both ways a runtime can't be reached: the liveness probe of a
+    ``joining`` row and the delete of a ``stopping`` row. After the outage both reconcile.
+    """
+    from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
+
+    repo = _stale_repo(2, statuses=("joining", "stopping"), quiet_min=12)
+    runtime = _Outage(state="destroyed")
+    failures = InMemoryItemFailures(max_failures=5)
+    posted: list[dict] = []
+
+    async def post(body):
+        posted.append(body)
+        return 200
+
+    before = _reconcile_items("stale-nonterminal", "runtime_unreachable")
+    for _ in range(8):
+        await reconcile_stale_nonterminal_sweep(
+            repo,
+            runtime,
+            post,
+            stop_grace=45,
+            active_grace=300,
+            preactive_grace=300,
+            log=_Log(),
+            item_failures=failures,
+        )
+    assert failures.counts == {} and posted == []
+    assert _reconcile_items("stale-nonterminal", "runtime_unreachable") == before + 16
+    runtime.down = False
+    await reconcile_stale_nonterminal_sweep(
+        repo,
+        runtime,
+        post,
+        stop_grace=45,
+        active_grace=300,
+        preactive_grace=300,
+        log=_Log(),
+        item_failures=failures,
+    )
+    assert sorted((b["connection_id"], b["status"]) for b in posted) == [
+        ("sess-1", "failed"),
+        ("sess-2", "completed"),
+    ]
+
+
+@pytest.mark.parametrize("loop", ["stale-stopping", "stale-nonterminal"])
+async def test_a_stale_row_the_runtime_never_answers_about_is_given_up_by_age(
+    monkeypatch, loop
+):
+    """The one bound on a runtime that doesn't answer is the row's age: quiet longer than
+    ``UNPROVEN_TEARDOWN_MAX_AGE_S``, it is given up at once."""
+    from meeting_api.lifecycle.reconcile import (
+        reconcile_stale_nonterminal_sweep,
+        reconcile_stale_stopping_sweep,
+    )
+
+    monkeypatch.setenv("UNPROVEN_TEARDOWN_MAX_AGE_S", "3600")
+    failures = InMemoryItemFailures(max_failures=5)
+    given_up = _reconcile_items(loop, "given_up")
+    if loop == "stale-stopping":
+        repo = _PagedStopping([(9, "sess-9", "mtg-9-x", _minutes_ago(61))])
+        await reconcile_stale_stopping_sweep(
+            repo, _Outage(), _ok, stop_grace=45, log=_Log(), item_failures=failures
+        )
+        item = "9"
+    else:
+        await reconcile_stale_nonterminal_sweep(
+            _stale_repo(quiet_min=61),
+            _Outage(),
+            _ok,
+            stop_grace=45,
+            active_grace=300,
+            log=_Log(),
+            item_failures=failures,
+        )
+        item = "1"
+    assert failures.gave_up == {(loop, item)}
+    assert _reconcile_items(loop, "given_up") == given_up + 1
 
 
 async def test_the_sweep_reads_the_waiting_meetings_in_pages(monkeypatch):
