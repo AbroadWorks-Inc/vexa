@@ -780,6 +780,32 @@ async def test_pg_the_link_stays_held_while_the_meeting_waits(pg):
     )
 
 
+async def test_pg_the_next_meeting_on_the_link_waits_for_the_new_bot(pg):
+    mid, session = await pg.sent(status="active", end_in=timedelta(minutes=3))
+    workload = (await pg.row(mid))["bot_container_id"]
+    await _fail(pg, session, "completed", "left_alone", "runtime_destroy")
+    now = _now()
+    after = await pg.service().put_entry(
+        USER,
+        entry_body(
+            "google:cal-2",
+            meeting_url=GMEET,
+            start=_iso(now + timedelta(minutes=4)),
+            end=_iso(now + timedelta(minutes=30)),
+        ),
+    )
+    nxt = await pg.id_of(after["meeting"]["id"])
+    assert nxt != mid
+    runtime = _gone(workload)
+    counters = await pg.tick(runtime, at=_later(130))
+    assert (counters["skipped_live"], counters["spawned"]) == (1, 1)
+    assert (await pg.row(nxt))["status"] == "scheduled"
+    assert "meeting.waiting_for_room" in await pg.types(nxt)
+    assert len(runtime.specs) == 1 and (await pg.row(mid))["bot_container_id"] == (
+        runtime.specs[0]["workloadId"]
+    )
+
+
 async def test_pg_the_exporters_meeting_completed_fires_once_and_sequence_grows(pg):
     from meeting_api import create_app
     from meeting_api.lifecycle.machine import TransitionSource
