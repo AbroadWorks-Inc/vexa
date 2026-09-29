@@ -87,8 +87,10 @@ __all__ = [
     "PostgresIntakeStore",
     "PostgresIntakeTx",
     "link_rows",
+    "load_views",
     "lock_meeting_on_its_link",
     "take_link_lock",
+    "violated_constraint",
 ]
 
 
@@ -178,10 +180,15 @@ async def link_rows(db: AsyncSession, user_id: int, room: Room) -> list[LinkRow]
     ]
 
 
-def _constraint(exc: Any) -> str:
-    """The name of the constraint a write violated, never the values it carried."""
-    cause = getattr(getattr(exc, "orig", None), "__cause__", None)
-    return str(getattr(cause, "constraint_name", None) or "a unique or foreign key")
+def violated_constraint(error: Any) -> Optional[str]:
+    """The name of the constraint an ``IntegrityError`` names, never the values it carried:
+    asyncpg's error (the DBAPI error's cause) carries ``constraint_name``."""
+    orig = getattr(error, "orig", None)
+    for candidate in (orig, getattr(orig, "__cause__", None)):
+        name = getattr(candidate, "constraint_name", None)
+        if name:
+            return str(name)
+    return None
 
 
 def _plan_data(plan: Plan) -> dict[str, Any]:
@@ -267,7 +274,9 @@ class PostgresIntakeStore:
                     await take_link_lock(db, user_id, room)
                 yield PostgresIntakeTx(db)
         except IntegrityError as exc:
-            raise ConstraintRace(_constraint(exc)) from exc
+            raise ConstraintRace(
+                violated_constraint(exc) or "a unique or foreign key"
+            ) from exc
 
     async def overdue_meetings(
         self, now: datetime, *, after: Optional[int], limit: int

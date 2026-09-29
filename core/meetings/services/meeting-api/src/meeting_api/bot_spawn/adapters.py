@@ -61,17 +61,6 @@ def _iso_utc(dt) -> Optional[str]:
 LIVE_LINK_INDEX = "uq_meeting_live_user_platform_native"
 
 
-def _violated_constraint(error) -> Optional[str]:
-    """The constraint an ``IntegrityError`` names: asyncpg's error (the DBAPI error's cause)
-    carries ``constraint_name``."""
-    orig = getattr(error, "orig", None)
-    for candidate in (orig, getattr(orig, "__cause__", None)):
-        name = getattr(candidate, "constraint_name", None)
-        if name:
-            return name
-    return None
-
-
 def _row_to_dict(m) -> dict:
     return {
         "id": m.id,
@@ -879,6 +868,7 @@ class SqlAlchemyMeetingRepo:
         ``bot_joins_at`` reads it). Commits the caller's transaction."""
         from sqlalchemy.exc import IntegrityError
 
+        from ..intake.adapters import violated_constraint
         from ..intake.status import StatusConflict, write_status
 
         # The row is locked and the live-row dedup has passed, so a status other than `scheduled`
@@ -897,7 +887,7 @@ class SqlAlchemyMeetingRepo:
         except IntegrityError as e:
             # The live-row index backstop: a writer outside these locks made another row live. Any
             # other constraint is a fault, not a duplicate, and propagates.
-            if _violated_constraint(e) != LIVE_LINK_INDEX:
+            if violated_constraint(e) != LIVE_LINK_INDEX:
                 raise
             await db.rollback()
             raise DuplicateMeeting(f"An active meeting already exists for {room}") from e
