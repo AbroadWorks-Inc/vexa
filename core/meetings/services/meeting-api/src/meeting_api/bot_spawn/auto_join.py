@@ -655,11 +655,12 @@ async def auto_join_tick(
         counters["due"] += len(due)
         return due
 
+    # Each read keeps its own give-up record: a meeting one gives up the other still works.
     await run_pages(
         item_failures, AUTO_JOIN,
         lambda after: repo.list_due_meetings(now, lead_s, after=after, limit=limit),
         limit=limit, after_of=lambda row: (row["event_time"], row["id"]),
-        item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row["user_id"],
+        item_id_of=lambda row: f"due:{row['id']}", user_id_of=lambda row: row["user_id"],
         action=_one, select=_due,
     )
     if hasattr(repo, "list_retry_meetings"):
@@ -667,7 +668,7 @@ async def auto_join_tick(
             item_failures, AUTO_JOIN,
             lambda after: repo.list_retry_meetings(after=after, limit=limit),
             limit=limit, after_of=lambda row: row["id"],
-            item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row["user_id"],
+            item_id_of=lambda row: f"retry:{row['id']}", user_id_of=lambda row: row["user_id"],
             action=_retry_one,
         )
     return counters

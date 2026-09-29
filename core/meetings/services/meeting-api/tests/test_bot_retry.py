@@ -1277,6 +1277,96 @@ async def test_a_runtime_5xx_on_a_delete_is_not_a_refusal(code, refused):
     assert caught.value.refused is refused
 
 
+# ── every read has its own give-up record (§6.9 F-I) ─────────────────────────────────────
+
+
+class _BothReads:
+    """One meeting listed by the backstop's two reads: waiting past its deadline, then a spawn
+    that died before its session write. Ending it as a waiting meeting keeps failing."""
+
+    def __init__(self) -> None:
+        self.ended: list[int] = []
+
+    async def list_retry_meetings(self, *, after=None, limit=None):
+        mark = {"due_at": "2026-01-01T00:00:00Z", "workload": "w", "proven_gone": True}
+        return (
+            [] if after else [{"id": 5, "user_id": USER, "data": {"bot_retry": mark}}]
+        )
+
+    async def end_retry(self, *, meeting_id, change_reason=None, message=None):
+        raise RuntimeError("the database flapped")
+
+    async def list_unfinished_spawns(self, *, after=None, limit=None):
+        plan = {"session": "sess-new", "at": "2026-01-01T00:00:00Z"}
+        row = {"id": 5, "user_id": USER, "data": {"spawn_session": plan}}
+        return [] if after else [{**row, "written": False, "newest_session": None}]
+
+    async def end_unfinished_spawn(self, *, meeting_id, untracked_grace):
+        self.ended.append(meeting_id)
+        return "evt-1"
+
+
+async def test_a_meeting_given_up_by_one_backstop_read_is_still_ended_by_the_other():
+    """M2: the waiting read gives meeting 5 up; the unfinished-spawn read still ends it."""
+    from meeting_api.lifecycle.reconcile import end_overdue_retries
+
+    repo = _BothReads()
+    failures = InMemoryItemFailures(max_failures=1)
+    ended = await end_overdue_retries(
+        repo, untracked_grace=600, log=_Log(), failures=failures
+    )
+    assert failures.gave_up == {("retry-overdue", "waiting:5")}
+    assert repo.ended == [5] and ended == 1
+
+
+async def test_a_meeting_given_up_by_the_due_read_is_still_driven_by_the_retry_read():
+    """M2: the auto-join tick's due read gives meeting 5 up; its retry read still drives it."""
+    from intake_builders import send_clock, sweep_intake
+    from meeting_api.bot_spawn.auto_join import auto_join_tick
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+
+    repo = _waiting_repo(proven=False)
+    scheduled = {"title": "standup", "scheduled_at": NOW.isoformat()}
+    due_row = {
+        **repo._meetings[5],
+        "status": "scheduled",
+        "has_entries": False,
+        "data": scheduled,
+    }
+
+    async def due(now, lead_s, *, after=None, limit=None):
+        return [] if after else [{**due_row, "event_time": NOW}]
+
+    proofs: list[int] = []
+
+    async def prove_retry_gone(*, meeting_id, workload):
+        proofs.append(meeting_id)
+        return False
+
+    async def merge(meeting_id, patch):
+        raise RuntimeError("poison row")  # the due read's first write
+
+    repo.list_due_meetings = due
+    repo.prove_retry_gone = prove_retry_gone
+    repo.merge_meeting_data = merge
+    failures = InMemoryItemFailures(max_failures=1)
+    with send_clock(NOW):
+        await auto_join_tick(
+            repo,
+            FakeRuntimeClient(workloads={"mtg-5-old": {"state": "destroyed"}}),
+            **sweep_intake(
+                transcribe_gate=lambda: None,
+                now=NOW + timedelta(minutes=5),
+                token_secret="s",
+                redis_url="redis://r",
+                allow_uncapped=True,
+                item_failures=failures,
+            ),
+        )
+    assert failures.gave_up == {("auto-join", "due:5")}
+    assert proofs == [5]
+
+
 # ── the upstream reconcile loops: paged, each row bounded (§6.9 F-I) ──────────────────────
 
 
@@ -1517,14 +1607,14 @@ async def test_a_waiting_meeting_the_sweep_cannot_end_is_given_up():
 
     repo.end_retry = broken
     failures = InMemoryItemFailures(max_failures=2)
-    await failures.failed("auto-join", "5", RuntimeError("the driver gave it up"))
-    await failures.failed("auto-join", "5", RuntimeError("the driver gave it up"))
+    await failures.failed("auto-join", "retry:5", RuntimeError("the driver gave it up"))
+    await failures.failed("auto-join", "retry:5", RuntimeError("the driver gave it up"))
     for _ in range(3):
         await end_overdue_retries(
             repo, untracked_grace=600, log=_Log(), failures=failures
         )
     assert tries == [5, 5]
-    assert await failures.given_up(OVERDUE_RETRY_SWEEP, ["5"]) == {"5"}
+    assert await failures.given_up(OVERDUE_RETRY_SWEEP, ["waiting:5"]) == {"waiting:5"}
 
 
 # ── a session with no recorded workload: the sweeps reach the workload it was sent as ─────────

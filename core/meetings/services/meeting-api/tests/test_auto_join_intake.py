@@ -250,7 +250,7 @@ async def test_a_poison_row_never_blocks_the_rest_and_is_given_up():
     assert counters["spawned"] == 2
     assert {repo._meetings[m]["status"] for m in (1, 3)} == {"requested"}
     await _paged_tick(repo, runtime, item_failures=failures)
-    assert await failures.given_up("auto-join", ["2"]) == {"2"}
+    assert await failures.given_up("auto-join", ["due:2"]) == {"due:2"}
     await _paged_tick(repo, runtime, item_failures=failures)
     assert tried == [2, 2] and repo._meetings[2]["status"] == "scheduled"
 

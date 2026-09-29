@@ -708,7 +708,9 @@ async def end_overdue_retries(
     its claim, insert or reopen and its session write (``intake.retry.unfinished_spawn``: the row
     names the planned session, and no session row has it) ends the same way past that time plus
     ``untracked_grace``, its planned workload recorded for the teardown sweep
-    (``repo.end_unfinished_spawn``). Each one ended gets the meeting-level finish
+    (``repo.end_unfinished_spawn``). The two reads keep their own give-up records (item ids
+    ``waiting:<id>`` and ``unfinished-spawn:<id>``), so a meeting one gives up the other still
+    ends. Each one ended gets the meeting-level finish
     ``finish_meeting(meeting_id)`` (the app's). Best-effort: never raises. Returns how many
     ended."""
     if not hasattr(repo, "list_retry_meetings") or not hasattr(repo, "end_retry"):
@@ -764,7 +766,8 @@ async def end_overdue_retries(
             failures, OVERDUE_RETRY_SWEEP,
             lambda after: repo.list_retry_meetings(after=after, limit=page_size),
             limit=page_size, after_of=lambda row: row["id"],
-            item_id_of=lambda row: str(row["id"]), user_id_of=lambda row: row.get("user_id"),
+            item_id_of=lambda row: f"waiting:{row['id']}",
+            user_id_of=lambda row: row.get("user_id"),
             action=end, select=lambda rows: [row for row in rows if ending(row)],
         )
         if hasattr(repo, "list_unfinished_spawns"):
@@ -772,7 +775,7 @@ async def end_overdue_retries(
                 failures, OVERDUE_RETRY_SWEEP,
                 lambda after: repo.list_unfinished_spawns(after=after, limit=page_size),
                 limit=page_size, after_of=lambda row: row["id"],
-                item_id_of=lambda row: str(row["id"]),
+                item_id_of=lambda row: f"unfinished-spawn:{row['id']}",
                 user_id_of=lambda row: row.get("user_id"),
                 action=end_spawn, select=lambda rows: [row for row in rows if unfinished(row)],
             )
