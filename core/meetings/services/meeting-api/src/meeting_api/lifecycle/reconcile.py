@@ -535,9 +535,10 @@ async def retry_unproven_teardowns(
     failures: "ItemFailures",
     batch_size: Optional[int] = None,
 ) -> int:
-    """§6.9 F-K2 with F-I's bound: every finished meeting whose unproven workload's delete wasn't
-    confirmed (``data.unproven_teardown``, written by ``bot_spawn.request_bot``) is tried again,
-    a page of ``SWEEP_BATCH_SIZE`` at a time by meeting id (``sweeps.item_failures.run_pages``),
+    """§6.9 F-K2 with F-I's bound: every workload whose delete wasn't confirmed when its meeting
+    ended or freed its link (``data.unproven_teardown``, ``bot_spawn.ports.unproven_teardown``) is
+    tried again, whatever the meeting's status now (a continued meeting keeps its list), a page
+    of ``SWEEP_BATCH_SIZE`` meetings at a time by meeting id (``sweeps.item_failures.run_pages``),
     each through ``run_item`` (item ``<meeting id>:<workload>``). The reap gate's own
     evidence clears it: the runtime reports the workload terminal, a delete it confirms, or a 404
     that has lasted past ``untracked_grace`` (``MEETING_UNTRACKED_GRACE_SEC``) since it was
@@ -550,7 +551,7 @@ async def retry_unproven_teardowns(
         return 0
     from datetime import timezone
 
-    from ..bot_spawn.ports import UNPROVEN_TEARDOWN
+    from ..bot_spawn.ports import teardown_done
     from ..intake.rules import as_utc
     from ..sweeps.item_failures import run_pages, sweep_batch_size
 
@@ -572,7 +573,9 @@ async def retry_unproven_teardowns(
             return
         if verdict != "proven":
             raise UnprovenTeardownFailed(why)
-        await repo.merge_meeting_data(row["id"], {UNPROVEN_TEARDOWN: None})
+        await repo.merge_meeting_data(
+            row["id"], lambda data: teardown_done(data, row.get("workload"))
+        )
         cleared += 1
 
     try:

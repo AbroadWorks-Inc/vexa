@@ -343,21 +343,18 @@ class SqlAlchemyMeetingRepo:
             return _with_projection(_row_to_dict(m), await project_stored(db, m.id))
 
     async def list_unproven_teardowns(self, *, after=None, limit=None) -> list[dict]:
-        """The finished meetings whose unproven workload still waits for its delete
-        (``data.unproven_teardown``, §6.9 F-K2), by id, one page of ``limit`` after ``after``:
-        ``{id, user_id, workload, since}`` each. The reconcile sweep's read."""
+        """The meetings, whatever their status, holding workloads that still wait for their
+        delete (``data.unproven_teardown``, §6.9 F-K2), by id, one page of ``limit`` meetings
+        after ``after``: ``{id, user_id, workload, since}`` for each pending workload. The
+        reconcile sweep's read."""
         from sqlalchemy import select
 
-        from ..intake.status import FINISHED_STATUSES
         from ..sessions.models import Meeting
-        from .ports import UNPROVEN_TEARDOWN
+        from .ports import UNPROVEN_TEARDOWN, pending_teardowns
 
         stmt = (
             select(Meeting.id, Meeting.user_id, Meeting.data[UNPROVEN_TEARDOWN])
-            .where(
-                Meeting.status.in_(FINISHED_STATUSES),
-                Meeting.data[UNPROVEN_TEARDOWN].astext.isnot(None),
-            )
+            .where(Meeting.data[UNPROVEN_TEARDOWN].astext.isnot(None))
             .order_by(Meeting.id)
         )
         if after is not None:
@@ -367,10 +364,9 @@ class SqlAlchemyMeetingRepo:
         async with self._session_factory() as db:
             rows = (await db.execute(stmt)).all()
         return [
-            {"id": mid, "user_id": uid, "workload": (t or {}).get("workload"),
-             "since": (t or {}).get("since")}
-            for mid, uid, t in rows
-            if isinstance(t, dict)
+            {"id": mid, "user_id": uid, "workload": t.get("workload"), "since": t.get("since")}
+            for mid, uid, pending in rows
+            for t in pending_teardowns({UNPROVEN_TEARDOWN: pending})
         ]
 
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
@@ -983,9 +979,11 @@ class SqlAlchemyMeetingRepo:
             )).scalars().all()
             return [_row_to_dict(m) for m in rows]
 
-    async def merge_meeting_data(self, meeting_id, patch: dict) -> None:
+    async def merge_meeting_data(self, meeting_id, patch) -> None:
         """Merge ``patch`` into ``meeting.data`` (a ``None`` value REMOVES the key) — the sweep's
-        error/backoff stamping primitive. Row-locked; a missing row is a no-op."""
+        error/backoff stamping primitive. ``patch`` may be a function of the row's data read under
+        the lock (a read-modify-write, such as the pending-teardown list). Row-locked; a missing
+        row is a no-op."""
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
@@ -998,6 +996,8 @@ class SqlAlchemyMeetingRepo:
             if meeting is None:
                 return
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
+            if callable(patch):
+                patch = patch(dict(data))
             for k, v in patch.items():
                 if v is None:
                     data.pop(k, None)

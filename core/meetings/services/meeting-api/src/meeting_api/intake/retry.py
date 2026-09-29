@@ -299,7 +299,7 @@ async def end(
         "failure_reason": message or mark.get("message"),
     }
     if not mark.get("proven_gone") and mark.get("workload"):
-        patch.update(unproven_teardown(str(mark["workload"])))
+        patch.update(unproven_teardown(meeting.data, str(mark["workload"])))
     if reason is not None:
         patch["completion_reason"] = reason
     if mark.get("stage") is not None:

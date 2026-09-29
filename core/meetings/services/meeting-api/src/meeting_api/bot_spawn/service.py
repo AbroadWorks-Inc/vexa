@@ -821,7 +821,7 @@ async def request_bot(
         if verdict == "confirmed" or merge is None:
             return verdict
         try:
-            await merge(meeting_id, unproven_teardown(workload_id))
+            await merge(meeting_id, lambda data: unproven_teardown(data, workload_id))
         except Exception as record_err:  # noqa: BLE001 — logged above; never masks the spawn error
             log_event(
                 "bot_spawn_unproven_teardown_unrecorded", audience="system", level="error",

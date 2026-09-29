@@ -1453,7 +1453,7 @@ async def _ended_with_a_pending_teardown(pg: Pg) -> tuple[int, str]:
     workload = runtime.specs[0]["workloadId"]
     row = await pg.row(mid)
     assert row["status"] == "failed"
-    assert row["data"]["unproven_teardown"]["workload"] == workload
+    assert _pending(row) == [workload]
     return mid, workload
 
 
@@ -1548,7 +1548,7 @@ async def test_pg_a_404_inside_the_grace_is_not_cleared_and_after_it_is(pg):
         == 0
     )  # waiting out the grace is not a failure
     await pg.execute(
-        "UPDATE meetings SET data = jsonb_set(data, '{unproven_teardown,since}', "
+        "UPDATE meetings SET data = jsonb_set(data, '{unproven_teardown,0,since}', "
         "'\"2026-01-01T00:00:00Z\"') WHERE id = :m",
         m=mid,
     )
@@ -1571,7 +1571,7 @@ async def test_pg_a_post_spawn_failure_on_the_last_attempt_records_the_unproven_
     workload = runtime.specs[0]["workloadId"]
     row = await pg.row(mid)
     assert row["status"] == "failed"
-    assert row["data"]["unproven_teardown"]["workload"] == workload
+    assert _pending(row) == [workload]
 
 
 def _container_write_cancelled(pg: Pg):
@@ -1617,9 +1617,7 @@ async def test_pg_a_cancel_after_the_session_write_on_the_last_attempt_records_i
         )
     row = await pg.row(mid)
     assert row["status"] == "failed"
-    assert (
-        row["data"]["unproven_teardown"]["workload"] == runtime.specs[0]["workloadId"]
-    )
+    assert _pending(row) == [runtime.specs[0]["workloadId"]]
 
 
 async def _unproven_waiting(pg: Pg, **kw: Any) -> tuple[int, str]:
@@ -1634,6 +1632,63 @@ async def _unproven_waiting(pg: Pg, **kw: Any) -> tuple[int, str]:
     return mid, runtime.specs[0]["workloadId"]
 
 
+async def _stopped_unproven(pg: Pg) -> tuple[int, str]:
+    """A meeting stopped while waiting on an unproven workload: ``failed``, that workload
+    pending its delete."""
+    from meeting_api.intake.stop import IntakeStop
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    mid, workload = await _unproven_waiting(pg)
+    await IntakeStop(
+        pg.store, InMemoryCommandPublisher(), FakeRuntimeClient()
+    ).stop_live(USER, mid, outcome=None)
+    return mid, workload
+
+
+def _pending(row: dict) -> list[str]:
+    return [t["workload"] for t in row["data"].get("unproven_teardown") or []]
+
+
+async def test_pg_a_reopened_meeting_has_its_pending_teardown_deleted_while_live(pg):
+    from meeting_api.lifecycle.reconcile import retry_unproven_teardowns
+    from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
+    mid, workload = await _stopped_unproven(pg)
+    await pg.repo.reopen_meeting(meeting_id=mid)
+    assert (await pg.row(mid))["status"] == "requested"
+    runtime = FakeRuntimeClient(workloads={workload: {"state": "running"}})
+    await retry_unproven_teardowns(
+        pg.repo,
+        runtime,
+        untracked_grace=600,
+        log=_SilentLog(),
+        failures=InMemoryItemFailures(max_failures=5),
+    )
+    assert runtime.deleted == [workload]
+    row = await pg.row(mid)
+    assert row["status"] == "requested" and "unproven_teardown" not in row["data"]
+
+
+async def test_pg_a_second_pending_teardown_never_overwrites_the_first(pg):
+    from meeting_api.intake.stop import IntakeStop
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    mid, first = await _stopped_unproven(pg)
+    await pg.repo.reopen_meeting(meeting_id=mid)
+    await pg.execute(
+        "UPDATE meetings SET data = data || jsonb_build_object('bot_retry', "
+        "jsonb_build_object('reason', 'join_failure', 'workload', 'mtg-second', "
+        "'due_at', '2026-01-01T00:00:00Z', 'proven_gone', false)) WHERE id = :m",
+        m=mid,
+    )
+    await IntakeStop(
+        pg.store, InMemoryCommandPublisher(), FakeRuntimeClient()
+    ).stop_live(USER, mid, outcome=None)
+    row = await pg.row(mid)
+    assert row["status"] == "failed"
+    assert _pending(row) == [first, "mtg-second"]
+
+
 async def test_pg_a_stop_inside_the_backoff_records_the_unproven_teardown(pg):
     from meeting_api.intake.stop import IntakeStop
     from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
@@ -1644,7 +1699,7 @@ async def test_pg_a_stop_inside_the_backoff_records_the_unproven_teardown(pg):
     ).stop_live(USER, mid, outcome=None)
     row = await pg.row(mid)
     assert row["status"] == "failed"
-    assert row["data"]["unproven_teardown"]["workload"] == workload
+    assert _pending(row) == [workload]
 
 
 async def test_pg_the_planned_end_passing_while_unproven_records_the_teardown(pg):
@@ -1652,7 +1707,7 @@ async def test_pg_the_planned_end_passing_while_unproven_records_the_teardown(pg
     await pg.tick(_gone(), at=_later(91))
     row = await pg.row(mid)
     assert row["status"] == "failed"
-    assert row["data"]["unproven_teardown"]["workload"] == workload
+    assert _pending(row) == [workload]
 
 
 async def test_pg_a_waiting_meeting_proven_gone_ends_without_a_teardown(pg):
@@ -1681,7 +1736,7 @@ async def test_pg_a_raced_stop_whose_delete_fails_records_the_unproven_teardown(
     workload = runtime.specs[0]["workloadId"]
     row = await pg.row(mid)
     assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
-    assert row["data"]["unproven_teardown"]["workload"] == workload
+    assert _pending(row) == [workload]
 
 
 async def _lost_and_waiting(pg: Pg):

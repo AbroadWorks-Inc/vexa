@@ -294,6 +294,8 @@ class InMemoryMeetingRepo:
         m = self._meetings.get(meeting_id)
         if m is None:
             return
+        if callable(patch):
+            patch = patch(dict(m["data"]))
         for k, v in patch.items():
             if v is None:
                 m["data"].pop(k, None)
@@ -420,17 +422,20 @@ class InMemoryMeetingRepo:
         return dict(row)
 
     async def list_unproven_teardowns(self, *, after=None, limit=None) -> list:
-        """The real adapter's read of finished rows carrying ``data.unproven_teardown``."""
-        from .ports import UNPROVEN_TEARDOWN
+        """The real adapter's read of the rows carrying pending teardowns, any status: a page of
+        ``limit`` rows after ``after``, one item per pending workload."""
+        from .ports import pending_teardowns
 
-        rows = []
-        for mid, m in sorted(self._meetings.items()):
-            pending = (m.get("data") or {}).get(UNPROVEN_TEARDOWN)
-            if (m["status"] in _TERMINAL_STATUSES and isinstance(pending, dict)
-                    and (after is None or mid > after)):
-                rows.append({"id": mid, "user_id": m["user_id"],
-                             "workload": pending.get("workload"), "since": pending.get("since")})
-        return rows if limit is None else rows[:limit]
+        found = [
+            (mid, m) for mid, m in sorted(self._meetings.items())
+            if pending_teardowns(m.get("data")) and (after is None or mid > after)
+        ]
+        found = found if limit is None else found[:limit]
+        return [
+            {"id": mid, "user_id": m["user_id"], "workload": t.get("workload"),
+             "since": t.get("since")}
+            for mid, m in found for t in pending_teardowns(m.get("data"))
+        ]
 
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
         """The real adapter's ``retry.end`` on a waiting row (no outbox here): an event id when it
@@ -453,7 +458,7 @@ class InMemoryMeetingRepo:
         if not mark.get("proven_gone") and mark.get("workload"):
             from .ports import unproven_teardown
 
-            row["data"].update(unproven_teardown(str(mark["workload"])))
+            row["data"].update(unproven_teardown(row["data"], str(mark["workload"])))
         return f"evt_retry_end_{meeting_id}"
 
     async def list_retry_meetings(self, *, after=None, limit=None) -> list:

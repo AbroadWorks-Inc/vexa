@@ -1098,7 +1098,7 @@ async def test_a_pending_teardown_without_a_readable_since_is_bounded(since):
         if since is None
         else {"workload": "mtg-5-old", "since": since}
     )
-    repo._meetings[5]["data"]["unproven_teardown"] = pending
+    repo._meetings[5]["data"]["unproven_teardown"] = [pending]
     failures = InMemoryItemFailures(max_failures=2)
     runtime = FakeRuntimeClient(workloads={})  # 404
     for _ in range(3):

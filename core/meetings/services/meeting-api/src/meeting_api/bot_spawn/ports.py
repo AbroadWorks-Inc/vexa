@@ -401,18 +401,35 @@ class TranscriptionNotConfigured(Exception):
 
 
 
-#: ``meetings.data`` key of a finished meeting whose unproven workload's delete wasn't confirmed:
-#: ``{workload, since}``. The reconcile sweep retries it (§6.9 F-K2, F-I).
+#: ``meetings.data`` key: the workloads whose delete wasn't confirmed when the meeting ended or
+#: freed its link, each ``{workload, since}``, whatever the meeting's status now. The reconcile
+#: sweep retries each (§6.9 F-K2, F-I).
 UNPROVEN_TEARDOWN = "unproven_teardown"
 
 
-def unproven_teardown(workload: str, *, now: Optional[datetime] = None) -> dict:
+def pending_teardowns(data: Any) -> list[dict]:
+    """The workloads ``data`` holds pending their delete (``UNPROVEN_TEARDOWN``)."""
+    raw = data.get(UNPROVEN_TEARDOWN) if isinstance(data, dict) else None
+    return [t for t in raw if isinstance(t, dict)] if isinstance(raw, list) else []
+
+
+def unproven_teardown(data: Any, workload: str, *, now: Optional[datetime] = None) -> dict:
     """The one ``meetings.data`` patch every path writes when it ends a meeting, or frees its
-    link, while ``workload`` may still run: ``{unproven_teardown: {workload, since}}``. The
-    reconcile sweep deletes that workload, bounded (``reconcile.retry_unproven_teardowns``, §6.9
-    F-K2, F-I)."""
+    link, while ``workload`` may still run: ``data``'s pending list with ``{workload, since}``
+    added (a workload already on it keeps its ``since``; nothing on it is dropped). The reconcile
+    sweep deletes each, bounded (``reconcile.retry_unproven_teardowns``, §6.9 F-K2, F-I)."""
+    pending = pending_teardowns(data)
+    if any(t.get("workload") == workload for t in pending):
+        return {UNPROVEN_TEARDOWN: pending}
     at = now or datetime.now(timezone.utc)
-    return {UNPROVEN_TEARDOWN: {"workload": workload, "since": at.isoformat()}}
+    return {UNPROVEN_TEARDOWN: [*pending, {"workload": workload, "since": at.isoformat()}]}
+
+
+def teardown_done(data: Any, workload: Optional[str]) -> dict:
+    """The patch that takes ``workload`` off ``data``'s pending list (the key goes with the last
+    one)."""
+    rest = [t for t in pending_teardowns(data) if t.get("workload") != workload]
+    return {UNPROVEN_TEARDOWN: rest or None}
 
 
 def workload_id_for(meeting_id: Any, session_uid: str) -> str:
