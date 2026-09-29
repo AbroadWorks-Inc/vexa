@@ -323,6 +323,7 @@ async def auto_join_tick(
         ExactRowSpawn,
         spawn_failure,
     )
+    from ..intake.rules import FINISHED_STATUSES, is_overdue
     from ..intake.sweeps import _publish as publish_events
     from ..intake.sweeps import check_room
     from ..sweeps.item_failures import run_pages, sweep_batch_size
@@ -579,7 +580,7 @@ async def auto_join_tick(
         if mark is None or row.get("status") != "requested":
             return
         end = _instant(row.get("scheduled_end_at"))
-        if data.get("stop_requested") or (end is not None and now >= end):
+        if data.get("stop_requested") or is_overdue(end, now=now):
             await _end_waiting(row, stopped=bool(data.get("stop_requested")))
             return
         due = _parse_iso(mark.get("due_at"))
@@ -619,7 +620,7 @@ async def auto_join_tick(
             return
         counters["errors"] += 1
         current = await repo.get_meeting(row["id"])
-        if outcome.claimed and (current or {}).get("status") in ("completed", "failed"):
+        if outcome.claimed and (current or {}).get("status") in FINISHED_STATUSES:
             # This new bot failed after its claim and its spawn flow ended the meeting (the last
             # attempt, or the stop fence): it gets the meeting-level finish like every other end.
             # A meeting someone else ended first has had its finish.

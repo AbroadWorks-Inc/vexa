@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse, Response
 from . import bot_spawn as _bot_spawn
 from . import events as _flows_events
 from .intake import retry as _retry
+from .intake import rules as _rules
 from . import recordings as _recordings
 from .callback_auth import (
     INTERNAL_SECRET_HEADER,
@@ -960,7 +961,7 @@ def _mount_lifecycle(
         # side effect below (finalize, provenance, the system and flows edges, the copilot reap)
         # follows the row's persisted status; a refused write (no row) reaches none of them.
         persisted_status = meeting_row.get("status") if isinstance(meeting_row, dict) else None
-        row_finished = persisted_status in ("completed", "failed")
+        row_finished = persisted_status in _rules.FINISHED_STATUSES
         retry_pending = isinstance(meeting_row, dict) and (
             _retry.marker(meeting_row.get("data")) is not None
         )
@@ -971,7 +972,7 @@ def _mount_lifecycle(
         # fallback otherwise. It is additive alongside meeting.status_change, never instead of it.
         event_type = (
             "bot.retry" if retry_pending and rec.status is not None
-            and rec.status.value in ("completed", "failed")
+            and rec.status.value in _rules.FINISHED_STATUSES
             else "bot.failed" if persisted_status == "failed"
             and rec.status is not None and rec.status.value == "completed"
             else None
@@ -979,7 +980,7 @@ def _mount_lifecycle(
         terminal_advanced = (
             not change.no_op
             and rec.status is not None
-            and rec.status.value in ("completed", "failed")
+            and rec.status.value in _rules.FINISHED_STATUSES
             and isinstance(meeting_row, dict)
             and meeting_row.get("id") is not None
             and row_finished

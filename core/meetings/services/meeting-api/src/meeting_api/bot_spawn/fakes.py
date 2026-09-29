@@ -351,7 +351,7 @@ class InMemoryMeetingRepo:
         row = self._meetings.get(meeting_id)
         if row is None:
             return None
-        if row["status"] in ("completed", "failed") or row["data"].get("bot_retry"):
+        if row["status"] in _TERMINAL_STATUSES or row["data"].get("bot_retry"):
             return dict(row)
         row["status"] = "failed"
         row["data"].update(dict(data or {}))
