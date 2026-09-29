@@ -420,7 +420,8 @@ class InMemoryMeetingRepo:
         return dict(row)
 
     async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
-        """The real adapter's ``retry.end`` on a waiting row (no outbox here)."""
+        """The real adapter's ``retry.end`` on a waiting row (no outbox here): an event id when it
+        ended the meeting, ``None`` when the meeting wasn't waiting."""
         from ..intake import retry
 
         row = self._meetings.get(meeting_id)
@@ -436,7 +437,7 @@ class InMemoryMeetingRepo:
             row["data"]["completion_reason"] = mark["reason"]
         if mark.get("stage") is not None:
             row["data"]["failure_stage"] = mark["stage"]
-        return None
+        return f"evt_retry_end_{meeting_id}"
 
     async def list_retry_meetings(self, *, after=None, limit=None) -> list:
         """The real adapter's retry read: ``requested`` rows with ``data.bot_retry``, by id, each

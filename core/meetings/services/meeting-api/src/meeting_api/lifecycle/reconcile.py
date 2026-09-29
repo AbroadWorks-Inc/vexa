@@ -519,7 +519,8 @@ async def end_overdue_retries(
             continue
         code, message = retry.overdue(mark, limit)
         try:
-            await repo.end_retry(meeting_id=row["id"], change_reason=code, message=message)
+            if await repo.end_retry(meeting_id=row["id"], change_reason=code, message=message) is None:
+                continue  # the driver or a stop ended it between the listing and the lock
             ended += 1
             log.warning("nonterminal-reconcile: waiting meeting %s ended — %s", row["id"], message)
             if finish_meeting is not None:

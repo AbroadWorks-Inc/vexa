@@ -953,3 +953,42 @@ async def test_the_retired_session_of_a_claimed_meeting_writes_nothing():
         is None
     )
     assert repo._meetings[5]["status"] == "requested"
+
+
+async def test_the_sweep_finishes_only_a_meeting_its_end_actually_ended():
+    from meeting_api.lifecycle.reconcile import end_overdue_retries
+
+    finished: list[int] = []
+
+    async def finish(meeting_id: int, **kw) -> None:
+        finished.append(meeting_id)
+
+    def overdue_repo():
+        repo = _waiting_repo(proven=False)
+        late = datetime.now(UTC) - timedelta(seconds=601)
+        repo._meetings[5]["data"]["bot_retry"]["due_at"] = late.isoformat()
+        return repo
+
+    repo = overdue_repo()
+    assert (
+        await end_overdue_retries(
+            repo, untracked_grace=600, log=_Log(), finish_meeting=finish
+        )
+        == 1
+    )
+    assert finished == [5]
+
+    raced = overdue_repo()
+
+    async def already_ended(**kw):
+        return None  # the driver or a stop ended it between the listing and the lock
+
+    raced.end_retry = already_ended
+    finished.clear()
+    assert (
+        await end_overdue_retries(
+            raced, untracked_grace=600, log=_Log(), finish_meeting=finish
+        )
+        == 0
+    )
+    assert finished == []
