@@ -231,7 +231,7 @@ class ExactRowSpawn:
             code, message = spawn_failure(exc, user_id=user_id, meeting_id=meeting_id)
             if watch.claimed:
                 await self._end_not_sent(user_id, meeting_id, code, message)
-            return self._failed(user_id, meeting_id, code, message)
+            return self._failed(user_id, meeting_id, code, message, claimed=watch.claimed)
         return SpawnOutcome("sent")
 
     async def _spawn(
@@ -380,7 +380,9 @@ class ExactRowSpawn:
             )
 
     @staticmethod
-    def _failed(user_id: int, meeting_id: int, code: str, message: str) -> SpawnOutcome:
+    def _failed(
+        user_id: int, meeting_id: int, code: str, message: str, *, claimed: bool = False
+    ) -> SpawnOutcome:
         log_event(
             "spawn_exact_failed",
             audience="user",
@@ -390,4 +392,4 @@ class ExactRowSpawn:
             meeting_id=str(meeting_id),
             fields={"code": code, "message": message},
         )
-        return SpawnOutcome("failed", code, message)
+        return SpawnOutcome("failed", code, message, claimed=claimed)

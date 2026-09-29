@@ -616,10 +616,16 @@ async def auto_join_tick(
             return
         counters["errors"] += 1
         current = await repo.get_meeting(row["id"])
-        if (current or {}).get("status") in ("completed", "failed"):
-            # The new bot failed after its claim on the meeting's last attempt: the spawn flow
-            # ended the meeting; it gets the meeting-level finish like every other end.
-            await _finish(row["id"], stopped=False)
+        if outcome.claimed and (current or {}).get("status") in ("completed", "failed"):
+            # This new bot failed after its claim and its spawn flow ended the meeting (the last
+            # attempt, or the stop fence): it gets the meeting-level finish like every other end.
+            # A meeting someone else ended first has had its finish.
+            ended = (current or {}).get("data") or {}
+            await _finish(
+                row["id"],
+                stopped=bool(ended.get("stop_requested"))
+                or ended.get("completion_reason") == "stopped",
+            )
             return
         still = retry.marker((current or {}).get("data"))
         if still is not None and still.get("at") == mark.get("at"):

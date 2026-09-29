@@ -183,12 +183,13 @@ class Pg:
         untracked_grace: float = 600.0,
         finish_meeting: Any = None,
         fetch_bot_context: Any = _ctx,
+        repo: Any = None,
     ) -> dict:
         """One auto-join tick at ``at``: the due rows and the meetings waiting for a new bot."""
         from meeting_api.bot_spawn.auto_join import auto_join_tick
 
         return await auto_join_tick(
-            self.repo,
+            repo or self.repo,
             runtime,
             store=self.store,
             intake=self.service(runtime),
@@ -1636,3 +1637,71 @@ async def test_pg_a_raced_stop_whose_delete_fails_records_the_unproven_teardown(
     row = await pg.row(mid)
     assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
     assert row["data"]["unproven_teardown"]["workload"] == workload
+
+
+async def _lost_and_waiting(pg: Pg):
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    mid, session = await pg.sent(status="active")
+    app, sink, streams, finalized = await _finishing_app(pg)
+    await app.state.apply_lifecycle_event(
+        {
+            "connection_id": session,
+            "status": "completed",
+            "completion_reason": "left_alone",
+        },
+        transition_source=TransitionSource.RUNTIME_DESTROY,
+        force_terminal_on_destroy=True,
+    )
+    return mid, app, sink
+
+
+async def test_pg_the_driver_finishes_only_a_meeting_its_own_spawn_ended(pg):
+    """A stop ends the waiting meeting between the driver's read and its claim: the stop's own
+    finish is the meeting's, and the driver adds none."""
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    mid, app, sink = await _lost_and_waiting(pg)
+
+    class StoppedFirst(SqlAlchemyMeetingRepo):
+        async def create_meeting_guarded(self, **kw):
+            await self.end_retry(
+                meeting_id=kw["claim_meeting_id"], change_reason="stopped"
+            )
+            return await super().create_meeting_guarded(**kw)
+
+    await pg.tick(
+        FakeRuntimeClient(),
+        at=_later(),
+        finish_meeting=app.state.finish_meeting,
+        repo=StoppedFirst(pg.session_factory),
+    )
+    assert (await pg.row(mid))["status"] == "failed"
+    assert sink.events == []
+
+
+async def test_pg_the_driver_finishes_a_stop_its_spawn_hit_as_a_user_stop(pg):
+    from meeting_api.bot_spawn.adapters import SqlAlchemyMeetingRepo
+
+    mid, app, sink = await _lost_and_waiting(pg)
+    await pg.execute(
+        "UPDATE meeting_aw_state SET send_attempts = 2 WHERE meeting_id = :m", m=mid
+    )
+
+    class StopAfterClaim(SqlAlchemyMeetingRepo):
+        async def create_meeting_guarded(self, **kw):
+            row = await super().create_meeting_guarded(**kw)
+            await self.merge_meeting_data(row["id"], {"stop_requested": True})
+            return row
+
+    await pg.tick(
+        FakeRuntimeClient(),
+        at=_later(),
+        finish_meeting=app.state.finish_meeting,
+        repo=StopAfterClaim(pg.session_factory),
+    )
+    row = await pg.row(mid)
+    assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
+    assert sink.events == ["bot.failed"]
+    typed = app.state.typed_webhooks[-1]
+    assert typed["data"]["status_change"]["transition_source"] == "user_stop"

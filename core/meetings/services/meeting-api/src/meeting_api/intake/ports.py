@@ -366,11 +366,14 @@ class IntakeStore(Protocol):
 class SpawnOutcome:
     """The spawn path's answer for one exact row (§1.5): ``code`` and ``message`` are set on
     ``failed`` (a §1.13 typed code and its exact message). ``not_due`` answers only the scheduler,
-    whose claim re-checks its due rule under the lock; nothing was claimed."""
+    whose claim re-checks its due rule under the lock; nothing was claimed. ``claimed`` says a
+    ``failed`` spawn had claimed the row first, so the spawn flow's own ending is the row's
+    (§6.9 F-K2); it is not part of the answer's value."""
 
     result: Literal["sent", "already_live", "not_due", "failed"]
     code: Optional[str] = None
     message: Optional[str] = None
+    claimed: bool = field(default=False, compare=False)
 
 
 class SpawnPort(Protocol):
