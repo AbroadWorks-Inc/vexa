@@ -9,19 +9,9 @@ DB source-of-truth) over the PRE-ALLOWED `meeting_api → admin_api` edge
 added to `pyproject.toml` (the same wiring `gateway/services/conformance` already uses to reach
 `meeting_api`'s `src`).
 
-**Local/dev environment note** (read before "why did this collect-error"): both `sqlalchemy` and
-`asyncpg` are genuinely absent from this package's own `pyproject.toml`/`uv.lock` — by design, the
-same way `meeting_api.sessions.models` is imported lazily only by the production `bot_spawn` /
-`recordings` / `collector.adapters` paths, never by the (fakes-only) offline test suite. The
-Dockerfile installs the real driver stack at image-build time (`sqlalchemy[asyncio]==2.0.36`,
-`asyncpg==0.30.0` — see `Dockerfile`'s "Production-only runtime deps" step), not via `uv sync`. To
-actually run this file (as opposed to letting it skip cleanly), install those exact pins into this
-package's local venv first — this does NOT touch `pyproject.toml`/`uv.lock`, so a subsequent clean
-`uv sync` reverts to the lean offline set:
-
-    uv pip install "sqlalchemy[asyncio]==2.0.36" "asyncpg==0.30.0"
-
-Then, with the throwaway Postgres running (constraints.md):
+`sqlalchemy[asyncio]==2.0.36` and `asyncpg==0.30.0` are pinned in this package's `pyproject.toml`
+(the same versions the image installs). This file still skips unless `MEETING_API_TEST_DATABASE_URL`
+is set. With the throwaway Postgres running (constraints.md):
 
     MEETING_API_TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@localhost:55432/postgres \\
       PYTHONDONTWRITEBYTECODE=1 uv run pytest -q tests/test_intake_pg_schema.py

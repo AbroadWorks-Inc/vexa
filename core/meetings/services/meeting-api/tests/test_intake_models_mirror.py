@@ -8,15 +8,11 @@ file takes that edge and compares the two live model modules directly — a stro
 frozen seal snapshot, and it fails immediately (not at the next `pnpm seal:schema`) if a future edit
 touches one mirror and not the other.
 
-Both modules import SQLAlchemy at class-definition time, which is NOT a declared `meeting-api`
-pyproject dependency (see `sessions/models.py`'s own docstring: the production runtime installs
-`sqlalchemy[asyncio]`/`asyncpg` via the Dockerfile, not `uv sync`, precisely so the lean offline
-test venv never needs it). This file is therefore only importable when `sqlalchemy` happens to be
-installed in the venv actually running pytest, and it becomes so for CI/local runs by installing the
-exact Dockerfile pins (`sqlalchemy[asyncio]==2.0.36`) ephemerally — see
-`tests/test_intake_pg_schema.py`'s docstring for the exact command. `admin_api`'s `src` is reached
-via the `pythonpath` entry added to this package's `pyproject.toml` (the same wiring style
-`gateway/services/conformance` already uses to reach `meeting_api`'s `src`) — no new pip dependency.
+Both modules import SQLAlchemy at class-definition time. That library is pinned in this
+package's `pyproject.toml` at the image's version (`sqlalchemy[asyncio]==2.0.36`), so the
+python gate can import them. `admin_api`'s `src` is reached via the `pythonpath` entry in
+that same file (the same wiring style `gateway/services/conformance` already uses to reach
+`meeting_api`'s `src`).
 """
 
 from __future__ import annotations

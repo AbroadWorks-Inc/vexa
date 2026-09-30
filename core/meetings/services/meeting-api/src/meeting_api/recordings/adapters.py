@@ -4,9 +4,9 @@ Thin translations of the ports to the concrete clients, as the parent's
 ``recordings.internal_upload_recording`` (storage upload + the ``SELECT ... FOR UPDATE`` row lock on
 ``meeting.data``) and ``recording_finalizer`` (master build + upload) do. They carry NO test logic.
 
-Heavy imports (boto3/minio, SQLAlchemy) are LAZY (inside the methods / ``build_production_router``)
-so the package imports + unit-tests with the in-memory fakes without those runtime deps in the gate
-venv — which is why ``pyproject.toml`` needs no extra pins.
+Heavy imports (boto3, SQLAlchemy) stay inside the methods, so importing this module does not
+load them. Production boot does import SQLAlchemy, which ``pyproject.toml`` pins; boto3 stays
+image-only because constructing ``S3Storage`` does not open a client.
 """
 from __future__ import annotations
 

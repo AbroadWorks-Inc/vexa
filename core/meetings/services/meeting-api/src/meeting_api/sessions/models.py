@@ -10,10 +10,9 @@ admin_api`` edge for these models, but we DO NOT take it: mirroring keeps the mo
 import-free of the identity domain (no real edge is created), exactly as the folded collector
 already did.
 
-SQLAlchemy is imported at MODULE load, so this module is only imported lazily by the production
-``bot_spawn`` / ``recordings`` / ``collector.adapters`` paths at runtime — never during the gate
-venv's test run (the in-memory fakes never touch it). That is why ``pyproject.toml`` carries no
-``greenlet`` pin.
+SQLAlchemy is imported at MODULE load. Production adapters import this module lazily; the
+mirror test and production boot import it too. ``pyproject.toml`` therefore pins
+``sqlalchemy[asyncio]`` at the image's version (``greenlet`` comes with that extra).
 
 Recordings + notes live in ``meetings.data`` JSONB (there is NO separate recordings table — see
 ``schema/MIGRATION-0001-drop-recordings.md``). ``MeetingSession`` keys N sessions per meeting by

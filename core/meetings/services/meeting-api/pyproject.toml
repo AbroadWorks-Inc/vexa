@@ -18,6 +18,10 @@ dependencies = [
     "python-dateutil>=2.9,<3",
     "cryptography==50.0.1",      # webhook secrets: AES-256-GCM decrypt at signing time (§2.7)
     "prometheus-client==0.19.0", # GET /metrics: the §1.13 metrics in the text exposition format
+    # Production boot (`build_production_app`) imports these before it finishes reading settings.
+    # The image already installs the same pins; the python gate's `uv run pytest` must have them too.
+    "sqlalchemy[asyncio]==2.0.36",
+    "asyncpg==0.30.0",
 ]
 
 [tool.uv]
