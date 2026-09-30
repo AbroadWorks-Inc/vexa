@@ -22,6 +22,7 @@ from meeting_api.webhooks import (
     build_system_webhook_from_env,
     verify_signature,
 )
+from internal_callers import BOT
 
 
 SECRET = "system-callback-secret"
@@ -55,11 +56,13 @@ def _seed(repo, *, session_uid="sess-system", data=None):
 
 
 def _post(client, body):
-    response = client.post("/bots/internal/callback/lifecycle", json=body)
+    response = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=body)
     assert response.status_code == 200, response.text
 
 
-def test_completed_is_sent_once_to_system_sink_and_replay_is_inert():
+def test_the_lifecycle_callback_does_not_post_the_system_sink():
+    """A completed meeting and a replay of it do not post the system hook. The subscriber
+    event is the outbox row the status write commits with the status."""
     repo = InMemoryMeetingRepo()
     _seed(repo)
     sink = _SystemCapture()
@@ -86,14 +89,10 @@ def test_completed_is_sent_once_to_system_sink_and_replay_is_inert():
     for event in (joining, active, completed, completed):
         _post(client, event)
 
-    assert len(sink.calls) == 1
-    delivered = sink.calls[0]["envelope"]
-    assert delivered["event_type"] == "meeting.completed"
-    assert delivered["data"]["meeting"]["user_id"] == 17
-    assert sink.calls[0]["label"].startswith("meeting:")
+    assert sink.calls == []
 
 
-def test_failed_terminal_is_sent_but_intermediate_statuses_are_not():
+def test_a_failed_callback_does_not_post_the_system_sink():
     repo = InMemoryMeetingRepo()
     _seed(repo)
     sink = _SystemCapture()
@@ -109,7 +108,6 @@ def test_failed_terminal_is_sent_but_intermediate_statuses_are_not():
             "timestamp": "2026-07-29T10:00:00.000Z",
         },
     )
-    assert sink.calls == []
     _post(
         client,
         {
@@ -121,9 +119,7 @@ def test_failed_terminal_is_sent_but_intermediate_statuses_are_not():
             "timestamp": "2026-07-29T10:00:10.000Z",
         },
     )
-    assert [call["envelope"]["event_type"] for call in sink.calls] == [
-        "bot.failed",
-    ]
+    assert sink.calls == []
 
 
 @pytest.mark.asyncio

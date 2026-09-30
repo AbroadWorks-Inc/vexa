@@ -1,0 +1,5 @@
+{
+  "subject": "1",
+  "scopes": ["webhooks", "erase"],
+  "expires_at": "2027-09-27T00:00:00Z"
+}

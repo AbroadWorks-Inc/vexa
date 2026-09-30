@@ -46,7 +46,7 @@ def test_non_expiring_token_never_expires():
 
 
 def test_mint_rejects_unknown_scope():
-    """Minting with a scope outside {bot, tx, browser} is rejected (parent → 422)."""
+    """Minting with a scope outside the vocabulary is rejected (parent → 422)."""
     with pytest.raises(ValueError):
         mint_token("42", ["admin"])
 
@@ -70,3 +70,31 @@ def test_to_contract_shape_matches_identity_v1():
     assert blob["scopes"] == ["tx"]
     assert blob["expires_at"].endswith("Z")
     assert blob["email"] == "o@vexa.ai"
+
+
+def test_the_scope_vocabulary_holds_the_least_privilege_scopes():
+    """§1.10: webhooks, erase and export are scopes admin-api mints; identity.v1 names them too."""
+    import json
+    from pathlib import Path
+
+    from identity_core.tokens import SCOPES
+
+    schema = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "contracts"
+            / "identity.v1"
+            / "identity.schema.json"
+        ).read_text()
+    )
+    assert SCOPES == {"bot", "tx", "browser", "webhooks", "erase", "export"}
+    assert set(schema["$defs"]["Scope"]["enum"]) == SCOPES
+
+
+@pytest.mark.parametrize("scope", ["webhooks", "erase", "export"])
+def test_a_least_privilege_token_validates_for_its_own_scope_only(scope):
+    token = mint_token("42", [scope])
+    assert validate_token(token, required_scope=scope, now=NOW) is token
+    with pytest.raises(TokenError) as ei:
+        validate_token(token, required_scope="bot", now=NOW)
+    assert ei.value.code == "missing-scope"

@@ -3,8 +3,8 @@
 Derived from the real admin-api behavior (`services/admin-api/app/main.py::validate_token` +
 `libs/admin-models/admin_models/token_scope.py`), reimplemented clean and DB-free:
 
-- A token carries a `subject` (owning user id), `scopes[]` drawn from {bot, tx, browser}
-  (admin-models `VALID_SCOPES`), an optional `expires_at`, and an optional `email`.
+- A token carries a `subject` (owning user id), `scopes[]` drawn from {bot, tx, browser, webhooks,
+  erase, export} (admin-models `VALID_SCOPES`), an optional `expires_at`, and an optional `email`.
 - Validation rejects an **expired** token (parent: `expires_at < utcnow()` → 401 "Token expired")
   and rejects a token **out of scope** for the capability being checked (parent: the request scope
   must intersect the token's DB scopes, else 403).
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # Mirrors admin-models VALID_SCOPES. Frozen so callers can't mutate the capability vocabulary.
-SCOPES: frozenset[str] = frozenset({"bot", "tx", "browser"})
+SCOPES: frozenset[str] = frozenset({"bot", "tx", "browser", "webhooks", "erase", "export"})
 
 
 class TokenError(Exception):

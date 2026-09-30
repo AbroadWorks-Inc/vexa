@@ -68,6 +68,7 @@ class InMemoryTranscriptStore:
         updated_at: str = "2026-06-20T09:00:05Z",
         constructed_meeting_url: Optional[str] = None,
         segments: Optional[list[dict]] = None,
+        has_entries: bool = False,
     ) -> int:
         mid = meeting_id if meeting_id is not None else self._next_id
         self._next_id = max(self._next_id, mid + 1)
@@ -84,6 +85,8 @@ class InMemoryTranscriptStore:
             "created_at": created_at,
             "updated_at": updated_at,
             "segments": {s["segment_id"]: s for s in (segments or [])},
+            # Whether a `meeting_entries` row points at the meeting (§1.6: entries manage it).
+            "has_entries": has_entries,
         }
         return mid
 
@@ -99,26 +102,39 @@ class InMemoryTranscriptStore:
             return None
         return (m["native_meeting_id"], m.get("platform") or "google_meet")
 
-    def _find(self, user_id, platform, native_meeting_id) -> Optional[int]:
-        # NEWEST-first, exactly like the SqlAlchemy store (``order_by(Meeting.created_at.desc())``): a user
-        # with several rows on the SAME native link resolves to the LATEST run. This faithfully mirrors the
-        # symptom-2 ambiguity — the native path can only ever address the newest row, which is precisely
-        # why the by-ROW-id read path exists (P0). Tiebreak on the id so the pick is deterministic.
-        matches = [
-            (mid, m) for mid, m in self._meetings.items()
-            if m["user_id"] == user_id
-            and m["platform"] == platform
-            and m["native_meeting_id"] == native_meeting_id
-        ]
-        if not matches:
-            return None
-        matches.sort(key=lambda kv: (kv[1].get("created_at") or "", kv[0]), reverse=True)
-        return matches[0][0]
+    def _resolve(self, user_id, platform, native_meeting_id, kind):
+        """The caller's link resolved by the one link resolver (§1.6), over the rows the SqlAlchemy
+        store's ``intake.adapters.link_rows`` would read (``intake.fakes.link_rows_in``)."""
+        from datetime import datetime, timezone
+
+        from ..intake.fakes import link_rows_in
+        from ..intake.ports import Room
+        from ..intake.resolver import resolve
+
+        rows = link_rows_in(
+            ({**m, "id": mid} for mid, m in self._meetings.items()),
+            user_id, Room(platform, native_meeting_id),
+        )
+        return resolve(rows, kind, now=datetime.now(timezone.utc))
+
+    def _find(self, user_id, platform, native_meeting_id, kind=None) -> Optional[int]:
+        """The id of the row ``kind`` (default ``READ``) resolves the caller's link to."""
+        from ..intake.resolver import LinkKind
+
+        row = self._resolve(user_id, platform, native_meeting_id, kind or LinkKind.READ)
+        return row.id if row is not None else None
+
+    async def resolve_room(self, user_id, platform, native_meeting_id, kind):
+        return self._resolve(user_id, platform, native_meeting_id, kind)
+
+    async def entry_managed(self, user_id, meeting_id) -> bool:
+        m = self._meetings.get(meeting_id)
+        return bool(m is not None and m["user_id"] == user_id and m.get("has_entries"))
 
     async def _transcript_doc(self, mid, *, viewer_is_owner: bool) -> dict:
         """Build the api.v1 ``TranscriptionResponse`` for row ``mid`` — shared by ``get_transcript``
-        (native → newest) and ``get_transcript_by_id`` (exact row). Keyed by the row id ``mid``, so a
-        by-id read returns exactly that row's segments/notes. Mirrors the real store's viewer-aware
+        (native → the link resolver's READ row, §1.6) and ``get_transcript_by_id`` (exact row).
+        Keyed by the row id ``mid``, so a by-id read returns exactly that row's segments/notes. Mirrors the real store's viewer-aware
         response projection, ``viewer_is_owner`` included — the fake and the real store must agree on
         what a share recipient receives, since most of the suite drives the fake."""
         from .projection import project_response_data
@@ -272,19 +288,25 @@ class InMemoryTranscriptStore:
         return (result, has_more) if list_view else result
 
     async def authorize_subscribe(self, user_id, platform, native_meeting_id, member_workspaces=None) -> Optional[int]:
+        from datetime import datetime, timezone
+
+        from ..intake.resolver import LinkKind, LinkRow, resolve
+
         mid = self._find(user_id, platform, native_meeting_id)
         if mid is not None:
             return mid  # (a) owner
+        shared = []
         for m_id, m in self._meetings.items():
             if not (m.get("platform") == platform and m.get("native_meeting_id") == native_meeting_id
                     and isinstance(m.get("data"), dict)):
                 continue
             data = m["data"]
-            if member_workspaces and data.get("workspace_id") in member_workspaces:
-                return m_id  # (b) member of the bound workspace
-            if user_id in (data.get("transcript_viewers") or []):
-                return m_id  # (c) redeemed an independent transcript-share link
-        return None
+            if ((member_workspaces and data.get("workspace_id") in member_workspaces)  # (b) workspace
+                    or user_id in (data.get("transcript_viewers") or [])):  # (c) transcript share
+                shared.append(LinkRow.of(m_id, m["status"], data, m.get("start_time"),
+                                         m.get("created_at")))
+        picked = resolve(shared, LinkKind.READ, now=datetime.now(timezone.utc))
+        return picked.id if picked is not None else None
 
     async def get_meeting_participants(self, user_id, platform, native_meeting_id):
         """Mirror of ``SqlAlchemyTranscriptStore.get_meeting_participants``: the owned row's
@@ -312,7 +334,9 @@ class InMemoryTranscriptStore:
         }
 
     async def bind_workspace(self, user_id, platform, native_meeting_id, workspace_id):
-        mid = self._find(user_id, platform, native_meeting_id)
+        from ..intake.resolver import LinkKind
+
+        mid = self._find(user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT)
         if mid is None:
             return None
         self._meetings[mid]["data"]["workspace_id"] = workspace_id
@@ -331,8 +355,11 @@ class InMemoryTranscriptStore:
 
     async def mint_transcript_share(self, user_id, platform, native_meeting_id, *,
                                     mode="open", allowed_emails=None, expires_in_sec=86400):
-        return self._mint_share_on(self._find(user_id, platform, native_meeting_id),
-                                   mode, allowed_emails, expires_in_sec)
+        from ..intake.resolver import LinkKind
+
+        return self._mint_share_on(
+            self._find(user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT),
+            mode, allowed_emails, expires_in_sec)
 
     async def mint_transcript_share_by_id(self, user_id, meeting_id, *,
                                           mode="open", allowed_emails=None, expires_in_sec=86400):
@@ -393,10 +420,14 @@ class InMemoryTranscriptStore:
         return docs
 
     async def set_intent(self, user_id, platform, native_meeting_id, status, scheduled_at=None):
-        mid = self._find(user_id, platform, native_meeting_id)
+        from ..intake.resolver import LinkKind, ManagedByEntries
+
+        mid = self._find(user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT)
         if mid is None:
             return None
         m = self._meetings[mid]
+        if m.get("has_entries"):
+            raise ManagedByEntries(mid)
         data = m["data"]
         prev_status = m.get("status")
         prev_at = data.get("scheduled_at")
@@ -624,6 +655,8 @@ class InMemoryTranscriptStore:
         m = self._meetings.get(meeting_id)
         if m is None or m["user_id"] != user_id:
             return None
+        if m.get("has_entries"):
+            return {"error": "managed_by_entries"}  # §1.6 — mirrors the adapter
         if m["status"] not in ("idle", "scheduled"):
             return {"error": "conflict"}
         data = m["data"]
@@ -698,9 +731,13 @@ class InMemoryTranscriptStore:
         return self._planned_row(meeting_id)
 
     async def delete_planned_meeting(self, user_id, meeting_id):
+        from ..intake.resolver import ManagedByEntries
+
         m = self._meetings.get(meeting_id)
         if m is None or m["user_id"] != user_id:
             return None
+        if m.get("has_entries"):
+            raise ManagedByEntries(meeting_id)  # §1.6 — mirrors the adapter
         if m["status"] not in ("idle", "scheduled"):
             return False
         del self._meetings[meeting_id]

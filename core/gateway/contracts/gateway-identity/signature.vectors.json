@@ -1,0 +1,1780 @@
+{
+  "description": "Test vectors for the gateway identity signature, version v2 (design §1.10, §6.9 F-E). The gateway signs every request it forwards with x-user-id; meeting-api and admin-api verify. The secrets here are test-only literals, never deployed.",
+  "header": "x-gateway-signature",
+  "version": "v2",
+  "format": "kid=<key id>,t=<unix seconds, digits only>,v2=<64 lower-case hex digits>",
+  "message": "v2\\n<kid>\\n<t>\\n<user_id>\\n<email>\\n<scopes>\\n<limits>\\n<workspaces>\\n<webhook_url>\\n<webhook_secret>\\n<webhook_events>\\n<METHOD>\\n<body_sha256>\\n<query>\\n<path>",
+  "message_rule": "the fifteen fields joined by a line feed (\\n), in this order. Only the last field, path, can contain a line feed, so the join is unambiguous.",
+  "algorithm": "HMAC-SHA256 over the UTF-8 message; the key is the 32 raw bytes the kid names in the ring (the base64 decoded, not its text)",
+  "ring_rule": "GATEWAY_IDENTITY_KEYS is the same format as the webhook secret encryption ring: a non-empty JSON object {\"<kid>\": \"<exactly 32 bytes, standard base64>\"}. A kid is 1-64 characters of A-Z a-z 0-9 . _ - (it travels in the header). GATEWAY_IDENTITY_ACTIVE_KEY (gateway only) names the kid the gateway signs with; it must be in the ring.",
+  "path_rule": "the request path as the receiving service routes it: percent-decoded, no query string, no scheme or host (ASGI scope['path']). The gateway takes httpx.URL(<forwarded url>).path.",
+  "query_rule": "the raw query string exactly as forwarded, without the leading '?', or empty when there is none (ASGI scope['query_string'], ASCII). The gateway takes the query of the URL httpx sends: httpx.URL(<downstream url>).copy_merge_params(<forwarded params>).query. Not parsed, not re-ordered, not re-encoded.",
+  "body_rule": "body_sha256 is the lower-case hex SHA-256 of the exact request body bytes: the bytes the gateway forwards, and the bytes the verifier receives before any handler reads them. An empty body hashes the empty string (e3b0c442...b855). In these vectors body is given as a UTF-8 string.",
+  "user_id_rule": "the exact x-user-id header value; a request must carry exactly one x-user-id and exactly one x-gateway-signature",
+  "identity_headers": [
+    "x-user-email",
+    "x-user-scopes",
+    "x-user-limits",
+    "x-user-workspaces",
+    "x-user-webhook-url",
+    "x-user-webhook-secret",
+    "x-user-webhook-events"
+  ],
+  "identity_headers_rule": "email, scopes, limits, workspaces, webhook_url, webhook_secret and webhook_events are the exact values of the identity headers in identity_headers, in that order, as forwarded; an absent header is an empty field. These, with x-user-id, are every x-user-* header the gateway forwards. A request that carries any of them more than once is refused. In the vectors and cases, headers lists the identity headers present.",
+  "rotation_rule": "the gateway signs with the active key and names it in kid. A verifier looks the kid up in its own ring and checks the signature with that key only; a kid not in its ring is refused. Without a usable ring a verifier accepts nothing.",
+  "max_skew_s": 60,
+  "keys": {
+    "gw-2026-09": "dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUE=",
+    "gw-2026-03": "dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUI="
+  },
+  "active_key": "gw-2026-09",
+  "vectors": [
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {},
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-09\n1790000000\n7\n\n\n\n\n\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "kid=gw-2026-09,t=1790000000,v2=6f8b7186f2be232e6973457a43c9a89d6ca46e3005d0fe69fee3caca5ea35a43"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-09\n1790000000\n7\n\nbot,tx\n3\n\n\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "body_sha256": "42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4",
+      "message": "v2\ngw-2026-09\n1790000000\n7\nu@example.com\nbot,tx\n3\nws-1,ws-2\nhttps://hooks.example.com/aw\nwhsec-test-only\n{\"meeting.completed\": true}\nPOST\n42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4\n\n/bots",
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=5&offset=10",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-09\n1790000000\n7\n\nbot,tx\n3\n\n\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nlimit=5&offset=10\n/meetings",
+      "header": "kid=gw-2026-09,t=1790000000,v2=d8800ac05074b123dfccff221f9dab4f75b49e741445166537f35df2d25d9716"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot",
+        "x-user-limits": "3"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "body_sha256": "42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4",
+      "message": "v2\ngw-2026-09\n1790000000\n7\n\nbot\n3\n\n\n\n\nPOST\n42ea3792b92482d130662ec3da782750eb868956b90783e795bf0ee1242c4fb4\n\n/bots",
+      "header": "kid=gw-2026-09,t=1790000000,v2=0a4bed3d4ea619a40e9f3eadac4bbf43846d64026a08d462e80952d13bce6d93"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "42",
+      "headers": {
+        "x-user-scopes": "bot"
+      },
+      "method": "PUT",
+      "path": "/v2/entries",
+      "query": "",
+      "body": "{\"entries\":[{\"source\":\"calendar\",\"meeting_url\":\"https://meet.google.com/abc-defg-hij\"}]}",
+      "body_sha256": "2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6",
+      "message": "v2\ngw-2026-09\n1790000000\n42\n\nbot\n\n\n\n\n\nPUT\n2a1bbadbf723e215e5063e0221bb5015a9b8f4b2c4d8d8a7bbb23d8217b804b6\n\n/v2/entries",
+      "header": "kid=gw-2026-09,t=1790000000,v2=a006bbc55b12b86ba2c1db1def88d60f9e1aa95a176dee7079b00bdf0c3333c6"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "42",
+      "headers": {
+        "x-user-limits": "5"
+      },
+      "method": "DELETE",
+      "path": "/meetings/google_meet/abc-defg-hij",
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-09\n1790000000\n42\n\n\n5\n\n\n\n\nDELETE\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings/google_meet/abc-defg-hij",
+      "header": "kid=gw-2026-09,t=1790000000,v2=eef987cbf0977dd82bd7cba3c76944ddb3da47f55fa96318168641921b7e72ad"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "1",
+      "headers": {
+        "x-user-scopes": "tx,export",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/transcripts/zoom/85012345678",
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-09\n1790000000\n1\n\ntx,export\n3\n\n\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/transcripts/zoom/85012345678",
+      "header": "kid=gw-2026-09,t=1790000000,v2=aa3ff44cf7a51685e7dad9d73182047c91e2b7e8826ae13b4813a34504d3d87a"
+    },
+    {
+      "kid": "gw-2026-09",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings/teams/room one",
+      "query": "type=audio&x=%2F",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-09\n1790000000\n7\n\ntx\n3\n\n\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ntype=audio&x=%2F\n/meetings/teams/room one",
+      "header": "kid=gw-2026-09,t=1790000000,v2=ffda921c2a7e11822418da1e17cde8348e897dece00a9612ec0f41c0e97327f9"
+    },
+    {
+      "kid": "gw-2026-03",
+      "t": 1790000000,
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "v2\ngw-2026-03\n1790000000\n7\n\nbot,tx\n3\n\n\n\n\nGET\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n/meetings",
+      "header": "kid=gw-2026-03,t=1790000000,v2=c818fa452c559483b84047833c785d2ada2a21d951dbeb212ac08549f6bdbafd"
+    }
+  ],
+  "verify_cases": [
+    {
+      "case": "signed now",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "signed 60 s ago",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000060,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "signed 61 s ago",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000061,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "signed 60 s ahead",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1789999940,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "signed 61 s ahead",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1789999939,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "for another user",
+      "user_id": "8",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "for another method",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "POST",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "for another path",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings/1",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "with its query",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=5&offset=10",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=d8800ac05074b123dfccff221f9dab4f75b49e741445166537f35df2d25d9716",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "query changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=6&offset=10",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=d8800ac05074b123dfccff221f9dab4f75b49e741445166537f35df2d25d9716",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "query dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=d8800ac05074b123dfccff221f9dab4f75b49e741445166537f35df2d25d9716",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "query added",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "limit=5",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "query reordered",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "offset=10&limit=5",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=d8800ac05074b123dfccff221f9dab4f75b49e741445166537f35df2d25d9716",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "with its JSON body",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=0dc02add1babb12ae8ffc201eed1d900bc228b3853f33bc18bb7c264dc38e029",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "body with one byte changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hik\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=0dc02add1babb12ae8ffc201eed1d900bc228b3853f33bc18bb7c264dc38e029",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "body dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=0dc02add1babb12ae8ffc201eed1d900bc228b3853f33bc18bb7c264dc38e029",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "body added to an empty-body signature",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "{}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "scopes changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx,export",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "scopes dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "limits changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "45"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "limits dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "scopes and limits swapped",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "3",
+        "x-user-limits": "bot,tx"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "no scopes or limits, none signed",
+      "user_id": "7",
+      "headers": {},
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=6f8b7186f2be232e6973457a43c9a89d6ca46e3005d0fe69fee3caca5ea35a43",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "scopes added to a bare signature",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=6f8b7186f2be232e6973457a43c9a89d6ca46e3005d0fe69fee3caca5ea35a43",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every identity header signed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "every header signed, email changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "someone@else.example",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, email dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "email added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=db6da0afc8e3b3cfeaf4e4cefe75a104b588f0c19e62bb8a2b43f09d8181672c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, scopes changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx,export",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, scopes dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "scopes added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=04f1db5db2ce6a7c94ef80c75f0f657f2253702645060b575d889e6a8b5cafb5",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, limits changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "45",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, limits dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "limits added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=eca3aa87194c82dfe17868d28ca91e52cb1f62ffe05775646c9c35f1615366d7",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, workspaces changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2,ws-other",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, workspaces dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "workspaces added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fb9dc74c74d48132e1e7bb0790c30891c05bce96ee9cf1ea46d9bfa9d73f56ef",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, webhook-url changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://attacker.example/hook",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, webhook-url dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "webhook-url added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=66f99d923821e3f9c5141ae453f0dd67fdaf87d64812e8a014be31f845b5dee5",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, webhook-secret changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-other",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, webhook-secret dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "webhook-secret added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=0db11696ab6f42a696ffbad3591d16458ca1a8963a81f475c1ba652d5ec1137a",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, webhook-events changed",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true, \"bot.failed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, webhook-events dropped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "webhook-events added to a signature of every other header",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "u@example.com",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "ws-1,ws-2",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bc6ec4371f4a6584e3e8547a7d9220b226ff097c67fd41142a6259245fcba5ac",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "every header signed, email and workspaces swapped",
+      "user_id": "7",
+      "headers": {
+        "x-user-email": "ws-1,ws-2",
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3",
+        "x-user-workspaces": "u@example.com",
+        "x-user-webhook-url": "https://hooks.example.com/aw",
+        "x-user-webhook-secret": "whsec-test-only",
+        "x-user-webhook-events": "{\"meeting.completed\": true}"
+      },
+      "method": "POST",
+      "path": "/bots",
+      "query": "",
+      "body": "{\"platform\":\"google_meet\",\"native_meeting_id\":\"abc-defg-hij\"}",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=fa8dd2e37aa3ffb34ee6a94aef2d92f16eb1087729d36175212360e0241b4c1c",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "under the active key, older key also in the ring",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "under the active key, only key in the ring",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09"
+      ],
+      "valid": true
+    },
+    {
+      "case": "under an older key still in the ring",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-03,t=1790000000,v2=c818fa452c559483b84047833c785d2ada2a21d951dbeb212ac08549f6bdbafd",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": true
+    },
+    {
+      "case": "under an older key dropped from the ring",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-03,t=1790000000,v2=c818fa452c559483b84047833c785d2ada2a21d951dbeb212ac08549f6bdbafd",
+      "verifier_kids": [
+        "gw-2026-09"
+      ],
+      "valid": false
+    },
+    {
+      "case": "a kid not in the ring",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2025-01,t=1790000000,v2=19cb00db71091e11fdde6dabe1b05a507edc570668416ed9a947c9b30ed3d75a",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "kid relabelled: signed under the active key, header names the older one",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-03,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "kid relabelled: signed for the older kid with the active key's bytes",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-03,t=1790000000,v2=325febc039d326dd3667dab46fe95b51a1ab76850234b6e446d7bb4da341416b",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "an empty ring",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [],
+      "valid": false
+    },
+    {
+      "case": "no kid",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "empty kid",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "kid with a comma",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw,2026,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "kid after t",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "t=1790000000,kid=gw-2026-09,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "a v1 signature",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "t=1790000000,v1=90f0c6cd23d647551926c794febfaa3e5f663429b060b7bf5c825bf61414f30b",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "a v2 mac labelled v1",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v1=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "missing header",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": null,
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "missing user id",
+      "user_id": null,
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "empty header",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "no v2",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "no t",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "fields reversed",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633,t=1790000000,kid=gw-2026-09",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "extra field",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633,v0=00",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "t not digits",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=+1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "t with spaces",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t= 1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "v2 upper-case hex",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=BB359C8B5890C9A3ED45B73FF9B5B5ECFBEDDC9457138C08401FF7FB23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "v2 too short",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb232866",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "v2 not hex",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000000,
+      "header": "kid=gw-2026-09,t=1790000000,v2=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    },
+    {
+      "case": "tampered t",
+      "user_id": "7",
+      "headers": {
+        "x-user-scopes": "bot,tx",
+        "x-user-limits": "3"
+      },
+      "method": "GET",
+      "path": "/meetings",
+      "query": "",
+      "body": "",
+      "now": 1790000001,
+      "header": "kid=gw-2026-09,t=1790000001,v2=bb359c8b5890c9a3ed45b73ff9b5b5ecfbeddc9457138c08401ff7fb23286633",
+      "verifier_kids": [
+        "gw-2026-09",
+        "gw-2026-03"
+      ],
+      "valid": false
+    }
+  ],
+  "ring_cases": [
+    {
+      "case": "one key",
+      "keys": "{\"k1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": true
+    },
+    {
+      "case": "two keys",
+      "keys": "{\"gw-2026-09\": \"dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUE=\", \"gw-2026-03\": \"dGVzdC1nYXRld2F5LWlkZW50aXR5LXJpbmcta2V5LUI=\"}",
+      "valid": true
+    },
+    {
+      "case": "kid of 64 characters",
+      "keys": "{\"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": true
+    },
+    {
+      "case": "kid with . _ -",
+      "keys": "{\"gw.2026_09-a\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": true
+    },
+    {
+      "case": "not JSON",
+      "keys": "k1:cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=",
+      "valid": false
+    },
+    {
+      "case": "a JSON array",
+      "keys": "[\"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"]",
+      "valid": false
+    },
+    {
+      "case": "an empty object",
+      "keys": "{}",
+      "valid": false
+    },
+    {
+      "case": "a key that is not a string",
+      "keys": "{\"k1\": 7}",
+      "valid": false
+    },
+    {
+      "case": "a key that is not base64",
+      "keys": "{\"k1\": \"not base64!\"}",
+      "valid": false
+    },
+    {
+      "case": "a key of 31 bytes",
+      "keys": "{\"k1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg==\"}",
+      "valid": false
+    },
+    {
+      "case": "a key of 33 bytes",
+      "keys": "{\"k1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJy\"}",
+      "valid": false
+    },
+    {
+      "case": "an empty kid",
+      "keys": "{\"\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid of 65 characters",
+      "keys": "{\"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid with a comma",
+      "keys": "{\"k,1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid with an equals sign",
+      "keys": "{\"k=1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    },
+    {
+      "case": "a kid with a space",
+      "keys": "{\"k 1\": \"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=\"}",
+      "valid": false
+    }
+  ]
+}

@@ -64,6 +64,28 @@ CASES = [
     ("GET", "/meetings/google_meet/abc-defg-hij/participants",
      "/meetings/{platform}/{native_meeting_id}/participants"),
 
+    ("PUT", "/v2/entries", "/v2/entries"),
+    ("POST", "/v2/entries/remove", "/v2/entries/remove"),
+    ("GET", "/v2/entries", "/v2/entries"),
+    ("GET", "/v2/meetings", "/v2/meetings"),
+    ("GET", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/stop",
+     "/v2/meetings/{meeting_id}/stop"),
+    ("DELETE", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/export",
+     "/v2/meetings/{meeting_id}/export"),
+
+    ("POST", "/v2/webhooks", "/v2/webhooks"),
+    ("GET", "/v2/webhooks", "/v2/webhooks"),
+    ("PATCH", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30", "/v2/webhooks/{subscription_id}"),
+    ("DELETE", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30", "/v2/webhooks/{subscription_id}"),
+    ("POST", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30/rotate-secret",
+     "/v2/webhooks/{subscription_id}/rotate-secret"),
+    ("POST", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30/test",
+     "/v2/webhooks/{subscription_id}/test"),
+    ("GET", "/v2/webhooks/0d7c9f2e-5b1a-4e3c-8f6d-2a9b1c4e7f30/deliveries",
+     "/v2/webhooks/{subscription_id}/deliveries"),
+
     ("GET", "/transcripts/by-id/42", "/transcripts/by-id/{meeting_id}"),
     ("GET", "/transcripts/google_meet/abc-defg-hij", "/transcripts/{platform}/{native_meeting_id}"),
     ("POST", "/transcripts/google_meet/abc-defg-hij/share",
@@ -119,7 +141,7 @@ CASES = [
     ("OPTIONS", "/mcp/session", "/mcp/{path:path}"),
 ]
 
-SCOPES = ["bot", "tx", "browser"]
+SCOPES = ["bot", "tx", "browser", "erase", "webhooks", "export"]
 
 # CASES IS THE FULL PRODUCT'S DECLARATION LIST AND STAYS WHOLE — it is reviewed once, above, and a
 # list that shrinks with the tree is a list that cannot catch a row going missing. What varies is
@@ -174,7 +196,12 @@ def test_scope_matrix(method, url, template, scope):
         assert r.status_code != 403, f"{method} {url} with [{scope}] should pass the scope gate"
     else:
         assert r.status_code == 403, f"{method} {url} with [{scope}] → {r.status_code}, expected 403"
-        assert r.json()["detail"] == "Insufficient scope for this endpoint"
+        if url.startswith("/v2/"):
+            # §2.5: the edge's own refusals on /v2 carry the /v2 error body.
+            assert r.json() == {"error": {"code": "forbidden",
+                                          "message": "Insufficient scope for this endpoint"}}
+        else:
+            assert r.json()["detail"] == "Insufficient scope for this endpoint"
 
 
 def test_browser_only_key_reaches_no_route_at_all():
@@ -221,12 +248,94 @@ def test_bot_scope_still_runs_the_bot_lifecycle():
     assert client.get("/bots/status", headers=AUTH).status_code == 200
 
 
+#: The routes a bot+tx key must NOT reach: each needs a least-privilege scope of its own (§1.10).
+#: Written down here, not read from ROUTE_SCOPES, so a manifest edit that moves any other route out
+#: of bot/tx turns the test below red instead of redefining what it expects.
+LEAST_PRIVILEGE = frozenset({
+    ("DELETE", "/v2/meetings/{meeting_id}"),
+    ("POST", "/v2/meetings/{meeting_id}/export"),
+    ("POST", "/v2/webhooks"),
+    ("GET", "/v2/webhooks"),
+    ("PATCH", "/v2/webhooks/{subscription_id}"),
+    ("DELETE", "/v2/webhooks/{subscription_id}"),
+    ("POST", "/v2/webhooks/{subscription_id}/rotate-secret"),
+    ("POST", "/v2/webhooks/{subscription_id}/test"),
+    ("GET", "/v2/webhooks/{subscription_id}/deliveries"),
+})
+#: The routes a ``webhooks`` key reaches (§2.7), and the only ones.
+WEBHOOK_ROUTES = frozenset(k for k in LEAST_PRIVILEGE if k[1].startswith("/v2/webhooks"))
+
+
 def test_a_bot_and_tx_key_reaches_every_route():
     """The shape every real key has (the terminal mints bot+tx+browser; the docs' own mint example
-    is bot+tx) is unaffected end to end — no route in the matrix regresses to 403."""
+    is bot+tx) is unaffected end to end — no route in the matrix regresses to 403, except the
+    least-privilege routes listed above, which it must not reach."""
     client = _client(["bot", "tx"])
-    for method, url, _template in CARRIED_CASES:
-        assert _request(client, method, url).status_code != 403, f"{method} {url} regressed"
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) in LEAST_PRIVILEGE:
+            assert status == 403, f"{method} {url} let a bot+tx key past its own scope"
+        else:
+            assert status != 403, f"{method} {url} regressed"
+
+
+def test_an_erase_key_reaches_only_the_erase_route():
+    """``erase`` (§1.10) is least privilege: it opens DELETE /v2/meetings/{id} and nothing else."""
+    client = _client(["erase"])
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) == ("DELETE", "/v2/meetings/{meeting_id}"):
+            assert status != 403, f"{method} {url} refused an erase key"
+        else:
+            assert status == 403, f"{method} {url} let an erase key in"
+
+
+def test_a_webhooks_key_reaches_only_the_webhook_routes():
+    """``webhooks`` (§1.10) is least privilege: it opens the /v2/webhooks routes and nothing else."""
+    client = _client(["webhooks"])
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) in WEBHOOK_ROUTES:
+            assert status != 403, f"{method} {url} refused a webhooks key"
+        else:
+            assert status == 403, f"{method} {url} let a webhooks key in"
+
+
+def test_an_export_key_reaches_only_the_export_route():
+    """``export`` (§1.10) is least privilege: it opens POST /v2/meetings/{id}/export and nothing
+    else."""
+    client = _client(["export"])
+    for method, url, template in CARRIED_CASES:
+        status = _request(client, method, url).status_code
+        if (method, template) == ("POST", "/v2/meetings/{meeting_id}/export"):
+            assert status != 403, f"{method} {url} refused an export key"
+        else:
+            assert status == 403, f"{method} {url} let an export key in"
+
+
+def test_the_exporter_key_reaches_its_reads_and_its_result_route():
+    """The exporter's key is ``tx`` + ``export`` (§1.10): its reads (the recording list, the master
+    and the transcript by id) and its result route are all open to it, and each is forwarded to
+    meeting-api at the same path."""
+    downstream = FakeDownstream(status_code=200, body={"ok": True})
+    client = TestClient(create_app(
+        FakeAuthorizer(user={"user_id": 7, "scopes": ["tx", "export"], "max_concurrent": 3,
+                             "email": "u@example.com"}),
+        downstream,
+        FakeRedis(),
+    ))
+    for method, url in [
+        ("GET", "/recordings"),
+        ("GET", "/recordings/42/master"),
+        ("GET", "/transcripts/by-id/42"),
+        ("POST", "/v2/meetings/5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90/export"),
+    ]:
+        downstream.last = None
+        r = _request(client, method, url)
+        assert r.status_code == 200, f"{method} {url} -> {r.status_code}"
+        assert downstream.last is not None, f"{method} {url} was not forwarded"
+        assert downstream.last["method"] == method
+        assert downstream.last["url"].endswith(url), f"{method} {url}"
 
 
 # --- deny by default -----------------------------------------------------------------------------
@@ -332,7 +441,7 @@ def test_scope_lookup_denies_when_the_matched_route_is_unknowable():
 def test_route_scope_declarations_only_use_real_scopes():
     """A typo'd scope name ('bots', 'transcript') would be unsatisfiable and lock a route out
     silently; the vocabulary is the one admin-api mints against."""
-    vocabulary = {"bot", "tx", "browser"}
+    vocabulary = {"bot", "tx", "browser", "erase", "webhooks", "export"}
     for key, scopes in ROUTE_SCOPES.items():
         assert scopes, f"{key} declares an EMPTY scope set — that denies every key"
         assert set(scopes) <= vocabulary, f"{key} declares unknown scope(s) {set(scopes) - vocabulary}"

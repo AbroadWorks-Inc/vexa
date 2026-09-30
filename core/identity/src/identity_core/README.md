@@ -3,7 +3,7 @@
 The identity CORE. Public surface is `__init__.py` (the lane's `index`):
 
 - **`tokens.py`** — `ScopedToken` value object + `mint_token` / `validate_token`. Scopes are
-  `{bot, tx, browser}` (admin-models `VALID_SCOPES`). Validation rejects expired (`token-expired`)
+  `{bot, tx, browser, webhooks, erase, export}` (admin-models `VALID_SCOPES`). Validation rejects expired (`token-expired`)
   and out-of-scope (`missing-scope`) tokens — derived from admin-api `/internal/validate`.
 - **`access.py`** — `can_access(subject, resource, action)`: the `AccessPolicy` Protocol (port) +
   `OwnerOnlyPolicy`, a **default-deny** owner-only adapter (P20). Guards the three read paths

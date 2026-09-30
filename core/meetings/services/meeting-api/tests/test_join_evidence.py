@@ -50,6 +50,8 @@ from meeting_api.lifecycle.join_evidence import (
     normalize_evidence,
 )
 from meeting_api.lifecycle.machine import LifecycleSink, MeetingStore
+from gateway_identity import via_gateway
+from internal_callers import BOT
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
 
@@ -74,7 +76,7 @@ def _repo_with_meeting(status: str = "requested", session_uid: str = "sess-evide
 def _drive(client: TestClient, *events: dict) -> None:
     """POST a sequence of lifecycle.v1 events through the shipped callback, asserting each lands."""
     for ev in events:
-        r = client.post(ENDPOINT, json=ev)
+        r = client.post(ENDPOINT, headers=BOT, json=ev)
         assert r.status_code == 200, f"{ev.get('status')} rejected: {r.text}"
 
 
@@ -520,7 +522,7 @@ def test_evidence_surfaces_on_the_list_endpoints(endpoint):
             "bot_logs": ["noise"] * 100,
         },
     )
-    client = TestClient(create_app(transcript_store=store, meeting_repo=InMemoryMeetingRepo()))
+    client = TestClient(via_gateway(create_app(transcript_store=store, meeting_repo=InMemoryMeetingRepo())))
     r = client.get(endpoint, headers={"x-user-id": "7"})
     assert r.status_code == 200, r.text
     row = r.json()["meetings"][0]
@@ -640,7 +642,7 @@ def test_failure_class_fixture_replays_deterministically(name, prefix, terminal,
     # terminal — the FSM's entry edge is None → joining, so this exercises the rehydrate path too.
     events.append({"connection_id": "sess-evidence", **terminal})
     for ev in events:
-        r = client.post(ENDPOINT, json=ev)
+        r = client.post(ENDPOINT, headers=BOT, json=ev)
         assert r.status_code in (200, 409), r.text
     data = _stored_data(repo, meeting["id"])
     assert data.get("reason"), f"[{name}] the terminal landed with no reason at all (#1059)"
@@ -668,17 +670,19 @@ from meeting_api.lifecycle.reconcile import (  # noqa: E402
     reconcile_stale_nonterminal_sweep,
     synthesize_terminal_for_dead_workload,
 )
+from meeting_api.sweeps.item_failures import InMemoryItemFailures  # noqa: E402
 
 
 def _run_sweep(client: TestClient, repo: InMemoryMeetingRepo):
     import logging
 
     async def _post(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, None, _post, stop_grace=45.0, active_grace=300.0,
         log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     ))
 
 
@@ -747,7 +751,7 @@ def test_runtime_destroy_terminal_stamps_typed_evidence():
     client = TestClient(create_app(meeting_repo=repo))
 
     async def _drive_terminal(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     drove = asyncio.run(synthesize_terminal_for_dead_workload(
         repo, "wl-1", "exited", _drive_terminal, log=logging.getLogger("test.runtime"),
@@ -777,7 +781,7 @@ def test_a_hostile_evidence_payload_never_breaks_the_terminal(hostile):
     repo, meeting = _repo_with_meeting()
     client = TestClient(create_app(meeting_repo=repo))
     _drive(client, {"connection_id": "sess-evidence", "status": "joining"})
-    r = client.post(ENDPOINT, json={
+    r = client.post(ENDPOINT, headers=BOT, json={
         "connection_id": "sess-evidence", "status": "failed", "exit_code": 1,
         "completion_reason": "join_failure", "reason": "something went wrong", **hostile,
     })
@@ -815,7 +819,7 @@ def test_evidence_capture_survives_a_broken_taxonomy(monkeypatch):
     repo, meeting = _repo_with_meeting()
     client = TestClient(create_app(meeting_repo=repo))
     _drive(client, {"connection_id": "sess-evidence", "status": "joining"})
-    r = client.post(ENDPOINT, json={
+    r = client.post(ENDPOINT, headers=BOT, json={
         "connection_id": "sess-evidence", "status": "failed", "exit_code": 1,
         "completion_reason": "join_failure", "reason": "the run failed normally",
     })

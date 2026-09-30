@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "internal_error",
+    "message": "the write kept conflicting with another; it was not stored"
+  }
+}

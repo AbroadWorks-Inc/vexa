@@ -24,6 +24,8 @@ helm upgrade --install vexa deploy/helm/charts/vexa -n vexa --create-namespace \
   --set global.imageTag=YYMMDD-HHMM \
   --set secrets.adminApiToken=$ADMIN_TOKEN \
   --set secrets.internalApiSecret=$INTERNAL_API_SECRET \
+  --set-file secrets.gatewayIdentityKeys=gateway-identity-ring.json \
+  --set secrets.gatewayIdentityActiveKey=$GATEWAY_IDENTITY_ACTIVE_KEY \
   --set secrets.transcriptionServiceToken=$STT_TOKEN \
   --wait --timeout 10m
 
@@ -50,7 +52,7 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 |---|---|---|
 | `global.imageTag` | `""` | Set to a pinned `YYMMDD-HHMM` tag — overrides every service tag (build-once). |
 | `runtime.backend` | `k8s` | `k8s` spawns Pods via RBAC (real cloud); `docker` mounts the host socket (single-node only); `process` runs child processes. |
-| `secrets.*` | placeholders | `adminApiToken`, `internalApiSecret`, `transcriptionServiceToken`, `dispatchSigningKey`, `nextauthSecret`, `anthropic*`. Or set `secrets.existingSecretName` (must carry `ADMIN_API_TOKEN`, `INTERNAL_API_SECRET`, `TRANSCRIPTION_SERVICE_TOKEN`, `VEXA_DISPATCH_SIGNING_KEY`, `NEXTAUTH_SECRET`). |
+| `secrets.*` | placeholders | `adminApiToken`, `internalApiSecret`, `gatewayIdentityKeys`, `gatewayIdentityActiveKey`, `transcriptionServiceToken`, `dispatchSigningKey`, `nextauthSecret`, `anthropic*`. Or set `secrets.existingSecretName` (must carry `ADMIN_API_TOKEN`, `INTERNAL_API_SECRET`, `GATEWAY_IDENTITY_KEYS`, `GATEWAY_IDENTITY_ACTIVE_KEY`, `TRANSCRIPTION_SERVICE_TOKEN`, `VEXA_DISPATCH_SIGNING_KEY`, `NEXTAUTH_SECRET`). |
 | `postgres.enabled` / `redis.enabled` / `minio.enabled` | `true` | Flip to `false` to use managed backing; then set `database.*` / `redisConfig.*` and a pre-existing `postgres.credentialsSecretName`. |
 | `postgres.existingCredentialsSecret` | `false` | `true` keeps the in-cluster Postgres but reads its password from a pre-created `postgres.credentialsSecretName` Secret (`POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`); the chart renders none, so an upgrade never rewrites it. |
 | `statefulAntiAffinity` | `true` | postgres, redis and minio prefer different nodes. `false` drops that preference when they are meant to share one node (Karpenter otherwise starts an extra node for it). |
@@ -58,6 +60,27 @@ Docker to build the images. It proves the control plane stands up and `/health` 
 | `terminal.enabled` | `true` | The web UI. Set `terminal.publicUrl` (NEXTAUTH_URL/TERMINAL_URL) when fronted by ingress; add OAuth via `terminal.extraEnv`. |
 | `ingress.enabled` | `false` | Fronts the **terminal** by default; set `host`/`className`/`tls`. Add a second path to `gateway` to also expose the raw API. |
 | `minio.service.type` | `ClusterIP` | `NodePort` to reach presigned download URLs browser-side on dev clusters. |
+| `GATEWAY_IDENTITY_KEYS`, `GATEWAY_IDENTITY_ACTIVE_KEY`, `WEBHOOK_SECRET_ENC_KEYS`, `WEBHOOK_SECRET_ENC_ACTIVE_KEY` | none | The gateway identity ring (JSON `{"<kid>": "<32 bytes base64>"}`, the webhook ring's format) and its active kid come from the existing Secret or, in the chart-managed one, from the required `secrets.gatewayIdentityKeys` (pass it with `--set-file`) and `secrets.gatewayIdentityActiveKey`; the gateway reads both and refuses to start without them, and meeting-api and admin-api hold the same ring. The webhook key ring is read only from an existing Secret (meeting-api and admin-api); without it the webhook feature is off. |
+| `meetingApi.entryMaxDaysAhead` / `joinNowAdoptAheadSeconds` / `entryBlockedHosts` / `intakeMaxActiveEntries` | `30` / `3600` / `""` / `100000` | Meeting intake (`ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES`). |
+| `meetingApi.intakeConflictRetries` | `3` | `INTAKE_CONFLICT_RETRIES`: retries for an entry write that lost a database-constraint race before it answers `500 internal_error`. |
+| `meetingApi.intakeConflictDelayMinSeconds` / `intakeConflictDelayMaxSeconds` | `0.01` / `0.05` | `INTAKE_CONFLICT_DELAY_MIN_S`, `INTAKE_CONFLICT_DELAY_MAX_S` (§6.9 F-D): the random pause before each of those retries is a point between the two, times the try's number. |
+| `meetingApi.intakeStopLinkRetries` | `1` | `INTAKE_STOP_LINK_RETRIES` (§1.7): how many more times `POST /v2/meetings/{id}/stop` runs again when the meeting moved to another link between its read and its link lock; after the last it answers `503 unavailable`. |
+| `meetingApi.gatewayIdentityMaxSkewSeconds` / `adminApi.gatewayIdentityMaxSkewSeconds` | `60` / `60` | `GATEWAY_IDENTITY_MAX_SKEW_S` (§1.10): a gateway signature whose `t` is further than this from the service's clock is refused with 401 (the replay window). Set both the same. |
+| `meetingApi.autoJoinLeadSeconds` / `notSentSweepIntervalSeconds` / `jitsiHosts` | `120` / `30` / `""` | `AUTO_JOIN_LEAD_S`, `NOT_SENT_SWEEP_INTERVAL_S`, `VEXA_JITSI_HOSTS`. |
+| `meetingApi.botSendMaxAttempts` / `botSendRetryBackoffSeconds` | `3` / `60` | `BOT_SEND_MAX_ATTEMPTS`, `BOT_SEND_RETRY_BACKOFF_S`: retry budget and backoff for an entry-managed meeting's bot send. |
+| `meetingApi.meetingUntrackedGraceSeconds` | `600` | `MEETING_UNTRACKED_GRACE_SEC` (§6.9 F-K2): how long a runtime 404 must last before a workload counts as gone, and how long past `due_at` a waiting meeting or an unfinished spawn gets before it ends `failed`. |
+| `meetingApi.sweepBatchSize` / `sweepMaxItemFailures` | `200` / `5` | `SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`: paging size and give-up threshold shared by the auto-join tick, the not-sent sweep and the outbox publisher. |
+| `meetingApi.unprovenTeardownMaxAgeSeconds` | `21600` | `UNPROVEN_TEARDOWN_MAX_AGE_S` (§6.9 F-K2, F-I): how long a workload's teardown is chased while the runtime doesn't answer before it is given up: a pending teardown (`data.unproven_teardown`) from its `since`, a `stale-stopping` or `stale-nonterminal` reconcile row from its `updated_at`. A runtime that doesn't answer is never one of the item's failures, so this age is its only bound; a refused delete still counts toward `SWEEP_MAX_ITEM_FAILURES`. |
+| `meetingApi.sweepItemFailuresRetentionSeconds` | `604800` | `SWEEP_ITEM_FAILURES_RETENTION_S` (§6.9 F-I): a `sweep_item_failures` record untouched this long is deleted, `SWEEP_BATCH_SIZE` at a time, on each reconcile pass. A given-up item's record is touched whenever its sweep still lists it, so only records of items no longer pending go. |
+| `meetingApi.webhookPrivateHostAllowlist` / `adminApi.webhookPrivateHostAllowlist` | `""` | `WEBHOOK_PRIVATE_HOST_ALLOWLIST`: private hosts a webhook may target; empty refuses every private target. Set both the same. |
+| `meetingApi.webhookPublishIntervalSeconds` / `webhookSendIntervalSeconds` | `1` / `1` | `WEBHOOK_PUBLISH_INTERVAL_S`, `WEBHOOK_SEND_INTERVAL_S`. |
+| `meetingApi.webhookRetryScheduleSeconds` / `webhookDnsThreads` / `webhookDnsTimeoutSeconds` | `60,300,1800,7200` / `4` / `5` | `WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S`: the sender's retry waits, its own DNS pool size and per-lookup timeout. |
+| `meetingApi.webhookSendTimeoutSeconds` / `webhookLeaseSeconds` / `webhookClaimLimit` | `10` / `60` / `50` | `WEBHOOK_SEND_TIMEOUT_S`, `WEBHOOK_LEASE_S`, `WEBHOOK_CLAIM_LIMIT` (§1.8): the most one subscription post may take in total (longer is a failed attempt, error `timeout`), how long a sender's claim holds a delivery row (it must be more than the send timeout + 5 s, or meeting-api refuses to start), and the most rows one sender tick claims. |
+| `adminApi.webhookMaxSubscriptions` / `webhookDeliveryRetentionDays` | `20` / `30` | `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS`. |
+| `adminApi.webhookDeliveryRetentionBatchSize` / `webhookDeliveryRetentionMaxBatches` | `1000` / `100` | `WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE`, `WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES` (§6.9 F-I): the daily retention sweep deletes in batches of this many rows, each its own transaction, and at most this many batches of each delete per run; a run that reaches the cap logs a warning, counts `aw_sweep_runs_total{sweep="webhook-retention",result="capped"}` and leaves the rest to the next run. |
+| `gateway.intakeRateLimitPerMin` | `600` | `INTAKE_RATE_LIMIT_PER_MIN`: entry writes per account per minute. |
+| `gateway.rateLimitBurst` / `rateLimitRps` | `120` / `40` | `GATEWAY_RATE_LIMIT_BURST`, `GATEWAY_RATE_LIMIT_RPS` (WS-6): the per-user token bucket at the single REST funnel — burst capacity and refill rate. |
+| `meetingApi.podAnnotations` / `adminApi.podAnnotations` | `{}` | Merged over `global.podAnnotations` for that service's pods; a key set here wins (e.g. `prometheus.io/scrape`). |
 
 ## Known boundaries (v0.12)
 

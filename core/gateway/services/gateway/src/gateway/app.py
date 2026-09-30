@@ -42,6 +42,8 @@ from . import routes_manifest
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 
+from .identity_signature import SIGNATURE_HEADER, KeyRingError, sign_now, signing_key
+from .intake_limit import IntakeLimiter, IntakeUnavailable
 from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event, set_user_id
 from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
 
@@ -49,7 +51,7 @@ from .ports import Authorizer, AuthUnavailable, DownstreamClient, RedisBus
 # 401 that blames the caller's (valid) key. Shared by /auth/me and the proxy authorizer. Also
 # emits a TYPED, non-empty auth-infra log line (FM02: the old path swallowed the failure in a
 # silent `except`, erasing the one signal that would have named this incident for what it was).
-def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
+def _auth_unavailable_response(exc: Exception, *, span: str, path: str) -> Response:
     log_event(
         "auth_infra_unavailable",
         audience="system",
@@ -57,18 +59,52 @@ def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
         span=span,
         fields={"reason": type(exc).__name__, "detail": str(exc)},
     )
+    return refusal(path, 503, "Authentication temporarily unavailable, retry",
+                    headers={"Retry-After": "1"})
+
+
+# §2.5: every error the edge itself answers on a /v2 path carries the /v2 error body; every other
+# route keeps {"detail": ...}. A downstream answer is never rewritten — this shapes only what the
+# gateway itself refuses. The mapping is CLOSED: every `refusal` call passes a literal status that is
+# a key here (pinned by test_every_refusal_status_the_gateway_uses_has_a_v2_code).
+V2_PREFIX = "/v2/"
+V2_ERROR_CODES = {
+    400: "invalid_request",
+    401: "unauthorized",
+    403: "forbidden",
+    429: "rate_limited",
+    502: "unavailable",
+    503: "unavailable",
+    504: "unavailable",
+}
+
+
+def refusal(path: str, status: int, message: str, headers: Optional[Dict[str, str]] = None) -> Response:
+    if path.startswith(V2_PREFIX):
+        body: dict = {"error": {"code": V2_ERROR_CODES[status], "message": message}}
+    else:
+        body = {"detail": message}
     return Response(
-        content=json.dumps({"detail": "Authentication temporarily unavailable, retry"}),
-        status_code=503,
+        content=json.dumps(body),
+        status_code=status,
         media_type="application/json",
-        headers={"Retry-After": "1"},
+        headers=headers,
     )
 
+
+# §1.13: the entry writes, which share one per-account budget (intake_limit.py).
+_INTAKE_WRITE_ROUTES: FrozenSet[Tuple[str, str]] = frozenset(
+    {("PUT", "/v2/entries"), ("POST", "/v2/entries/remove")}
+)
+
 # --- the scope model -------------------------------------------------------------------------
-# The three key scopes, as ``docs/docs/authentication.mdx`` defines them:
-#   bot     — "send and manage meeting bots, read transcripts"
-#   tx      — "transcription / transcript access"
-#   browser — "browser-tool capabilities"
+# The key scopes, as ``docs/docs/authentication.mdx`` defines them:
+#   bot      — "send and manage meeting bots, read transcripts"
+#   tx       — "transcription / transcript access"
+#   browser  — "browser-tool capabilities"
+#   erase    — "erase a finished meeting's data"
+#   webhooks — "manage webhook subscriptions"
+#   export   — "report an export result"
 #
 # Read as capabilities, that gives one rule per domain:
 #   BOT       anything that can make a bot EXIST, stop existing, or change how it behaves — the
@@ -81,6 +117,9 @@ def _auth_unavailable_response(exc: Exception, *, span: str) -> Response:
 #             NEITHER — a browser-only key — is refused.
 #   browser   grants NO gateway route. v0.12 serves no browser-tool surface at this edge, so a
 #             browser-only key can authenticate (GET /auth/me) and do nothing else.
+#   erase     least privilege for one act: DELETE /v2/meetings/{id} (erase a finished meeting's
+#             aw-bots data, §1.13). `webhooks` and `export` are in the vocabulary for the webhook
+#             subscription routes and the exporter's result route; their domains declare them.
 # ── THE TABLE IS ASSEMBLED, NOT WRITTEN HERE (PRD decisions 40.5 + 40.7) ─────────────────────
 #
 # This used to be a 92-line literal holding all 69 rows, seven of them the agent domain's. That
@@ -170,9 +209,9 @@ _MCP_HEADERS = ("mcp-session-id", "mcp-protocol-version")
 # admin-api's /user. Every param is re-encoded as ONE opaque segment before it is interpolated.
 # Control characters (NUL, CR, LF) are refused here instead: httpx raises ``InvalidURL`` for them,
 # which is NOT a ``RequestError`` and would escape the 502/504 mapping as a gateway 500.
-def _path_segment(value: str) -> Tuple[Optional[str], Optional[Response]]:
+def _path_segment(value: str, path: str) -> Tuple[Optional[str], Optional[Response]]:
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-        return None, _invalid_path_param_response()
+        return None, _invalid_path_param_response(path)
     segment = quote(value, safe="")
     # ``quote`` leaves "." alone (it is unreserved), but httpx RESOLVES a dot-only segment against
     # the base path — "/user/calendars/.." becomes admin-api's "/user". Percent-encode it so the
@@ -182,12 +221,8 @@ def _path_segment(value: str) -> Tuple[Optional[str], Optional[Response]]:
     return segment, None
 
 
-def _invalid_path_param_response() -> Response:
-    return Response(
-        content=json.dumps({"detail": "invalid path parameter"}),
-        status_code=400,
-        media_type="application/json",
-    )
+def _invalid_path_param_response(path: str) -> Response:
+    return refusal(path, 400, "invalid path parameter")
 
 
 def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
@@ -211,7 +246,8 @@ def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
 # the gateway resolved from the api-key, ``x-internal-secret`` is the internal service tier (agent-api
 # ``_internal_caller``, admin-api ``_check_internal`` — the gate the meeting room calls its own trust
 # boundary), ``x-gateway-verified`` is the marker ``VEXA_REQUIRE_GATEWAY_IDENTITY`` looks for, and
-# ``x-admin-api-key`` is admin-api's privileged surface.
+# ``x-admin-api-key`` is admin-api's privileged surface, and ``x-gateway-signature`` is the signature
+# meeting-api and admin-api check ``x-user-id`` against (``identity_signature.py``, §1.10).
 #
 # NONE of them may arrive from a client. The strip used to be an eight-name list of ``x-user-*``
 # spellings, so ``x-internal-secret`` from the public edge reached agent-api and was believed — and
@@ -219,7 +255,7 @@ def _required_scopes(request: Request, table=None) -> Optional[FrozenSet[str]]:
 # any api-key holder. A LIST rots the moment a new authority header is added; a PREFIX rule does not,
 # which is why this matches by family and why every new internal header must be spelled into one.
 _AUTHORITY_HEADER_PREFIXES = ("x-user-", "x-internal-", "x-vexa-internal-")
-_AUTHORITY_HEADER_EXACT = frozenset({"x-admin-api-key", "x-gateway-verified"})
+_AUTHORITY_HEADER_EXACT = frozenset({"x-admin-api-key", "x-gateway-verified", SIGNATURE_HEADER})
 
 
 def _is_authority_header(name: str) -> bool:
@@ -228,12 +264,8 @@ def _is_authority_header(name: str) -> bool:
     return name in _AUTHORITY_HEADER_EXACT or name.startswith(_AUTHORITY_HEADER_PREFIXES)
 
 
-def _insufficient_scope_response() -> Response:
-    return Response(
-        content=json.dumps({"detail": "Insufficient scope for this endpoint"}),
-        status_code=403,
-        media_type="application/json",
-    )
+def _insufficient_scope_response(path: str) -> Response:
+    return refusal(path, 403, "Insufficient scope for this endpoint")
 
 
 def create_app(
@@ -246,6 +278,7 @@ def create_app(
     admin_api_url: str = _DEFAULT_ADMIN_API_URL,
     mcp_url: str = _DEFAULT_MCP_URL,
     rate_limiter=None,
+    intake_limiter: Optional[IntakeLimiter] = None,
 ) -> FastAPI:
     """Build the gateway FastAPI app over the injected ports.
 
@@ -253,6 +286,7 @@ def create_app(
     ``downstream``  — forwards proxied HTTP requests to meeting-api (the unified control plane:
                       /bots + /transcripts + /meetings + /recordings all live there now, P2).
     ``redis``       — pub/sub bus for the ``/ws`` fan-in.
+    ``intake_limiter`` — the per-account entry-write budget (§1.13); ``None`` counts nothing.
     """
     # ── WHICH DOMAINS THIS DEPLOYMENT FRONTS (PRD decisions 40.6 + 40.7) ─────────────────────
     #
@@ -303,7 +337,7 @@ def create_app(
         try:
             user_data = await authorizer.resolve(api_key)
         except AuthUnavailable as e:
-            return _auth_unavailable_response(e, span="auth")  # #495: infra down → 503, not 401
+            return _auth_unavailable_response(e, span="auth", path=request.url.path)  # #495: infra down → 503, not 401
         if not user_data:
             return Response(content=json.dumps({"detail": "Invalid API key"}),
                             status_code=401, media_type="application/json")
@@ -319,31 +353,23 @@ def create_app(
     # (agent chat SSE). Returns (downstream_headers, None) on success, or (None, error_Response) when
     # the caller is rejected (fail-closed). This is the ONE place the key → user resolution and the
     # anti-spoof identity injection live, so REST and SSE scope a request identically.
-    async def _authorize(method: str, request: Request, *, api_key: Optional[str] = None):
+    async def _authorize(method: str, url: str, request: Request, *, api_key: Optional[str] = None):
         # ``api_key`` overrides the header lookup for a route whose CLIENT protocol carries the key
         # somewhere else (the MCP transport uses ``Authorization: Bearer``). The resolution, the
         # scope check and the identity injection below are the same for every route.
         client_key = api_key if api_key is not None else request.headers.get("x-api-key")
         # Fail-closed: a client route with no key is rejected before any downstream call.
         if not client_key:
-            return None, Response(
-                content=json.dumps({"detail": "Missing API key"}),
-                status_code=401,
-                media_type="application/json",
-            )
+            return None, refusal(request.url.path, 401, "Missing API key")
 
         try:
             user_data = await authorizer.resolve(client_key)
         except AuthUnavailable as e:
             # #495: the validation hop is unreachable/faulted — tell the caller the truth (503,
             # retry), never 401. A valid key must not be reported as invalid because we are slow.
-            return None, _auth_unavailable_response(e, span="auth")
+            return None, _auth_unavailable_response(e, span="auth", path=request.url.path)
         if not user_data:
-            return None, Response(
-                content=json.dumps({"detail": "Invalid API key"}),
-                status_code=401,
-                media_type="application/json",
-            )
+            return None, refusal(request.url.path, 401, "Invalid API key")
 
         # Bind the resolved user to the trace context so every later line carries user_id.
         user_id = user_data["user_id"]
@@ -353,12 +379,7 @@ def create_app(
         # the control plane (the max_concurrent_bots cap bounds active bots, not request rate). 429 when
         # the per-user token bucket is empty; the bucket refills continuously (Retry-After: 1s).
         if rate_limiter is not None and not rate_limiter.allow(str(user_id)):
-            return None, Response(
-                content=json.dumps({"detail": "Rate limit exceeded"}),
-                status_code=429,
-                media_type="application/json",
-                headers={"Retry-After": "1"},
-            )
+            return None, refusal(request.url.path, 429, "Rate limit exceeded", headers={"Retry-After": "1"})
 
         # Scope enforcement — DENY BY DEFAULT. Every proxied route declares its scopes in
         # ROUTE_SCOPES; an undeclared route is refused here rather than forwarded, so the failure
@@ -379,7 +400,7 @@ def create_app(
                 user_id=user_id,
                 fields={"method": method, "path": request.url.path},
             )
-            return None, _insufficient_scope_response()
+            return None, _insufficient_scope_response(request.url.path)
         user_scopes = set(user_data.get("scopes", []))
         if not user_scopes & required:
             log_event(
@@ -390,7 +411,37 @@ def create_app(
                 user_id=user_id,
                 fields={"method": method, "path": request.url.path, "required": sorted(required)},
             )
-            return None, _insufficient_scope_response()
+            return None, _insufficient_scope_response(request.url.path)
+
+        # §1.13: an entry write spends from its account's per-minute budget, counted only once the
+        # key and scope are good. A store that cannot count refuses the write — never uncounted.
+        route_path = getattr(request.scope.get("route"), "path", None)
+        if intake_limiter is not None and (request.method.upper(), route_path) in _INTAKE_WRITE_ROUTES:
+            try:
+                decision = await intake_limiter.hit(str(user_id))
+            except IntakeUnavailable as e:
+                log_event(
+                    "intake_limit_unavailable",
+                    audience="system",
+                    level="error",
+                    span="auth",
+                    user_id=user_id,
+                    fields={"method": method, "path": request.url.path, "reason": str(e)},
+                )
+                return None, refusal(request.url.path, 503, "Entry writes are temporarily unavailable, retry")
+            if not decision.allowed:
+                log_event(
+                    "intake_rate_limited",
+                    audience="user",
+                    level="warning",
+                    span="auth",
+                    user_id=user_id,
+                    fields={"method": method, "path": request.url.path, "retry_after": decision.retry_after},
+                )
+                return None, refusal(
+                    request.url.path, 429, "Entry write rate limit exceeded",
+                    headers={"Retry-After": str(decision.retry_after)},
+                )
 
         # USER-facing event: the request was accepted on behalf of this user.
         log_event(
@@ -431,36 +482,57 @@ def create_app(
             if user_data.get("webhook_events"):
                 headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
         headers[TRACE_HEADER] = get_trace_id() or ""
+        # §1.10: meeting-api and admin-api believe these x-user-* headers only with a fresh
+        # signature, which _sign adds once the exact query and body to forward are known. Without a usable key ring
+        # there is no identity to vouch for; the fault names a setting, never a key.
+        try:
+            signing_key()
+        except KeyRingError as e:
+            log_event(
+                "identity_signing_unconfigured",
+                audience="system",
+                level="error",
+                span="auth",
+                user_id=user_id,
+                fields={"method": method, "path": request.url.path, "fault": str(e)},
+            )
+            return None, refusal(request.url.path, 503, str(e))
         return headers, None
+
+    # §1.10, §6.9 F-E: signed with the ring's active key, named by kid, over the forwarded
+    # x-user-id and every other identity header (identity_signature.IDENTITY_HEADERS), the method,
+    # the path and query of the URL httpx sends, and the SHA-256 of the exact body bytes forwarded.
+    def _sign(headers: dict, method: str, url: str, params: Optional[dict], content: bytes) -> None:
+        headers[SIGNATURE_HEADER] = sign_now(signing_key(), headers, method, url, params, content)
 
     # --- the REST proxy: faithful carve of main.forward_request for client (non-admin) routes.
     async def _forward(method: str, url: str, request: Request, *, api_key: Optional[str] = None) -> Response:
-        headers, error = await _authorize(method, request, api_key=api_key)
+        headers, error = await _authorize(method, url, request, api_key=api_key)
         if error is not None:
             return error
 
         content = await request.body()
+        params = dict(request.query_params) or None
         # A public gateway must not LEAK its own 500 for an UPSTREAM fault: map a slow upstream → 504 and
         # an unreachable/transport-failed upstream → 502, so a client can tell "backend down" from
         # "gateway broke" (and get a retryable signal). Timeout is a subclass of RequestError → catch it first.
         try:
+            _sign(headers, method, url, params, content)
             resp = await downstream.request(
                 method,
                 url,
                 headers=headers,
-                params=dict(request.query_params) or None,
+                params=params,
                 content=content,
             )
         except httpx.InvalidURL:
             # Not a RequestError: without this arm an unparseable hop URL surfaces as a gateway 500
             # even though the fault is in what the CALLER put in the path.
-            return _invalid_path_param_response()
+            return _invalid_path_param_response(request.url.path)
         except httpx.TimeoutException:
-            return Response(content=json.dumps({"detail": "upstream timeout"}),
-                            status_code=504, media_type="application/json")
+            return refusal(request.url.path, 504, "upstream timeout")
         except httpx.RequestError as e:
-            return Response(content=json.dumps({"detail": f"upstream unreachable: {type(e).__name__}"}),
-                            status_code=502, media_type="application/json")
+            return refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
 
         # SYSTEM/debug event: the proxy hop completed.
         log_event(
@@ -615,6 +687,52 @@ def create_app(
     async def delete_planned_meeting(meeting_id: int, request: Request):
         return await _forward("DELETE", _meeting(f"/meetings/{meeting_id}"), request)
 
+    # ---- meeting intake (§2.1): entries in, aw-bots meetings out, keyed by the meeting UUID. Each
+    # forwards verbatim to the same meeting-api path; the UUID is re-encoded as one opaque segment.
+    @app.put("/v2/entries")
+    async def put_entry(request: Request):
+        return await _forward("PUT", _meeting("/v2/entries"), request)
+
+    @app.post("/v2/entries/remove")
+    async def remove_entry(request: Request):
+        return await _forward("POST", _meeting("/v2/entries/remove"), request)
+
+    @app.get("/v2/entries")
+    async def list_entries(request: Request):
+        return await _forward("GET", _meeting("/v2/entries"), request)
+
+    @app.get("/v2/meetings")
+    async def list_v2_meetings(request: Request):
+        return await _forward("GET", _meeting("/v2/meetings"), request)
+
+    @app.get("/v2/meetings/{meeting_id}")
+    async def get_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("GET", _meeting(f"/v2/meetings/{segment}"), request)
+
+    @app.post("/v2/meetings/{meeting_id}/stop")
+    async def stop_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("POST", _meeting(f"/v2/meetings/{segment}/stop"), request)
+
+    @app.delete("/v2/meetings/{meeting_id}")
+    async def erase_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("DELETE", _meeting(f"/v2/meetings/{segment}"), request)
+
+    @app.post("/v2/meetings/{meeting_id}/export")
+    async def export_v2_meeting(meeting_id: str, request: Request):
+        segment, error = _path_segment(meeting_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("POST", _meeting(f"/v2/meetings/{segment}/export"), request)
+
     # User-owned scheduling intent (schedule/cancel) — the Meetings surface's Schedule/Cancel action
     # PUTs here; forwards to meeting-api's PUT /meetings/{platform}/{native}/intent (owner-scoped).
     # Mint an INDEPENDENT transcript share link for a meeting (owner) — Lane A / M0.
@@ -749,28 +867,28 @@ def create_app(
 
     @app.patch("/user/calendars/{calendar_id}")
     async def update_user_calendar(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("PATCH", _admin(f"/user/calendars/{segment}"), request)
 
     @app.delete("/user/calendars/{calendar_id}")
     async def delete_user_calendar(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("DELETE", _admin(f"/user/calendars/{segment}"), request)
 
     @app.get("/user/calendars/{calendar_id}/sync")
     async def get_calendar_connection_sync(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("GET", _meeting(f"/user/calendars/{segment}/sync"), request)
 
     @app.post("/user/calendars/{calendar_id}/sync")
     async def run_calendar_connection_sync(calendar_id: str, request: Request):
-        segment, error = _path_segment(calendar_id)
+        segment, error = _path_segment(calendar_id, request.url.path)
         if error is not None:
             return error
         return await _forward("POST", _meeting(f"/user/calendars/{segment}/sync"), request)
@@ -793,6 +911,51 @@ def create_app(
     async def get_user_transcription(request: Request):
         return await _forward("GET", _admin("/user/transcription"), request)
 
+    # ---- webhook subscriptions (§2.7): identity owns them. Each forwards verbatim to the same
+    # admin-api path; the subscription id is re-encoded as one opaque segment. Scope `webhooks`.
+    @app.post("/v2/webhooks")
+    async def create_webhook(request: Request):
+        return await _forward("POST", _admin("/v2/webhooks"), request)
+
+    @app.get("/v2/webhooks")
+    async def list_webhooks(request: Request):
+        return await _forward("GET", _admin("/v2/webhooks"), request)
+
+    @app.patch("/v2/webhooks/{subscription_id}")
+    async def patch_webhook(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("PATCH", _admin(f"/v2/webhooks/{segment}"), request)
+
+    @app.delete("/v2/webhooks/{subscription_id}")
+    async def delete_webhook(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("DELETE", _admin(f"/v2/webhooks/{segment}"), request)
+
+    @app.post("/v2/webhooks/{subscription_id}/rotate-secret")
+    async def rotate_webhook_secret(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("POST", _admin(f"/v2/webhooks/{segment}/rotate-secret"), request)
+
+    @app.post("/v2/webhooks/{subscription_id}/test")
+    async def test_webhook(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("POST", _admin(f"/v2/webhooks/{segment}/test"), request)
+
+    @app.get("/v2/webhooks/{subscription_id}/deliveries")
+    async def list_webhook_deliveries(subscription_id: str, request: Request):
+        segment, error = _path_segment(subscription_id, request.url.path)
+        if error is not None:
+            return error
+        return await _forward("GET", _admin(f"/v2/webhooks/{segment}/deliveries"), request)
+
     # ---- the AGENT domain (P20·Stage 2): the gateway fronts agent-api under the canonical /agent/*
     # prefix so the SAME edge resolves key → user and injects X-User-Id; agent-api derives `subject`
     # from it (never the client). The terminal therefore talks ONLY to the gateway (one authenticated
@@ -806,11 +969,12 @@ def create_app(
     SSE_HEADERS = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
     async def _forward_stream(method: str, url: str, request: Request) -> Response:
-        headers, error = await _authorize(method, request)
+        headers, error = await _authorize(method, url, request)
         if error is not None:
             return error
         content = await request.body()
         params = dict(request.query_params) or None
+        _sign(headers, method, url, params, content)
 
         async def body():
             async for chunk in downstream.stream(method, url, headers=headers, params=params, content=content):
@@ -832,11 +996,12 @@ def create_app(
     async def _forward_stream_verbatim(
         method: str, url: str, request: Request, *, api_key: Optional[str] = None
     ) -> Response:
-        headers, error = await _authorize(method, request, api_key=api_key)
+        headers, error = await _authorize(method, url, request, api_key=api_key)
         if error is not None:
             return error
         content = await request.body()
         params = dict(request.query_params) or None
+        _sign(headers, method, url, params, content)
 
         stack = AsyncExitStack()
         try:
@@ -845,12 +1010,10 @@ def create_app(
             )
         except httpx.TimeoutException:
             await stack.aclose()
-            return Response(content=json.dumps({"detail": "upstream timeout"}),
-                            status_code=504, media_type="application/json")
+            return refusal(request.url.path, 504, "upstream timeout")
         except httpx.RequestError as e:
             await stack.aclose()
-            return Response(content=json.dumps({"detail": f"upstream unreachable: {type(e).__name__}"}),
-                            status_code=502, media_type="application/json")
+            return refusal(request.url.path, 502, f"upstream unreachable: {type(e).__name__}")
 
         log_event(
             "downstream_stream_opened",

@@ -16,18 +16,23 @@ fully in-process.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..lifecycle.machine import dominant_completion_reason
 from .ports import (
+    ClaimNotDue,
+    ClaimTargetMoved,
     DuplicateMeeting,
     MaxBotsExceeded,
     MeetingStopped,
+    PlannedRow,
     QuotaExceeded,
     SpawnFailed,
     WorkloadUnknown,
     _archive_completion,
     _stopped_reopen_detail,
+    planned_claim,
     reconcile_grace_for_status,
 )
 
@@ -76,15 +81,13 @@ class InMemoryMeetingRepo:
         return None
 
     async def find_latest(self, user_id, platform, native_meeting_id) -> Optional[dict]:
-        rows = [
-            m for m in self._meetings.values()
-            if m["user_id"] == user_id
-            and m["platform"] == platform
-            and m["native_meeting_id"] == native_meeting_id
-        ]
-        if not rows:
-            return None
-        return dict(max(rows, key=lambda m: m["id"]))  # id is monotonic → most recent
+        from ..intake.fakes import link_rows_in
+        from ..intake.ports import Room
+        from ..intake.resolver import LinkKind, resolve
+
+        rows = link_rows_in(self._meetings.values(), user_id, Room(platform, native_meeting_id))
+        picked = resolve(rows, LinkKind.READ, now=datetime.now(timezone.utc))
+        return dict(self._meetings[picked.id]) if picked is not None else None
 
     async def create_meeting(self, *, user_id, platform, native_meeting_id, data) -> dict:
         mid = self._next_id
@@ -108,23 +111,51 @@ class InMemoryMeetingRepo:
 
     async def create_meeting_guarded(
         self, *, user_id, platform, native_meeting_id, data, max_concurrent=None,
-        exclude_meeting_id=None,
+        exclude_meeting_id=None, claim_meeting_id=None, claim_due=None,
     ) -> dict:
-        """ATOMIC dedup + cap + insert (ROB1/ROB2). The check and the insert run with NO ``await``
-        between them, so even ``SlowRepo`` (which adds ``await asyncio.sleep(0)`` inside the SEPARATE
-        ``count_active_bots`` / ``create_meeting`` methods) cannot interleave concurrent spawns here —
-        modelling the real adapter's single-transaction guard (advisory lock + unique partial index)."""
+        """ATOMIC dedup + cap + claim-or-insert (ROB1/ROB2, §1.5). The check and the write run with
+        NO ``await`` between them, so even ``SlowRepo`` (which adds ``await asyncio.sleep(0)`` inside
+        the SEPARATE ``count_active_bots`` / ``create_meeting`` methods) cannot interleave concurrent
+        spawns here — modelling the real adapter's single-transaction guard (link lock + per-user
+        advisory lock + unique partial index). A row may carry ``scheduled_end_at`` (the
+        ``meeting_aw_state`` column the real adapter's claim reads) and ``has_entries`` (whether a
+        ``meeting_entries`` row points at it)."""
+        from ..intake import retry
+        from .auto_join import LIVE_STATUSES
+
         # 0. depleted — a cap <= 0 means NO bots allowed (0 is "depleted", never "unlimited");
         #    only ``None`` (no cap provided) skips the gate. Mirrors the real adapter.
         if max_concurrent is not None and max_concurrent <= 0:
             raise MaxBotsExceeded(user_id, max_concurrent)
-        # 1. dedup — an ACTIVE row for (user, platform, native) blocks the spawn (409).
+        # 0b. the exact row — another user's or a missing row, or one on another link, is refused.
+        target = None
+        if claim_meeting_id is not None:
+            target = self._meetings.get(claim_meeting_id)
+            if target is None or target["user_id"] != user_id:
+                raise LookupError(f"meeting {claim_meeting_id} not found for user {user_id}")
+            if (target["platform"], target["native_meeting_id"]) != (platform, native_meeting_id):
+                raise ClaimTargetMoved(claim_meeting_id)
+            if (claim_due is not None and target["status"] == "scheduled"
+                    and not claim_due.holds(
+                        target["data"], managed=bool(target.get("has_entries")),
+                        scheduled_end_at=target.get("scheduled_end_at"))):
+                raise ClaimNotDue(claim_meeting_id)
+        # A meeting waiting for its next bot whose failed workload is proven gone (§6.9 F-K2)
+        # holds its own link and bot slot: its own row is left out of both checks.
+        waiting: Optional[dict] = None
+        if (target is not None and target["status"] == "requested"
+                and retry.proven(target["data"])):
+            waiting = target
+            exclude_meeting_id = target["id"]
+        # 1. dedup — a LIVE row for (user, platform, native) blocks the spawn (409).
         for m in self._meetings.values():
+            if waiting is not None and m["id"] == waiting["id"]:
+                continue
             if (
                 m["user_id"] == user_id
                 and m["platform"] == platform
                 and m["native_meeting_id"] == native_meeting_id
-                and m["status"] in _ACTIVE_STATUSES
+                and m["status"] in LIVE_STATUSES
             ):
                 raise DuplicateMeeting(
                     f"An active meeting already exists for {platform}/{native_meeting_id}"
@@ -139,19 +170,50 @@ class InMemoryMeetingRepo:
                 and m["id"] != exclude_meeting_id
             )
             if active >= max_concurrent:
-                raise MaxBotsExceeded(user_id, max_concurrent)
-        # 2b. claim — a PLANNED row (intent status) for the same (user, platform, native) is
-        #     UPGRADED in place, mirroring the real adapter: spawn keys merge OVER the planned
-        #     data (title / scheduled_at / workspace_id / auto_join / calendar_uid survive).
-        planned_rows = [
-            m for m in self._meetings.values()
+                raise MaxBotsExceeded(user_id, max_concurrent, active=active)
+        # 2a'. the waiting meeting is claimed without a status change: the marker's failure goes
+        #      into the completion history, the failed workload is forgotten.
+        if waiting is not None:
+            waiting["data"] = {
+                **retry.claimed(waiting["data"]), **dict(data or {}),
+                "auto_join_last_attempt": datetime.now(timezone.utc).isoformat(),
+            }
+            waiting["bot_container_id"] = None
+            waiting["end_time"] = None
+            return dict(waiting)
+        # 2a. the exact row moves `scheduled` → `requested` (any other status → MeetingStopped),
+        #     the spawn keys merged over its data and the send time stamped (§2.4).
+        if target is not None:
+            if target["status"] != "scheduled":
+                raise MeetingStopped(
+                    f"meeting {claim_meeting_id} is {target['status']}; only a scheduled meeting "
+                    f"can be sent a bot"
+                )
+            target["status"] = "requested"
+            target["data"] = {
+                **dict(target["data"]), **dict(data or {}),
+                "auto_join_last_attempt": datetime.now(timezone.utc).isoformat(),
+            }
+            return dict(target)
+        # 2b. claim — the PLANNED row (intent status) the R1 join_now rule picks is UPGRADED in
+        #     place, mirroring the real adapter: spawn keys merge OVER the planned data (title /
+        #     scheduled_at / workspace_id / auto_join / calendar_uid survive).
+        planned_rows = {
+            m["id"]: m for m in self._meetings.values()
             if m["user_id"] == user_id
             and m["platform"] == platform
             and m["native_meeting_id"] == native_meeting_id
             and m["status"] in ("idle", "scheduled")
-        ]
-        if planned_rows:
-            row = max(planned_rows, key=lambda m: m["id"])  # newest, like the real adapter
+        }
+        picked = planned_claim(
+            [PlannedRow.of(m["id"], m["status"], m["data"], m.get("start_time"),
+                           m.get("created_at"), m.get("scheduled_end_at"),
+                           bool(m.get("has_entries")))
+             for m in planned_rows.values()],
+            now=datetime.now(timezone.utc),
+        )
+        if picked is not None:
+            row = planned_rows[picked]
             row["status"] = "requested"
             row["end_time"] = None
             row["bot_container_id"] = None
@@ -160,8 +222,8 @@ class InMemoryMeetingRepo:
             # exist (a scheduled row flagged by a rev-193 DELETE that never terminalized it), and
             # claiming one while the flag rides along would make the spawn fence abort the very bot
             # the user just asked for. The flag records intent about the run that WAS planned; this
-            # is a new one. (Post-fix, a stop terminalizes the planned row, so it is not claimable
-            # at all — this only ever meets rows written by an older build.)
+            # is a new one. (A stop never touches a planned row — §1.6, it stops the live meeting
+            # only — so the flag on a plan only ever comes from an older build.)
             planned.pop("stop_requested", None)
             row["data"] = {**planned, **dict(data or {})}
             return dict(row)
@@ -185,13 +247,38 @@ class InMemoryMeetingRepo:
         self._meetings[mid] = row
         return dict(row)
 
-    async def list_scheduled_meetings(self) -> list:
-        return [
-            dict(m) for m in self._meetings.values()
-            if m["status"] == "scheduled"
-            and m["native_meeting_id"] is not None
-            and m["platform"] not in (None, "", "unknown")
-        ]
+    async def list_due_meetings(self, now, lead_s, *, after=None, limit=None) -> list:
+        """The real adapter's due read: ``scheduled`` rows with a joinable link whose meeting time
+        (``data.scheduled_at``, else ``start_time``, else ``created_at``) is at or before
+        ``now + lead_s``, by meeting time then id, each with its ``scheduled_end_at`` /
+        ``waiting_for_room_sent_at`` (ISO strings, as the adapter renders them), ``has_entries``
+        and ``event_time`` (the meeting time); one page of ``limit`` rows after ``after``, an
+        ``(event_time, id)`` pair."""
+        from datetime import timedelta
+
+        from ..intake.projection import iso_utc
+        from ..intake.rules import meeting_start
+
+        due_by = now + timedelta(seconds=lead_s)
+        due = []
+        for m in self._meetings.values():
+            if (m["status"] != "scheduled" or m["native_meeting_id"] is None
+                    or m["platform"] in (None, "", "unknown")):
+                continue
+            at = meeting_start(m.get("data"), m.get("start_time"), m.get("created_at"))
+            if at is None or at > due_by:
+                continue
+            if after is not None and (at, m["id"]) <= after:
+                continue
+            due.append((at, m["id"], {
+                **m,
+                "scheduled_end_at": iso_utc(m.get("scheduled_end_at")),
+                "waiting_for_room_sent_at": iso_utc(m.get("waiting_for_room_sent_at")),
+                "has_entries": bool(m.get("has_entries")),
+                "event_time": at,
+            }))
+        rows = [row for _, _, row in sorted(due, key=lambda item: (item[0], item[1]))]
+        return rows if limit is None else rows[:limit]
 
     async def list_live_meetings(self) -> list:
         from .auto_join import LIVE_STATUSES
@@ -207,6 +294,8 @@ class InMemoryMeetingRepo:
         m = self._meetings.get(meeting_id)
         if m is None:
             return
+        if callable(patch):
+            patch = patch(dict(m["data"]))
         for k, v in patch.items():
             if v is None:
                 m["data"].pop(k, None)
@@ -258,11 +347,14 @@ class InMemoryMeetingRepo:
 
     async def fail_meeting(
         self, *, meeting_id, reason, failure_stage="requested",
-        completion_reason="start_failed", data=None,
+        completion_reason="start_failed", data=None, outcome=None,
+        workload_id=None, workload_gone=True,
     ) -> Optional[dict]:
         row = self._meetings.get(meeting_id)
         if row is None:
             return None
+        if row["status"] in _TERMINAL_STATUSES or row["data"].get("bot_retry"):
+            return dict(row)
         row["status"] = "failed"
         row["data"].update(dict(data or {}))
         if failure_stage is not None:
@@ -301,15 +393,139 @@ class InMemoryMeetingRepo:
         sid = next(
             (s["session_uid"] for s in reversed(self.sessions) if s["meeting_id"] == row["id"]), None
         )
+        from ..intake import retry
+
         return {
             "meeting_id": row["id"],
             "status": row["status"],
             "session_uid": sid,
             "stop_requested": bool((row.get("data") or {}).get("stop_requested")),
+            "bot_retry": retry.marker(row.get("data")),
         }
 
+    async def prove_retry_gone(self, *, meeting_id, workload) -> bool:
+        from ..intake import retry
+
+        row = self._meetings.get(meeting_id)
+        if row is None:
+            return False
+        mark = retry.marker(row.get("data"))
+        if mark is None or row["status"] != "requested" or mark.get("workload") != workload:
+            return False
+        row["data"][retry.MARKER] = {**mark, "proven_gone": True}
+        return True
+
+    async def get_finished_meeting(self, meeting_id) -> Optional[dict]:
+        row = self._meetings.get(meeting_id)
+        if row is None or row["status"] not in _TERMINAL_STATUSES:
+            return None
+        return dict(row)
+
+    async def claim_finish(self, *, meeting_id, session_uid) -> Optional[dict]:
+        """The real adapter's at-most-once claim of a finished meeting end's finish."""
+        from .ports import FINISHED_END, finished_end
+
+        row = self._meetings.get(meeting_id)
+        if row is None or row["status"] not in _TERMINAL_STATUSES:
+            return None
+        end = finished_end(row["status"], session_uid)
+        if (row.get("data") or {}).get(FINISHED_END) == end:
+            return None
+        row["data"] = {**(row.get("data") or {}), FINISHED_END: end}
+        return dict(row)
+
+    async def list_unproven_teardowns(self, *, after=None, limit=None) -> list:
+        """The real adapter's read of the rows carrying pending teardowns, any status: a page of
+        ``limit`` rows after ``after``, one item per pending workload."""
+        from .ports import pending_teardowns
+
+        found = [
+            (mid, m) for mid, m in sorted(self._meetings.items())
+            if pending_teardowns(m.get("data")) and (after is None or mid > after)
+        ]
+        found = found if limit is None else found[:limit]
+        return [
+            {"id": mid, "user_id": m["user_id"], "workload": t.get("workload"),
+             "since": t.get("since")}
+            for mid, m in found for t in pending_teardowns(m.get("data"))
+        ]
+
+    async def end_retry(self, *, meeting_id, change_reason=None, message=None) -> Optional[str]:
+        """The real adapter's ``retry.end`` on a waiting row (no outbox here): an event id when it
+        ended the meeting, ``None`` when the meeting wasn't waiting."""
+        from ..intake import retry
+
+        row = self._meetings.get(meeting_id)
+        if row is None:
+            return None
+        mark = retry.marker(row.get("data"))
+        if mark is None or row["status"] != "requested":
+            return None
+        row["status"] = "failed"
+        row["data"][retry.MARKER] = None
+        row["data"]["failure_reason"] = message or mark.get("message")
+        if mark.get("reason") is not None:
+            row["data"]["completion_reason"] = mark["reason"]
+        if mark.get("stage") is not None:
+            row["data"]["failure_stage"] = mark["stage"]
+        if not mark.get("proven_gone") and mark.get("workload"):
+            from .ports import unproven_teardown
+
+            row["data"].update(unproven_teardown(row["data"], str(mark["workload"])))
+        return f"evt_retry_end_{meeting_id}"
+
+    async def list_unfinished_spawns(self, *, after=None, limit=None) -> list:
+        """The real adapter's read of ``requested`` rows with no marker, no container and a
+        ``data.spawn_session``, each with ``written`` and its ``newest_session``."""
+        rows = []
+        for mid, m in sorted(self._meetings.items()):
+            data = m.get("data") or {}
+            if (m["status"] != "requested" or m.get("bot_container_id") or data.get("bot_retry")
+                    or not data.get("spawn_session") or (after is not None and mid <= after)):
+                continue
+            sessions = [s["session_uid"] for s in self.sessions if s["meeting_id"] == mid]
+            rows.append({**m, "written": data["spawn_session"].get("session") in sessions,
+                         "newest_session": sessions[-1] if sessions else None})
+        return rows if limit is None else rows[:limit]
+
+    async def end_unfinished_spawn(self, *, meeting_id, untracked_grace) -> Optional[str]:
+        """The real adapter's end of a meeting whose spawn died before its session write."""
+        from ..intake import retry
+
+        row = self._meetings.get(meeting_id)
+        if (row is None or row["status"] != "requested" or row.get("bot_container_id")
+                or retry.marker(row["data"]) is not None):
+            return None
+        sessions = [s["session_uid"] for s in self.sessions if s["meeting_id"] == meeting_id]
+        plan = row["data"].get("spawn_session") or {}
+        ending = retry.unfinished_spawn(
+            meeting_id, row["data"], written=plan.get("session") in sessions,
+            newest_session=sessions[-1] if sessions else None,
+            untracked_grace=untracked_grace, now=datetime.now(timezone.utc),
+        )
+        if ending is None:
+            return None
+        row["status"] = "failed"
+        row["data"].update(ending[1])
+        return f"evt_unfinished_spawn_{meeting_id}"
+
+    async def list_retry_meetings(self, *, after=None, limit=None) -> list:
+        """The real adapter's retry read: ``requested`` rows with ``data.bot_retry``, by id, each
+        with its ``scheduled_end_at`` (an ISO string, as the adapter renders it)."""
+        from ..intake import retry
+        from ..intake.projection import iso_utc
+
+        rows = [
+            {**m, "scheduled_end_at": iso_utc(m.get("scheduled_end_at"))}
+            for mid, m in sorted(self._meetings.items())
+            if m["status"] == "requested" and retry.marker(m.get("data")) is not None
+            and (after is None or mid > after)
+        ]
+        return rows if limit is None else rows[:limit]
+
     async def update_meeting_status(
-        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
+        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None,
+        change_reason=None, expected_from=None, transition_source=None,
     ) -> None:
         sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
         if sess is None:
@@ -317,6 +533,23 @@ class InMemoryMeetingRepo:
         row = self._meetings.get(sess["meeting_id"])
         if row is None:
             return
+        # Only the meeting's newest session writes, never a retired one (the adapter's §6.9 F-K2
+        # guard).
+        from ..intake import retry
+
+        if (
+            [s for s in self.sessions if s["meeting_id"] == row["id"]][-1] is not sess
+            or session_uid in retry.retired_sessions(row["data"])
+        ):
+            return None
+        # The adapter's conditional write: only from a predecessor, never off a finished status.
+        from .auto_join import LIVE_STATUSES
+
+        predecessors = set(LIVE_STATUSES if expected_from is None else expected_from)
+        predecessors -= {"completed", "failed"}
+        pending = bool(row["data"].get("bot_retry"))  # §6.9 F-K2: waiting for its next bot
+        if row["status"] != status and (pending or row["status"] not in predecessors):
+            return None
         row["status"] = status
         if completion_reason is not None:
             row["data"]["completion_reason"] = completion_reason
@@ -479,13 +712,15 @@ class InMemoryMeetingRepo:
         return True
 
     async def list_stale_nonterminal(
-        self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None
+        self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None,
+        after: Any = None, limit: Optional[int] = None,
     ) -> list:
         """In-memory mirror of the SQL adapter's general reconcile query. A row is stale once its age
         (now - ``updated_at``) passes its per-status grace (``reconcile_grace_for_status`` — the SAME
         policy the SQL adapter reads, so the two listings cannot drift). Rows carry a static created/
         updated timestamp, so a test sets ``updated_at`` (or leaves it in the past) to mark a row
-        stale; a row whose ``updated_at`` is recent is NOT listed."""
+        stale; a row whose ``updated_at`` is recent is NOT listed. One page of ``limit`` by id
+        after ``after``."""
         from datetime import datetime, timezone
 
         non_terminal = {
@@ -501,6 +736,8 @@ class InMemoryMeetingRepo:
             row = self._meetings.get(mid)
             if row is None or row["status"] not in non_terminal:
                 continue
+            if isinstance(row.get("data", {}).get("bot_retry"), dict):
+                continue  # §6.9 F-K2: waiting for its next bot (the SQL adapter's rule)
             upd = row.get("updated_at")
             try:
                 u = datetime.fromisoformat(str(upd).replace("Z", "+00:00")) if upd else None
@@ -516,8 +753,13 @@ class InMemoryMeetingRepo:
             if (now - u).total_seconds() < grace:
                 continue
             stop_req = bool(row.get("data", {}).get("stop_requested"))
-            out[mid] = (row["status"], s["session_uid"], row.get("bot_container_id"), stop_req)
-        return [(mid, st, sid, bcid, sr) for mid, (st, sid, bcid, sr) in out.items()]
+            out[mid] = (
+                row["status"], s["session_uid"], row.get("bot_container_id"), stop_req, u,
+            )
+        page = [
+            (mid, *rest) for mid, rest in sorted(out.items()) if after is None or mid > after
+        ]
+        return page if limit is None else page[:limit]
 
     # ── test affordances (not part of the port) ──────────────────────────────────────────────────
     def set_status(self, meeting_id: int, status: str) -> None:

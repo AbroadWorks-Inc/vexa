@@ -12,12 +12,12 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from ..callback_auth import internal_secret, secret_matches
 from .ports import RecordingRepo, Storage
 from .deletion import MeetingNotTerminal, delete_owned_recording
 from .service import (
@@ -212,9 +212,8 @@ def build_router(
         if media_type == SIGNAL_MEDIA_TYPE:
             part = str(meta.get("part") or "")
             bearer = _bearer_token(authorization)
-            internal_secret = os.getenv("INTERNAL_API_SECRET")
             token_meeting_id = None
-            if not (internal_secret and bearer == internal_secret):
+            if not secret_matches(bearer, internal_secret()):
                 try:
                     claims = _verify_meeting_token(bearer, secret=token_secret)
                 except ValueError as e:
@@ -241,9 +240,8 @@ def build_router(
         # Auth: accept either the INTERNAL_API_SECRET (the bot's internal upload uses it, like the
         # lifecycle callback; meeting is scoped by session_uid) OR a MeetingToken (carries its meeting_id).
         bearer = _bearer_token(authorization)
-        internal_secret = os.getenv("INTERNAL_API_SECRET")
         token_meeting_id: Optional[int] = None
-        if internal_secret and bearer == internal_secret:
+        if secret_matches(bearer, internal_secret()):
             token_meeting_id = None  # internal auth → scope by session; skip the MeetingToken cross-check
         else:
             try:

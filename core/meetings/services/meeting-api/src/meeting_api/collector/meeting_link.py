@@ -133,10 +133,10 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
         # Jitsi: the canonical public deployment, plus (for a deliberately pasted link) the common
         # self-hosted conventions — a host containing "jitsi", or a bare ``meet.*`` host (jitsi's
         # own recommended naming). Known platforms are matched ABOVE, so this only fires for
-        # unclaimed hosts. The room is the path's single segment, kept EXACTLY as it appears in
-        # the URL (case + percent-encoding preserved) — the native id is embedded back into the
-        # construct-URL template and the DELETE path param, so it must stay URL-safe; decoding
-        # here would corrupt rooms with encoded characters. Callers keep the raw URL alongside
+        # unclaimed hosts. The room is the path's single segment, with case folded to lower-case
+        # and percent-encoding preserved — the native id is embedded back into the construct-URL
+        # template and the DELETE path param, so it must stay URL-safe; decoding here would
+        # corrupt rooms with encoded characters. Callers keep the raw URL alongside
         # (``meeting_url``) so a self-hosted room joins on ITS deployment, not the template's.
         is_jitsi_host = (
             host == "meet.jit.si"
@@ -158,7 +158,7 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
             # A bare room would make meet.jit.si/daily and video.corp/daily collide on every
             # (platform, native_meeting_id) key: duplicate checks, calendar adoption, MCP
             # idempotency. meet.jit.si keeps the bare room (canonical, unambiguous).
-            return ("jitsi", room if host == "meet.jit.si" else f"{room}@{host}")
+            return ("jitsi", room.lower() if host == "meet.jit.si" else f"{room.lower()}@{host}")
         return None
 
     # Bare numeric id → assume Zoom

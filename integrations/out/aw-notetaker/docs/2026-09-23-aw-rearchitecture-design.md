@@ -22,7 +22,7 @@ What Vexa gives us unchanged:
 | Cheap elastic infra | bot Pods pinned to our Karpenter NodePool via `runtime.nodeSelector`/`runtime.tolerations` (→ `RUNTIME_K8S_*`), sized by `runtime.workloadResources.meetingBot` (request = limit) |
 | Users / keys / caps | admin-api users + API keys, per-user `max_concurrent_bots` |
 | Recording | browser MediaRecorder → webm chunks → S3 → master on read |
-| Meeting-finished signal | system webhook `meeting.completed` (HMAC-signed, Redis retry + dead letter) |
+| Meeting-finished signal | the exporter's own `/v2/webhooks` subscription: `meeting.completed` and `bot.failed` (HMAC-signed, delivery state in Postgres, bounded retries; meeting-intake design §2.7) |
 | Live transcription | exists; **off by default** for us (`TRANSCRIBE_ENABLED=false`), per-bot override |
 
 What we add:
@@ -42,12 +42,12 @@ What we add:
 | D4 | Vexa storage = bucket **`aw-bots`** (`recordings/`, `signal/`, later `userdata/`); product folder = `aw-chatworks-transcribe/recordings/`. | agreed |
 | D5 | `aw-bots` lifecycle: expire `recordings/` + `signal/` after **14 days**; `userdata/` never. Exporter deletes nothing. | agreed |
 | D6 | Guest-join bots now; signed-in bots later (one stored session per concurrent bot). | agreed |
-| D7 | Trigger = Vexa system webhook (`VEXA_SYSTEM_WEBHOOK_URL`/`_SECRET`). | agreed |
+| D7 | Trigger = the exporter's own aw-bots `/v2/webhooks` subscription (`meeting.completed`, `bot.failed`; secret `EXPORTER_WEBHOOK_SECRET`). Upstream's system webhook (`VEXA_SYSTEM_WEBHOOK_URL`/`_SECRET`) is off for AW (meeting-intake design §1.8, §1.9, §6.9 F-X). | agreed |
 | D8 | Spawning/timing = Vexa auto-join (no custom dispatcher/orchestrator). Bot Pods on Karpenter. | agreed |
 | D9 | Old folder contract `recordings/{platform}_{event_id}_{job_id}/` is dropped; new name in §3. | agreed |
 | D10 | Portal keeps Google OAuth and pushes plans via `POST /meetings` (not Vexa ICS sync, which needs each user to paste a secret iCal URL). | agreed |
 | D11 | ONE Vexa service account owns every meeting; portal users keep their own Google-login accounts and the portal decides who sees which meeting. Vexa's dedup is per (user, platform, native id) (`bot_spawn/adapters.py:492`), so a single account is what stops shared internal meetings getting one bot per attendee. Its `max_concurrent_bots` is raised with growth. | agreed |
-| D12 | Exporter reads meeting-api **in-cluster** with `X-User-Id` = the webhook's `meeting.user_id` (the header the gateway injects after key auth). meeting-api is on no public ingress. There is **no NetworkPolicy**: the `talke-prod-usw1` cluster doesn't enforce them (VPC CNI network-policy agent off, checked 2026-09-24), so AW Bots follows the existing infra, and any Pod in the cluster can reach meeting-api, Vexa's Redis (no password) and its Postgres. Enforcement is a separate cluster-wide decision (aw-notetaker `CHANGELOG.md`). | agreed |
+| D12 | Exporter reads meeting-api **through the gateway** with its own key (`exporter`, scopes `tx` + `export`; `GATEWAY_URL`, `EXPORTER_API_KEY`): the gateway sets and signs `x-user-id`, and meeting-api refuses a direct call that names a user itself (meeting-intake design §1.9, §1.10). meeting-api is on no public ingress. There is **no NetworkPolicy**: the `talke-prod-usw1` cluster doesn't enforce them (VPC CNI network-policy agent off, checked 2026-09-24), so AW Bots follows the existing infra, and any Pod in the cluster can reach meeting-api, Vexa's Redis (no password) and its Postgres. Enforcement is a separate cluster-wide decision (aw-notetaker `CHANGELOG.md`). | agreed |
 | D13 | AW Bots runs on machines of its own: Karpenter pools `aw-bots-services` (the chart's services, Postgres, Redis, exporter; amd64, on-demand) and `aw-bots-meetings` (bot Pods). Postgres/Redis volumes use StorageClass `ebs-sc-gp3` (any zone, expandable). agent-api is off. It shares nothing with the old cloud bot or the portal, so either can be removed without touching the other. | agreed |
 
 ## 3. Output folder
@@ -56,7 +56,7 @@ What we add:
 s3://aw-chatworks-transcribe/recordings/<platform>_<nativeMeetingId>_<startUTC>/
   master.webm              kept    — Vexa audio master (opus)
   audio.wav                temp    — 16 kHz mono PCM; notetaker-worker deletes it after transcribing
-  meeting.json             kept    — Vexa meeting row (webhook data.meeting)
+  meeting.json             kept    — the §2.4 meeting as the webhook sent it (data.meeting)
   recordings.json          kept    — Vexa recording index for this meeting
   participants.json        kept    — names observed speaking (from speaker-activity.jsonl)
   speaker_timeline.json    kept    — speaker_timeline points + speaker_intervals (worker's mapper input)
@@ -77,7 +77,7 @@ s3://aw-chatworks-transcribe/recordings/<platform>_<nativeMeetingId>_<startUTC>/
 - `platform` = Vexa's value (`google_meet`, `zoom`, `teams`), passed unchanged to `/process`
   (any non-`jitsi` value takes the worker's bot path).
 - `nativeMeetingId` reduced to `[A-Za-z0-9.-]` (anything else → `-`), so `_` only separates fields.
-- `startUTC` = meeting `start_time` as `YYYYMMDDTHHMMSSmmmZ` (e.g. `20260922T170234432Z`).
+- `startUTC` = the meeting's `started_at` as `YYYYMMDDTHHMMSSmmmZ` (e.g. `20260922T170234432Z`).
 - The name is a pure function of the Vexa meeting row, so the portal computes it without a lookup.
 - `transcript.json` from the original request = the worker's `notes.json.transcript_segments` +
   `transcript.txt` (the portal already reads these).
@@ -88,18 +88,24 @@ Python 3.11 service: FastAPI + uvicorn, httpx, boto3, pydantic; `ffmpeg` binary 
 replica; per-meeting jobs are independent.
 
 ### 4.1 Intake — `POST /hooks/vexa`
-- Verify `X-Webhook-Signature: sha256=HMAC(secret, "<X-Webhook-Timestamp>." + raw_body)` with
-  `hmac.compare_digest`; reject timestamps older than 300 s; fail closed if the secret is unset.
-- `meeting.completed` → enqueue; any other event → 200 no-op (logged).
-- Durable enqueue: `PUT s3://aw-bots/aw-exporter/pending/<meeting_id>.json` (the envelope), then
-  **202**. Enqueue failure → 503 so Vexa's retry queue redelivers.
+- Verify `X-Webhook-Signature: sha256=HMAC(secret, "<X-Webhook-Timestamp>." + raw_body)` (or, for
+  24 h after a rotation, `X-Webhook-Signature-Previous`) under `EXPORTER_WEBHOOK_SECRET` with
+  `hmac.compare_digest`; reject timestamps more than 300 s off; fail closed if the secret is unset.
+  `data.meeting` is the §2.4 meeting of the meeting-intake design (`id` UUID, `upstream_id`,
+  `started_at`, `ended_at`); each queued `event_id` is recorded under `aw-exporter/events/`, so a
+  redelivery is answered 200 `duplicate`.
+- `meeting.completed` → enqueue; `bot.failed` → enqueue too (a failed meeting that has a recording
+  is exported, intake design §6.9 F-K2; see `README.md` "Which meetings are exported"); any other
+  event → 200 no-op (logged).
+- Durable enqueue: `PUT s3://aw-bots/aw-exporter/pending/<meeting UUID>.json` (the envelope), then
+  **202**. Enqueue failure → 503 so aw-bots' subscription delivery retries it.
 - Worker loop (`EXPORT_CONCURRENCY`, default 4) drains the pending prefix; on startup and every
   `EXPORT_SWEEP_SECONDS` (default 60) it re-lists it, so a restart mid-job resumes. The pending
   object is removed only when the job reaches a terminal state.
 
-### 4.2 Job (idempotent; key = Vexa meeting id)
+### 4.2 Job (idempotent; key = the meeting's UUID)
 1. `<folder>/_export.json` with `state=handed_off` exists → drop pending, done.
-2. meeting-api `GET /recordings?meeting_id=<id>` (header `X-User-Id: <user_id>`). No audio →
+2. `GET /recordings?meeting_id=<upstream_id>` through the gateway with the exporter's key, every page. No audio →
    `_export.json {state:"no_audio"}`, done.
 3. `GET /recordings/<rid>/master?type=audio` → Vexa assembles the master (upstream finalize-on-read)
    and returns `storage_path`; server-side copy `aw-bots/<storage_path>` → `<folder>/master.webm`.
@@ -111,17 +117,16 @@ replica; per-meeting jobs are independent.
    gap-filled decode reproduces 1935.62 s, matching the PTS span; ~34 s dropped across ~220
    inter-packet gaps) — which silently shifts every downstream speaker-interval timestamp
    computed relative to this wav's t=0. See §4.3 clock origin.
-5. `speaker-activity.jsonl` (`aw-bots/signal/<user_id>/<meeting_id>/<session_uid>/speaker-activity.jsonl`,
-   session uid from `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`,
+5. `speaker-activity.jsonl` (`aw-bots/signal/<owner>/<upstream_id>/<session_uid>/speaker-activity.jsonl`,
+   owner and session uid from the recording's `storage_path`) → speaker events (§4.3) → `speaker_timeline.json`,
    `participants.json`. This is aw-bots' own always-on who-spoke-when file — no audio in it — and
    the *only* source of names; there is **no fallback** to the debug capture tape
    (`captured-signal.jsonl`, off by default, §7). See
    [speaker-activity design](2026-09-23-speaker-activity-design.md). **Activity wait:** aw-bots
    uploads it in its teardown, *after* it emits `meeting.completed`, so an absent file is not yet
-   "missing". While `now < meeting.end_time + ACTIVITY_WAIT_SECONDS` (default 120; naive
-   `end_time` read as UTC) the job raises a retryable `ActivityNotReady` before copying anything
+   "missing". While `now < meeting.ended_at + ACTIVITY_WAIT_SECONDS` (default 120) the job raises a retryable `ActivityNotReady` before copying anything
    or calling `/process`, and the queue's backoff re-runs it. Past the deadline (or with no
-   `end_time`, which gives no fixed deadline) it proceeds without it. Problems degrade
+   `ended_at`, which gives no fixed deadline) it proceeds without it. Problems degrade
    attribution, never fail the export — the resulting state is recorded in
    `_export.json.speaker_activity`:
    - `ok` — parsed; events used. A header-only file (nobody spoke before the bot left, or the
@@ -141,9 +146,8 @@ replica; per-meeting jobs are independent.
    `_export.json.speaker_activity_events` records how many speaker events were derived (0 for
    `missing`/`invalid`), so an empty-but-`ok` export is visible without opening the timeline.
    The timeline's `recording_ended_at` / clip bound is `recording_started_at` + the transcoded
-   `audio.wav`'s own duration (not `meeting.end_time`), so intervals never outrun the audio.
-   `room_name` = `data.constructed_meeting_url`, else top-level `constructed_meeting_url`, else
-   the native id. Audio moves through local temp files (`master.webm` download, `audio.wav`
+   `audio.wav`'s own duration (not `meeting.ended_at`), so intervals never outrun the audio.
+   `room_name` = the meeting's `meeting_url`, else its `room`. Audio moves through local temp files (`master.webm` download, `audio.wav`
    upload), never as whole-file bytes in memory.
 6. Write `meeting.json`, `recordings.json`; `live_transcript.json` if the meeting had
    `transcribe_enabled`; copy `signal/*` if `EXPORT_DEBUG=1`.
@@ -151,8 +155,9 @@ replica; per-meeting jobs are independent.
    platform:<platform>, idempotency_key:"vexa-<id>"}`; backoff retry on connect errors/5xx.
 8. `_export.json {state:"handed_off", vexa_meeting_id, exported_at, elapsed_s, exporter_version,
    speaker_activity, speaker_activity_events, audio_recordings}` last; delete pending. `audio_recordings` counts the recordings with
-   an audio media file; when it is > 1 (a multi-session meeting) a warning is logged and only
-   the first is exported (see §9).
+   an audio media file — one per bot session. A meeting with several sessions (a bot failed and
+   a new one joined, intake design §6.9 F-K2) is exported as one folder on one clock: see
+   `README.md` "Several bot sessions".
 
 After `EXPORT_MAX_ATTEMPTS` (default 5, exponential backoff): `_export.json {state:"failed", error}`,
 pending moved to `aw-exporter/failed/`. `aw-bots` is never modified, so a re-run is always possible.
@@ -217,11 +222,13 @@ fallback to the tape (§4.2 step 5, [speaker-activity design](2026-09-23-speaker
   transcript-independent dependency for attribution).
 
 ### 4.4 Config (names only)
-`MEETING_API_URL`, `VEXA_WEBHOOK_SECRET`, `VEXA_BUCKET` (aw-bots), `EXPORT_BUCKET`
+`GATEWAY_URL`, `EXPORTER_API_KEY`, `EXPORTER_WEBHOOK_SECRET`, `VEXA_BUCKET` (aw-bots), `EXPORT_BUCKET`
 (aw-chatworks-transcribe), `EXPORT_PREFIX` (recordings/), `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS` (default 15000),
-`ACTIVITY_WAIT_SECONDS` (default 120, replaces `TAPE_WAIT_SECONDS`), `AWS_REGION`. S3 via IRSA
+`ACTIVITY_WAIT_SECONDS` (default 120, replaces `TAPE_WAIT_SECONDS`), `EXPORT_MAX_RECORDINGS`
+(default 50; every page of the meeting's recordings is read up to it, past it the export fails —
+`README.md` "Several bot sessions"), `AWS_REGION`. S3 via IRSA
 (no static keys). aw-bots' own safety ceiling for `speaker-activity.jsonl`,
 `VEXA_SPEAKER_ACTIVITY_MAX_BYTES` (default 128 MiB — about 3× the ~40 MB upper estimate for a
 3-hour meeting, and small enough to upload inside the bot's 8 s teardown bound in-cluster), is a
@@ -229,6 +236,10 @@ bot-pod env var, not an exporter one — see §7 and the
 [speaker-activity design](2026-09-23-speaker-activity-design.md).
 
 ## 5. Portal → Vexa (aw-notetaker repo; own plan)
+
+> The meeting-intake design (`2026-09-25-meeting-intake-and-webhooks-design.md`, Parts 3 and 4)
+> replaces this section: the calendar module sends entries with `PUT /v2/entries`, and the portal
+> reads meetings from aw-bots with `user=`.
 - One Vexa service account (created once by an operator via admin-api); its API key lives in a K8s
   Secret the portal reads. `max_concurrent_bots` on that account ≥ the NodePool's planned peak.
 - Calendar poll (existing OAuth read) → for each upcoming event with a Meet/Zoom/Teams link:
@@ -254,15 +265,15 @@ bot-pod env var, not an exporter one — see §7 and the
 ## 7. Deployment config (deployment track)
 - meeting-api: `TRANSCRIBE_ENABLED=false`, `RECORDING_ENABLED=true`, `MINIO_BUCKET=aw-bots`,
   `S3_ENDPOINT=https://s3.<region>.amazonaws.com` (no static keys → IRSA),
-  `VEXA_SYSTEM_WEBHOOK_URL=http://aw-exporter.<ns>.svc.cluster.local:8080/hooks/vexa`,
-  `VEXA_SYSTEM_WEBHOOK_SECRET` (Secret), `VEXA_SYSTEM_WEBHOOK_ALLOW_PRIVATE_HTTP=true`,
-  `AUTO_JOIN_LEAD_S` sized to cover node provisioning + bot image pull + browser boot (see risks).
+  no `VEXA_SYSTEM_WEBHOOK_URL`/`_SECRET` (the exporter's trigger is its `/v2/webhooks` subscription,
+  D7; `WEBHOOK_PRIVATE_HOST_ALLOWLIST` on meeting-api and admin-api holds
+  `aw-exporter.aw-bots.svc.cluster.local`), `AUTO_JOIN_LEAD_S` sized to cover node provisioning + bot image pull + browser boot (see risks).
 - **Deploy order: meeting-api → bot → exporter.** A new bot against an old meeting-api gets a 422
   on the `speaker-activity` signal part (the file is lost); the new exporter against old bots finds
   no `speaker-activity.jsonl` and has no fallback, so every meeting exports `missing`.
 - **Rollout step, in the same change that ships the new bot:** admin-api platform diagnostics
   `capture_signal=false` — the debug capture tape (`captured-signal.jsonl`) off by default for every
-  meeting, since naming no longer depends on it (§4.2 step 5, §4.3). This is required, not a later
+  meeting, since naming doesn't depend on it (§4.2 step 5, §4.3). This is required, not a later
   nicety: meeting-api's signal janitor evicts whole `signal/<u>/<m>/<s>/` prefixes, which include
   `speaker-activity.jsonl` (§9). The alternative is raising the janitor budget
   (`SIGNAL_TAPE_BUDGET_BYTES`). Switch the tape on per platform or per user only to investigate a
@@ -313,13 +324,14 @@ Measured on the OLD bot (v0.10.4, 85 meetings): memory 0.48 GiB (bot alone) → 
   `aw-bots/aw-exporter/*`, rw `aw-chatworks-transcribe/recordings/*` **plus
   `s3:PutObjectTagging` on `aw-chatworks-transcribe`** (the exporter tags every object it
   writes there with its retention class, §3). Lifecycle per D5.
-- Network: exporter → meeting-api (internal), → `notetaker-api.notetaker:8080`; no NetworkPolicy (D12).
+- Network: exporter → the gateway (in-cluster), → `notetaker-api.notetaker:8080`; aw-bots' subscription sender → the exporter's Service (allow-listed in `WEBHOOK_PRIVATE_HOST_ALLOWLIST`); no NetworkPolicy (D12).
 - Exporter Deployment: single replica with `strategy: Recreate` — a rolling update would briefly
   run two pods, i.e. two overlapping pending-queue sweepers.
-- Alerting + recovery: alert on intake 401/400 responses — Vexa's webhook delivery drops non-429
-  4xx permanently, so a secret mismatch or a rejected envelope loses that meeting's trigger. Keep
-  a backfill path: list completed meetings from meeting-api and re-enqueue them (the job is
-  idempotent on the Vexa meeting id).
+- Alerting + recovery: a 401 or 400 from the exporter ends that delivery `failed` (aw-bots never
+  retries a non-429 4xx), so a secret mismatch or a rejected envelope loses that meeting's
+  trigger; aw-notetaker's `AwBotsWebhookDeliveryFailed` alert fires on it, and the subscription's
+  delivery log shows it. Keep a backfill path: list finished meetings through the gateway and
+  re-enqueue them (the job is idempotent on the meeting's UUID).
 
 ## 8. Out of scope
 Signed-in bots; Jitsi via Vexa (Jibri path unchanged); `notetaker-worker` changes; `/process`'s
@@ -334,9 +346,10 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
 - **Memory sizing is from the old bot** — re-measured on 0.12 before §7.1 values are locked.
 - **Clock alignment** of tape vs master (S1 measures it).
 - **Speaker names with transcription off** — seen only on a transcription-on tape; verified early.
-- meeting-api trusts `X-User-Id` and the cluster enforces no network isolation (D12): any Pod in
-  the cluster could act as the service account. Closed only by cluster-wide NetworkPolicy
-  enforcement.
+- The cluster enforces no network isolation (D12): any Pod can reach meeting-api, Vexa's Redis and
+  its Postgres. meeting-api believes a user only with the gateway's signature (meeting-intake
+  design §1.10), so a Pod can't act as the service account through meeting-api's routes; Redis and
+  Postgres stay open to it until cluster-wide NetworkPolicy enforcement.
 - Mixed-lane hint density for Zoom/Teams untested here — validated live.
 - One service account serialises spawns through Vexa's per-user advisory lock (held for the
   create transaction only) — measured at a top-of-hour burst during live validation.
@@ -350,9 +363,9 @@ single-pod in-process queueing (noted); EKS manifests for the Vexa stack itself.
   tape is ON (`capture_signal` defaults ON) only about 200 sessions fit the budget, so a late retry
   or a backfill can find the file gone and export `missing`. Mitigation: `capture_signal=false` as
   a rollout step (§7), or a larger `SIGNAL_TAPE_BUDGET_BYTES`.
-- Multi-session meetings (the bot rejoined → several audio recordings) export only one session;
-  the count is recorded in `_export.json.audio_recordings` and logged, the other sessions' audio
-  is not exported.
+- Multi-session meetings (several audio recordings) are joined on the clock of the recordings'
+  `created_at` origins (§4.3), so each session's placement carries that rule's residual; two
+  sessions whose origins overlap are placed back to back and logged (`session_overlap`).
 - With one Vexa service account (D11), every meeting's recordings JSONB lives under one user, so
   the recordings load meeting-api does per request grows with the total number of meetings.
 - Task 11 must also measure: the mixed-lane (Zoom/Teams) clock-origin residual (§4.3's rule is

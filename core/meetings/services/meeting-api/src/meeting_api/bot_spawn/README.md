@@ -26,6 +26,31 @@ effect (403 deny, 503 unavailable)**
 eager-create the `MeetingSession` (`session_uid` == `connectionId`) → write the kernel workload id
 back as `bot_container_id` → return the `api.v1` `MeetingResponse` (now listing its `sessions`).
 
+### Which row a spawn claims (§1.5)
+`create_meeting_guarded` takes the link's advisory lock (intake's key), then the per-user lock, then
+the row. Any LIVE row on the link (`auto_join.LIVE_STATUSES`, `needs_help` and `stopping` included)
+is a 409. With `claim_meeting_id` (the scheduler and intake's instant join) exactly that
+`scheduled` row moves to `requested` through `intake.status.write_status` and gets
+`data.auto_join_last_attempt`; any other status is `MeetingStopped`, a row on another link
+`ClaimTargetMoved`, and with the scheduler's `claim_due` (`auto_join.DueWindow`, the time part of
+`due_rows`) a `scheduled` row that is no longer due under the lock (moved or ended since the tick
+read it) `ClaimNotDue`, which the tick skips. Without it (`POST /bots`): among entry-managed rows, the one the R1 `join_now`
+rule picks (the earliest that hasn't ended and starts within `JOIN_NOW_ADOPT_AHEAD_S`); else among
+entry-less rows, upstream's rule, the newest, leaving out any starting after that window; else a new
+row is inserted. A future occurrence is never claimed.
+
+### The auto-join sweep (§1.5)
+`auto_join.auto_join_tick` reads only the due rows (`list_due_meetings(now, lead_s, after=, limit=)`:
+`scheduled`, meeting time at or before `now + lead_s`, through the partial index
+`ix_meeting_scheduled_due`, in pages of `SWEEP_BATCH_SIZE` by meeting time then id) and
+sends each bot through `intake.ExactRowSpawn`, claiming that exact row. An entry-less row keeps the
+`AUTO_JOIN_GRACE_S` window and its retry stamps; a meeting entries manage is due until its
+`scheduled_end_at`, has its link checked under the link lock (`intake.sweeps.check_room`: wait for
+a busy link with no retry pause, or merge into an open-ended `join_now` meeting), and counts a
+failed send with its typed code (`meeting_aw_state.send_attempts`, `last_error_code`; §6.9 F-K).
+Each row runs through `sweeps.item_failures.run_item`: a row that raises fails alone and, after
+`SWEEP_MAX_ITEM_FAILURES`, is given up (§6.9 F-I).
+
 ### P3c — `continue_meeting` (sequential multi-bot per meeting)
 When the prior meeting for `(platform, native_id)` is TERMINAL (`completed`/`failed`), reuse the
 SAME meeting row + add a NEW `MeetingSession` instead of the 409. Transcripts + recordings stay keyed

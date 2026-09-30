@@ -94,9 +94,9 @@
   {
    "key": "INTERNAL_API_SECRET",
    "class": "defaulted",
-   "default": "(unset — the internal lifecycle-callback header is then not attached)",
+   "default": "(unset — the bot's lifecycle callbacks and the runtime's callbacks are refused with 401, bots get no internalSecret, and a recording upload needs a MeetingToken)",
    "secret": true,
-   "description": "shared secret for internal service-to-service calls (x-internal-secret on the self-driven lifecycle callback). Unset is a documented degrade; a PUBLISHED PLACEHOLDER is not — it is the whole internal tier handed to anyone who read the repository (F95), so the boot refuses it.",
+   "description": "shared secret for internal service-to-service calls. §1.10: meeting-api hands it to each bot (invocation internalSecret), POST /bots/internal/callback/lifecycle requires it as x-internal-secret, it keys the per-bot token in the runtime callbackUrl (POST /runtime/callback?t=<hex HMAC-SHA256 of \"aw-runtime-callback.<workloadId>\">; callback_auth.py), and a recording upload may present it as its bearer; every comparison is constant-time. Unset is a documented degrade; a PUBLISHED PLACEHOLDER is not — it is the whole internal tier handed to anyone who read the repository (F95), so the boot refuses it.",
    "forbidden_values": [
      "vexa-internal-secret",
      "lite-internal-secret",
@@ -106,6 +106,31 @@
      "default",
      "secret"
    ]
+  },
+  {
+   "key": "GATEWAY_IDENTITY_KEYS",
+   "class": "defaulted",
+   "default": "(unset — every client route answers 401; the bot callbacks, /internal/*, /health and /metrics are unaffected)",
+   "secret": true,
+   "description": "§1.10, §6.9 F-E: the key ring the gateway signs x-user-id with, the same ring the gateway holds, in the webhook secret encryption ring's format: JSON {\"<kid>\": \"<exactly 32 bytes, base64>\"}, a kid being 1-64 of A-Z a-z 0-9 . _ -. identity_guard.py checks x-gateway-signature: kid=<kid>,t=<unix>,v2=<hex HMAC-SHA256> under the key its kid names, over the kid, t, x-user-id and every other identity header the gateway forwards (email, scopes, limits, workspaces, webhook url, secret and events), method, body SHA-256, raw query and path (core/gateway/contracts/gateway-identity), and refuses with 401 a signature that is missing, malformed, under a kid not in this ring, wrong for any of those, or more than GATEWAY_IDENTITY_MAX_SKEW_S seconds from this clock. Unset or malformed, every client request is refused and the rejection log names the fault, never a key.",
+   "forbidden_values": [
+    "vexa-internal-secret",
+    "lite-internal-secret",
+    "changeme",
+    "change-me",
+    "CHANGE-ME",
+    "default",
+    "secret",
+    "<REPLACE_ME>"
+   ],
+   "targets": ["compose", "helm", "lite"]
+  },
+  {
+   "key": "GATEWAY_IDENTITY_MAX_SKEW_S",
+   "class": "defaulted",
+   "default": "60",
+   "description": "§1.10, §6.9 F-E: identity_guard.py refuses with 401 a gateway signature whose t is more than this many seconds before or after this service's clock (the replay window); the same setting on meeting-api and admin-api. Not a positive whole number, the guard is not built (a ValueError naming the setting) and no client request is served.",
+   "targets": ["helm"]
   },
   {
    "key": "DEFAULT_BOT_NAME",
@@ -150,9 +175,7 @@
    "class": "defaulted",
    "default": "",
    "description": "Comma-separated additional Jitsi deployment hostnames (a self-hosted instance whose name carries neither 'jitsi' nor a 'meet' label, e.g. calls.example.org) recognized when parsing pasted meeting links AND calendar (ICS) links; meet.jit.si, *jitsi* hosts, and (for pasted links) meet-labelled hosts are always recognized — unset ⇒ no extra hosts",
-   "targets": [
-    "compose"
-   ]
+   "targets": ["compose", "helm"]
   },
   {
    "key": "RECORDING_ENABLED",
@@ -363,6 +386,84 @@
    "targets": []
   },
   {
+   "key": "WEBHOOK_PRIVATE_HOST_ALLOWLIST",
+   "class": "defaulted",
+   "default": "portal.notetaker.svc.cluster.local",
+   "description": "webhooks (§2.7): comma-separated hosts a subscription delivery may target although they are private (compared case-insensitively, never resolved); the send-time SSRF guard (webhooks/ssrf.py) refuses every other private, loopback, link-local or internal target. admin-api applies the same list on save.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_SECRET_ENC_KEYS",
+   "class": "defaulted",
+   "default": "(unset — with WEBHOOK_SECRET_ENC_ACTIVE_KEY also unset, no subscription delivery is signed or sent; deliveries wait in webhook_deliveries)",
+   "secret": true,
+   "description": "webhooks (§2.7): the key ring subscription secrets are encrypted under, JSON {\"<id>\": \"<32 bytes, base64>\"} (AES-256-GCM; webhooks/secret_box.py), the same ring admin-api holds. meeting-api only decrypts, at signing time. Set with a malformed ring, a key that is not exactly 32 bytes, or without WEBHOOK_SECRET_ENC_ACTIVE_KEY, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_SECRET_ENC_ACTIVE_KEY",
+   "class": "defaulted",
+   "default": "(unset — see WEBHOOK_SECRET_ENC_KEYS)",
+   "description": "webhooks (§2.7): the id in WEBHOOK_SECRET_ENC_KEYS admin-api encrypts new secrets under. meeting-api decrypts with each row's own key id; this must still name a key in the ring, or meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_PUBLISH_INTERVAL_S",
+   "class": "defaulted",
+   "default": "1",
+   "description": "webhooks (§1.8): cadence (s) of the outbox publisher (intake/outbox.py), single-flight across replicas: each tick turns up to 500 unpublished webhook_outbox rows into webhook_deliveries rows, one per matching active subscriber. It runs only with Postgres and ADMIN_API_URL + INTERNAL_API_SECRET (the subscription read); without them outbox rows stay unpublished.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_SEND_INTERVAL_S",
+   "class": "defaulted",
+   "default": "1",
+   "description": "webhooks (§1.8): cadence (s) of the subscription sender, one loop per replica (not single-flight: due webhook_deliveries rows are claimed FOR UPDATE SKIP LOCKED with a 60 s lease, so replicas share them). It runs only with Postgres, ADMIN_API_URL + INTERNAL_API_SECRET (the subscription read) and the WEBHOOK_SECRET_ENC_* key ring.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_RETRY_SCHEDULE_S",
+   "class": "defaulted",
+   "default": "60,300,1800,7200",
+   "description": "webhooks (§1.8, §6.9 F-A): the subscription sender's retry waits (s), comma-separated, 1 to 20 positive whole numbers. Its length is the number of retries: after a 5xx, 429, timeout, connection error, DNS timeout, too little lease left to post (lease short) or nothing to sign or resolve with, attempt n waits entry n; one failure after the last entry the delivery is dead (the default: 4 retries, 5 attempts). Set but malformed, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_DNS_THREADS",
+   "class": "defaulted",
+   "default": "4",
+   "description": "webhooks (§1.8, §6.9 F-H): threads in the subscription sender's own DNS pool (the send-time SSRF guard's lookups), per replica; a whole number of at least 1. The pool is separate from the default executor recording storage uses, so slow DNS never delays recordings, and it is shut down on app shutdown. Set but malformed, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_DNS_TIMEOUT_S",
+   "class": "defaulted",
+   "default": "5",
+   "description": "webhooks (§1.8, §6.9 F-H): the most (s, above 0, decimals allowed) one send-time DNS lookup may take, waiting for a pool thread included. A lookup that takes longer is a failed attempt (error 'dns timeout') on WEBHOOK_RETRY_SCHEDULE_S. Set but malformed, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_SEND_TIMEOUT_S",
+   "class": "defaulted",
+   "default": "10",
+   "description": "webhooks (§1.8, §6.9 F-H): the most (s, above 0, decimals allowed) one subscription post may take in total; longer is a failed attempt (error 'timeout') on WEBHOOK_RETRY_SCHEDULE_S. Set but malformed, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_LEASE_S",
+   "class": "defaulted",
+   "default": "60",
+   "description": "webhooks (§1.8): how long (whole s, at least 1) a sender's claim holds a delivery row before another replica may claim it again. It must be more than WEBHOOK_SEND_TIMEOUT_S + 5 s, so a claim can post and record inside it; a claim with less left sends nothing and records 'lease short'. Set but malformed, or too short, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
+   "key": "WEBHOOK_CLAIM_LIMIT",
+   "class": "defaulted",
+   "default": "50",
+   "description": "webhooks (§1.8): the most delivery rows (whole, at least 1) one sender tick claims; the rest wait for the next tick. Set but malformed, meeting-api refuses to start.",
+   "targets": ["helm"]
+  },
+  {
    "key": "SCHEDULER_TICK_INTERVAL",
    "class": "defaulted",
    "default": "1",
@@ -408,8 +509,8 @@
    "key": "MEETING_UNTRACKED_GRACE_SEC",
    "class": "defaulted",
    "default": "600",
-   "description": "continuous-untracked window (s): a meeting whose workload the runtime 404s for this long with no re-adoption and no bot callback is presumed lost and failed with an evidence note",
-   "targets": []
+   "description": "continuous-untracked window (s): a meeting whose workload the runtime 404s for this long with no re-adoption and no bot callback is presumed lost and failed with an evidence note. Also §6.9 F-K2's proof-of-gone wait on a runtime 404, and the grace a waiting meeting or an unproven spawn gets past due_at.",
+   "targets": ["helm"]
   },
   {
    "key": "VEXA_SERVICE_AUTHORITY_CONFIG",
@@ -533,13 +634,13 @@
    "class": "defaulted",
    "default": "120",
    "description": "auto-join lead (s) — the bot is sent this long before data.scheduled_at, so it is standing in the lobby at the scheduled start rather than setting out then (#1208). Deploy values may override.",
-   "targets": []
+   "targets": ["helm"]
   },
   {
    "key": "AUTO_JOIN_GRACE_S",
    "class": "defaulted",
    "default": "600",
-   "description": "auto-join grace (s) — a scheduled meeting older than this is never auto-joined (no hours-late joins)",
+   "description": "auto-join grace (s) — an entry-less scheduled meeting older than this is never auto-joined (no hours-late joins); a meeting entries manage is due until its end instead (§1.5). The link resolver also uses it to ignore stale timed plans (an entry-less scheduled row past data.scheduled_at + this grace) on upstream planned edits (§1.6)",
    "targets": []
   },
   {
@@ -550,11 +651,116 @@
    "targets": []
   },
   {
+   "key": "NOT_SENT_SWEEP_INTERVAL_S",
+   "class": "defaulted",
+   "default": "30",
+   "description": "not-sent sweep cadence (s, §1.5) — how often scheduled meetings that entries manage are checked for an end passed without a bot (they end failed, outcome not_sent)",
+   "targets": ["helm"]
+  },
+  {
    "key": "AUTO_JOIN_ALLOW_UNCAPPED",
    "class": "defaulted",
    "default": "false — with no admin edge (ADMIN_API_URL/INTERNAL_API_SECRET) the per-user cap is unresolvable and the sweep fails closed (refuses to spawn); set 1 to deliberately allow uncapped self-host spawns",
    "description": "opt-in escape hatch (#656): allow the auto-join sweep to spawn uncapped when the per-user cap cannot be resolved. Unsafe mode — chosen, never defaulted.",
    "targets": []
+  },
+  {
+   "key": "ENTRY_MAX_DAYS_AHEAD",
+   "class": "defaulted",
+   "default": "30",
+   "description": "intake (§1.1 R3): PUT /v2/entries refuses an entry starting more than this many days ahead with too_far_ahead",
+   "targets": ["helm"]
+  },
+  {
+   "key": "JOIN_NOW_ADOPT_AHEAD_S",
+   "class": "defaulted",
+   "default": "3600",
+   "description": "intake (§1.1 R1) and POST /bots (§1.5): a join_now entry, or a POST /bots without a row id, adopts the earliest non-finished meeting on its link that hasn't ended and starts within this many seconds",
+   "targets": ["helm"]
+  },
+  {
+   "key": "ENTRY_BLOCKED_HOSTS",
+   "class": "defaulted",
+   "default": "meet.abroadworks.com",
+   "description": "intake (§1.3): comma-separated meeting-link hostnames refused with platform_not_enabled; empty ⇒ none refused",
+   "targets": ["helm"]
+  },
+  {
+   "key": "BOT_SEND_MAX_ATTEMPTS",
+   "class": "defaulted",
+   "default": "3",
+   "description": "intake and auto-join (§6.9 F-K): an entry-managed meeting's bot send is tried at most this many times in total; the last failure ends the meeting not_sent with its typed code",
+   "targets": ["helm"]
+  },
+  {
+   "key": "BOT_SEND_RETRY_BACKOFF_S",
+   "class": "defaulted",
+   "default": "60",
+   "description": "intake and auto-join (§6.9 F-K): seconds between two sends of an entry-managed meeting's bot after a failure (entry-less rows keep AUTO_JOIN_RETRY_BACKOFF_S)",
+   "targets": ["helm"]
+  },
+  {
+   "key": "INTAKE_MAX_ACTIVE_ENTRIES",
+   "class": "defaulted",
+   "default": "100000",
+   "description": "intake (§1.13): per-account quota of active entries (entries of unfinished meetings); a write that would add one past it is refused with 429 quota_exceeded",
+   "targets": ["helm"]
+  },
+  {
+   "key": "INTAKE_CONFLICT_RETRIES",
+   "class": "defaulted",
+   "default": "3",
+   "description": "intake (§6.9 F-D): how many more times an entry write that lost a race on a database constraint is run again, after a short random pause; one that still loses answers 500 internal_error",
+   "targets": ["helm"]
+  },
+  {
+   "key": "INTAKE_CONFLICT_DELAY_MIN_S",
+   "class": "defaulted",
+   "default": "0.01",
+   "description": "entry service (§6.9 F-D): the least (s) of the random pause before an entry write that lost a constraint race runs again; the pause is a random point between this and INTAKE_CONFLICT_DELAY_MAX_S, times the try's number",
+   "targets": ["helm"]
+  },
+  {
+   "key": "INTAKE_CONFLICT_DELAY_MAX_S",
+   "class": "defaulted",
+   "default": "0.05",
+   "description": "entry service (§6.9 F-D): the most (s) of that random pause, before it is multiplied by the try's number",
+   "targets": ["helm"]
+  },
+  {
+   "key": "INTAKE_STOP_LINK_RETRIES",
+   "class": "defaulted",
+   "default": "1",
+   "description": "stop (§1.7): how many more times POST /v2/meetings/{id}/stop is run again when the meeting moved to another link between its read and its link lock; after the last, the stop answers 503 unavailable (retry)",
+   "targets": ["helm"]
+  },
+  {
+   "key": "SWEEP_BATCH_SIZE",
+   "class": "defaulted",
+   "default": "200",
+   "description": "intake sweeps (§6.9 F-I): the auto-join tick, the not-sent sweep and the outbox publisher read their work in pages of at most this many items, in a stable order, every page each tick",
+   "targets": ["helm"]
+  },
+  {
+   "key": "SWEEP_MAX_ITEM_FAILURES",
+   "class": "defaulted",
+   "default": "5",
+   "description": "intake sweeps (§6.9 F-I): an item that fails this many times (counted per sweep in sweep_item_failures, across replicas) is logged, counted in aw_sweep_items_total{result=given_up} and never tried again by that sweep",
+   "targets": ["helm"]
+  },
+  {
+   "key": "UNPROVEN_TEARDOWN_MAX_AGE_S",
+   "class": "defaulted",
+   "default": "21600",
+   "description": "§6.9 F-K2/F-I: how long (s) a workload's teardown is chased while the runtime doesn't answer before it is given up: a pending teardown (data.unproven_teardown) from its since, a stale-stopping or stale-nonterminal reconcile row from its updated_at. A runtime that doesn't answer is never one of the item's failures, so this age is its only bound; a refused delete still counts toward SWEEP_MAX_ITEM_FAILURES. Longer than any meeting (6 h)",
+   "targets": ["helm"]
+  },
+  {
+   "key": "SWEEP_ITEM_FAILURES_RETENTION_S",
+   "class": "defaulted",
+   "default": "604800",
+   "description": "§6.9 F-I: how long (s) a sweep_item_failures record untouched is kept; each reconcile pass deletes the older ones, SWEEP_BATCH_SIZE at a time (7 days). A given-up item's record is touched whenever its sweep still lists it, so only given-up items no longer pending go (their meeting gone or finished, their work cleared)",
+   "targets": ["helm"]
   },
   {
    "key": "CALENDAR_SYNC_INTERVAL_S",

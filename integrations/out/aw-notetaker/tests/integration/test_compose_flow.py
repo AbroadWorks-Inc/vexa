@@ -27,7 +27,8 @@ import threading
 import time
 import uuid
 import wave
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -37,9 +38,16 @@ import pytest
 import uvicorn
 from botocore.exceptions import ClientError
 
+from exporter.audio import webm_to_wav
 from exporter.job import recording_origin_ms
 from exporter.naming import folder_name
-from tests.builders import two_speaker_gmeet_lines
+from tests.builders import (
+    frame,
+    header,
+    meeting_event,
+    two_speaker_gmeet_lines,
+    wav_samples,
+)
 from tests.integration.stub_meeting_api import create_app as create_meeting_api_app
 from tests.integration.stub_notetaker import create_app as create_notetaker_app
 
@@ -59,21 +67,59 @@ MINIO_SECRET_KEY = "minio-it-secret"  # test-only literal
 
 USER_ID = 1
 VEXA_MEETING_ID = 99
-RECORDING_ID = 2
-SESSION_UID = "sess-1"
+MEETING_UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
+EXPORTER_API_KEY = "it-exporter-key"  # test-only literal, not a real credential
 NATIVE_MEETING_ID = "it-synthetic-meet-abcd"
-STORAGE_PATH = f"recordings/{USER_ID}/{RECORDING_ID}/{SESSION_UID}/audio/master.webm"
-ACTIVITY_KEY = (
-    f"signal/{USER_ID}/{VEXA_MEETING_ID}/{SESSION_UID}/speaker-activity.jsonl"
-)
 START_TIME = "2026-09-23T10:00:00.000Z"
 END_TIME = "2026-09-23T10:00:03.000Z"
-RECORDING_CREATED_AT = "2026-09-23T10:00:00.000Z"
-AUDIO_DURATION_S = 3.0
+PENDING_KEY = f"aw-exporter/pending/{MEETING_UUID}.json"
 
-ORIGIN_MS = recording_origin_ms({"created_at": RECORDING_CREATED_AT}, 15000)
-PENDING_KEY = f"aw-exporter/pending/{VEXA_MEETING_ID}.json"
-SEEDED_VEXA_KEYS = {STORAGE_PATH, ACTIVITY_KEY}
+
+@dataclass(frozen=True)
+class _Session:
+    """One bot session: its recording, its audio and its speaker activity."""
+
+    recording_id: int
+    uid: str
+    created_at: str
+    seconds: float
+    activity: Callable[[int], list[str]]
+
+    @property
+    def origin_ms(self) -> int:
+        return recording_origin_ms({"created_at": self.created_at}, 15000)
+
+    @property
+    def storage_path(self) -> str:
+        return f"recordings/{USER_ID}/{self.recording_id}/{self.uid}/audio/master.webm"
+
+    @property
+    def activity_key(self) -> str:
+        return f"signal/{USER_ID}/{VEXA_MEETING_ID}/{self.uid}/speaker-activity.jsonl"
+
+    @property
+    def recording(self) -> dict[str, Any]:
+        return {
+            "id": self.recording_id,
+            "meeting_id": VEXA_MEETING_ID,
+            "created_at": self.created_at,
+            "media_files": [{"type": "audio", "format": "webm"}],
+        }
+
+
+def _gamma_speaks(origin_ms: int) -> list[str]:
+    return [header()] + [
+        frame(origin_ms + i * 256, "Speaker Gamma", 0.2) for i in range(3)
+    ]
+
+
+ONE_SESSION = [
+    _Session(2, "sess-1", "2026-09-23T10:00:00.000Z", 3.0, two_speaker_gmeet_lines)
+]
+# The second bot's recording starts 5 s after the first's: 2 s of silence between.
+TWO_SESSIONS = ONE_SESSION + [
+    _Session(3, "sess-2", "2026-09-23T10:00:05.000Z", 2.0, _gamma_speaks)
+]
 
 FOLDER = folder_name("google_meet", NATIVE_MEETING_ID, START_TIME)
 BASE = f"recordings/{FOLDER}/"
@@ -166,23 +212,15 @@ def _sign(body: bytes, secret: str) -> dict[str, str]:
 
 
 def _envelope() -> dict[str, Any]:
-    return {
-        "event_id": "evt-it-1",
-        "event_type": "meeting.completed",
-        "data": {
-            "meeting": {
-                "id": VEXA_MEETING_ID,
-                "user_id": USER_ID,
-                "platform": "google_meet",
-                "native_meeting_id": NATIVE_MEETING_ID,
-                "start_time": START_TIME,
-                "end_time": END_TIME,
-                "constructed_meeting_url": "https://meet.google.com/it-synthetic-meet",
-                "status": "completed",
-                "data": {"name": "aw-exporter compose integration test"},
-            }
-        },
-    }
+    """A `meeting.completed` subscription delivery (webhook.v1 MeetingEvent)."""
+    return meeting_event(
+        upstream_id=VEXA_MEETING_ID,
+        room=NATIVE_MEETING_ID,
+        meeting_url="https://meet.google.com/it-synthetic-meet",
+        title="aw-exporter compose integration test",
+        started_at=START_TIME,
+        ended_at=END_TIME,
+    )
 
 
 def _list_keys(s3: S3Client, bucket: str, prefix: str) -> set[str]:
@@ -281,39 +319,43 @@ def s3(minio: dict[str, Any]) -> S3Client:
 
 
 @pytest.fixture
-def seeded_s3(s3: S3Client, tmp_path: Path) -> S3Client:
-    master_path = tmp_path / "master.webm"
-    _make_sine_webm(master_path, AUDIO_DURATION_S)
-    s3.put_object(
-        Bucket=VEXA_BUCKET,
-        Key=STORAGE_PATH,
-        Body=master_path.read_bytes(),
-        ContentType="video/webm",
-    )
-    activity_lines = two_speaker_gmeet_lines(ORIGIN_MS)
-    s3.put_object(
-        Bucket=VEXA_BUCKET,
-        Key=ACTIVITY_KEY,
-        Body=("\n".join(activity_lines) + "\n").encode(),
-        ContentType="application/x-ndjson",
-    )
+def sessions() -> list[_Session]:
+    return ONE_SESSION
+
+
+@pytest.fixture
+def seeded_s3(s3: S3Client, tmp_path: Path, sessions: list[_Session]) -> S3Client:
+    for session in sessions:
+        master_path = tmp_path / f"{session.uid}.webm"
+        _make_sine_webm(master_path, session.seconds)
+        s3.put_object(
+            Bucket=VEXA_BUCKET,
+            Key=session.storage_path,
+            Body=master_path.read_bytes(),
+            ContentType="video/webm",
+        )
+        activity_lines = session.activity(session.origin_ms)
+        s3.put_object(
+            Bucket=VEXA_BUCKET,
+            Key=session.activity_key,
+            Body=("\n".join(activity_lines) + "\n").encode(),
+            ContentType="application/x-ndjson",
+        )
     return s3
 
 
 @pytest.fixture
-def meeting_api_server() -> Iterator[dict[str, Any]]:
+def meeting_api_server(sessions: list[_Session]) -> Iterator[dict[str, Any]]:
     port = _free_port()
-    recording = {
-        "id": RECORDING_ID,
-        "meeting_id": VEXA_MEETING_ID,
-        "created_at": RECORDING_CREATED_AT,
-        "media_files": [{"type": "audio", "format": "webm"}],
-    }
-    app = create_meeting_api_app(recording, STORAGE_PATH)
+    app = create_meeting_api_app(
+        [session.recording for session in reversed(sessions)],
+        {session.recording_id: session.storage_path for session in sessions},
+        EXPORTER_API_KEY,
+    )
     server = _UvicornThread(app, port)
     server.start()
     try:
-        yield {"port": port}
+        yield {"port": port, "reports": app.state.reports}
     finally:
         server.stop()
 
@@ -341,8 +383,9 @@ def exporter(
     name = f"aw-exporter-it-exporter-{suffix}"
     port = _free_port()
     env = {
-        "MEETING_API_URL": f"http://host.docker.internal:{meeting_api_server['port']}",
-        "VEXA_WEBHOOK_SECRET": WEBHOOK_SECRET,
+        "GATEWAY_URL": f"http://host.docker.internal:{meeting_api_server['port']}",
+        "EXPORTER_API_KEY": EXPORTER_API_KEY,
+        "EXPORTER_WEBHOOK_SECRET": WEBHOOK_SECRET,
         "VEXA_BUCKET": VEXA_BUCKET,
         "EXPORT_BUCKET": EXPORT_BUCKET,
         "EXPORT_PREFIX": "recordings/",
@@ -384,6 +427,7 @@ def test_compose_flow_hands_off_meeting(
     exporter: dict[str, Any],
     seeded_s3: S3Client,
     notetaker_server: dict[str, Any],
+    meeting_api_server: dict[str, Any],
 ) -> None:
     body = json.dumps(_envelope()).encode()
     headers = {**_sign(body, WEBHOOK_SECRET), "Content-Type": "application/json"}
@@ -416,10 +460,10 @@ def test_compose_flow_hands_off_meeting(
 
     assert notetaker_server["calls"] == [
         {
-            "meeting_id": f"vexa-{VEXA_MEETING_ID}",
+            "meeting_id": MEETING_UUID,
             "s3_path": BASE,
             "platform": "google_meet",
-            "idempotency_key": f"vexa-{VEXA_MEETING_ID}",
+            "idempotency_key": MEETING_UUID,
         }
     ]
 
@@ -430,7 +474,7 @@ def test_compose_flow_hands_off_meeting(
         assert wav.getnchannels() == 1
         assert wav.getframerate() == 16000
         duration = wav.getnframes() / wav.getframerate()
-    assert abs(duration - AUDIO_DURATION_S) <= 0.2
+    assert abs(duration - ONE_SESSION[0].seconds) <= 0.2
 
     timeline = _get_json(seeded_s3, EXPORT_BUCKET, BASE + "speaker_timeline.json")
     intervals = timeline["speaker_intervals"]
@@ -446,7 +490,79 @@ def test_compose_flow_hands_off_meeting(
     ]
 
     _wait_for_pending_deleted(seeded_s3, timeout=10)
+    # The job step ends with the export result; the pending item goes once it is accepted.
+    assert meeting_api_server["reports"] == [
+        {
+            "meeting_id": MEETING_UUID,
+            "state": "handed_off",
+            "s3_path": f"s3://{EXPORT_BUCKET}/{BASE}",
+        }
+    ]
     vexa_keys = _list_keys(seeded_s3, VEXA_BUCKET, "")
-    assert {k for k in vexa_keys if not k.startswith("aw-exporter/")} == (
-        SEEDED_VEXA_KEYS
+    assert {k for k in vexa_keys if not k.startswith("aw-exporter/")} == {
+        ONE_SESSION[0].storage_path,
+        ONE_SESSION[0].activity_key,
+    }
+
+
+def _post_webhook(exporter: dict[str, Any]) -> None:
+    body = json.dumps(_envelope()).encode()
+    headers = {**_sign(body, WEBHOOK_SECRET), "Content-Type": "application/json"}
+    resp = httpx.post(
+        f"{exporter['base_url']}/hooks/vexa", content=body, headers=headers, timeout=10
     )
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.parametrize("sessions", [TWO_SESSIONS])
+def test_compose_flow_joins_two_bot_sessions_into_one_folder(
+    exporter: dict[str, Any],
+    seeded_s3: S3Client,
+    notetaker_server: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    """§6.9 F-K2: a second bot joined the same meeting; the folder carries
+    both sessions on one clock, the 2 s between them as silence."""
+    _post_webhook(exporter)
+
+    marker = _wait_for_export_marker(seeded_s3, timeout=60)
+    assert marker["audio_recordings"] == 2
+    assert marker["speaker_activity"] == "ok"
+    assert _list_keys(seeded_s3, EXPORT_BUCKET, BASE) == EXPECTED_KEYS
+    assert len(notetaker_server["calls"]) == 1
+
+    audio_bytes = seeded_s3.get_object(Bucket=EXPORT_BUCKET, Key=BASE + "audio.wav")[
+        "Body"
+    ].read()
+    samples, rate = wav_samples(audio_bytes)
+    assert rate == 16000
+    assert abs(len(samples) / rate - 7.0) <= 0.2
+    assert max(abs(v) for v in samples[int(3.3 * rate) : int(4.7 * rate)]) == 0
+    assert max(abs(v) for v in samples[int(5.2 * rate) : int(6.8 * rate)]) > 1000
+
+    master_path = tmp_path / "joined.webm"
+    master_path.write_bytes(
+        seeded_s3.get_object(Bucket=EXPORT_BUCKET, Key=BASE + "master.webm")[
+            "Body"
+        ].read()
+    )
+    master_wav = tmp_path / "joined.wav"
+    webm_to_wav(master_path, master_wav)
+    master_samples, master_rate = wav_samples(master_wav.read_bytes())
+    assert abs(len(master_samples) / master_rate - 7.0) <= 0.2
+
+    timeline = _get_json(seeded_s3, EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert [
+        (iv["speaker_name"], iv["start_sec"], iv["end_sec"])
+        for iv in timeline["speaker_intervals"]
+    ] == [
+        ("Speaker Alpha", 0.0, 0.768),
+        ("Speaker Beta", 1.5, 2.268),
+        ("Speaker Gamma", 5.0, 5.768),
+    ]
+    participants = _get_json(seeded_s3, EXPORT_BUCKET, BASE + "participants.json")
+    assert [p["id"] for p in participants["participants"]] == [
+        "speaker_alpha",
+        "speaker_beta",
+        "speaker_gamma",
+    ]

@@ -1,6 +1,7 @@
 """Token prefix scoping — derived from `libs/admin-models/admin_models/token_scope.py`.
 
-Format: vxa_<scope>_<random>. Valid scopes are {bot, tx, browser}. Tokens without the vxa_
+Format: vxa_<scope>_<random>. Valid scopes are {bot, tx, browser} plus the least-privilege
+{webhooks, erase, export} (§1.10). Tokens without the vxa_
 prefix are legacy (full access). The DB `api_tokens.scopes` column is authoritative; the prefix
 is a hint used at generation time + backfill.
 """
@@ -12,7 +13,10 @@ from typing import Optional, Set
 TOKEN_PREFIX = "vxa"
 TOKEN_PATTERN = re.compile(r"^vxa_([a-z]+)_(.+)$")
 
-VALID_SCOPES: Set[str] = {"bot", "tx", "browser"}
+VALID_SCOPES: Set[str] = {"bot", "tx", "browser", "webhooks", "erase", "export"}
+#: The scopes the /user/* self-serve tier answers. The least-privilege scopes open their own routes
+#: only (§1.10), so they are mintable but never reach this tier.
+USER_TIER_SCOPES: Set[str] = {"bot", "tx", "browser"}
 
 
 def generate_prefixed_token(scope: str, length: int = 32) -> str:

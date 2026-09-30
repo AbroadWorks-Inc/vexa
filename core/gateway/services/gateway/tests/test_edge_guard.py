@@ -21,7 +21,7 @@ from typing import Any, Optional
 import httpx
 import pytest
 from fastapi import FastAPI
-from guard import SecurityConfig
+from guard import SecurityConfig, SecurityMiddleware
 from httpx import ASGITransport
 from starlette.websockets import WebSocketDisconnect
 
@@ -40,7 +40,7 @@ from gateway.ratelimit import PerUserRateLimiter
 def _guard_middleware(app: FastAPI) -> Any:
     """Return the SecurityMiddleware entry on ``app`` if present, else None."""
     for mw in app.user_middleware:
-        if getattr(mw.cls, "__name__", "") == "SecurityMiddleware":
+        if isinstance(mw.cls, type) and issubclass(mw.cls, SecurityMiddleware):
             return mw
     return None
 
@@ -245,6 +245,99 @@ class TestGuardBehavior:
             assert (
                 await ac.get("/", headers={"X-Forwarded-For": "10.0.0.99"})
             ).status_code == 429
+
+
+def _make_v2_app(config: SecurityConfig) -> FastAPI:
+    """An isolated app with one ``/v2/`` route and one upstream route, guard applied."""
+    app = FastAPI()
+    app.add_api_route("/v2/meetings", _root_handler, methods=["GET"])
+    app.add_api_route("/bots", _root_handler, methods=["GET"])
+    apply_guard(app, config=config)
+    return app
+
+
+class TestGuardV2Shape:
+    """§2.5: the guard's own refusals on a ``/v2/`` path carry ``{"error": {code, message}}``;
+    every other path keeps the guard's own body. Unique XFF IPs keep the process-wide
+    ``RateLimitManager`` buckets apart from the other tests'."""
+
+    @pytest.mark.asyncio
+    async def test_a_per_ip_429_on_v2_has_the_error_shape(self) -> None:
+        app = _make_v2_app(_enforcing_config(rate_limit=2, trusted_proxies=["127.0.0.1"]))
+        headers = {"X-Forwarded-For": "10.0.0.71"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            for _ in range(2):
+                assert (await ac.get("/v2/meetings", headers=headers)).status_code == 200
+            resp = await ac.get("/v2/meetings", headers=headers)
+        assert resp.status_code == 429
+        assert resp.headers["content-type"] == "application/json"
+        assert resp.json() == {
+            "error": {"code": "rate_limited", "message": "Too many requests"}
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_per_ip_429_on_v2_retries_after_the_guard_window(self) -> None:
+        """§2.5: ``rate_limited`` sets ``Retry-After``: the guard's own window, in seconds."""
+        app = _make_v2_app(
+            _enforcing_config(
+                rate_limit=1, rate_limit_window=45, trusted_proxies=["127.0.0.1"]
+            )
+        )
+        headers = {"X-Forwarded-For": "10.0.0.74"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            assert (await ac.get("/v2/meetings", headers=headers)).status_code == 200
+            resp = await ac.get("/v2/meetings", headers=headers)
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "45"
+
+    @pytest.mark.asyncio
+    async def test_the_retry_after_is_the_window_the_gateway_configures(
+        self, monkeypatch
+    ) -> None:
+        """The window comes from ``GUARD_RATE_LIMIT_WINDOW`` through ``build_guard_config``."""
+        monkeypatch.setenv("GUARD_ENABLE_REDIS", "false")
+        monkeypatch.setenv("GUARD_RATE_LIMIT_RPM", "1")
+        monkeypatch.setenv("GUARD_RATE_LIMIT_WINDOW", "37")
+        monkeypatch.setenv("GUARD_TRUSTED_PROXIES", "127.0.0.1")
+        app = _make_v2_app(build_guard_config())
+        headers = {"X-Forwarded-For": "10.0.0.75"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            assert (await ac.get("/v2/meetings", headers=headers)).status_code == 200
+            resp = await ac.get("/v2/meetings", headers=headers)
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "37"
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_address_on_v2_has_the_error_shape(self) -> None:
+        app = _make_v2_app(
+            _enforcing_config(
+                rate_limit=1000, trusted_proxies=["127.0.0.1"], blacklist=["10.0.0.72"]
+            )
+        )
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.get("/v2/meetings", headers={"X-Forwarded-For": "10.0.0.72"})
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "forbidden"
+
+    @pytest.mark.asyncio
+    async def test_a_per_ip_429_off_v2_keeps_the_guard_body(self) -> None:
+        app = _make_v2_app(_enforcing_config(rate_limit=1, trusted_proxies=["127.0.0.1"]))
+        headers = {"X-Forwarded-For": "10.0.0.73"}
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            assert (await ac.get("/bots", headers=headers)).status_code == 200
+            resp = await ac.get("/bots", headers=headers)
+        assert resp.status_code == 429
+        assert resp.text == "Too many requests"
 
 
 # ── WS guard hook ──────────────────────────────────────────────────────────────
@@ -567,3 +660,25 @@ class TestBothLayers:
             assert (
                 resp.headers.get("retry-after") is None
             )  # guard's 429, not the limiter's
+
+
+def test_no_gateway_module_imports_another_modules_private_names():
+    """A module's ``_``-names are its own: the edge guard shapes its /v2 refusals through the
+    app's public ``refusal``, ``V2_PREFIX`` and ``V2_ERROR_CODES``."""
+    import ast
+    import pathlib
+
+    package = pathlib.Path(_edge_guard.__file__).parent
+    private = []
+    for source in sorted(package.glob("*.py")):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level == 0 and not (node.module or "").startswith("gateway"):
+                continue
+            private += [
+                f"{source.name}: {alias.name} from {'.' * node.level}{node.module or ''}"
+                for alias in node.names
+                if alias.name.startswith("_") and not alias.name.startswith("__")
+            ]
+    assert private == []

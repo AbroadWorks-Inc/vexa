@@ -58,6 +58,7 @@ async def test_ensure_fts_index_is_called_from_the_real_lifespan():
         system_webhook_sink=None,
         session_factory=None,  # _guarded degrades to run-the-tick unconditionally (no real PG)
         storage=None,
+        intake=None,
     )
 
     async with app.router.lifespan_context(app):
@@ -88,6 +89,7 @@ async def test_ensure_fts_index_is_skipped_gracefully_without_the_real_store():
         system_webhook_sink=None,
         session_factory=None,
         storage=None,
+        intake=None,
     )
 
     # No assertion beyond "the lifespan starts and tears down without raising" — the proof this

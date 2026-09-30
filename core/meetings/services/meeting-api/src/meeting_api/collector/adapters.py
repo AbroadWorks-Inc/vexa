@@ -465,22 +465,64 @@ class SqlAlchemyTranscriptStore:
             "segments": segments,
         }
 
-    async def get_transcript(self, user_id, platform, native_meeting_id) -> Optional[dict]:
-        from sqlalchemy import select  # lazy: SQLAlchemy not needed for the in-memory fakes
+    @staticmethod
+    async def _room_row(db, user_id, platform, native_meeting_id, kind):
+        """The caller's link resolved in ``db`` by the one link resolver (§1.6): the account's rows
+        on the link (``intake.adapters.link_rows``) through ``intake.resolver.resolve``. Raises
+        ``AmbiguousRoom`` for a ``PLANNED_EDIT`` on several planned meetings."""
+        from ..intake.adapters import link_rows
+        from ..intake.ports import Room
+        from ..intake.resolver import resolve
 
-        from .models import Meeting  # local re-export of the admin-api models
+        rows = await link_rows(db, user_id, Room(platform, native_meeting_id))
+        return resolve(rows, kind, now=_now())
+
+    async def _room_meeting(self, db, user_id, platform, native_meeting_id, kind, *,
+                            for_update=False):
+        """The ``Meeting`` row ``_room_row`` picks (locked ``FOR UPDATE`` when asked), or None."""
+        from sqlalchemy import select
+
+        from .models import Meeting
+
+        picked = await self._room_row(db, user_id, platform, native_meeting_id, kind)
+        if picked is None:
+            return None
+        stmt = select(Meeting).where(Meeting.id == picked.id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        return (await db.execute(stmt)).scalars().first()
+
+    async def resolve_room(self, user_id, platform, native_meeting_id, kind):
+        async with self._session_factory() as db:
+            return await self._room_row(db, user_id, platform, native_meeting_id, kind)
+
+    @staticmethod
+    async def _has_entries(db, meeting_id, user_id=None) -> bool:
+        """Whether a ``meeting_entries`` row points at the meeting (scoped to ``user_id``'s own
+        meeting when given): entries manage it (§1.6)."""
+        from sqlalchemy import exists, select
+
+        from ..sessions.models import MeetingEntry
+        from .models import Meeting
+
+        stmt = select(Meeting.id).where(
+            Meeting.id == meeting_id, exists().where(MeetingEntry.meeting_id == Meeting.id)
+        )
+        if user_id is not None:
+            stmt = stmt.where(Meeting.user_id == user_id)
+        return (await db.execute(stmt)).scalars().first() is not None
+
+    async def entry_managed(self, user_id, meeting_id) -> bool:
+        async with self._session_factory() as db:
+            return await self._has_entries(db, meeting_id, user_id)
+
+    async def get_transcript(self, user_id, platform, native_meeting_id) -> Optional[dict]:
+        from ..intake.resolver import LinkKind
 
         async with self._session_factory() as db:
-            stmt = (
-                select(Meeting)
-                .where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                )
-                .order_by(Meeting.created_at.desc())
+            meeting = await self._room_meeting(
+                db, user_id, platform, native_meeting_id, LinkKind.READ
             )
-            meeting = (await db.execute(stmt)).scalars().first()
             if not meeting:
                 return None
             data = meeting.data if isinstance(meeting.data, dict) else {}
@@ -571,8 +613,7 @@ class SqlAlchemyTranscriptStore:
             # SQL wrapper for COALESCE(data.scheduled_at, start_time, created_at) — created by the
             # admin-api schema sync (MIGRATION-0005). Semantics mirrored by the fake via
             # projection.list_order_key. Internal enumeration (get-by-id filter, /bots/status,
-            # calendar sync) keeps created_at DESC — _resolve_owned_native documents "newest owned
-            # row" against exactly that order.
+            # calendar sync) keeps created_at DESC.
             _pin_sql = "status IN ({})".format(
                 ", ".join(f"'{s}'" for s in sorted(LIST_PIN_STATUSES)))
             event_order = (
@@ -705,16 +746,11 @@ class SqlAlchemyTranscriptStore:
             binding, never by picking a row blindly."""
         from sqlalchemy import select
 
+        from ..intake.resolver import LinkKind, LinkRow, resolve
         from .models import Meeting
 
         async with self._session_factory() as db:
-            owned = (await db.execute(
-                select(Meeting).where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                ).order_by(Meeting.created_at.desc()).limit(1)
-            )).scalars().first()
+            owned = await self._room_row(db, user_id, platform, native_meeting_id, LinkKind.READ)
             if owned:
                 return owned.id  # (a) owner
             rows = (await db.execute(
@@ -723,18 +759,19 @@ class SqlAlchemyTranscriptStore:
                     Meeting.platform_specific_id == native_meeting_id,
                 )
             )).scalars().all()
+            shared = []
             for mtg in rows:
                 data = mtg.data if isinstance(mtg.data, dict) else {}
-                if member_workspaces and data.get("workspace_id") in member_workspaces:
-                    return mtg.id  # (b) member of the meeting's bound shared workspace (optional convenience)
-                if user_id in (data.get("transcript_viewers") or []):
-                    return mtg.id  # (c) redeemed an INDEPENDENT transcript-share link for this meeting
-            return None
+                if ((member_workspaces and data.get("workspace_id") in member_workspaces)  # (b) bound workspace
+                        or user_id in (data.get("transcript_viewers") or [])):  # (c) INDEPENDENT share link
+                    shared.append(LinkRow.of(mtg.id, mtg.status, data, mtg.start_time, mtg.created_at))
+            picked = resolve(shared, LinkKind.READ, now=_now())
+            return picked.id if picked is not None else None
 
     async def get_meeting_participants(self, user_id, platform, native_meeting_id) -> Optional[dict]:
         """OWNER-scoped (``ports.TranscriptStore.get_meeting_participants``). ONE session, two reads:
-        the newest owned row's ``data['attendees']`` (the calendar invitation's ATTENDEE lines), and
-        DISTINCT ``transcriptions.speaker`` for that row ordered by FIRST utterance.
+        the ``data['attendees']`` (the calendar invitation's ATTENDEE lines) of the owned row the
+        link resolver reads (§1.6), and DISTINCT ``transcriptions.speaker`` for that row ordered by FIRST utterance.
 
         The speaker read is a grouped aggregate, NOT a segment fetch: a long meeting has thousands of
         rows and this endpoint wants at most a few dozen names, so ``GROUP BY speaker`` keeps the
@@ -742,16 +779,13 @@ class SqlAlchemyTranscriptStore:
         let a per-meeting response grow with the meeting)."""
         from sqlalchemy import func, select
 
-        from .models import Meeting, Transcription
+        from ..intake.resolver import LinkKind
+        from .models import Transcription
 
         async with self._session_factory() as db:
-            meeting = (await db.execute(
-                select(Meeting).where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                ).order_by(Meeting.created_at.desc()).limit(1)
-            )).scalars().first()
+            meeting = await self._room_meeting(
+                db, user_id, platform, native_meeting_id, LinkKind.READ
+            )
             if meeting is None:
                 return None  # → 404. NOT an empty roster: the caller owns no such meeting.
             data = meeting.data if isinstance(meeting.data, dict) else {}
@@ -775,20 +809,14 @@ class SqlAlchemyTranscriptStore:
         """OWNER-scoped: bind the meeting to a shared workspace (``data.workspace_id``) so its members can
         subscribe to the live transcript feed (authorize_subscribe branch b). Many meetings → one workspace
         (Amendment 6). Returns the bound workspace_id, or None if the caller owns no such meeting."""
-        from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
-        from .models import Meeting
+        from ..intake.resolver import LinkKind
 
         async with self._session_factory() as db:
-            stmt = (
-                select(Meeting).where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                ).order_by(Meeting.created_at.desc()).limit(1).with_for_update()
+            meeting = await self._room_meeting(
+                db, user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT, for_update=True
             )
-            meeting = (await db.execute(stmt)).scalars().first()
             if not meeting:
                 return None
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
@@ -798,13 +826,13 @@ class SqlAlchemyTranscriptStore:
             await db.commit()
             return workspace_id
 
-    async def _mint_share_on(self, stmt, *, mode, allowed_emails, expires_in_sec) -> "Optional[dict]":
-        """Mint a grant onto whichever ONE row ``stmt`` selects. The two public mints differ only in
-        how they address the meeting; everything after the row is identical."""
+    async def _mint_share_on(self, pick, *, mode, allowed_emails, expires_in_sec) -> "Optional[dict]":
+        """Mint a grant onto the ONE row ``pick(db)`` returns (locked, or None). The two public
+        mints differ only in how they address the meeting; everything after the row is identical."""
         from sqlalchemy.orm.attributes import flag_modified
 
         async with self._session_factory() as db:
-            meeting = (await db.execute(stmt)).scalars().first()
+            meeting = await pick(db)
             if not meeting:
                 return None
             grant, secret = _build_share_grant(mode, allowed_emails, expires_in_sec)
@@ -828,16 +856,15 @@ class SqlAlchemyTranscriptStore:
         ``platform_specific_id``, so no pair addresses it at all (meeting 97, 2026-09-02 — every
         attendee mail for it shipped with no token). Prefer ``mint_transcript_share_by_id``; this one
         stays because 0.10 clients and the ``/transcripts/{platform}/{native}/share`` alias call it."""
-        from sqlalchemy import select
+        from ..intake.resolver import LinkKind
 
-        from .models import Meeting
+        async def planned(db):
+            return await self._room_meeting(
+                db, user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT, for_update=True
+            )
 
         return await self._mint_share_on(
-            select(Meeting).where(
-                Meeting.user_id == user_id, Meeting.platform == platform,
-                Meeting.platform_specific_id == native_meeting_id,
-            ).order_by(Meeting.created_at.desc()).limit(1).with_for_update(),
-            mode=mode, allowed_emails=allowed_emails, expires_in_sec=expires_in_sec)
+            planned, mode=mode, allowed_emails=allowed_emails, expires_in_sec=expires_in_sec)
 
     async def mint_transcript_share_by_id(self, user_id, meeting_id, *,
                                           mode="open", allowed_emails=None, expires_in_sec=86400) -> "Optional[dict]":
@@ -856,11 +883,15 @@ class SqlAlchemyTranscriptStore:
             mid = int(meeting_id)
         except (TypeError, ValueError):
             return None
+        async def by_id(db):
+            return (await db.execute(
+                select(Meeting).where(
+                    Meeting.id == mid, Meeting.user_id == user_id,
+                ).limit(1).with_for_update()
+            )).scalars().first()
+
         return await self._mint_share_on(
-            select(Meeting).where(
-                Meeting.id == mid, Meeting.user_id == user_id,
-            ).limit(1).with_for_update(),
-            mode=mode, allowed_emails=allowed_emails, expires_in_sec=expires_in_sec)
+            by_id, mode=mode, allowed_emails=allowed_emails, expires_in_sec=expires_in_sec)
 
     async def redeem_transcript_share(self, user_id, user_email, token) -> "Optional[dict]":
         """Redeem a transcript share token (any authenticated user) → grants THIS user subscribe access to
@@ -1076,24 +1107,14 @@ class SqlAlchemyTranscriptStore:
         """Owner-scoped atomic read→modify→write of ``meeting.data['docs']`` under ONE
         ``SELECT … FOR UPDATE`` row lock. Returns the updated docs list, or ``None`` when the
         user owns no such meeting."""
-        from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
-        from .models import Meeting
+        from ..intake.resolver import LinkKind
 
         async with self._session_factory() as db:
-            stmt = (
-                select(Meeting)
-                .where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                )
-                .order_by(Meeting.created_at.desc())
-                .limit(1)
-                .with_for_update()
+            meeting = await self._room_meeting(
+                db, user_id, platform, native_meeting_id, LinkKind.READ, for_update=True
             )
-            meeting = (await db.execute(stmt)).scalars().first()
             if not meeting:
                 return None
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
@@ -1118,37 +1139,35 @@ class SqlAlchemyTranscriptStore:
         """Owner-scoped atomic write of the INTENT status (``idle`` / ``scheduled``) onto the
         ``meetings.status`` column under ONE ``SELECT … FOR UPDATE`` row lock. Stamps / clears
         ``meeting.data['scheduled_at']``. NEVER touches the bot FSM."""
-        from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
-        from .models import Meeting
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..intake.resolver import LinkKind, ManagedByEntries
+        from ..intake.status import write_status
 
         async with self._session_factory() as db:
-            stmt = (
-                select(Meeting)
-                .where(
-                    Meeting.user_id == user_id,
-                    Meeting.platform == platform,
-                    Meeting.platform_specific_id == native_meeting_id,
-                )
-                .order_by(Meeting.created_at.desc())
-                .limit(1)
-                .with_for_update()
+            await take_link_lock(db, user_id, Room(platform, native_meeting_id))
+            meeting = await self._room_meeting(
+                db, user_id, platform, native_meeting_id, LinkKind.PLANNED_EDIT, for_update=True
             )
-            meeting = (await db.execute(stmt)).scalars().first()
             if not meeting:
                 return None
+            if await self._has_entries(db, meeting.id):
+                raise ManagedByEntries(meeting.id)
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
             prev_status = meeting.status
             prev_at = data.get("scheduled_at")
             new_at = scheduled_at if status == "scheduled" else None
-            meeting.status = status
             if status == "scheduled":
                 data["scheduled_at"] = new_at
             else:
                 data.pop("scheduled_at", None)
             meeting.data = data
             flag_modified(meeting, "data")
+            if prev_status != status:
+                await db.flush()
+                await write_status(db, meeting.id, status, expected_from={prev_status})
             await db.commit()
             changed = (prev_status != status) or (prev_at != new_at)
             return {
@@ -1195,10 +1214,15 @@ class SqlAlchemyTranscriptStore:
         ``auto_join_last_attempt``/``auto_join_error`` seed the row with a backoff already earned
         elsewhere — calendar sync passes them when this row replaces a terminal one the auto-join
         sweep already dispatched for, so the replacement is not due the instant it exists. Written
-        in the INSERT, not patched after, so no sweep tick can see the row without them."""
+        in the INSERT, not patched after, so no sweep tick can see the row without them. The row
+        and its first event go through the status writer, under the link's lock (taken before the
+        per-user lock, the §1.4 order ``create_meeting_guarded`` keeps too)."""
         from sqlalchemy import bindparam, select, text
         from sqlalchemy.exc import IntegrityError
 
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..intake.status import STATUS_CHANGE_EVENT, insert_meeting
         from .models import Meeting
 
         data: dict = {"auto_join": bool(auto_join)}
@@ -1228,6 +1252,8 @@ class SqlAlchemyTranscriptStore:
         status = "scheduled" if scheduled_at else "idle"
 
         async with self._session_factory() as db:
+            if native_meeting_id is not None:
+                await take_link_lock(db, user_id, Room(platform, native_meeting_id))
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(:uid)").bindparams(bindparam("uid", user_id))
             )
@@ -1242,12 +1268,12 @@ class SqlAlchemyTranscriptStore:
                 )).scalars().first()
                 if dup is not None:
                     return {"error": "duplicate"}
-            m = Meeting(
-                user_id=user_id, platform=platform, platform_specific_id=native_meeting_id,
-                status=status, data=data,
-            )
-            db.add(m)
             try:
+                m = await insert_meeting(
+                    db, user_id=user_id, platform=platform,
+                    native_meeting_id=native_meeting_id, status=status, data=data,
+                    first_event=STATUS_CHANGE_EVENT,
+                )
                 await db.commit()
             except IntegrityError:
                 await db.rollback()
@@ -1468,14 +1494,35 @@ class SqlAlchemyTranscriptStore:
 
     async def update_planned_meeting(self, user_id, meeting_id, updates) -> "Optional[dict]":
         """ROW-id-addressed PATCH of a planned row (intent status only). ``updates`` carries only
-        the keys the caller sent — presence means apply (None clears where documented)."""
+        the keys the caller sent — presence means apply (None clears where documented).
+
+        Locks in the §1.4 order: the row's link, and the new link when the edit moves it (sorted),
+        then the per-user lock, then the row. A row whose link changed before the row lock answers
+        ``conflict``. A status change (``scheduled_at`` set or cleared) goes through the status
+        writer."""
         from sqlalchemy import bindparam, select, text
         from sqlalchemy.exc import IntegrityError
         from sqlalchemy.orm.attributes import flag_modified
 
+        from ..intake.adapters import take_link_lock
+        from ..intake.ports import Room
+        from ..intake.status import write_status
         from .models import Meeting
 
         async with self._session_factory() as db:
+            link = (await db.execute(
+                select(Meeting.platform, Meeting.platform_specific_id)
+                .where(Meeting.id == meeting_id, Meeting.user_id == user_id)
+            )).first()
+            if link is None:
+                return None
+            rooms = set()
+            if link[1] is not None:
+                rooms.add(Room(link[0], link[1]))
+            if updates.get("native_meeting_id") is not None:
+                rooms.add(Room(updates.get("platform") or link[0], updates["native_meeting_id"]))
+            for room in sorted(rooms):
+                await take_link_lock(db, user_id, room)
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(:uid)").bindparams(bindparam("uid", user_id))
             )
@@ -1485,6 +1532,11 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
+            if (meeting.platform, meeting.platform_specific_id) != tuple(link):
+                return {"error": "conflict"}
+            # Entries manage it: edited only through /v2/entries (§1.6).
+            if await self._has_entries(db, meeting.id):
+                return {"error": "managed_by_entries"}
             if meeting.status not in ("idle", "scheduled"):
                 return {"error": "conflict"}
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
@@ -1516,13 +1568,14 @@ class SqlAlchemyTranscriptStore:
                     data["title"] = updates["title"]
                 else:
                     data.pop("title", None)
+            new_status = meeting.status
             if "scheduled_at" in updates:
                 if updates["scheduled_at"]:
                     data["scheduled_at"] = updates["scheduled_at"]
-                    meeting.status = "scheduled"
+                    new_status = "scheduled"
                 else:
                     data.pop("scheduled_at", None)
-                    meeting.status = "idle"
+                    new_status = "idle"
             if "workspace_id" in updates:
                 if updates["workspace_id"]:
                     # an explicit bind is the USER's choice — it also lifts any series tombstone
@@ -1571,6 +1624,9 @@ class SqlAlchemyTranscriptStore:
             meeting.data = data
             flag_modified(meeting, "data")
             try:
+                if new_status != meeting.status:
+                    await db.flush()
+                    await write_status(db, meeting.id, new_status, expected_from={meeting.status})
                 await db.commit()
             except IntegrityError:
                 await db.rollback()
@@ -1581,6 +1637,7 @@ class SqlAlchemyTranscriptStore:
     async def delete_planned_meeting(self, user_id, meeting_id) -> "Optional[bool]":
         from sqlalchemy import select
 
+        from ..intake.resolver import ManagedByEntries
         from .models import Meeting
 
         async with self._session_factory() as db:
@@ -1590,6 +1647,9 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
+            # Entries manage it: edited only through /v2/entries (§1.6).
+            if await self._has_entries(db, meeting.id):
+                raise ManagedByEntries(meeting.id)
             if meeting.status not in ("idle", "scheduled"):
                 return False
             await db.delete(meeting)

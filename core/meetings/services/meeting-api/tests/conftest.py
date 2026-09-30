@@ -23,6 +23,26 @@ def _stt_configured(monkeypatch):
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "test-stt-token")
 
 
+@pytest.fixture(autouse=True)
+def _gateway_identity(monkeypatch):
+    """§1.10: client routes believe x-user-id only with the gateway's signature. The suite runs with
+    the stand-in gateway's ring (``gateway_identity.RING``); a route test reaches the app through
+    ``gateway_identity.via_gateway``, and a test of the unconfigured case clears it."""
+    from gateway_identity import RING
+
+    monkeypatch.setenv("GATEWAY_IDENTITY_KEYS", RING)
+
+
+@pytest.fixture(autouse=True)
+def _internal_secret(monkeypatch):
+    """§1.10: the bot's lifecycle callback carries ``x-internal-secret`` and the runtime posts to a
+    tokened URL, both keyed by ``INTERNAL_API_SECRET``. The suite runs with
+    ``internal_callers.INTERNAL_SECRET``; a test of the unconfigured case clears it."""
+    from internal_callers import INTERNAL_SECRET
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", INTERNAL_SECRET)
+
+
 # --- lifecycle.v1 goldens (the seam) ---------------------------------------------------
 
 def _repo_root() -> Path:
@@ -111,3 +131,53 @@ async def fake_redis():
     finally:
         await client.flushall()
         await client.aclose()
+
+
+# --- real Postgres (intake/webhook schema, §1.2) ---------------------------------------
+
+@pytest.fixture()
+async def intake_pg_engine():
+    """An async engine on ``MEETING_API_TEST_DATABASE_URL`` with every admin-api table dropped
+    before and after the test. The caller builds whatever schema it needs (``ensure_schema`` or a
+    migration). SQLAlchemy/asyncpg are imported here, not at module load, so the offline suite never
+    needs them — see ``test_intake_pg_schema.py``'s docstring for the ephemeral install."""
+    import os
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from admin_api.schema import models as admin_models
+
+    eng = create_async_engine(os.environ["MEETING_API_TEST_DATABASE_URL"])
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    yield eng
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    await eng.dispose()
+
+
+@pytest.fixture()
+async def link_pg_engine():
+    """An async engine on ``MEETING_API_TEST_DATABASE_URL`` with the admin-api schema built and
+    every table dropped before and after — the link resolver's Postgres tests (§1.6). Skips
+    cleanly when the variable is unset."""
+    import os
+
+    url = os.getenv("MEETING_API_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("real-Postgres proofs for §1.6; set MEETING_API_TEST_DATABASE_URL to run")
+    pytest.importorskip("sqlalchemy", reason="see test_intake_pg_schema.py's docstring")
+    pytest.importorskip("asyncpg", reason="see test_intake_pg_schema.py's docstring")
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from admin_api.schema import models as admin_models
+    from admin_api.schema import sync as admin_sync
+
+    eng = create_async_engine(url)
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    await admin_sync.ensure_schema(eng, admin_models.Base)
+    yield eng
+    async with eng.begin() as conn:
+        await conn.run_sync(admin_models.Base.metadata.drop_all)
+    await eng.dispose()

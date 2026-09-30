@@ -48,6 +48,9 @@ def _load_lifecycle_schema() -> dict:
 _SCHEMA = _load_lifecycle_schema()
 _REGISTRY = Registry().with_resource(_SCHEMA["$id"], Resource.from_contents(_SCHEMA))
 
+#: The sealed ``CompletionReason`` values, read from the schema itself.
+SEALED_COMPLETION_REASONS = frozenset(_SCHEMA["$defs"]["CompletionReason"]["enum"])
+
 
 def conforms(obj: Dict[str, Any], shape: str) -> None:
     """Validate `obj` against `lifecycle.v1#/$defs/<shape>` (raises on non-conformance)."""

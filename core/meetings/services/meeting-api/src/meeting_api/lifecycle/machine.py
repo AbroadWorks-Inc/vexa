@@ -160,6 +160,11 @@ def bot_status_from_persisted(status: Optional[str]) -> Optional[BotStatus]:
         return None
     return _PERSISTED_STATUS_TO_BOTSTATUS.get(status)
 
+def persisted_statuses_for(status: Optional[BotStatus]) -> frozenset:
+    """The persisted meeting statuses the FSM reads as `status` (the inverse of
+    `bot_status_from_persisted`): an FSM edge's `from`, as the statuses the row may hold."""
+    return frozenset(s for s, b in _PERSISTED_STATUS_TO_BOTSTATUS.items() if b == status)
+
 # Stage a record was in maps to the FailureStage to record if it terminates `failed`.
 # (Mirrors the parent's `_failure_stage_from_status`: derive server-side from current
 # state, never trust the bot's stale payload value.)

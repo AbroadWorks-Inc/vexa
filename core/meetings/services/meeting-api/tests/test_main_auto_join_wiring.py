@@ -39,8 +39,27 @@ class _StopLoop(Exception):
 class _FakeMeetingRepo:
     # Only needs to exist + carry the attribute `_auto_join_loop` gates on; auto_join_tick itself
     # is stubbed below, so no real repo behaviour is exercised.
-    def list_scheduled_meetings(self):  # pragma: no cover - never actually called (tick is stubbed)
+    def list_due_meetings(self, now, lead_s):  # pragma: no cover - never called (tick is stubbed)
         return []
+
+
+class _FakeSession:
+    """Just enough of an AsyncSession for the sweeps' advisory lock: every lock is granted."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, *a, **kw):
+        return types.SimpleNamespace(scalar=lambda: True)
+
+
+def _fake_session_factory():
+    # §1.5: the auto-join and not-sent sweeps need Postgres (the intake store) and run only with a
+    # session factory; this one serves the single-flight lock and nothing else.
+    return _FakeSession()
 
 
 class _FakeRuntime:
@@ -53,6 +72,16 @@ class _FakeRedis:
 
     async def publish(self, channel, message):
         self.published.append((channel, message))
+
+
+def _intake(session_factory, repo, runtime, redis_client):
+    """The entry service as ``build_production_app`` builds it (``_build_intake``), over the fakes."""
+    from meeting_api.service_authority import AllowAllServiceAuthority
+
+    return main_mod._build_intake(
+        session_factory, repo, runtime,
+        service_authority=AllowAllServiceAuthority(), commands=redis_client,
+    )
 
 
 def _fake_app():
@@ -94,18 +123,20 @@ async def test_auto_join_tick_publish_status_is_wired_and_publishes(monkeypatch)
 
     app = _fake_app()
     redis_client = _FakeRedis()
+    repo, runtime = _FakeMeetingRepo(), _FakeRuntime()
 
     main_mod._attach_background_loops(
         app,
         transcript_store=types.SimpleNamespace(),
         segment_bus=types.SimpleNamespace(),
         redis_client=redis_client,
-        meeting_repo=_FakeMeetingRepo(),
-        runtime=_FakeRuntime(),
+        meeting_repo=repo,
+        runtime=runtime,
         service_authority=None,
         system_webhook_sink=None,
-        session_factory=None,  # _guarded degrades to run-the-tick unconditionally
+        session_factory=_fake_session_factory,
         storage=None,
+        intake=_intake(_fake_session_factory, repo, runtime, redis_client),
     )
 
     async with app.router.lifespan_context(app):
@@ -145,3 +176,171 @@ async def test_auto_join_tick_publish_status_is_wired_and_publishes(monkeypatch)
         "status": "joining",
         "when": "2026-09-03T08:52:00Z",
     }
+
+
+# ── §1.5: the intake store and entry service reach the tick; the not-sent sweep is wired ────────
+
+
+async def _run_loops(monkeypatch, *, session_factory, env=None):
+    """Start the REAL lifespan once, every loop ending after one tick. Returns the guarded
+    single-flight keys, the sleep delays and the app."""
+    from meeting_api.sweeps import single_flight
+
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    guarded: list[int] = []
+
+    async def _record(lock, key, body):
+        guarded.append(key)
+        await body()
+        return True
+
+    monkeypatch.setattr(single_flight, "run_single_flight", _record)
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _sleep_once_then_stop(delay, *a, **kw):
+        delays.append(delay)
+        raise _StopLoop()
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep_once_then_stop)
+    monkeypatch.setattr(main_mod.log, "exception", lambda *a, **kw: None)
+    app = _fake_app()
+    redis_client, repo, runtime = _FakeRedis(), _FakeMeetingRepo(), _FakeRuntime()
+    main_mod._attach_background_loops(
+        app,
+        transcript_store=types.SimpleNamespace(),
+        segment_bus=types.SimpleNamespace(),
+        redis_client=redis_client,
+        meeting_repo=repo,
+        runtime=runtime,
+        service_authority=None,
+        system_webhook_sink=None,
+        session_factory=session_factory,
+        storage=None,
+        intake=(
+            _intake(session_factory, repo, runtime, redis_client)
+            if session_factory is not None
+            else None
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        await real_sleep(0.05)
+    return guarded, delays
+
+
+async def test_auto_join_tick_gets_the_intake_store_service_and_publisher(monkeypatch):
+    from meeting_api.intake import IntakeService, OutboxOnly, PostgresIntakeStore
+    from meeting_api.sweeps.single_flight import sweep_lock_key
+
+    captured: dict = {}
+
+    async def _stub(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub)
+    guarded, _ = await _run_loops(monkeypatch, session_factory=_fake_session_factory)
+
+    assert isinstance(captured["store"], PostgresIntakeStore)
+    assert isinstance(captured["intake"], IntakeService)
+    assert isinstance(captured["publisher"], OutboxOnly)
+    assert sweep_lock_key("auto-join") in guarded
+
+
+async def test_not_sent_sweep_runs_single_flight_on_its_own_interval(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from meeting_api.intake import OutboxOnly, PostgresIntakeStore
+    from meeting_api.intake import sweeps as sweeps_mod
+    from meeting_api.sweeps.item_failures import PostgresItemFailures
+    from meeting_api.sweeps.single_flight import sweep_lock_key
+
+    calls: list[tuple] = []
+
+    async def _stub_auto_join(*args, **kwargs):
+        calls.append(("auto-join", kwargs["store"], kwargs))
+
+    async def _stub_not_sent(store, **kwargs):
+        calls.append(("not-sent", store, kwargs))
+        return 0
+
+    monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub_auto_join)
+    monkeypatch.setattr(sweeps_mod, "not_sent_tick", _stub_not_sent)
+    guarded, delays = await _run_loops(
+        monkeypatch,
+        session_factory=_fake_session_factory,
+        env={
+            "NOT_SENT_SWEEP_INTERVAL_S": "7",
+            "SWEEP_BATCH_SIZE": "50",
+            "SWEEP_MAX_ITEM_FAILURES": "4",
+        },
+    )
+
+    (not_sent,) = [c for c in calls if c[0] == "not-sent"]
+    (auto_join,) = [c for c in calls if c[0] == "auto-join"]
+    _, store, kwargs = not_sent
+    assert isinstance(store, PostgresIntakeStore) and store is auto_join[1]
+    assert isinstance(kwargs["publisher"], OutboxOnly)
+    assert set(kwargs) == {"publisher", "now", "failures", "batch_size"}
+    # §6.9 F-I: both sweeps share the one Postgres failure record and the page size
+    assert isinstance(kwargs["failures"], PostgresItemFailures)
+    assert kwargs["failures"] is auto_join[2]["item_failures"]
+    assert kwargs["failures"]._max == 4
+    assert kwargs["batch_size"] == auto_join[2]["batch_size"] == 50
+    assert abs(kwargs["now"] - datetime.now(timezone.utc)) < timedelta(seconds=30)
+    assert sweep_lock_key("not-sent") in guarded
+    assert 7.0 in delays
+
+
+async def test_without_postgres_neither_sweep_runs(monkeypatch):
+    from meeting_api.intake import sweeps as sweeps_mod
+
+    calls: list[str] = []
+
+    async def _stub_auto_join(*args, **kwargs):
+        calls.append("auto-join")
+
+    async def _stub_not_sent(*args, **kwargs):
+        calls.append("not-sent")
+        return 0
+
+    monkeypatch.setattr(auto_join_mod, "auto_join_tick", _stub_auto_join)
+    monkeypatch.setattr(sweeps_mod, "not_sent_tick", _stub_not_sent)
+    await _run_loops(monkeypatch, session_factory=None)
+    assert calls == []
+
+
+async def test_without_postgres_the_reconcile_sweep_keeps_one_failure_record(monkeypatch):
+    """§6.9 F-I in Lite: the failure counts that bound a sweep's items live in one in-memory
+    record per process, not a fresh one per pass, so SWEEP_MAX_ITEM_FAILURES still gives up."""
+    from meeting_api.lifecycle import reconcile as reconcile_mod
+    from meeting_api.sweeps.item_failures import InMemoryItemFailures
+
+    captured: list = []
+
+    async def _stub_nonterminal(*args, **kwargs):
+        captured.append(kwargs.get("item_failures"))
+        return 0
+
+    async def _stub_stopping(*args, **kwargs):
+        return 0
+
+    async def _none(*args, **kwargs):  # pragma: no cover - the sweeps are stubbed
+        return []
+
+    monkeypatch.setattr(_FakeMeetingRepo, "list_stale_stopping", _none, raising=False)
+    monkeypatch.setattr(_FakeMeetingRepo, "list_stale_nonterminal", _none, raising=False)
+    monkeypatch.setattr(reconcile_mod, "reconcile_stale_nonterminal_sweep", _stub_nonterminal)
+    monkeypatch.setattr(reconcile_mod, "reconcile_stale_stopping_sweep", _stub_stopping)
+
+    plain_app = _fake_app
+
+    def _app_with_the_lifecycle():
+        app = plain_app()
+        app.state.apply_lifecycle_event = _none
+        return app
+
+    monkeypatch.setattr(sys.modules[__name__], "_fake_app", _app_with_the_lifecycle)
+    await _run_loops(monkeypatch, session_factory=None, env={"SWEEP_MAX_ITEM_FAILURES": "3"})
+    (failures,) = captured
+    assert isinstance(failures, InMemoryItemFailures) and failures._max == 3

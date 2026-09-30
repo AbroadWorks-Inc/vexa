@@ -64,7 +64,7 @@ loses a card and never loses the fact.
 - **the flows suite** — `test_carrier_census.py` holds the census and the domain manifests in
   agreement in both directions.
 
-## Registered, not yet sealed
+## Registered and sealed
 
 It is registered in `architecture.calm.json` as node `flows.v1` (`metadata.path`
 `core/flows/contracts/flows.v1`, `domain` `flows`), inside the `flows-composed` container —
@@ -77,9 +77,8 @@ that, and `gate:arch-report` was red behind it. A README asserting the state a g
 worse than silence — it answers the question a reader would otherwise have gone and checked. Landed
 with the node, so the sentence and the chart move together.
 
-It carries no entry in `contracts.seal.json`, so `gate:contract-version` reports it as *in
-development* — and that part is deliberate. Sealing publishes a frozen `.vN`; freezing a shape on
-the branch that introduces it would pin it before anybody has built a consumer against it. Re-seal
-with `pnpm seal:contracts` in a `lane:contract` review once it has one.
+It is sealed in `contracts.seal.json`, so `gate:contract-version` freezes `flows.schema.json`: a
+back-compatible change re-seals with `pnpm seal:contracts` in a `lane:contract` review, and a
+breaking one opens `flows.v2`.
 
 _Governed by `docs/docs/governance/architecture.mdx` (P1–P12). This folder owns one concern; its public surface is its `index`/contract; it may depend only on what the dependency-rules allow._

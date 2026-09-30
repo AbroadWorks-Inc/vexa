@@ -18,7 +18,7 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: meeting-api
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        {{- toYaml (merge (deepCopy (.Values.meetingApi.podAnnotations | default dict)) (.Values.global.podAnnotations | default dict)) | nindent 8 }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.meetingApi.terminationGracePeriodSeconds | default 30 }}
       securityContext:
@@ -90,6 +90,29 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: ADMIN_API_TOKEN
+            # The gateway identity key ring is in either Secret; the webhook key ring only in an
+            # existing one.
+            - name: GATEWAY_IDENTITY_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_KEYS
+                  optional: true
+            - name: WEBHOOK_SECRET_ENC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: WEBHOOK_SECRET_ENC_KEYS
+                  optional: true
+            - name: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+                  optional: true
+            # The gateway signature's freshness window (the replay window); the same on admin-api.
+            - name: GATEWAY_IDENTITY_MAX_SKEW_S
+              value: {{ .Values.meetingApi.gatewayIdentityMaxSkewSeconds | default "60" | quote }}
             - name: DEFAULT_BOT_NAME
               value: {{ .Values.meetingApi.defaultBotName | default "" | quote }}
             - name: TRANSCRIPTION_SERVICE_URL
@@ -146,6 +169,62 @@ spec:
               value: {{ .Values.meetingApi.botS3AccessKey | default "" | quote }}
             - name: BOT_S3_SECRET_KEY
               value: {{ .Values.meetingApi.botS3SecretKey | default "" | quote }}
+            # Meeting intake + auto-join.
+            - name: ENTRY_MAX_DAYS_AHEAD
+              value: {{ .Values.meetingApi.entryMaxDaysAhead | default "30" | quote }}
+            - name: JOIN_NOW_ADOPT_AHEAD_S
+              value: {{ .Values.meetingApi.joinNowAdoptAheadSeconds | default "3600" | quote }}
+            - name: ENTRY_BLOCKED_HOSTS
+              value: {{ .Values.meetingApi.entryBlockedHosts | default "" | quote }}
+            - name: INTAKE_MAX_ACTIVE_ENTRIES
+              value: {{ .Values.meetingApi.intakeMaxActiveEntries | default "100000" | quote }}
+            - name: INTAKE_CONFLICT_RETRIES
+              value: {{ .Values.meetingApi.intakeConflictRetries | default "3" | quote }}
+            - name: INTAKE_CONFLICT_DELAY_MIN_S
+              value: {{ .Values.meetingApi.intakeConflictDelayMinSeconds | default "0.01" | quote }}
+            - name: INTAKE_CONFLICT_DELAY_MAX_S
+              value: {{ .Values.meetingApi.intakeConflictDelayMaxSeconds | default "0.05" | quote }}
+            - name: INTAKE_STOP_LINK_RETRIES
+              value: {{ .Values.meetingApi.intakeStopLinkRetries | default "1" | quote }}
+            - name: AUTO_JOIN_LEAD_S
+              value: {{ .Values.meetingApi.autoJoinLeadSeconds | default "120" | quote }}
+            - name: NOT_SENT_SWEEP_INTERVAL_S
+              value: {{ .Values.meetingApi.notSentSweepIntervalSeconds | default "30" | quote }}
+            - name: BOT_SEND_MAX_ATTEMPTS
+              value: {{ .Values.meetingApi.botSendMaxAttempts | default "3" | quote }}
+            - name: BOT_SEND_RETRY_BACKOFF_S
+              value: {{ .Values.meetingApi.botSendRetryBackoffSeconds | default "60" | quote }}
+            - name: SWEEP_BATCH_SIZE
+              value: {{ .Values.meetingApi.sweepBatchSize | default "200" | quote }}
+            - name: SWEEP_MAX_ITEM_FAILURES
+              value: {{ .Values.meetingApi.sweepMaxItemFailures | default "5" | quote }}
+            - name: MEETING_UNTRACKED_GRACE_SEC
+              value: {{ .Values.meetingApi.meetingUntrackedGraceSeconds | default "600" | quote }}
+            - name: UNPROVEN_TEARDOWN_MAX_AGE_S
+              value: {{ .Values.meetingApi.unprovenTeardownMaxAgeSeconds | default "21600" | quote }}
+            - name: SWEEP_ITEM_FAILURES_RETENTION_S
+              value: {{ .Values.meetingApi.sweepItemFailuresRetentionSeconds | default "604800" | quote }}
+            - name: VEXA_JITSI_HOSTS
+              value: {{ .Values.meetingApi.jitsiHosts | default "" | quote }}
+            # Webhook subscriptions: the outbox publisher and the sender.
+            - name: WEBHOOK_PRIVATE_HOST_ALLOWLIST
+              value: {{ .Values.meetingApi.webhookPrivateHostAllowlist | default "" | quote }}
+            - name: WEBHOOK_PUBLISH_INTERVAL_S
+              value: {{ .Values.meetingApi.webhookPublishIntervalSeconds | default "1" | quote }}
+            - name: WEBHOOK_SEND_INTERVAL_S
+              value: {{ .Values.meetingApi.webhookSendIntervalSeconds | default "1" | quote }}
+            - name: WEBHOOK_RETRY_SCHEDULE_S
+              value: {{ .Values.meetingApi.webhookRetryScheduleSeconds | default "60,300,1800,7200" | quote }}
+            - name: WEBHOOK_DNS_THREADS
+              value: {{ .Values.meetingApi.webhookDnsThreads | default "4" | quote }}
+            - name: WEBHOOK_DNS_TIMEOUT_S
+              value: {{ .Values.meetingApi.webhookDnsTimeoutSeconds | default "5" | quote }}
+            - name: WEBHOOK_SEND_TIMEOUT_S
+              value: {{ .Values.meetingApi.webhookSendTimeoutSeconds | default "10" | quote }}
+            - name: WEBHOOK_LEASE_S
+              value: {{ .Values.meetingApi.webhookLeaseSeconds | default "60" | quote }}
+            - name: WEBHOOK_CLAIM_LIMIT
+              value: {{ .Values.meetingApi.webhookClaimLimit | default "50" | quote }}
             {{- with .Values.meetingApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

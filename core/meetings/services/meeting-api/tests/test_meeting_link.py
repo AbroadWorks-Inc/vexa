@@ -12,18 +12,23 @@ from meeting_api.collector.meeting_link import find_meeting_link, parse_meeting_
 
 class TestParseJitsi:
     def test_canonical_room(self):
-        assert parse_meeting_url("https://meet.jit.si/VexaStandup") == ("jitsi", "VexaStandup")
+        assert parse_meeting_url("https://meet.jit.si/VexaStandup") == ("jitsi", "vexastandup")
 
-    def test_room_case_preserved(self):
-        assert parse_meeting_url("https://meet.jit.si/MyRoom") == ("jitsi", "MyRoom")
+    def test_room_case_lowercased(self):
+        assert parse_meeting_url("https://meet.jit.si/MyRoom") == ("jitsi", "myroom")
 
     def test_trailing_slash(self):
-        assert parse_meeting_url("https://meet.jit.si/MyRoom/") == ("jitsi", "MyRoom")
+        assert parse_meeting_url("https://meet.jit.si/MyRoom/") == ("jitsi", "myroom")
 
-    def test_url_encoded_room_stays_encoded(self):
+    def test_standup_room_lowercased(self):
+        # Brief requirement: https://meet.jit.si/Standup → standup
+        assert parse_meeting_url("https://meet.jit.si/Standup") == ("jitsi", "standup")
+
+    def test_url_encoded_room_stays_encoded_but_lowercased(self):
         # The native id is embedded back into URL templates / path params, so the
         # percent-encoded form IS the id — decoding would corrupt the round-trip.
-        assert parse_meeting_url("https://meet.jit.si/Team%20Sync") == ("jitsi", "Team%20Sync")
+        # Room name should still be lowercased for non-encoded parts.
+        assert parse_meeting_url("https://meet.jit.si/Team%20Sync") == ("jitsi", "team%20sync")
 
     def test_bare_origin_rejected(self):
         assert parse_meeting_url("https://meet.jit.si/") is None
@@ -36,14 +41,14 @@ class TestParseJitsi:
         # meeting_url so the bot joins on that host, not the meet.jit.si template.
         # The native id embeds the host (room@host) — a jitsi room is deployment-scoped,
         # so same-named rooms on different deployments never share an identity key.
-        assert parse_meeting_url("https://jitsi.example.org/MyRoom") == ("jitsi", "MyRoom@jitsi.example.org")
+        assert parse_meeting_url("https://jitsi.example.org/MyRoom") == ("jitsi", "myroom@jitsi.example.org")
 
     def test_self_hosted_meet_convention_inferred_on_paste(self):
-        assert parse_meeting_url("https://meet.example.org/TeamSync") == ("jitsi", "TeamSync@meet.example.org")
+        assert parse_meeting_url("https://meet.example.org/TeamSync") == ("jitsi", "teamsync@meet.example.org")
         # Regionalized deployments put "meet" mid-hostname.
         assert parse_meeting_url("https://eu.meet.example.org/QualifiedRoomName") == (
             "jitsi",
-            "QualifiedRoomName@eu.meet.example.org",
+            "qualifiedroomname@eu.meet.example.org",
         )
         # "meet" must be a whole label — meetings.example.org is NOT a jitsi convention.
         assert parse_meeting_url("https://meetings.example.org/Room") is None
@@ -67,7 +72,7 @@ class TestParseExistingPlatformsUnchanged:
 class TestFindMeetingLinkJitsi:
     def test_found_in_free_text(self):
         got = find_meeting_link("Join us: https://meet.jit.si/VexaStandup today")
-        assert got == ("jitsi", "VexaStandup", "https://meet.jit.si/VexaStandup")
+        assert got == ("jitsi", "vexastandup", "https://meet.jit.si/VexaStandup")
 
     def test_meet_label_host_not_imported_from_free_text(self):
         # The meet-label convention is pasted-link-only — an ICS full of arbitrary
@@ -76,22 +81,31 @@ class TestFindMeetingLinkJitsi:
 
 
 class TestConfiguredJitsiHosts:
+    def test_configured_abroadworks_host_lowercases_room(self, monkeypatch):
+        # Brief requirement: https://meet.abroadworks.com/Team-Sync (host in VEXA_JITSI_HOSTS)
+        # → team-sync@meet.abroadworks.com
+        monkeypatch.setenv("VEXA_JITSI_HOSTS", "meet.abroadworks.com")
+        assert parse_meeting_url("https://meet.abroadworks.com/Team-Sync") == (
+            "jitsi",
+            "team-sync@meet.abroadworks.com",
+        )
+
     def test_declared_host_parses_and_imports(self, monkeypatch):
         monkeypatch.setenv("VEXA_JITSI_HOSTS", "eu.meet.example.org, calls.example.io")
         # Pasted link on a declared host — parses in strict mode too. Declared or not, a
         # non-canonical deployment's native id stays deployment-scoped (room@host).
         assert parse_meeting_url("https://eu.meet.example.org/Weekly", generic_hosts=False) == (
             "jitsi",
-            "Weekly@eu.meet.example.org",
+            "weekly@eu.meet.example.org",
         )
         # A declared host with NO jitsi/meet naming at all.
         assert parse_meeting_url("https://calls.example.io/Standup", generic_hosts=False) == (
             "jitsi",
-            "Standup@calls.example.io",
+            "standup@calls.example.io",
         )
         # Calendar (ICS) free-text scan now imports it — the point of the setting.
         got = find_meeting_link("agenda: https://eu.meet.example.org/Weekly today")
-        assert got == ("jitsi", "Weekly@eu.meet.example.org", "https://eu.meet.example.org/Weekly")
+        assert got == ("jitsi", "weekly@eu.meet.example.org", "https://eu.meet.example.org/Weekly")
 
     def test_unset_env_declares_nothing(self, monkeypatch):
         monkeypatch.delenv("VEXA_JITSI_HOSTS", raising=False)

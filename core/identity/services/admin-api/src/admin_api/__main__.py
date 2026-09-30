@@ -97,6 +97,8 @@ def build_production_app():
     from .app import db as app_db
     from .app.events import FLOWS_API_URL_ENV, deprecated_flows_url_env_in_use
     from .app.main import create_app
+    from .app.metrics import PostgresTokenExpiry
+    from .app.retention import attach_retention
     from .config_preflight import preflight
     from .schema.models import Base
     from .schema.sync import ensure_schema
@@ -125,7 +127,7 @@ def build_production_app():
         pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
         max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
     )
-    app = create_app()
+    app = create_app(token_expiry=PostgresTokenExpiry(app_db.get_engine))
 
     @app.on_event("startup")
     async def _converge_schema() -> None:
@@ -140,10 +142,14 @@ def build_production_app():
         # SchemaInvariantError out of this ASGI-lifespan startup hook; uvicorn aborts startup and
         # exits(3), so the port never binds, /health never answers, and the compose healthcheck /
         # k8s startupProbe+readinessProbe never pass. Deliberate: the spawn path documents relying
-        # on uq_meeting_active_user_platform_native as its DB backstop, so a DB where that index is
+        # on uq_meeting_live_user_platform_native as its DB backstop, so a DB where that index is
         # absent must not be served by a process that assumes it. Not retried (see
         # _is_transient_connect_error) — it needs an operator, not a backoff.
         await _connect_with_retry(lambda: ensure_schema(app_db.get_engine(), Base))
+
+    # §1.13: the daily webhook delivery retention sweep (single-flight across replicas), started
+    # after the schema convergence above because startup hooks run in registration order.
+    attach_retention(app, app_db.get_engine)
 
     return app
 

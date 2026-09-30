@@ -18,7 +18,7 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: admin-api
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        {{- toYaml (merge (deepCopy (.Values.adminApi.podAnnotations | default dict)) (.Values.global.podAnnotations | default dict)) | nindent 8 }}
     spec:
       securityContext:
         {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
@@ -65,8 +65,44 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
+            # The gateway identity key ring is in either Secret; the webhook key ring only in an
+            # existing one.
+            - name: GATEWAY_IDENTITY_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_KEYS
+                  optional: true
+            - name: WEBHOOK_SECRET_ENC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: WEBHOOK_SECRET_ENC_KEYS
+                  optional: true
+            - name: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+                  optional: true
+            # The gateway signature's freshness window (the replay window); the same on meeting-api.
+            - name: GATEWAY_IDENTITY_MAX_SKEW_S
+              value: {{ .Values.adminApi.gatewayIdentityMaxSkewSeconds | default "60" | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.adminApi.logLevel | default "info" | quote }}
+            # POST /v2/webhooks/{id}/test hands the send to meeting-api's internal edge.
+            - name: MEETING_API_URL
+              value: "http://{{ include "vexa.componentName" (list . "meeting-api") }}:{{ .Values.meetingApi.service.port }}"
+            - name: WEBHOOK_MAX_SUBSCRIPTIONS
+              value: {{ .Values.adminApi.webhookMaxSubscriptions | default "20" | quote }}
+            - name: WEBHOOK_DELIVERY_RETENTION_DAYS
+              value: {{ .Values.adminApi.webhookDeliveryRetentionDays | default "30" | quote }}
+            - name: WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE
+              value: {{ .Values.adminApi.webhookDeliveryRetentionBatchSize | default "1000" | quote }}
+            - name: WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES
+              value: {{ .Values.adminApi.webhookDeliveryRetentionMaxBatches | default "100" | quote }}
+            - name: WEBHOOK_PRIVATE_HOST_ALLOWLIST
+              value: {{ .Values.adminApi.webhookPrivateHostAllowlist | default "" | quote }}
             {{- with .Values.adminApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

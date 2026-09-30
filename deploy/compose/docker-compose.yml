@@ -105,6 +105,7 @@ services:
       # the admin surface answers 500 rather than accepting a secret everybody has.
       - ADMIN_API_TOKEN=${ADMIN_TOKEN:-}
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
+      - GATEWAY_IDENTITY_KEYS=${GATEWAY_IDENTITY_KEYS}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # ── the publish edge (config.v1 class `publish-edge`) ──────────────────────────────────
       # Identity hands `onboarding.completed` to flows here. Same variable, same default-empty
@@ -313,6 +314,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - RUNTIME_API_URL=http://runtime:8090
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
+      - GATEWAY_IDENTITY_KEYS=${GATEWAY_IDENTITY_KEYS}
       # The bot's display name in the meeting. The terminal omits bot_name on join, so this is what
       # participants see; set DEFAULT_BOT_NAME in .env and restart meeting-api (no terminal rebuild).
       - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-Vexa}
@@ -425,6 +427,8 @@ services:
       - AGENT_API_URL=${AGENT_API_URL:-http://agent-api:8100}
       - REDIS_URL=redis://redis:6379/0
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
+      - GATEWAY_IDENTITY_KEYS=${GATEWAY_IDENTITY_KEYS}
+      - GATEWAY_IDENTITY_ACTIVE_KEY=${GATEWAY_IDENTITY_ACTIVE_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # fastapi-guard edge layer (edge_guard.py): per-IP throttle + auto-ban at the edge.
       # ON by default with generous limits (owner ruling — protection that ships dark protects

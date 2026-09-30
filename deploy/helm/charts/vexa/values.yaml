@@ -46,6 +46,17 @@ global:
 # VEXA_SERVICE_AUTHORITY_SECRET, VEXA_SYSTEM_WEBHOOK_SECRET, VEXA_DISPATCH_SIGNING_KEY,
 # VEXA_BOT_API_KEY, ANTHROPIC_API_KEY,
 # ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN.
+# GATEWAY_IDENTITY_KEYS + GATEWAY_IDENTITY_ACTIVE_KEY — the key ring the gateway signs x-user-id
+#   with (the webhook ring's format: JSON {"<kid>": "<32 bytes base64>"}) and the kid it signs
+#   with. The gateway reads both and refuses to start without them (not optional); meeting-api and
+#   admin-api read the ring. In an existing Secret, or secrets.gatewayIdentityKeys +
+#   secrets.gatewayIdentityActiveKey for the chart-managed one. Rotation: add the new key to the
+#   ring and roll all three; switch the active kid and roll the gateway; later drop the old key and
+#   roll all three.
+# WEBHOOK_SECRET_ENC_KEYS + WEBHOOK_SECRET_ENC_ACTIVE_KEY — the key ring webhook subscription
+#   secrets are encrypted under (JSON {"<id>": "<32 bytes base64>"} + the active id), on
+#   meeting-api and admin-api. Read ONLY from an existing Secret (no value here); unset, the
+#   services switch webhook subscriptions off and log why.
 # The deployment profile, the same word the mcp and transcription services read. Anything but
 # `production` (including unset) is a development posture; `production` makes an empty
 # `secrets.secretsKey` a boot refusal instead of a silently generated key (R-E08).
@@ -56,6 +67,9 @@ secrets:
   adminApiToken: "CHANGE_ME"        # admin-api auth + MeetingToken signing (== meeting-api ADMIN_TOKEN)
   internalApiSecret: ""             # REQUIRED, no default (F95): the internal tier every service
                                     # presents AND believes — `openssl rand -hex 32`
+  gatewayIdentityKeys: ""           # REQUIRED, no default: GATEWAY_IDENTITY_KEYS, the JSON key ring the
+                                    # gateway signs x-user-id with — pass it with --set-file
+  gatewayIdentityActiveKey: ""      # REQUIRED, no default: GATEWAY_IDENTITY_ACTIVE_KEY, its kid to sign with
   transcriptionServiceToken: ""     # funded STT token threaded into spawned bots
   serviceAuthoritySecret: ""        # exact-byte HMAC secret; required only when meetingApi.serviceAuthorityConfig is set
   systemWebhookSecret: ""           # exact-byte HMAC secret; required only when meetingApi.systemWebhookUrl is set
@@ -134,6 +148,12 @@ gateway:
     ipBlacklist: ""           # comma-separated IPs to block (403)
     trustedProxies: ""        # comma-separated trusted proxy IPs (enables X-Forwarded-For)
     trustXForwardedProto: false
+  # Entry writes (PUT /v2/entries + POST /v2/entries/remove) allowed per account per minute,
+  # counted in Redis across every gateway replica (INTAKE_RATE_LIMIT_PER_MIN).
+  intakeRateLimitPerMin: 600
+  # WS-6 per-user token bucket at the single REST funnel (GATEWAY_RATE_LIMIT_BURST / _RPS).
+  rateLimitBurst: 120
+  rateLimitRps: 40
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 512Mi }
@@ -170,6 +190,16 @@ adminApi:
     ipBlacklist: ""           # comma-separated IPs to block (403)
     trustedProxies: ""        # comma-separated trusted proxy IPs (enables X-Forwarded-For)
     trustXForwardedProto: false
+  # Webhook subscriptions (admin-api side).
+  webhookMaxSubscriptions: "20"         # WEBHOOK_MAX_SUBSCRIPTIONS — per-account quota
+  webhookDeliveryRetentionDays: "30"    # WEBHOOK_DELIVERY_RETENTION_DAYS — daily sweep of final deliveries
+  webhookDeliveryRetentionBatchSize: "1000"  # WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE — rows per delete batch, each its own transaction
+  webhookDeliveryRetentionMaxBatches: "100"  # WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES — per-run cap of batches of each delete; the rest waits for the next run
+  webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — comma-separated private hosts a
+                                        # subscription URL may name; empty ⇒ every private target refused
+  gatewayIdentityMaxSkewSeconds: "60"   # GATEWAY_IDENTITY_MAX_SKEW_S — a gateway signature's freshness window; set meetingApi's the same
+  # Merged over global.podAnnotations for admin-api's pods; a key set here wins.
+  podAnnotations: {}
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 512Mi }
@@ -219,6 +249,38 @@ meetingApi:
   botS3SecretKey: ""
   minioSecure: "false"
   logLevel: "info"
+  # Meeting intake (PUT /v2/entries) and auto-join.
+  entryMaxDaysAhead: "30"               # ENTRY_MAX_DAYS_AHEAD — an entry further ahead is refused
+  joinNowAdoptAheadSeconds: "3600"      # JOIN_NOW_ADOPT_AHEAD_S — a pasted link adopts a meeting starting within this
+  entryBlockedHosts: ""                 # ENTRY_BLOCKED_HOSTS — comma-separated link hosts refused; empty ⇒ none
+  intakeMaxActiveEntries: "100000"      # INTAKE_MAX_ACTIVE_ENTRIES — per-account quota of active entries
+  intakeConflictRetries: "3"            # INTAKE_CONFLICT_RETRIES — retries for an entry write that lost a database-constraint race
+  intakeConflictDelayMinSeconds: "0.01" # INTAKE_CONFLICT_DELAY_MIN_S — least random pause before that retry (times the try's number)
+  intakeConflictDelayMaxSeconds: "0.05" # INTAKE_CONFLICT_DELAY_MAX_S — most random pause before that retry (times the try's number)
+  intakeStopLinkRetries: "1"            # INTAKE_STOP_LINK_RETRIES — reruns of a stop whose meeting moved link before it answers 503
+  autoJoinLeadSeconds: "120"            # AUTO_JOIN_LEAD_S — the bot is sent this long before the meeting starts
+  notSentSweepIntervalSeconds: "30"     # NOT_SENT_SWEEP_INTERVAL_S — cadence of the not-sent sweep
+  botSendMaxAttempts: "3"               # BOT_SEND_MAX_ATTEMPTS — entry-managed bot-send retry budget
+  botSendRetryBackoffSeconds: "60"      # BOT_SEND_RETRY_BACKOFF_S — backoff between entry-managed bot-send attempts
+  sweepBatchSize: "200"                 # SWEEP_BATCH_SIZE — paging size shared by the auto-join tick, not-sent sweep and outbox publisher
+  sweepMaxItemFailures: "5"             # SWEEP_MAX_ITEM_FAILURES — give-up threshold shared by those same sweeps
+  meetingUntrackedGraceSeconds: "600"   # MEETING_UNTRACKED_GRACE_SEC — a runtime 404's proof-of-gone wait; a waiting meeting's/unproven spawn's grace past due_at
+  unprovenTeardownMaxAgeSeconds: "21600"  # UNPROVEN_TEARDOWN_MAX_AGE_S — how long a teardown is chased while the runtime doesn't answer (pending teardowns and stale reconcile rows)
+  sweepItemFailuresRetentionSeconds: "604800"  # SWEEP_ITEM_FAILURES_RETENTION_S — an untouched sweep_item_failures record is pruned after this
+  jitsiHosts: ""                        # VEXA_JITSI_HOSTS — comma-separated self-hosted Jitsi hostnames
+  gatewayIdentityMaxSkewSeconds: "60"   # GATEWAY_IDENTITY_MAX_SKEW_S — a gateway signature's freshness window; set adminApi's the same
+  # Webhook subscriptions (meeting-api side: the outbox publisher and the sender).
+  webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — same list as adminApi's, applied on send
+  webhookPublishIntervalSeconds: "1"    # WEBHOOK_PUBLISH_INTERVAL_S
+  webhookSendIntervalSeconds: "1"       # WEBHOOK_SEND_INTERVAL_S
+  webhookRetryScheduleSeconds: "60,300,1800,7200"  # WEBHOOK_RETRY_SCHEDULE_S — comma-separated sender retry waits
+  webhookDnsThreads: "4"                # WEBHOOK_DNS_THREADS — threads in the sender's own DNS pool
+  webhookDnsTimeoutSeconds: "5"         # WEBHOOK_DNS_TIMEOUT_S — max seconds for one send-time DNS lookup
+  webhookSendTimeoutSeconds: "10"       # WEBHOOK_SEND_TIMEOUT_S — max seconds one subscription post takes in total
+  webhookLeaseSeconds: "60"             # WEBHOOK_LEASE_S — a sender claim's hold on a delivery row; must exceed the send timeout + 5 s
+  webhookClaimLimit: "50"               # WEBHOOK_CLAIM_LIMIT — most delivery rows one sender tick claims
+  # Merged over global.podAnnotations for meeting-api's pods; a key set here wins.
+  podAnnotations: {}
   resources:
     requests: { cpu: 200m, memory: 512Mi }
     limits:   { cpu: 1000m, memory: 1Gi }

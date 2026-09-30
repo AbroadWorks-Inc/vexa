@@ -29,6 +29,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from intake_builders import sweep_intake
 from meeting_api import create_app
 from meeting_api.bot_spawn.auto_join import auto_join_tick, due_rows
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
@@ -37,6 +38,8 @@ from meeting_api.bot_spawn.service import request_bot
 from meeting_api.lifecycle.machine import dominant_completion_reason
 from meeting_api.lifecycle.occurrence import Disposition, disposition, may_dispatch_again
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+from gateway_identity import via_gateway
+from internal_callers import BOT
 
 USER = 7
 PLATFORM = "google_meet"
@@ -68,7 +71,7 @@ def _app(repo, runtime=None, publisher=None):
 def _client(app) -> httpx.AsyncClient:
     """An ASGI client usable from INSIDE a running loop — the race tests fire the DELETE from within
     the spawn path, which ``TestClient`` (sync, spins its own loop) cannot do."""
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=via_gateway(app)), base_url="http://t")
 
 
 async def _seed_scheduled(repo, *, native=NATIVE, data=None) -> dict:
@@ -84,56 +87,38 @@ async def _seed_scheduled(repo, *, native=NATIVE, data=None) -> dict:
 async def _sweep(repo, runtime, at):
     return await auto_join_tick(
         repo, runtime, transcribe_gate=lambda: None, now=at,
-        token_secret="s", redis_url="redis://r", allow_uncapped=True,
+        token_secret="s", redis_url="redis://r", allow_uncapped=True, **sweep_intake(),
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-# F1 — a stop on a SCHEDULED occurrence: never dispatched, and terminal immediately
+# F1 — a stop on a SCHEDULED occurrence. §1.6: the stop means the live meeting only and never
+# cancels a plan; a plan is called off by removing its entry (or DELETE /meetings/… upstream).
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-async def test_f1_stopping_a_scheduled_occurrence_terminalizes_it_and_no_bot_is_dispatched():
-    """Row 26306, exactly: stop a scheduled occurrence, then run the sweep in its own due window.
-
-    Two assertions, and the second is the one rev 193 failed: the row must be TERMINAL (a flagged
-    ``scheduled`` row is a zombie no rule owns), and the sweep must send nothing."""
+async def test_f1_a_stop_never_cancels_a_scheduled_occurrence():
+    """§1.6: ``DELETE /bots/{p}/{n}`` on a link whose only meeting is a scheduled occurrence finds
+    no live meeting → 404, and the plan is left exactly as it was: still ``scheduled``, no
+    ``stop_requested`` flag (the zombie shape F1 was), still due in its window."""
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     planned = await _seed_scheduled(repo)
 
     async with _client(_app(repo, runtime)) as client:
         r = await client.delete(f"/bots/{PLATFORM}/{NATIVE}", headers={"x-user-id": str(USER)})
 
-    assert r.status_code == 200, r.text
-    assert r.json()["cancelled"] == [planned["id"]], (
-        "the response must name the plan it CANCELLED — a caller cannot tell 'asked a bot to leave' "
-        "from 'called off a meeting that had none' otherwise"
-    )
-
+    assert r.status_code == 404, r.text
     row = await repo.get_meeting(planned["id"])
-    assert row["status"] == "failed", (
-        "a stopped plan must be TERMINAL. Left `scheduled`, it falls between the sweep's rate rule "
-        "and occurrence.py's eligibility rule — which is how 26306 was dispatched at 02:52:16"
-    )
-    assert row["data"]["completion_reason"] == "stopped"
-    assert row["data"]["stop_requested"] is True
-    assert "failure_stage" not in row["data"], (
-        "no bot ever ran, so there is no stage to attribute; stamping one would claim a spawn that "
-        "never happened"
-    )
-    assert disposition(row) is Disposition.USER_STOPPED
-    assert not may_dispatch_again(row)
-
-    # The sweep, in the exact window the storm fired in.
-    counters = await _sweep(repo, runtime, _at(0))
-    assert counters["due"] == 0 and counters["spawned"] == 0
-    assert runtime.specs == [], "a bot went into a meeting the user had already called off"
+    assert row["status"] == "scheduled"
+    assert "stop_requested" not in row["data"]
+    assert runtime.specs == [] and runtime.deleted == []
+    assert due_rows([row], now=_at(0)) == [row]
 
 
 async def test_f1_a_flagged_scheduled_row_is_never_due():
     """The standing guarantee, independent of who wrote the row.
 
-    Post-fix the stop terminalizes the plan, so this shape should not exist — but rev-193 rows do
-    exist, and a row carrying the user's stop must never be due whatever left it that way. Asserted
+    A stop never touches a plan (§1.6), so no current writer leaves this shape — but rev-193 rows
+    do exist, and a row carrying the user's stop must never be due whatever left it that way. Asserted
     on the PURE filter so it holds for every caller of ``due_rows``."""
     zombie = {
         "id": 26306, "user_id": USER, "platform": PLATFORM, "native_meeting_id": NATIVE,
@@ -148,8 +133,8 @@ async def test_f1_a_flagged_scheduled_row_is_never_due():
 
 
 async def test_f1_an_explicit_new_post_still_works_on_a_stopped_room():
-    """The stop ends THAT occurrence, never the room. A user who stops a scheduled meeting and then
-    asks for a bot must get one — otherwise the fix trades a false positive for a dead product."""
+    """A stop never closes the room. A user who stops on a link holding a scheduled meeting and
+    then asks for a bot must get one (the stop found no live meeting, §1.6)."""
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     await _seed_scheduled(repo)
     async with _client(_app(repo, runtime)) as client:
@@ -321,8 +306,8 @@ async def test_f3_a_lost_race_records_stopped_not_the_fault_it_hit():
 
     async with _client(_app(repo)) as client:
         # The FSM's first event must be `joining`; then the bot's own terminal, blaming the network.
-        await client.post(LIFECYCLE, json={"connection_id": "sess-1", "status": "joining"})
-        r = await client.post(LIFECYCLE, json={
+        await client.post(LIFECYCLE, headers=BOT, json={"connection_id": "sess-1", "status": "joining"})
+        r = await client.post(LIFECYCLE, headers=BOT, json={
             "connection_id": "sess-1", "status": "failed",
             "completion_reason": "join_failure", "exit_code": 1,
         })

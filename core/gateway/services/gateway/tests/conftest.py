@@ -8,6 +8,7 @@ fake downstream that echoes a recorded reply, and a tiny in-process redis pub/su
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from contextlib import asynccontextmanager
@@ -24,6 +25,12 @@ from gateway import CARRIED_DOMAINS
 os.environ.setdefault("GUARD_ENABLED", "true")
 os.environ.setdefault("GUARD_ENABLE_REDIS", "false")
 os.environ.setdefault("GUARD_RATE_LIMIT_RPM", "0")
+# §1.10: the gateway forwards nothing without the key ring it signs x-user-id with. A test-only
+# one-key ring; tests that assert the unconfigured case clear it.
+os.environ.setdefault(
+    "GATEWAY_IDENTITY_KEYS", json.dumps({"gw-unit": base64.b64encode(b"test-gateway-identity-unit-key-1").decode()})
+)
+os.environ.setdefault("GATEWAY_IDENTITY_ACTIVE_KEY", "gw-unit")
 
 # ── WHICH PROFILE IS THIS BUILD? ────────────────────────────────────────────────────────────────
 #

@@ -36,6 +36,8 @@ from meeting_api.lifecycle.machine import (
     MeetingStore,
     can_transition,
 )
+from gateway_identity import via_gateway
+from internal_callers import BOT, runtime_callback
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
 
@@ -98,7 +100,7 @@ def _seed(repo: InMemoryMeetingRepo, *, status: str, session_uid: str = "sess-ui
 
 
 def _post(client: TestClient, **event):
-    return client.post(ENDPOINT, json=event)
+    return client.post(ENDPOINT, headers=BOT, json=event)
 
 
 def _drive_to(client: TestClient, target: str, *, connection_id: str = "c") -> None:
@@ -338,7 +340,7 @@ def test_missing_status_is_422():
     repo = InMemoryMeetingRepo()
     _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid"})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid"})
     assert r.status_code == 422, r.text
     assert "schema violation" in r.json()["detail"]
 
@@ -346,7 +348,7 @@ def test_missing_status_is_422():
 def test_missing_connection_id_is_422():
     repo = InMemoryMeetingRepo()
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"status": "joining"})
+    r = client.post(ENDPOINT, headers=BOT, json={"status": "joining"})
     assert r.status_code == 422, r.text
 
 
@@ -354,7 +356,7 @@ def test_bad_status_enum_is_422():
     repo = InMemoryMeetingRepo()
     _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "bogus"})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "bogus"})
     assert r.status_code == 422, r.text
 
 
@@ -364,7 +366,7 @@ def test_unknown_connection_id_joining_is_accepted_but_not_persisted():
     the current behaviour — the callback does not 404 an unknown session."""
     repo = InMemoryMeetingRepo()  # no meeting/session seeded
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "joining"})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "ghost", "status": "joining"})
     assert r.status_code == 200, r.text
     assert r.json()["meeting_status"] == "joining"
     # Nothing persisted (no such session) — get_status_by_session stays None.
@@ -377,7 +379,7 @@ def test_unknown_connection_id_terminal_is_409():
     session the control plane never saw."""
     repo = InMemoryMeetingRepo()
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "completed", "exit_code": 0})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "ghost", "status": "completed", "exit_code": 0})
     assert r.status_code == 409, r.text
     assert r.json()["from"] is None and r.json()["to"] == "completed"
 
@@ -395,7 +397,7 @@ def _reconcile_once(client: TestClient, repo: _ReconcileRepo) -> list[tuple[int,
     POST the synthetic completed callback. Returns [(meeting_id, session_uid, status_code), …]."""
     out = []
     for meeting_id, session_uid, _bot_container_id in repo.list_stale_stopping_sync():
-        r = client.post(ENDPOINT, json={
+        r = client.post(ENDPOINT, headers=BOT, json={
             "connection_id": session_uid, "status": "completed", "completion_reason": "stopped",
         })
         out.append((meeting_id, session_uid, r.status_code))
@@ -447,7 +449,7 @@ def test_reconcile_then_late_bot_terminal_is_idempotent_200():
     assert [c for *_, c in _reconcile_once(client, repo)] == [200]
 
     # The bot finally sends its terminal (the one the reconcile pre-empted).
-    r = client.post(ENDPOINT, json={
+    r = client.post(ENDPOINT, headers=BOT, json={
         "connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped",
     })
     assert r.status_code == 200, r.text
@@ -461,7 +463,7 @@ def test_bot_terminal_then_reconcile_finds_nothing():
     _seed(repo, status="stopping")
     client = TestClient(create_app(meeting_repo=repo))
     # Bot's own terminal lands first (rehydrates stopping→active, completes).
-    r = client.post(ENDPOINT, json={
+    r = client.post(ENDPOINT, headers=BOT, json={
         "connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped",
     })
     assert r.status_code == 200, r.text
@@ -476,7 +478,7 @@ def test_reconcile_late_bot_failed_after_completed_is_409():
     _seed(repo, status="stopping")
     client = TestClient(create_app(meeting_repo=repo))
     assert [c for *_, c in _reconcile_once(client, repo)] == [200]
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "failed", "exit_code": 1})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "failed", "exit_code": 1})
     assert r.status_code == 409, r.text
     assert r.json()["from"] == "completed" and r.json()["to"] == "failed"
 
@@ -497,7 +499,7 @@ def test_one_webhook_envelope_per_real_advance():
         ("active", {"status": "active"}),
         ("completed", {"status": "completed", "exit_code": 0, "completion_reason": "stopped"}),
     ]:
-        assert client.post(ENDPOINT, json={"connection_id": "sess-uid", **ev}).status_code == 200
+        assert client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", **ev}).status_code == 200
     envs = app.state.status_change_webhooks
     assert len(envs) == 3, [e["data"]["status_change"] for e in envs]
     news = [e["data"]["status_change"]["new_status"] for e in envs]
@@ -511,9 +513,9 @@ def test_no_ws_publish_on_idempotent_replay():
     redis = _RecordingRedis()
     client = TestClient(create_app(meeting_repo=repo, redis=redis))
     ev = {"connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped"}
-    client.post(ENDPOINT, json=ev)
+    client.post(ENDPOINT, headers=BOT, json=ev)
     n = len(redis.published)
-    client.post(ENDPOINT, json=ev)  # redelivery
+    client.post(ENDPOINT, headers=BOT, json=ev)  # redelivery
     assert len(redis.published) == n, f"duplicate ws publish on no-op replay: {redis.published}"
 
 
@@ -555,9 +557,9 @@ def test_no_extra_webhook_envelope_on_idempotent_replay():
     app = create_app(meeting_repo=repo)
     client = TestClient(app)
     ev = {"connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped"}
-    client.post(ENDPOINT, json=ev)
+    client.post(ENDPOINT, headers=BOT, json=ev)
     n = len(app.state.status_change_webhooks)
-    client.post(ENDPOINT, json=ev)  # redelivery — pure no-op
+    client.post(ENDPOINT, headers=BOT, json=ev)  # redelivery — pure no-op
     assert len(app.state.status_change_webhooks) == n, (
         "no_op replay appended a duplicate status_change envelope to app.state.status_change_webhooks "
         f"(expected {n}, got {len(app.state.status_change_webhooks)})"
@@ -576,7 +578,7 @@ def test_webhook_old_new_status_correct_across_full_path():
         {"status": "active"},
         {"status": "completed", "exit_code": 0, "completion_reason": "stopped"},
     ]:
-        client.post(ENDPOINT, json={"connection_id": "sess-uid", **ev})
+        client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", **ev})
     pairs = [(e["data"]["status_change"]["old_status"], e["data"]["status_change"]["new_status"])
              for e in app.state.status_change_webhooks]
     assert pairs == [
@@ -622,6 +624,7 @@ def test_sink_history_only_grows_on_real_advance():
 # persist → webhook → ws publish path is exercised end-to-end, no while/sleep wrapper.
 
 from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep  # noqa: E402
+from meeting_api.sweeps.item_failures import InMemoryItemFailures  # noqa: E402
 
 
 def _set_updated_now(repo: InMemoryMeetingRepo, meeting_id: int) -> None:
@@ -636,12 +639,13 @@ def _run_general_sweep(client: TestClient, repo: InMemoryMeetingRepo, *, stop_gr
     import logging
 
     async def _post(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, None, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"), **extra,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
 
 
@@ -731,12 +735,13 @@ def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grac
     import logging
 
     async def _post(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, runtime, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"), **extra,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
 
 
@@ -859,7 +864,7 @@ def test_bot_callback_evidence_still_completes_during_runtime_desync():
     assert _run_general_sweep_rt(client, repo, runtime) == 0        # 404 → no reap
     assert repo._meetings[m["id"]]["status"] == "active"
 
-    r = client.post(ENDPOINT, json={                                 # the bot's own evidence
+    r = client.post(ENDPOINT, headers=BOT, json={                                 # the bot's own evidence
         "connection_id": "sess-uid", "status": "completed", "completion_reason": "left_alone",
     })
     assert r.status_code == 200
@@ -881,12 +886,13 @@ def _run_general_sweep_esc(client, repo, runtime, tracker, *, untracked_grace,
     import logging
 
     async def _post_cb(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, runtime, _post_cb, stop_grace=stop_grace, active_grace=active_grace,
         log=logging.getLogger("test.reconcile"),
         untracked_grace=untracked_grace, untracked_since=tracker,
+        item_failures=InMemoryItemFailures(max_failures=5),
     ))
 
 
@@ -1023,7 +1029,7 @@ def _consume_runtime_terminal(client, repo, workload_id, state):
     import logging
 
     async def _drive(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     return asyncio.run(synthesize_terminal_for_dead_workload(
         repo, workload_id, state, _drive, log=logging.getLogger("test.runtime-cb"),
@@ -1099,7 +1105,7 @@ def test_runtime_destroyed_noop_on_already_terminal_meeting():
     repo._meetings[m["id"]]["bot_container_id"] = "wl-done"
     client = TestClient(create_app(meeting_repo=repo))
     # The bot completes it itself first.
-    client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "completed",
+    client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "completed",
                                 "completion_reason": "left_alone"})
     assert repo._meetings[m["id"]]["status"] == "completed"
 
@@ -1262,11 +1268,11 @@ def _stop_then_destroy(status: str):
     repo, pub = _ReconcileRepo(), InMemoryCommandPublisher()
     m = _seed(repo, status=status)
     repo._meetings[m["id"]]["bot_container_id"] = "wl-stopped"
-    client = TestClient(create_app(meeting_repo=repo, command_publisher=pub))
+    client = TestClient(via_gateway(create_app(meeting_repo=repo, command_publisher=pub)))
 
     r = client.delete("/bots/google_meet/m1", headers={"x-user-id": "1"})
     assert r.status_code == 200, r.text
-    rc = client.post("/runtime/callback", json={"workloadId": "wl-stopped", "state": "destroyed"})
+    rc = client.post(runtime_callback("wl-stopped"), json={"workloadId": "wl-stopped", "state": "destroyed"})
     assert rc.status_code == 200, rc.text
     return repo._meetings[m["id"]]
 
@@ -1345,7 +1351,7 @@ def test_status_change_envelope_log_is_bounded_under_sustained_callbacks():
     for i in range(overshoot):
         uid = f"leak-sess-{i}"
         _seed(repo, status="requested", session_uid=uid)
-        r = client.post(ENDPOINT, json={"connection_id": uid, "status": "joining"})
+        r = client.post(ENDPOINT, headers=BOT, json={"connection_id": uid, "status": "joining"})
         assert r.status_code == 200, r.text
 
     cap = _ENVELOPE_LOG_CAP
@@ -1544,21 +1550,25 @@ def test_stopping_row_still_reaps_on_its_short_grace():
 
 
 def test_pre_active_row_with_no_workload_at_all_still_reconciles():
-    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with NO recorded workload has
-    nothing that could be alive — the gate does not apply, so it still converges on the time window,
-    with a note that says so instead of claiming a bot went missing. (`joining`, not `requested`:
-    the FSM's only legal first edge is `<new>` → `joining`, so a never-reported row's convergence
-    rides the runtime-destroy force path, not this callback — unchanged by #862.)"""
+    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with a session and NO recorded
+    workload may still have the workload its spawn asked for (``workload_id_for``: a cancel between
+    the session write and the container write, §6.9 F-K2), so the sweep asks the runtime about that
+    id. A 404 is not evidence: the row converges on the bounded untracked window, with the
+    stage-derived reason. (`joining`, not `requested`: the FSM's only legal first edge is `<new>` →
+    `joining`.)"""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="joining")
     runtime = FakeRuntimeClient(workloads={})
     client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
 
-    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "joining"  # window opened only
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 1
     row = repo._meetings[m["id"]]
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "join_failure"
-    assert "no workload recorded" in _terminal_reason(repo, m["id"])
+    assert "presumed lost" in _terminal_reason(repo, m["id"])
 
 
 def test_pre_active_untracked_workload_still_escalates_on_the_bounded_window():

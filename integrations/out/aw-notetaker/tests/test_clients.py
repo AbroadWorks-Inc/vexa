@@ -1,4 +1,5 @@
-"""meeting-api client, notetaker client, and ffmpeg transcode (spec §4.2)."""
+"""meeting-api client (through the gateway), notetaker client, and ffmpeg
+transcode (spec §4.2, design §1.9)."""
 
 from __future__ import annotations
 
@@ -12,31 +13,155 @@ from typing import Any
 import httpx
 import pytest
 
-from exporter.audio import webm_to_wav
+from exporter.audio import join_wavs, join_webm, webm_to_wav
 from exporter.notetaker import Notetaker, NotetakerError
-from exporter.vexa_client import MeetingApi, MeetingApiError
+from exporter.vexa_client import (
+    MeetingApi,
+    MeetingApiError,
+    RecordingsPagingStalled,
+    TooManyRecordings,
+)
+from tests.builders import wav_samples, write_constant_wav
 
 
-def test_meeting_api_sends_user_header_and_parses() -> None:
+KEY = "test-exporter-key"
+
+
+def _api(handler: Any) -> MeetingApi:
+    return MeetingApi(
+        "http://gateway/", KEY, httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+
+def test_meeting_api_reads_through_the_gateway_with_the_exporter_key() -> None:
     seen: list[httpx.Request] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append(req)
-        return httpx.Response(200, json={"recordings": [{"id": 7}]})
+        return httpx.Response(200, json={"recordings": [{"id": 7}], "has_more": False})
 
-    api = MeetingApi("http://m", httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.list_recordings(user_id=3, meeting_id=9) == [{"id": 7}]
-    assert seen[0].headers["X-User-Id"] == "3"
+    assert _api(handler).list_recordings(meeting_id=9, max_recordings=50) == [{"id": 7}]
+    assert str(seen[0].url) == (
+        "http://gateway/recordings?meeting_id=9&limit=50&offset=0"
+    )
+    assert seen[0].headers["X-API-Key"] == KEY
     assert seen[0].url.params["meeting_id"] == "9"
 
 
+def _paged(rows: list[dict[str, Any]], seen: list[httpx.Request]) -> Any:
+    """meeting-api's `GET /recordings` paging: `limit`/`offset` in,
+    `has_more` out."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        limit = int(req.url.params["limit"])
+        offset = int(req.url.params["offset"])
+        page = rows[offset : offset + limit]
+        return httpx.Response(
+            200,
+            json={
+                "recordings": page,
+                "total": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + len(page) < len(rows),
+            },
+        )
+
+    return handler
+
+
+def test_list_recordings_reads_every_page_and_merges_them() -> None:
+    rows = [{"id": i} for i in range(70)]
+    seen: list[httpx.Request] = []
+
+    got = _api(_paged(rows, seen)).list_recordings(meeting_id=9, max_recordings=100)
+
+    assert got == rows
+    assert [(r.url.params["offset"], r.url.params["limit"]) for r in seen] == [
+        ("0", "50"),
+        ("50", "50"),
+    ]
+    assert {r.url.params["meeting_id"] for r in seen} == {"9"}
+
+
+def test_a_recording_seen_on_two_pages_is_listed_once() -> None:
+    pages = [
+        {"recordings": [{"id": 1}, {"id": 2}], "has_more": True},
+        {"recordings": [{"id": 2}, {"id": 3}], "has_more": False},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages.pop(0))
+
+    got = _api(handler).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert got == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+
+def test_list_recordings_over_the_cap_raises_after_a_bounded_read() -> None:
+    rows = [{"id": i} for i in range(500)]
+    seen: list[httpx.Request] = []
+
+    with pytest.raises(TooManyRecordings) as exc_info:
+        _api(_paged(rows, seen)).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert exc_info.value.max_recordings == 50
+    assert "more than 50 recordings" in str(exc_info.value)
+    assert len(seen) == 2
+
+
+def test_a_page_that_adds_nothing_while_more_is_promised_stops_the_read() -> None:
+    """A gateway that ignores `offset` and always says `has_more`: the read
+    stops at the second page instead of looping."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(
+            200, json={"recordings": [{"id": 1}, {"id": 2}], "has_more": True}
+        )
+
+    with pytest.raises(RecordingsPagingStalled, match="offset 2"):
+        _api(handler).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert len(seen) == 2
+
+
+def test_list_recordings_at_the_cap_is_every_recording() -> None:
+    rows = [{"id": i} for i in range(50)]
+
+    got = _api(_paged(rows, [])).list_recordings(meeting_id=9, max_recordings=50)
+
+    assert got == rows
+
+
+def test_meeting_api_never_sends_a_user_id_or_the_internal_secret() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        if req.url.path == "/recordings":
+            return httpx.Response(200, json={"recordings": []})
+        return httpx.Response(200, json={"storage_path": "x"})
+
+    api = _api(handler)
+    api.list_recordings(meeting_id=1, max_recordings=50)
+    api.master(recording_id=2)
+    api.transcript(meeting_id=3)
+    assert len(seen) == 3
+    for req in seen:
+        names = {name.lower() for name in req.headers}
+        assert "x-user-id" not in names
+        assert "x-internal-secret" not in names
+        assert "authorization" not in names
+
+
 def test_meeting_api_error() -> None:
-    api = MeetingApi(
-        "http://m",
-        httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
-    )
-    with pytest.raises(MeetingApiError):
-        api.master(user_id=1, recording_id=2)
+    api = _api(lambda r: httpx.Response(404))
+    with pytest.raises(MeetingApiError) as exc_info:
+        api.master(recording_id=2)
+    assert KEY not in str(exc_info.value)
 
 
 def test_meeting_api_master_parses_storage_path() -> None:
@@ -46,13 +171,12 @@ def test_meeting_api_master_parses_storage_path() -> None:
         seen.append(req)
         return httpx.Response(200, json={"storage_path": "aw-bots/x/master.webm"})
 
-    api = MeetingApi("http://m", httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.master(user_id=4, recording_id=11) == {
+    assert _api(handler).master(recording_id=11) == {
         "storage_path": "aw-bots/x/master.webm"
     }
     assert seen[0].url.path == "/recordings/11/master"
     assert seen[0].url.params["type"] == "audio"
-    assert seen[0].headers["X-User-Id"] == "4"
+    assert seen[0].headers["X-API-Key"] == KEY
 
 
 def test_meeting_api_transcript_parses_on_200() -> None:
@@ -62,18 +186,18 @@ def test_meeting_api_transcript_parses_on_200() -> None:
         seen.append(req)
         return httpx.Response(200, json={"segments": []})
 
-    api = MeetingApi("http://m", httpx.Client(transport=httpx.MockTransport(handler)))
-    assert api.transcript(user_id=5, meeting_id=42) == {"segments": []}
+    assert _api(handler).transcript(meeting_id=42) == {"segments": []}
     assert seen[0].url.path == "/transcripts/by-id/42"
-    assert seen[0].headers["X-User-Id"] == "5"
+    assert seen[0].headers["X-API-Key"] == KEY
 
 
 def test_meeting_api_transcript_404_returns_none() -> None:
-    api = MeetingApi(
-        "http://m",
-        httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
-    )
-    assert api.transcript(user_id=1, meeting_id=2) is None
+    assert _api(lambda r: httpx.Response(404)).transcript(meeting_id=2) is None
+
+
+def test_meeting_api_transcript_error_raises() -> None:
+    with pytest.raises(MeetingApiError):
+        _api(lambda r: httpx.Response(403)).transcript(meeting_id=2)
 
 
 def test_notetaker_body_and_retry_on_5xx() -> None:
@@ -237,3 +361,93 @@ def test_webm_to_wav(tmp_path: Path) -> None:
     with wave.open(str(dst), "rb") as w:
         assert w.getframerate() == 16000
         assert w.getnchannels() == 1
+
+
+def test_join_wavs_puts_each_part_after_its_silence(tmp_path: Path) -> None:
+    write_constant_wav(tmp_path / "a.wav", 0.5, 7)
+    write_constant_wav(tmp_path / "b.wav", 0.25, -3)
+    dst = tmp_path / "joined.wav"
+
+    join_wavs([(tmp_path / "a.wav", 0), (tmp_path / "b.wav", 30)], dst)
+
+    samples, rate = wav_samples(dst.read_bytes())
+    assert rate == 100
+    assert samples == [7] * 50 + [0] * 30 + [-3] * 25
+
+
+def test_join_wavs_refuses_parts_of_different_formats(tmp_path: Path) -> None:
+    write_constant_wav(tmp_path / "a.wav", 0.5, 1, rate=100)
+    write_constant_wav(tmp_path / "b.wav", 0.5, 1, rate=200)
+
+    with pytest.raises(ValueError, match="format"):
+        join_wavs(
+            [(tmp_path / "a.wav", 0), (tmp_path / "b.wav", 0)], tmp_path / "out.wav"
+        )
+
+
+def test_join_webm_decodes_every_part_with_the_dtx_filter_and_pads_the_gaps(
+    tmp_path: Path,
+) -> None:
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    parts = [(tmp_path / "a.webm", 0.0), (tmp_path / "b.webm", 2.5)]
+    join_webm(parts, tmp_path / "out.webm", run=fake_run)
+
+    cmd = captured[0]
+    assert cmd[0] == "ffmpeg" and cmd[-1] == str(tmp_path / "out.webm")
+    assert [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-i"] == [
+        str(tmp_path / "a.webm"),
+        str(tmp_path / "b.webm"),
+    ]
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert graph.count("aresample=async=1:first_pts=0") == 2
+    assert "atrim=duration=2.500000" in graph
+    assert "concat=n=3:v=0:a=1" in graph
+
+
+def test_join_webm_raises_runtimeerror_with_the_stderr_tail(tmp_path: Path) -> None:
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bad input")
+
+    with pytest.raises(RuntimeError, match="bad input"):
+        join_webm([(tmp_path / "a.webm", 0.0)], tmp_path / "out.webm", run=fake_run)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_join_webm_with_ffmpeg_keeps_the_gap_on_the_timeline(tmp_path: Path) -> None:
+    for name in ("a", "b"):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "libopus",
+                str(tmp_path / f"{name}.webm"),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    joined = tmp_path / "joined.webm"
+
+    join_webm([(tmp_path / "a.webm", 0.0), (tmp_path / "b.webm", 2.0)], joined)
+
+    wav_path = tmp_path / "joined.wav"
+    webm_to_wav(joined, wav_path)
+    samples, rate = wav_samples(wav_path.read_bytes())
+    assert abs(len(samples) / rate - 4.0) <= 0.1
+
+    def loud(start_s: float, end_s: float) -> float:
+        span = samples[int(start_s * rate) : int(end_s * rate)]
+        return max(abs(v) for v in span)
+
+    assert loud(0.2, 0.8) > 1000
+    assert loud(1.3, 2.7) == 0
+    assert loud(3.2, 3.8) > 1000

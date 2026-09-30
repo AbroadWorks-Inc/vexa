@@ -11,13 +11,15 @@ from fastapi.testclient import TestClient
 
 from meeting_api import create_app
 from meeting_api.collector.fakes import InMemoryTranscriptStore
+from gateway_identity import via_gateway
+from internal_callers import BOT
 
 USER = 7
 HEADERS = {"x-user-id": str(USER)}
 
 
 def test_create_app_health():
-    client = TestClient(create_app())
+    client = TestClient(via_gateway(create_app()))
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
@@ -29,7 +31,7 @@ def test_unified_app_mounts_every_module_route():
     """Every module's core route is reachable on the ONE app (the routing table is composed)."""
     store = InMemoryTranscriptStore()
     store.seed_meeting(user_id=USER, platform="google_meet", native_meeting_id="abc-defg-hij")
-    client = TestClient(create_app(transcript_store=store))
+    client = TestClient(via_gateway(create_app(transcript_store=store)))
 
     # Each module's core route is MOUNTED (resolves to a handler — never 404). One app, one router
     # table: lifecycle + bot_spawn + collector + recordings.
@@ -55,7 +57,7 @@ def test_unified_app_mounts_every_module_route():
 
 def test_post_bots_on_unified_app(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
-    client = TestClient(create_app())
+    client = TestClient(via_gateway(create_app()))
     r = client.post("/bots", headers=HEADERS,
                     json={"platform": "google_meet", "native_meeting_id": "abc-defg-hij"})
     assert r.status_code == 201, r.text
@@ -76,8 +78,8 @@ def test_lifecycle_callback_on_unified_app():
     assert events, "expected lifecycle.v1 goldens"
     event = json.loads(events[0].read_text())
 
-    client = TestClient(create_app())
-    r = client.post("/bots/internal/callback/lifecycle", json=event)
+    client = TestClient(via_gateway(create_app()))
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
     assert r.status_code in (200, 409), r.text  # accepted, or a legal-transition rejection
 
 
@@ -101,7 +103,7 @@ async def test_boot_loop_set_excludes_dead_scheduler_tick(caplog):
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     bus = RedisStreamBus(redis)
     # meeting_repo/runtime/session_factory left None → guarded loops degrade cleanly (Lite shape).
-    _attach_background_loops(app, store, bus, redis, meeting_repo=None, runtime=None)
+    _attach_background_loops(app, store, bus, redis, meeting_repo=None, runtime=None, intake=None)
 
     with caplog.at_level(logging.INFO, logger="meeting_api.entrypoint"):
         async with app.router.lifespan_context(app):

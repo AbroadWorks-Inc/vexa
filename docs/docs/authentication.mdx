@@ -70,19 +70,24 @@ is refused with `422` — never silently dropped.
 
 | Scope | Grants |
 |---|---|
-| `bot` | bot lifecycle — `POST`/`GET`/`DELETE /bots`, `/bots/status`, bot config — and the calendar connections (`/user/calendar`, `/user/calendars/*`), because an auto-join feed spawns bots |
-| `tx` | the transcript and meeting-record plane — `/meetings*`, `/transcripts/*` |
+| `bot` | bot lifecycle — `POST`/`GET`/`DELETE /bots`, `/bots/status`, bot config — and the calendar connections (`/user/calendar`, `/user/calendars/*`), because an auto-join feed spawns bots. Also the meeting entries (`PUT /v2/entries`, `POST /v2/entries/remove`, `GET /v2/entries`) and `POST /v2/meetings/{id}/stop` |
+| `tx` | the transcript and meeting-record plane — `/meetings*`, `/transcripts/*`, and the meeting reads `GET /v2/meetings` and `GET /v2/meetings/{id}` |
 | `browser` | browser-tool capabilities. **Reaches no API route today** — a browser-only key can call [`/auth/me`](/api/settings#identity) and nothing else |
+| `erase` | erase a finished meeting's data — `DELETE /v2/meetings/{id}` and nothing else |
+| `webhooks` | manage webhook subscriptions — `POST`/`GET /v2/webhooks`, `PATCH`/`DELETE /v2/webhooks/{id}`, `POST /v2/webhooks/{id}/rotate-secret`, `POST /v2/webhooks/{id}/test`, `GET /v2/webhooks/{id}/deliveries` — and nothing else |
+| `export` | report an export result — `POST /v2/meetings/{id}/export` and nothing else. The exporter's key holds `tx` + `export` |
 
 `/recordings*`, `/user/webhook*`, `/user/models`, `/user/transcription`, `/agent/*` and `/mcp` accept
-either `bot` or `tx`. Most keys want both: `{"scopes":["bot","tx"]}`. The three `/user/*` routes in
+either `bot` or `tx`. Most keys want both: `{"scopes":["bot","tx"]}`. `erase`, `webhooks` and
+`export` are least-privilege scopes: a `bot`+`tx` key does not reach their routes. The three `/user/*` routes in
 that list are the [Settings API](/api/settings) — model credentials, transcription backend, and
 webhook delivery, stored per key owner.
 
 Every route requires a scope. A key that holds none of the scopes a route accepts gets `403`,
 whichever route it is.
 
-Keys are prefixed by their primary scope — `vxa_bot_…`, `vxa_tx_…`, `vxa_browser_…`. A key without a
+Keys are prefixed by their primary scope — `vxa_bot_…`, `vxa_tx_…`, `vxa_browser_…`, `vxa_webhooks_…`,
+`vxa_erase_…`, `vxa_export_…`. A key without a
 recognized scope is rejected.
 
 ## Rotating and revoking

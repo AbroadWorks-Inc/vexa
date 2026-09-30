@@ -3,8 +3,8 @@
 The sealed identity contract. Two shapes, both derived from the real admin-api token model
 (`libs/admin-models` + admin-api `/internal/validate`):
 
-- **`ScopedToken`** — `subject` (owning user id), `scopes[]` (`bot|tx|browser`, mirrors admin-models
-  `VALID_SCOPES`), `expires_at` (RFC3339 or `null` = non-expiring), optional `email` / `issued_at`.
+- **`ScopedToken`** — `subject` (owning user id), `scopes[]` (`bot|tx|browser|webhooks|erase|export`,
+  mirrors admin-models `VALID_SCOPES`; the last three are least-privilege, §1.10), `expires_at` (RFC3339 or `null` = non-expiring), optional `email` / `issued_at`.
   This is what `tokens.py` mints and validates.
 - **`AccessDecision`** — the verdict `canAccess(subject, resource, action)` returns. **Default-deny**:
   `allow=false` unless a policy explicitly grants. `reason` is a stable code
@@ -16,6 +16,7 @@ The sealed identity contract. Two shapes, both derived from the real admin-api t
 - `ScopedToken.valid.json` — in-scope, far-future expiry.
 - `ScopedToken.expired.json` — past `expires_at` (shape-valid; rejected at validation time, not by schema).
 - `ScopedToken.scoped.json` — single-scope, non-expiring (`expires_at: null`).
+- `ScopedToken.least-privilege.json` — the least-privilege `webhooks` + `erase` scopes.
 - `AccessDecision.owner-allow.json` / `AccessDecision.not-owner-deny.json` — the allow/deny verdicts.
 
 ## Validate

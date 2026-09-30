@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "account_not_found",
+    "message": "no such account"
+  }
+}

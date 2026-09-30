@@ -12,7 +12,7 @@ exercises:
   email, plus webhook_url/secret/events from user.data; rejects expired tokens; bumps
   last_used_at; FAILS CLOSED when INTERNAL_API_SECRET is unset (503) and on a bad secret (403).
 
-  Token mint: scoped {bot,tx,browser}. Scopes via JSON body `{"scopes":["bot","tx"]}` or
+  Token mint: scoped {bot,tx,browser,webhooks,erase,export}. Scopes via JSON body `{"scopes":["bot","tx"]}` or
   query `?scopes=bot,tx` / `?scope=bot` (body wins when present). Optional `name` /
   `expires_in` in body or query; an invalid scope → 422. A JSON body with unknown fields
   is refused (422) — never silently dropped (#922).
@@ -32,10 +32,13 @@ from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..schema.models import APIToken, PlatformSetting, User
-from ..token_scope import VALID_SCOPES, generate_prefixed_token
+from ..token_scope import USER_TIER_SCOPES, VALID_SCOPES, generate_prefixed_token
 from .db import get_db
+from .identity_guard import IdentityGuard
 from . import events as events_mod
+from . import metrics as metrics_mod
 from . import person_settings as person_settings_mod
+from .webhook_subscriptions import WebhookDeps, build_webhook_router
 
 ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-API-Key", auto_error=False)
 USER_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -90,7 +93,7 @@ async def get_current_user(api_key: str = Security(USER_KEY_HEADER),
     if not row:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid API Key")
     token_scopes = set(row.scopes) if row.scopes else set()
-    if not token_scopes & VALID_SCOPES:
+    if not token_scopes & USER_TIER_SCOPES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Token scope not authorized for this endpoint")
     user = (await db.execute(select(User).where(User.id == row.user_id))).scalars().first()
     if not user:
@@ -414,8 +417,18 @@ def _resolve_capture_signal(user_data: dict, platform_diagnostics: dict) -> bool
     return True
 
 
-def create_app() -> FastAPI:
+def create_app(*, webhooks: Optional[WebhookDeps] = None,
+               token_expiry: Optional[metrics_mod.TokenExpiry] = None) -> FastAPI:
     app = FastAPI(title="Vexa Admin API (v0.12)")
+    # §1.10: a client route believes x-user-id only with the gateway's signature.
+    app.add_middleware(IdentityGuard)
+
+    # --- metrics (§1.13): exempt from the identity guard and in no gateway route table. The key
+    # expiry gauge reads `token_expiry` at scrape time; None → served without samples.
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics() -> Response:
+        body, content_type = await metrics_mod.render(token_expiry)
+        return Response(body, media_type=content_type)
 
     # --- liveness probe (gate:health): process-up, no DB dependency. Readiness (DB reachable)
     # is a separate concern — keeping /health a pure liveness check makes it green without a
@@ -1326,6 +1339,11 @@ def create_app() -> FastAPI:
             await _platform_setting("models", db),
             _MODELS_FIELDS,
         )}
+
+    # --- webhook subscriptions (§2.7): /v2/webhooks (scope `webhooks`, through the gateway) and
+    #     meeting-api's internal read of an account's active subscriptions (ciphertext only).
+    app.include_router(build_webhook_router(webhooks or WebhookDeps.from_env(),
+                                            check_internal=_check_internal_no_dev_bypass))
 
     @app.get("/")
     async def root():

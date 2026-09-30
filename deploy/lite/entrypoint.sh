@@ -50,6 +50,18 @@ export ADMIN_API_TOKEN="${ADMIN_API_TOKEN:-${ADMIN_TOKEN:-$(python3 -c "import s
 # internal tier (F95). A random per-boot value keeps the one-command quickstart working and is
 # nobody's to guess; set INTERNAL_API_SECRET explicitly when something outside talks in.
 export INTERNAL_API_SECRET="${INTERNAL_API_SECRET:-$(python3 -c "import secrets; print(secrets.token_hex(32))")}"
+# The key ring the gateway signs x-user-id with (§1.10), on the same terms: the gateway refuses to
+# boot without it and meeting-api/admin-api believe x-user-id only under its signature, so a
+# one-key ring and its kid are minted per boot for the three programs that share this environment
+# (supervisord passes this environment on). Set GATEWAY_IDENTITY_KEYS and
+# GATEWAY_IDENTITY_ACTIVE_KEY explicitly when a gateway outside the container signs for this
+# meeting-api.
+if [ -z "${GATEWAY_IDENTITY_KEYS:-}" ]; then
+  GATEWAY_IDENTITY_KEYS="$(python3 -c "import base64, json, secrets; print(json.dumps({'lite': base64.b64encode(secrets.token_bytes(32)).decode()}))")"
+  GATEWAY_IDENTITY_ACTIVE_KEY="lite"
+fi
+export GATEWAY_IDENTITY_KEYS="$GATEWAY_IDENTITY_KEYS"
+export GATEWAY_IDENTITY_ACTIVE_KEY="${GATEWAY_IDENTITY_ACTIVE_KEY:-}"
 export DEFAULT_BOT_NAME="${DEFAULT_BOT_NAME:-Vexa}"
 
 # Optional Google Meet speaker-stream tuning. Empty values preserve bot defaults; the runtime

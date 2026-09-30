@@ -29,6 +29,11 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "meeting_api"
 # Reviewed exceptions: "<relpath>:<lineno>" → one-line justification. Empty by design at ship.
 ALLOWLIST: dict[str, str] = {}
 
+# Wrappers over the SAME session: intake's ``PostgresIntakeTx(db)`` is the ``IntakeTx`` the status
+# and retry writers take, and every call on it runs on ``db``. Passing ``Wrapper(<session>)``, or
+# awaiting a name bound to it, is delegation of the session, not non-DB I/O.
+_SESSION_WRAPPERS = frozenset({"PostgresIntakeTx"})
+
 # Param is a live DB session if named one of these OR annotated with a name ending in "Session".
 _SESSION_PARAM_NAMES = {"db", "session", "conn", "connection"}
 
@@ -64,7 +69,8 @@ def _passes_alias(await_node: ast.Await, alias: str) -> bool:
       transaction is held, which is exactly FM03; not delegation → the caller flags it. (A ``*tasks``
       splat is unprovable → not delegation.)
     * any other call: delegation iff a TOP-LEVEL argument is exactly ``Name(alias)`` — ``helper(db)``
-      or ``helper(session=db)``, where the callee receives the session and is gated by Rule 2. A
+      or ``helper(session=db)``, where the callee receives the session and is gated by Rule 2 — or a
+      session wrapper around it (``PostgresIntakeTx(db)``, ``_SESSION_WRAPPERS``). A
       merely-nested mention (``foo(bar(db))``) is NOT delegation (the outer call is not DB work)."""
     val = await_node.value
     if not isinstance(val, ast.Call):
@@ -79,7 +85,33 @@ def _passes_alias(await_node: ast.Await, alias: str) -> bool:
     for arg in list(val.args) + [kw.value for kw in val.keywords]:
         if isinstance(arg, ast.Name) and arg.id == alias:
             return True
+        if _wraps(arg, alias):
+            return True
     return False
+
+
+def _wraps(node: ast.AST, alias: str) -> bool:
+    """``node`` is ``Wrapper(<alias>)`` for a session wrapper (``_SESSION_WRAPPERS``)."""
+    if not isinstance(node, ast.Call) or len(node.args) != 1 or node.keywords:
+        return False
+    f = node.func
+    fname = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+    arg = node.args[0]
+    return fname in _SESSION_WRAPPERS and isinstance(arg, ast.Name) and arg.id == alias
+
+
+def _wrapped_names(node: ast.AST, aliases: set[str]) -> set[str]:
+    """Names bound (``name = Wrapper(<alias>)``) to a session wrapper under ``node``."""
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Assign)
+            and len(sub.targets) == 1
+            and isinstance(sub.targets[0], ast.Name)
+            and any(_wraps(sub.value, a) for a in aliases)
+        ):
+            names.add(sub.targets[0].id)
+    return names
 
 
 def _session_params(fn: ast.AST) -> set[str]:
@@ -140,6 +172,7 @@ def _scan_file(path: Path) -> list[tuple[int, str, str]]:
             aliases = {a for a in (_is_session_ctx(it) for it in node.items) if a}
             if not aliases:
                 continue
+            aliases |= _wrapped_names(node, aliases)
             for aw in _awaits_in(node):
                 root = _root_name(aw)
                 if root in aliases:
@@ -157,6 +190,7 @@ def _scan_file(path: Path) -> list[tuple[int, str, str]]:
         params = _session_params(node)
         if not params:
             continue
+        params |= _wrapped_names(node, params)
         for aw in _awaits_in(node):
             root = _root_name(aw)
             if root in params:
@@ -237,3 +271,25 @@ def test_conn_named_session_helper_is_scanned_by_r2():
     assert "conn" in _session_params(fn)
     bad = [aw for aw in _awaits_in(fn) if _root_name(aw) not in {"conn"} and not _passes_alias(aw, "conn")]
     assert len(bad) == 1 and bad[0].lineno == 4  # the redis await, not conn.execute
+
+
+def test_awaiting_through_the_session_wrapper_is_delegation():
+    """``PostgresIntakeTx(db)`` wraps the same session (intake's ``IntakeTx`` over it): passing it,
+    or awaiting a name bound to it, is DB work under the caller's transaction, not an FM03 escape.
+    A different wrapper, or the wrapper around another name, is not."""
+    aw = _first_await("async def f(db):\n await retry.retry(PostgresIntakeTx(db), 1)\n")
+    assert _passes_alias(aw, "db") is True
+    aw = _first_await("async def f(db):\n await retry.retry(Other(db), 1)\n")
+    assert _passes_alias(aw, "db") is False
+    aw = _first_await("async def f(db, x):\n await retry.retry(PostgresIntakeTx(x), 1)\n")
+    assert _passes_alias(aw, "db") is False
+    src = (
+        "async def f(self):\n"
+        "    async with self._session_factory() as db:\n"
+        "        tx = PostgresIntakeTx(db)\n"
+        "        await tx.meeting(1)\n"
+        "        other = Other(db)\n"
+        "        await other.meeting(1)\n"
+    )
+    block = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.AsyncWith))
+    assert _wrapped_names(block, {"db"}) == {"tx"}

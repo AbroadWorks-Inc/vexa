@@ -32,6 +32,9 @@ from meeting_api.bot_spawn import MaxBotsExceeded, SpawnFailed, request_bot
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.ingest import consume_segments, ingest
+from meeting_api.sweeps.item_failures import InMemoryItemFailures
+from gateway_identity import via_gateway
+from internal_callers import BOT
 
 SECRET = "test-admin-token"
 USER = 7
@@ -129,7 +132,7 @@ def test_lifecycle_publish_failure_is_surfaced_but_not_fatal():
     runtime = FakeRuntimeClient()
     bad_redis = ExplodingRedis()
     app = create_app(meeting_repo=repo, runtime=runtime, command_publisher=bad_redis, redis=bad_redis)
-    client = TestClient(app)
+    client = TestClient(via_gateway(app))
 
     # Spawn so the session_uid → meeting mapping exists (the callback persists by session_uid).
     spawn = client.post(
@@ -141,8 +144,8 @@ def test_lifecycle_publish_failure_is_surfaced_but_not_fatal():
     meeting_id = spawn.json()["id"]
 
     # joining → active: the active advance publishes a ws BotStatus frame → publish raises.
-    assert client.post(LIFECYCLE_ENDPOINT, json={"connection_id": session_uid, "status": "joining"}).status_code == 200
-    r = client.post(LIFECYCLE_ENDPOINT, json={"connection_id": session_uid, "status": "active"})
+    assert client.post(LIFECYCLE_ENDPOINT, headers=BOT, json={"connection_id": session_uid, "status": "joining"}).status_code == 200
+    r = client.post(LIFECYCLE_ENDPOINT, headers=BOT, json={"connection_id": session_uid, "status": "active"})
 
     # The publish RAISED but the callback still returned 200 and the DB row still transitioned.
     assert r.status_code == 200, r.text
@@ -309,8 +312,9 @@ def test_real_loop_factory_survives_throwing_consume(monkeypatch):
 
         app = FastAPI()
         # Attach only the loops; the consumer loop is what we exercise. Signature is positional:
-        # _attach_background_loops(app, transcript_store, segment_bus, redis_client, meeting_repo=None).
-        entry._attach_background_loops(app, object(), object(), object(), None)
+        # _attach_background_loops(app, transcript_store, segment_bus, redis_client, meeting_repo=None),
+        # plus the entry service (none: no Postgres).
+        entry._attach_background_loops(app, object(), object(), object(), None, intake=None)
         # The lifespan starts the four loop tasks.
         async with app.router.lifespan_context(app):
             # Let the consumer tick: fail once, then keep ticking.
@@ -368,8 +372,9 @@ class _StaleStoppingRepo:
     def __init__(self, stale):
         self._stale = stale
 
-    async def list_stale_stopping(self, *, older_than_seconds):
-        return list(self._stale)
+    async def list_stale_stopping(self, *, older_than_seconds, after=None, limit=None):
+        rows = [r for r in self._stale if after is None or r[0] > after]
+        return rows if limit is None else rows[:limit]
 
 
 async def test_stop_reconcile_kills_orphan_workload():
@@ -390,6 +395,7 @@ async def test_stop_reconcile_kills_orphan_workload():
 
     n = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
 
     assert n == 1
@@ -398,10 +404,12 @@ async def test_stop_reconcile_kills_orphan_workload():
 
 
 async def test_stop_reconcile_no_container_id_does_not_crash():
-    """A stale `stopping` meeting whose bot_container_id was never written still completes — the sweep
-    skips the kill (nothing to target) and never raises."""
+    """A stale `stopping` meeting whose bot_container_id was never written still completes: the sweep
+    deletes the workload its session's spawn asked for (``workload_id_for``, §6.9 F-K2) first, and
+    never raises."""
     import logging
 
+    from meeting_api.bot_spawn.ports import workload_id_for
     from meeting_api.lifecycle.reconcile import reconcile_stale_stopping_sweep
 
     repo = _StaleStoppingRepo([(7, "sess-7", None)])
@@ -412,9 +420,10 @@ async def test_stop_reconcile_no_container_id_does_not_crash():
 
     n = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert n == 1
-    assert runtime.deleted == [], "no container id → no kill, no crash"
+    assert runtime.deleted == [workload_id_for(7, "sess-7")]
 
 
 async def test_stop_reconcile_kill_failure_never_completes_the_row():
@@ -441,6 +450,7 @@ async def test_stop_reconcile_kill_failure_never_completes_the_row():
 
     n = await reconcile_stale_stopping_sweep(
         repo, _ThrowingRuntime(), post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert n == 1, "only the CONFIRMED teardown completes; the failed one is retried next sweep"
     assert [b["connection_id"] for b in posted] == ["sess-10"], (
@@ -467,6 +477,7 @@ async def test_stop_reconcile_runtime_404_never_completes_the_row():
 
     n = await reconcile_stale_stopping_sweep(
         repo, runtime, post_lifecycle, stop_grace=45, log=logging.getLogger("t"),
+        item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert n == 0
     assert posted == [], "a runtime 404 must never advance the meeting to completed"
@@ -787,7 +798,7 @@ def test_duplicate_spawn_sequential_is_409():
     (only one bot per meeting). This is the sequential idempotency contract."""
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     app = create_app(meeting_repo=repo, runtime=runtime)
-    client = TestClient(app)
+    client = TestClient(via_gateway(app))
     body = {"platform": "google_meet", "native_meeting_id": "idem"}
     r1 = client.post("/bots", headers={"x-user-id": str(USER)}, json=body)
     assert r1.status_code == 201, r1.text
@@ -883,7 +894,7 @@ def test_stop_of_booting_bot_tears_down_workload_no_orphan():
     workload down — else the bot boots, joins, and orphans. Asserts the workload was deleted."""
     repo = InMemoryMeetingRepo()
     runtime = FakeRuntimeClient()
-    client = TestClient(create_app(meeting_repo=repo, runtime=runtime))
+    client = TestClient(via_gateway(create_app(meeting_repo=repo, runtime=runtime)))
     spawn = client.post("/bots", headers={"x-user-id": str(USER)},
                         json={"platform": "google_meet", "native_meeting_id": "orphan-race"})
     assert spawn.status_code == 201, spawn.text
@@ -907,7 +918,7 @@ def test_spawn_reconciles_a_stop_that_raced_the_boot():
             self._meetings[meeting_id]["status"] = "stopping"  # a concurrent DELETE raced in
             return row
 
-    client = TestClient(create_app(meeting_repo=_StopRacesRepo(), runtime=runtime))
+    client = TestClient(via_gateway(create_app(meeting_repo=_StopRacesRepo(), runtime=runtime)))
     r = client.post("/bots", headers={"x-user-id": str(USER)},
                     json={"platform": "google_meet", "native_meeting_id": "raced-spawn"})
     assert r.status_code == 201, r.text

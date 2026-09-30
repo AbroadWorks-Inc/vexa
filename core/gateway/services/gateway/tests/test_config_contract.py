@@ -11,6 +11,12 @@ import pytest
 
 from gateway import config_preflight as cp
 
+# A test-only one-key ring (§1.10): the gateway also refuses to boot without it.
+IDENTITY_RING = {
+    "GATEWAY_IDENTITY_KEYS": '{"gw-test": "dGVzdC1nYXRld2F5LWlkZW50aXR5LWNvbmZpZy1rZXk="}',
+    "GATEWAY_IDENTITY_ACTIVE_KEY": "gw-test",
+}
+
 
 def test_declaration_loads_and_internal_secret_is_required():
     decl = cp.load_declaration()
@@ -26,7 +32,7 @@ def test_preflight_refuses_boot_without_internal_api_secret():
 
 
 def test_preflight_passes_when_required_set():
-    cp.preflight({"INTERNAL_API_SECRET": "a-real-secret"})
+    cp.preflight({"INTERNAL_API_SECRET": "a-real-secret", **IDENTITY_RING})
 
 
 def test_preflight_refuses_the_published_placeholder():
@@ -40,6 +46,6 @@ def test_preflight_refuses_the_published_placeholder():
     KEY, never the value."""
     for placeholder in ("vexa-internal-secret", "lite-internal-secret", "changeme"):
         with pytest.raises(cp.ConfigError) as ei:
-            cp.preflight({**{}, "INTERNAL_API_SECRET": placeholder})
+            cp.preflight({**IDENTITY_RING, "INTERNAL_API_SECRET": placeholder})
         assert "INTERNAL_API_SECRET" in str(ei.value)
         assert placeholder not in str(ei.value), "a refusal must never echo the value"

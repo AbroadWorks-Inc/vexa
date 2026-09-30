@@ -23,12 +23,14 @@ The flow (parent ``meetings.py`` lines ~1010-1403, reduced to the standard-bot b
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import uuid
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from ..callback_auth import tokened_callback_url
 from ..config_preflight import CONFIG_FAULT_KINDS, cached_probe_verdict
 from ..obs import log_event
 from ..service_authority import (
@@ -51,6 +53,9 @@ from .ports import (
     SpawnFailed,
     TranscriptionNotConfigured,
     _stopped_reopen_detail,
+    spawn_session,
+    unproven_teardown,
+    workload_id_for,
 )
 
 # Re-exported here (defined in ports.py to avoid an adapters→service circular import) so callers that
@@ -373,9 +378,19 @@ async def _stop_requested_on(repo: MeetingRepo, meeting_id: Any) -> bool:
     return bool(((row or {}).get("data") or {}).get("stop_requested"))
 
 
+def _not_sent(exc: BaseException) -> Any:
+    """The ``not_sent`` outcome a spawn failure ends its meeting with: the §1.5 typed code and exact
+    message (``intake.spawn.spawn_failure``), the same the caller reports."""
+    from ..intake.spawn import spawn_failure
+    from ..intake.status import Outcome
+
+    code, message = spawn_failure(exc)
+    return Outcome("not_sent", code, message)
+
+
 async def _terminalize_as_stopped(
     repo: MeetingRepo, meeting_id: Any, status: Optional[str], *,
-    fenced_before_spawn: bool = False,
+    fenced_before_spawn: bool = False, outcome: Any = None,
 ) -> None:
     """Land a stop-fenced row on its truthful terminal: ``failed`` / ``stopped``.
 
@@ -396,6 +411,7 @@ async def _terminalize_as_stopped(
             failure_stage=status if status in ("requested", "joining", "awaiting_admission") else "requested",
             completion_reason="stopped",
             data={"stop_requested": True},
+            outcome=outcome,
         )
     except Exception as e:  # noqa: BLE001 — reconcile backstops; never mask the stop verdict
         log_event("bot_spawn_stop_terminalize_failed", audience="system", level="error",
@@ -431,6 +447,8 @@ async def request_bot(
     webhook_url: Optional[str] = None,
     webhook_secret: Optional[str] = None,
     webhook_events: Optional[dict] = None,
+    claim_meeting_id: Optional[int] = None,
+    claim_due: Optional[Any] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -442,7 +460,18 @@ async def request_bot(
     per-user cap — the spawn is rejected if the user already has that many ACTIVE bots. A cap
     ``<= 0`` means the quota is DEPLETED (every spawn rejected) — 0 is never "unlimited"; ``None``
     means no cap was provided, so no pre-check.
+
+    ``claim_meeting_id`` (§1.5): spawn on exactly that ``scheduled`` row (the scheduler and the
+    intake instant join pass it); without it the planned row the R1 ``join_now`` rule picks is
+    claimed, else a new row is inserted (``MeetingRepo.create_meeting_guarded``). ``claim_due``
+    (the scheduler's ``auto_join.DueWindow``) makes the claim re-check under the lock that the row
+    is still due (``ClaimNotDue`` otherwise).
     """
+    if claim_meeting_id is not None and continue_meeting:
+        raise ValueError(
+            "claim_meeting_id and continue_meeting are exclusive: a claim spawns on a scheduled "
+            "row, continue_meeting reopens a finished one"
+        )
     authority = authority or AllowAllServiceAuthority()
     # 1. URL.
     constructed_url = meeting_url or construct_meeting_url(
@@ -602,7 +631,10 @@ async def request_bot(
     #     replica deployment ever witnesses it.
     if authenticated and auth_userdata_path:
         conflict = await repo.find_active_by_userdata(auth_userdata_path)
-        if conflict is not None and (reused_row is None or conflict["id"] != reused_row["id"]):
+        # The row this spawn reuses or claims (a meeting waiting for its next bot, §6.9 F-K2) is
+        # not a conflict with itself.
+        own = {reused_row["id"] if reused_row is not None else None, claim_meeting_id}
+        if conflict is not None and conflict["id"] not in own:
             log_event(
                 "bot_spawn_auth_session_busy", audience="user", level="warning",
                 span="bots.create", user_id=user_id,
@@ -675,7 +707,9 @@ async def request_bot(
                     span="bots.create", user_id=user_id,
                     fields={"active": active, "cap": max_concurrent},
                 )
-                raise MaxBotsExceeded(user_id, max_concurrent)
+                raise MaxBotsExceeded(
+                    user_id, max_concurrent, active=active if max_concurrent > 0 else None,
+                )
         row = await repo.reopen_meeting(
             meeting_id=reused_row["id"],
             data_patch={
@@ -683,10 +717,14 @@ async def request_bot(
                 "recording_enabled": recording_enabled,
                 "transcription_provider": transcription_provider,
                 "service_authority": authority_record,
+                # Before the create, in the reopen's transaction: names this spawn's workload.
+                **spawn_session(connection_id),
             },
         )
     else:
-        meeting_data: dict[str, Any] = {}
+        # Before the create, in the claim's or the insert's transaction: names this spawn's
+        # workload should the process die before its session write (§6.9 F-K2).
+        meeting_data: dict[str, Any] = dict(spawn_session(connection_id))
         if constructed_url:
             meeting_data["constructed_meeting_url"] = constructed_url
         meeting_data["transcribe_enabled"] = transcribe_enabled
@@ -716,6 +754,8 @@ async def request_bot(
                 native_meeting_id=native_meeting_id,
                 data=meeting_data,
                 max_concurrent=max_concurrent,
+                claim_meeting_id=claim_meeting_id,
+                claim_due=claim_due,
             )
         except MaxBotsExceeded:
             log_event(
@@ -725,79 +765,169 @@ async def request_bot(
             )
             raise
     meeting_id = row["id"]
+    # The workload id this spawn asks the runtime for (§1.10 names it in the callback token).
+    workload_id = workload_id_for(meeting_id, connection_id)
 
-    # 4. MeetingToken + invocation. connection_id IS the session_uid (parent's connectionId).
-    redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
-    meeting_api_url = meeting_api_url or os.getenv("MEETING_API_URL", "http://meeting-api:8080")
-    internal_secret = internal_secret if internal_secret is not None else os.getenv(
-        "INTERNAL_API_SECRET"
-    )
-    # STT creds were resolved and gated at step 1b (before the meeting-row write); the resolved
-    # transcription_service_url/token/model flow into the invocation below. Without either the bot
-    # joins + captures but cannot transcribe — None-safe: omitted from the invocation when unset
-    # (transcribe still gated by transcribe_enabled, which step 1b refuses when unresolvable).
-    # Token must outlive the bot's max active time (default 4h, see bot deriveMaxActiveMs) or
-    # transcription dies mid-meeting when the JWT expires. Default 5h; override per deployment.
-    token_ttl_seconds = int(os.getenv("MEETING_TOKEN_TTL_SECONDS") or 18000)
-    token = mint_meeting_token(
-        meeting_id, user_id, platform, native_meeting_id, secret=token_secret, ttl_seconds=token_ttl_seconds
-    )
-    invocation = build_invocation(
-        meeting_id=meeting_id,
-        platform=platform,
-        meeting_url=join_url,
-        bot_name=bot_name or (os.getenv("DEFAULT_BOT_NAME") or f"VexaBot-{uuid.uuid4().hex[:6]}"),
-        passcode=passcode,
-        token=token,
-        native_meeting_id=native_meeting_id,
-        connection_id=connection_id,
-        language=language,
-        task=task,
-        transcription_tier=transcription_tier,
-        redis_url=redis_url,
-        meeting_api_callback_url=f"{meeting_api_url}/bots/internal/callback/lifecycle",
-        internal_secret=internal_secret,
-        transcribe_enabled=transcribe_enabled,
-        transcription_service_url=transcription_service_url,
-        transcription_service_token=transcription_service_token,
-        transcription_model=transcription_model,
-        recording_enabled=recording_enabled,
-        capture_modes=(["audio", "video"] if recording_enabled else None),
-        # O-TEL-1: the tape is INDEPENDENT of recording_enabled — a meeting the user never asked to
-        # record still yields a fixture. Both ride the same upload endpoint below.
-        capture_signal_enabled=capture_signal_enabled,
-        recording_upload_url=f"{meeting_api_url}/internal/recordings/upload",
-        authenticated=True if authenticated else None,
-        userdata_s3_path=auth_userdata_path,
-        s3_endpoint=auth_s3.get("s3_endpoint"),
-        s3_bucket=auth_s3.get("s3_bucket"),
-        s3_access_key=auth_s3.get("s3_access_key"),
-        s3_secret_key=auth_s3.get("s3_secret_key"),
-        # Explicit caller windows win; otherwise omit everyoneLeftTimeout so the bot's
-        # silence-window module default applies (the lobby window stays forgiving for
-        # human-in-the-loop dashboard joins).
-        automatic_leave=automatic_leave or {"waitingRoomTimeout": lobby_budget_ms()},
-    )
+    async def _fail_row(
+        reason: str, exc: BaseException, *, gone: bool, created: bool = True
+    ) -> Optional[dict]:
+        """Fail the claimed row BY ID (the ``MeetingSession`` may not exist yet), naming the
+        workload and whether it is proven gone (§6.9 F-K2: a meeting that is on retries, and a
+        new bot goes only once that workload is proven gone; ``created=False``: the create never
+        ran, so there is no workload to name). Returns the row as it stands, or
+        ``None`` when failing it failed. Best-effort: never masks the spawn error the caller
+        re-raises."""
+        try:
+            return await repo.fail_meeting(
+                meeting_id=meeting_id, reason=reason, failure_stage="requested",
+                outcome=_not_sent(exc), workload_id=workload_id if created else None,
+                workload_gone=gone,
+            )
+        except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
+            log_event(
+                "bot_spawn_fail_row_error", audience="system", level="error",
+                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                fields={"error": str(fail_err)},
+            )
+            return None
 
-    # 4b. THE SPAWN FENCE (F2, stage rev 193 row 26313). Re-read this row's user-stop flag from the
-    #     store — NOT from the snapshot above — immediately before the workload is created. A DELETE
-    #     that landed while the token was minted and the invocation built has already committed
-    #     `stop_requested`; creating the pod now would put a bot in a meeting the user has already
-    #     said no to, and the stop's own direct teardown cannot reach a workload that does not exist
-    #     yet. Refusing HERE means the common case creates no pod at all.
-    if await _stop_requested_on(repo, meeting_id):
-        await _terminalize_as_stopped(repo, meeting_id, row.get("status"), fenced_before_spawn=True)
-        log_event("bot_spawn_fenced_by_stop", audience="user", level="warning",
-                  span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                  fields={"phase": "before_workload_create"})
-        raise MeetingStopped(_stopped_spawn_detail(meeting_id))
+    async def _fail_unproven(reason: str, exc: BaseException) -> None:
+        """A create the runtime did not refuse: the workload may exist. A meeting that retries
+        proves it gone before its next bot (§6.9 F-K2); one that ends instead (its last attempt,
+        its planned end too close, no entries) frees its link, so the workload goes through
+        ``_teardown_or_record``."""
+        from ..intake import retry
 
-    # 5. Spawn over runtime.v1.
-    spec = build_workload_spec(
-        workload_id=f"mtg-{meeting_id}-{connection_id[:8]}",
-        invocation=invocation,
-        callback_url=f"{meeting_api_url}/runtime/callback",
-    )
+        failed_row = await _fail_row(reason, exc, gone=False)
+        if failed_row is not None and retry.marker(failed_row.get("data")) is not None:
+            return
+        await _teardown_or_record()
+
+    async def _teardown_or_record() -> str:
+        """Delete this spawn's workload, which may still run while its meeting ends or frees its
+        link, through the reconcile sweeps' teardown, and log the verdict. A delete not confirmed
+        is recorded on the row (``ports.unproven_teardown``, the one record) for the reconcile
+        sweep to retry, bounded (§6.9 F-K2, F-I). Returns the verdict; never raises."""
+        import logging
+
+        from ..lifecycle.reconcile import teardown_verdict
+
+        verdict = await teardown_verdict(
+            runtime, workload_id, meeting_id=meeting_id,
+            log=logging.getLogger("meeting_api.bot_spawn"),
+        )
+        log_event(
+            "bot_spawn_unproven_workload_teardown", audience="system",
+            level="info" if verdict == "confirmed" else "error",
+            span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+            fields={"workload_id": workload_id, "verdict": verdict},
+        )
+        merge = getattr(repo, "merge_meeting_data", None)
+        if verdict == "confirmed" or merge is None:
+            return verdict
+        try:
+            await merge(meeting_id, lambda data: unproven_teardown(data, workload_id))
+        except Exception as record_err:  # noqa: BLE001 — logged above; never masks the spawn error
+            log_event(
+                "bot_spawn_unproven_teardown_unrecorded", audience="system", level="error",
+                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                fields={"workload_id": workload_id, "error": type(record_err).__name__},
+            )
+        return verdict
+
+    # 4–5a. Everything before the workload create. A failure here cannot have started a pod —
+    #       `create_workload` has not been called — so the row is failed with the workload proven
+    #       gone (a claimed row retries normally, §6.9 F-K2; an inserted one ends). The stop
+    #       fence's own ending stands.
+    try:
+        # 4. MeetingToken + invocation. connection_id IS the session_uid (parent's connectionId).
+        redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
+        meeting_api_url = meeting_api_url or os.getenv("MEETING_API_URL", "http://meeting-api:8080")
+        internal_secret = internal_secret if internal_secret is not None else os.getenv(
+            "INTERNAL_API_SECRET"
+        )
+        # STT creds were resolved and gated at step 1b (before the meeting-row write); the resolved
+        # transcription_service_url/token/model flow into the invocation below. Without either the bot
+        # joins + captures but cannot transcribe — None-safe: omitted from the invocation when unset
+        # (transcribe still gated by transcribe_enabled, which step 1b refuses when unresolvable).
+        # Token must outlive the bot's max active time (default 4h, see bot deriveMaxActiveMs) or
+        # transcription dies mid-meeting when the JWT expires. Default 5h; override per deployment.
+        token_ttl_seconds = int(os.getenv("MEETING_TOKEN_TTL_SECONDS") or 18000)
+        token = mint_meeting_token(
+            meeting_id, user_id, platform, native_meeting_id, secret=token_secret, ttl_seconds=token_ttl_seconds
+        )
+        invocation = build_invocation(
+            meeting_id=meeting_id,
+            platform=platform,
+            meeting_url=join_url,
+            bot_name=bot_name or (os.getenv("DEFAULT_BOT_NAME") or f"VexaBot-{uuid.uuid4().hex[:6]}"),
+            passcode=passcode,
+            token=token,
+            native_meeting_id=native_meeting_id,
+            connection_id=connection_id,
+            language=language,
+            task=task,
+            transcription_tier=transcription_tier,
+            redis_url=redis_url,
+            meeting_api_callback_url=f"{meeting_api_url}/bots/internal/callback/lifecycle",
+            internal_secret=internal_secret,
+            transcribe_enabled=transcribe_enabled,
+            transcription_service_url=transcription_service_url,
+            transcription_service_token=transcription_service_token,
+            transcription_model=transcription_model,
+            recording_enabled=recording_enabled,
+            capture_modes=(["audio", "video"] if recording_enabled else None),
+            # O-TEL-1: the tape is INDEPENDENT of recording_enabled — a meeting the user never asked to
+            # record still yields a fixture. Both ride the same upload endpoint below.
+            capture_signal_enabled=capture_signal_enabled,
+            recording_upload_url=f"{meeting_api_url}/internal/recordings/upload",
+            authenticated=True if authenticated else None,
+            userdata_s3_path=auth_userdata_path,
+            s3_endpoint=auth_s3.get("s3_endpoint"),
+            s3_bucket=auth_s3.get("s3_bucket"),
+            s3_access_key=auth_s3.get("s3_access_key"),
+            s3_secret_key=auth_s3.get("s3_secret_key"),
+            # Explicit caller windows win; otherwise omit everyoneLeftTimeout so the bot's
+            # silence-window module default applies (the lobby window stays forgiving for
+            # human-in-the-loop dashboard joins).
+            automatic_leave=automatic_leave or {"waitingRoomTimeout": lobby_budget_ms()},
+        )
+
+        # 4b. THE SPAWN FENCE (F2, stage rev 193 row 26313). Re-read this row's user-stop flag from the
+        #     store — NOT from the snapshot above — immediately before the workload is created. A DELETE
+        #     that landed while the token was minted and the invocation built has already committed
+        #     `stop_requested`; creating the pod now would put a bot in a meeting the user has already
+        #     said no to, and the stop's own direct teardown cannot reach a workload that does not exist
+        #     yet. Refusing HERE means the common case creates no pod at all.
+        if await _stop_requested_on(repo, meeting_id):
+            stopped = MeetingStopped(_stopped_spawn_detail(meeting_id))
+            await _terminalize_as_stopped(repo, meeting_id, row.get("status"), fenced_before_spawn=True,
+                                          outcome=_not_sent(stopped))
+            log_event("bot_spawn_fenced_by_stop", audience="user", level="warning",
+                      span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
+                      fields={"phase": "before_workload_create"})
+            raise stopped
+
+        # 5. Spawn over runtime.v1.
+        spec = build_workload_spec(
+            workload_id=workload_id,
+            invocation=invocation,
+            # §1.10: the runtime posts back to this URL verbatim; its token names this workload.
+            callback_url=tokened_callback_url(
+                f"{meeting_api_url}/runtime/callback", workload_id, internal_secret or ""
+            ),
+        )
+    except MeetingStopped:
+        raise
+    except (Exception, asyncio.CancelledError) as e:
+        # The row this spawn claimed or inserted is failed with no workload (no pod can exist
+        # before the create), a cancel the same way: a session-less `requested` row would hold
+        # its link for good, since the reconcile sweeps list only rows with a session.
+        await _fail_row(
+            f"the bot could not be prepared ({type(e).__name__})", e, gone=True, created=False
+        )
+        raise
+
     try:
         result = await runtime.create_workload(spec)
         # Defense in depth at the service/port seam (#718 C2): the adapter already refuses a dead
@@ -807,31 +937,39 @@ async def request_bot(
         spawned_state = result.get("state")
         if spawned_state in ("stopped", "destroyed"):
             raise SpawnFailed(f"workload dead on spawn: {result.get('stopReason') or spawned_state}")
-    except QuotaExceeded:
+    except QuotaExceeded as e:
+        # The kernel's 429 is an explicit refusal: no workload was started.
         log_event(
             "bot_spawn_quota_exceeded", audience="user", level="warning",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
         )
+        await _fail_row(str(e) or "runtime quota exceeded", e, gone=True)
         raise
     except SpawnFailed as e:
         # No workload came up. Mark the just-inserted meeting row `failed` with the reason so no
         # `requested` row lingers for the 5-minute reaper to flip reason-less (#718): the failure and
         # its cause are on the row NOW, and POST /bots answers 502 with the same reason. The row is
         # failed BY ID — the MeetingSession is not created until after a successful spawn, so the
-        # session-keyed update_meeting_status cannot reach it yet.
+        # session-keyed update_meeting_status cannot reach it yet. Only an explicit refusal proves
+        # the workload gone; a 5xx does not (``SpawnFailed.refused``).
         reason = str(e) or "bot workload failed to start"
-        try:
-            await repo.fail_meeting(meeting_id=meeting_id, reason=reason, failure_stage="requested")
-        except Exception as fail_err:  # noqa: BLE001 — failing the row is best-effort; never mask the spawn error
-            log_event(
-                "bot_spawn_fail_row_error", audience="system", level="error",
-                span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                fields={"error": str(fail_err)},
-            )
+        if e.refused:
+            await _fail_row(reason, e, gone=True)
+        else:
+            await _fail_unproven(reason, e)
         log_event(
             "bot_spawn_failed", audience="system", level="error",
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
             fields={"reason": reason},
+        )
+        raise
+    except (Exception, asyncio.CancelledError) as e:
+        # No answer from the kernel (a timeout, a dropped connection, a protocol error, the
+        # request cancelled mid-create): it may have started the workload, so the row is failed
+        # with the workload named and NOT proven gone (§6.9 F-K2), which bounds it, and the error
+        # is re-raised.
+        await _fail_unproven(
+            f"the runtime did not answer the workload create ({type(e).__name__})", e
         )
         raise
 
@@ -842,13 +980,17 @@ async def request_bot(
     #      (a live bot with no session row to resolve its uploads, the meeting stuck `requested`) —
     #      ROB3. Wrap both DB writes: on failure, tear the just-created workload DOWN (best-effort) and
     #      re-raise as SpawnFailed so the route maps it to 502 and no half-spawned state is left behind.
+    #      The row is failed with the workload and whether its teardown was confirmed (§6.9 F-K2).
     try:
         # For a continued meeting this APPENDS a session to the reused row — N sessions per meeting (P3c).
         await repo.create_session(meeting_id=meeting_id, session_uid=connection_id)
         row = await repo.set_bot_container(meeting_id=meeting_id, bot_container_id=workload_id)
-    except Exception as e:  # noqa: BLE001 — any post-spawn DB failure must trigger compensation
+    except (Exception, asyncio.CancelledError) as e:
+        # Any post-spawn DB failure, or a cancel between the two writes, must trigger compensation.
+        torn_down = False
         try:
             await runtime.delete_workload(workload_id)
+            torn_down = True
         except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the cause
             log_event(
                 "bot_spawn_orphan_teardown_failed", audience="system", level="error",
@@ -860,9 +1002,18 @@ async def request_bot(
             span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
             fields={"workload_id": workload_id, "error": str(e)},
         )
-        raise SpawnFailed(
+        failed = SpawnFailed(
             f"post-spawn DB write failed; workload {workload_id} torn down"
-        ) from e
+            if torn_down
+            else f"post-spawn DB write failed; workload {workload_id} not torn down"
+        )
+        if torn_down:
+            await _fail_row(str(failed), failed, gone=True)
+        else:
+            await _fail_unproven(str(failed), failed)
+        if isinstance(e, asyncio.CancelledError):
+            raise
+        raise failed from e
 
     # THE INTERLOCK — the half of the fence that has no TOCTOU hole (F2).
     #
@@ -884,22 +1035,25 @@ async def request_bot(
     raced_status = (raced or {}).get("status")
     raced_stop = bool(((raced or {}).get("data") or {}).get("stop_requested"))
     if raced_stop or raced_status in ("stopping", "completed", "failed"):
-        try:
-            await runtime.delete_workload(workload_id)
+        # The workload runs while its meeting ends: deleted, or recorded for the reconcile sweep
+        # to delete, bounded (§6.9 F-K2) — never forgotten.
+        teardown = await _teardown_or_record()
+        if teardown == "confirmed":
             log_event("bot_spawn_raced_stop_torn_down", audience="system", level="warning",
                       span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
                       fields={"workload_id": workload_id, "raced_status": raced_status,
                               "stop_requested": raced_stop})
-        except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the spawn
+        else:
             log_event("bot_spawn_raced_stop_teardown_failed", audience="system", level="error",
                       span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                      fields={"workload_id": workload_id, "error": str(teardown_err)})
+                      fields={"workload_id": workload_id, "verdict": teardown})
         if raced_stop:
             # The run is over before it began, and the row must SAY SO now rather than sit
             # non-terminal until a reaper guesses. Truthfully: `failed` (the FSM's only legal
             # pre-active terminal) with the user's own reason.
-            await _terminalize_as_stopped(repo, meeting_id, raced_status)
-            raise MeetingStopped(_stopped_spawn_detail(meeting_id))
+            stopped = MeetingStopped(_stopped_spawn_detail(meeting_id))
+            await _terminalize_as_stopped(repo, meeting_id, raced_status, outcome=_not_sent(stopped))
+            raise stopped
 
     # The response lists the meeting's sessions (P3c) — all session_uids that ran against this row.
     sessions = await repo.list_sessions(meeting_id=meeting_id)
