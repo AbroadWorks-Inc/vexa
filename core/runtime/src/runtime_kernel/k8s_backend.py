@@ -72,6 +72,20 @@ def _kubectl(*args: str, check: bool = True, stdin: Optional[str] = None) -> sub
     return r
 
 
+def _already_gone(result: subprocess.CompletedProcess) -> bool:
+    """kubectl answered that this pod is not in the cluster. A connection failure is not this."""
+    text = f"{result.stderr or ''}\n{result.stdout or ''}"
+    return "(NotFound)" in text
+
+
+def _require_accepted(result: subprocess.CompletedProcess, what: str) -> None:
+    """A delete counts only when kubectl accepted it, or the pod was already gone."""
+    if result.returncode == 0 or _already_gone(result):
+        return
+    detail = (result.stderr or result.stdout or "").strip()
+    raise RuntimeError(f"{what} failed ({result.returncode}): {detail[:200]}")
+
+
 def _stop_grace_sec() -> int:
     """Graceful-delete window (SIGTERM → SIGKILL). Same env knob as the Docker backend
     (RUNTIME_STOP_GRACE_SEC, default 30) so a live meeting bot can honour SIGTERM — leave the
@@ -314,10 +328,19 @@ class K8sBackend:
             return []
 
     def exit_code(self, h: WorkloadHandle) -> Optional[int]:
+        """None while the pod is running, or when kubectl did not answer.
+
+        A failed ``kubectl get`` used to return 0 for every error. The kernel stores that as a
+        clean exit, and a second bot can be sent into a call that is still going. A timeout and
+        a missing pod are both a non-zero exit, so only the NotFound answer means the pod is gone.
+        """
         r = _kubectl("get", "pod", h._impl, "-o", "json", *self._ns_args(), check=False)  # type: ignore[attr-defined]
         if r.returncode != 0:
-            return 0                                     # gone (deleted/never-found) → no longer running
-        status = json.loads(r.stdout).get("status", {})
+            return 0 if _already_gone(r) else None
+        try:
+            status = json.loads(r.stdout).get("status", {})
+        except (json.JSONDecodeError, AttributeError):
+            return None
         phase = status.get("phase")
         if phase in ("Pending", "Running"):
             return None                                  # still scheduling / running
@@ -332,13 +355,30 @@ class K8sBackend:
         return None
 
     def terminate(self, h: WorkloadHandle) -> None:      # graceful: SIGTERM + grace, then SIGKILL
-        _kubectl("delete", "pod", h._impl, f"--grace-period={_stop_grace_sec()}", "--wait=false",
-                 *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        name = h._impl  # type: ignore[attr-defined]
+        _require_accepted(
+            _kubectl("delete", "pod", name, f"--grace-period={_stop_grace_sec()}", "--wait=false",
+                     *self._ns_args(), check=False),
+            f"kubectl delete pod {name}",
+        )
 
     def kill(self, h: WorkloadHandle) -> None:           # force: immediate SIGKILL + drop the object
-        _kubectl("delete", "pod", h._impl, "--grace-period=0", "--force", "--wait=false",
-                 *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        name = h._impl  # type: ignore[attr-defined]
+        _require_accepted(
+            _kubectl("delete", "pod", name, "--grace-period=0", "--force", "--wait=false",
+                     *self._ns_args(), check=False),
+            f"kubectl delete pod {name}",
+        )
 
     def cleanup(self, h: WorkloadHandle) -> None:
-        _kubectl("delete", "pod", h._impl, "--ignore-not-found", "--grace-period=0", "--force",
-                 "--wait=false", *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        """Reclaim the pod. Raises unless kubectl accepted the delete or the pod is already gone.
+
+        ``kernel.destroy`` marks the workload destroyed only after this returns. A failed delete
+        must not become that mark: meeting-api treats a destroyed workload as the bot having left.
+        """
+        name = h._impl  # type: ignore[attr-defined]
+        _require_accepted(
+            _kubectl("delete", "pod", name, "--ignore-not-found", "--grace-period=0", "--force",
+                     "--wait=false", *self._ns_args(), check=False),
+            f"kubectl delete pod {name}",
+        )
