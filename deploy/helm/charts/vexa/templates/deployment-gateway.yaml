@@ -72,7 +72,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: GATEWAY_IDENTITY_ACTIVE_KEY
+                  key: GATEWAY_IDENTITY_KEY_LABEL
             - name: INTAKE_RATE_LIMIT_PER_MIN
               value: {{ .Values.gateway.intakeRateLimitPerMin | default 600 | quote }}
             - name: GATEWAY_RATE_LIMIT_BURST

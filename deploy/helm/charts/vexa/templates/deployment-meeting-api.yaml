@@ -108,7 +108,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: WEBHOOK_SECRET_ENC_ACTIVE_KEY
+                  key: WEBHOOK_SECRET_ENC_KEY_LABEL
                   optional: true
             # The gateway signature's freshness window (the replay window); the same on admin-api.
             - name: GATEWAY_IDENTITY_MAX_SKEW_S
