@@ -1532,7 +1532,7 @@ class _NoSpawnPort:
         raise AssertionError("no spawn in this test")
 
 
-# ── Postgres: the legacy system URL ─────────────────────────────────────────────────────────
+# ── Postgres: a completed meeting's webhook is the outbox row ───────────────────────────────
 
 
 class _SystemCapture:
@@ -1543,9 +1543,9 @@ class _SystemCapture:
         self.calls.append(envelope)
 
 
-async def test_pg_the_system_url_still_receives_meeting_completed(pg):
-    """Upstream's system hook keeps working with upstream's meeting block; the §2.4 meeting's
-    own keys go to ``/v2/webhooks`` subscribers only (§6.9 F-X)."""
+async def test_pg_a_completed_meeting_s_webhook_is_the_outbox_row(pg):
+    """The lifecycle callback does not post the system hook. The subscriber event is the
+    outbox row written with the status."""
     mid = await pg.seed("requested", session_uid="sess-cb")
     sink = _SystemCapture()
     await _callback(
@@ -1555,14 +1555,12 @@ async def test_pg_the_system_url_still_receives_meeting_completed(pg):
         _event("completed", completion_reason="stopped", exit_code=0),
         sink=sink,
     )
-    assert [e["event_type"] for e in sink.calls] == ["meeting.completed"]
-    meeting = sink.calls[0]["data"]["meeting"]
-    assert meeting["id"] == mid
+    assert sink.calls == []
+    last = (await pg.events(mid))[-1]
+    assert last["event_type"] == "meeting.completed"
+    meeting = last["payload"]["data"]["meeting"]
     assert meeting["status"] == "completed"
-    assert meeting["completion_reason"] == "stopped"
-    assert meeting["start_time"] is not None and meeting["end_time"] is not None
-    assert not {"uuid", "entries", "outcome", "sequence"} & set(meeting)
-    assert await pg.seq(mid) == 3  # the subscription events are still written
+    assert await pg.seq(mid) == 3
 
 
 # ── Postgres: aw_meetings_failed_total, once per failed bot (§6.9 F-B) ──────────────────────

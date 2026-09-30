@@ -184,7 +184,7 @@ def create_app(
     token_secret: Optional[str] = None,
     # user-stop (DELETE /bots) redis command publisher
     command_publisher: Optional["object"] = None,
-    # per-user webhook delivery sink (WebhookSink) — delivers meeting.status_change on each FSM advance
+    # Accepted and stored. The callback does not post it: subscribers are delivered from webhook_outbox.
     webhook_sink: Optional["object"] = None,
     # operator-owned terminal callback — boot-frozen destination, never user/meeting input
     system_webhook_sink: Optional["object"] = None,
@@ -271,6 +271,9 @@ def create_app(
     app.state.lifecycle_sink = sink
     app.state.lifecycle_store = sink.store
     app.state.webhook_sink = webhook_sink
+    # Retained on the app so a caller can still pass them. The callback does not post either:
+    # the subscriber webhook is the outbox row written with the status.
+    app.state.system_webhook_sink = system_webhook_sink
     # #841: the per-user delivery ledger the read endpoint serves. Default to the in-memory fake so
     # the app-factory / conformance path stands up without redis (same pattern as the other ports).
     if delivery_ledger is None:
@@ -284,11 +287,8 @@ def create_app(
         app,
         sink,
         meeting_repo,
-        webhook_sink,
-        system_webhook_sink,
         redis,
         transcript_finalizer,
-        delivery_ledger,
     )
 
     # --- bot_spawn: POST /bots (invocation.v1 + runtime.v1) ---
@@ -399,17 +399,6 @@ def _build_webhooks_router(delivery_ledger: "object") -> "object":
 # ── lifecycle mount (the receiver's callback route, on the shared app) ───────────────────────────
 
 
-def _webhook_target_host(url: str) -> str:
-    """Host of a webhook URL, for the delivery log. Never the full URL: a subscriber's endpoint can
-    carry a token in its path or query, and an operator reading delivery outcomes does not need it."""
-    from urllib.parse import urlsplit
-
-    try:
-        return urlsplit(url).hostname or "?"
-    except Exception:  # noqa: BLE001 — a log field must never break delivery
-        return "?"
-
-
 def legacy_meeting_projection(row: dict) -> dict:
     """The parent's `_build_meeting_event_data` shape (webhooks.py) from a meeting row dict —
     the meeting block the typed webhooks the legacy system and per-user URLs receive carry (golden
@@ -444,11 +433,8 @@ def _mount_lifecycle(
     app: FastAPI,
     sink: LifecycleSink,
     meeting_repo: "_bot_spawn.MeetingRepo",
-    webhook_sink: "object" = None,
-    system_webhook_sink: "object" = None,
     redis: "object" = None,
     transcript_finalizer: "object" = None,
-    delivery_ledger: "object" = None,
 ) -> None:
     """Register the lifecycle.v1 callback route on the unified app (the lifecycle receiver's
     ``/bots/internal/callback/lifecycle`` handler, sharing the app's TraceMiddleware).
@@ -527,43 +513,6 @@ def _mount_lifecycle(
                 )
         return meeting_row
 
-    async def _deliver_system(typed_envelope: dict, meeting_row: dict) -> None:
-        """The operator callback is a separate trust boundary from a customer's webhook. It
-        receives terminal service facts only (``meeting.completed``, ``bot.failed``) of a finished
-        row, through a destination frozen by deployment config. A transient failure is retained
-        by the sink's dedicated retry queue; it never falls back to a user URL."""
-        if system_webhook_sink is None or typed_envelope.get("event_type") not in {
-            "meeting.completed",
-            "bot.failed",
-        }:
-            return
-        try:
-            result = await system_webhook_sink.deliver(
-                typed_envelope, label=f"meeting:{meeting_row.get('id')}"
-            )
-            if result is not None:
-                log_event(
-                    "system_webhook_delivery",
-                    audience="system",
-                    level="info" if result.status == "delivered" else "warning",
-                    span="lifecycle.callback",
-                    meeting_id=meeting_row.get("id"),
-                    fields={
-                        "outcome": result.status,
-                        "event_type": typed_envelope.get("event_type"),
-                        "status_code": result.status_code,
-                    },
-                )
-        except Exception as e:  # noqa: BLE001 — terminal fact stays in meeting storage
-            log_event(
-                "system_webhook_delivery_failed",
-                audience="system",
-                level="warning",
-                span="lifecycle.callback",
-                meeting_id=meeting_row.get("id"),
-                fields={"error_type": type(e).__name__},
-            )
-
     async def _reap_copilot(meeting_row: dict, *, session_uid: str) -> None:
         """COPILOT REAP (Bug 3): the moment a meeting lands TERMINAL, emit the `session_end` marker
         onto the meeting copilot transcript feed — the EXACT stream the meeting copilot worker
@@ -620,21 +569,25 @@ def _mount_lifecycle(
 
     async def _publish_edges(
         meeting_row: dict,
-        status_envelope: Optional[dict],
+        _status_envelope: Optional[dict],
         typed_envelope: Optional[dict],
         *,
         finished: bool,
     ) -> None:
-        """The outbound edges of one persisted meeting change: the flows edge, the system hook
-        (a ``finished`` row only) and the per-user ``webhook_url``."""
+        """The flows edge of one persisted meeting change.
+
+        The webhook is not sent here. ``write_status`` inserts the ``webhook_outbox`` row in the
+        same transaction as the status, and the publisher delivers that row to each subscriber.
+        The exporter is one subscriber: it writes the recording and calls notetaker. A second
+        post from this process is not part of that path.
+        """
         # THE MEETINGS→FLOWS PUBLISH EDGE (F168/F181, ADR-0037 / PRD 46 decision 42.2). An ad hoc
         # bot — started via the MCP `request_meeting_bot`, never through a calendar invite — has no
         # `invite_intake` reaction running for it, and that flow is the only thing that has ever
         # told flows a meeting started or finished (`emit_started` / `emit_completed`, PRD decision
-        # 42.2). meeting-api's only outbound door used to be the operator webhook below, which
-        # flows does not read. So this fires on exactly the two typed transitions that door already
-        # watches — one new domain telling flows a fact only meeting-api can know, alongside (never
-        # instead of) the webhook.
+        # 42.2). Flows does not read the subscriber webhook. This publish tells flows
+        # `meeting.started` and `meeting.completed` directly. It is not a second copy of that
+        # webhook: the webhook is the `webhook_outbox` row `write_status` commits with the status.
         #
         # THE SOURCE_EVENT_ID DELIBERATELY MATCHES flows' OWN SCHEME (`live-<id>` / `done-<id>`,
         # `lifecycle/webhook.py` / `flows_defs/production.py`), not a meeting-api-flavoured one.
@@ -675,76 +628,6 @@ def _mount_lifecycle(
                         )
                     except Exception:  # noqa: BLE001 — a publish edge is not a dependency
                         pass
-        # The operator callback: terminal service facts of a finished row (``_deliver_system``).
-        if typed_envelope is not None and finished:
-            await _deliver_system(typed_envelope, meeting_row)
-        # Deliver the sealed webhook.v1 envelopes (meeting.status_change + the typed event, if any)
-        # to the user's configured endpoint (per-user config rides on meeting.data — set at spawn
-        # from identity via the gateway; NO users-table read). The sink's per-user event filter
-        # (webhooks/delivery.py) suppresses unsubscribed event types before any HTTP.
-        # Best-effort: a delivery hiccup must never fail the bot's lifecycle callback (P3a).
-        if webhook_sink is not None:
-            data = meeting_row.get("data") if isinstance(meeting_row.get("data"), dict) else {}
-            url = data.get("webhook_url")
-            if url:
-                for env in (status_envelope, typed_envelope):
-                    if env is None:
-                        continue
-                    try:
-                        result = await webhook_sink.deliver(
-                            url, env, data.get("webhook_secret"),
-                            events_config=data.get("webhook_events"),
-                            label=f"meeting:{meeting_row.get('id')}",
-                        )
-                        # EVERY outcome is reported (#815). `deliver` never raises — it returns
-                        # delivered | suppressed | blocked | failed | queued — and the outcome used
-                        # to be discarded, so a webhook the subscriber never received (unsubscribed
-                        # event type, SSRF-blocked target, 4xx endpoint) was indistinguishable from
-                        # one that arrived: "my webhooks stopped" was undiagnosable in production.
-                        # The target is reported as host only — a webhook URL can carry a secret in
-                        # its path or query, and logs are not a place to put one.
-                        log_event(
-                            "webhook_delivery",
-                            audience="system",
-                            level="info" if result.status == "delivered" else "warning",
-                            span="lifecycle.callback",
-                            meeting_id=meeting_row.get("id"),
-                            fields={
-                                "outcome": result.status,
-                                "event_type": env.get("event_type"),
-                                "target_host": _webhook_target_host(url),
-                                "status_code": result.status_code,
-                                "error": result.error,
-                            },
-                        )
-                        # #841: ALSO record the outcome in the per-user delivery ledger — the
-                        # queryable surface GET /webhooks/deliveries serves. Logs (above) rotate and
-                        # are operator-facing; the ledger is the user's Delivery History. Host only,
-                        # never the URL/secret (P14). Best-effort — a ledger hiccup never fails the
-                        # callback, and a suppressed event is still worth recording (the user asked
-                        # "why didn't my webhook fire?" — "suppressed: unsubscribed" is the answer).
-                        if delivery_ledger is not None:
-                            from .webhooks import build_delivery_record
-
-                            try:
-                                await delivery_ledger.record(
-                                    meeting_row.get("user_id"),
-                                    build_delivery_record(
-                                        event_type=env.get("event_type"),
-                                        event_id=env.get("event_id"),
-                                        target_host=_webhook_target_host(url),
-                                        outcome=result.status,
-                                        status_code=result.status_code,
-                                        meeting_id=meeting_row.get("id"),
-                                    ),
-                                )
-                            except Exception as le:  # noqa: BLE001 — ledger is best-effort
-                                log_event("webhook_ledger_failed", audience="system",
-                                          level="warning", span="lifecycle.callback",
-                                          fields={"error": str(le)})
-                    except Exception as e:  # noqa: BLE001 — delivery is best-effort
-                        log_event("webhook_deliver_failed", audience="system", level="warning",
-                                  span="lifecycle.callback", fields={"error": str(e)})
 
     async def _finish(
         meeting_row: dict,
@@ -755,11 +638,11 @@ def _mount_lifecycle(
         event_type: Optional[str] = None,
         status_envelope: Optional[dict] = None,
     ) -> dict:
-        """Every finish step of a meeting, whatever ended it (§6.9 F-FIN): the transcript
-        finalized and the service provenance (``_finish_row``), the typed event, its edges
-        (``_publish_edges``: flows, the system hook, the per-user ``webhook_url``) and the copilot
-        reap. ``status_envelope`` is the ``meeting.status_change`` of the FSM advance that
-        finished it, if one did. Returns the finished row."""
+        """Every local finish step of a meeting, whatever ended it: the transcript finalized
+        and the service provenance (``_finish_row``), the flows edge and the copilot reap.
+        The subscriber webhook is not one of these steps. ``write_status`` stored it in
+        ``webhook_outbox`` in the same transaction as the status, and the publisher delivers
+        that row. Returns the finished row."""
         meeting_row = await _finish_row(meeting_row, persist)
         typed_envelope = _typed_envelope(change, meeting_row, event_type)
         await _publish_edges(meeting_row, status_envelope, typed_envelope, finished=True)
@@ -767,12 +650,13 @@ def _mount_lifecycle(
         return meeting_row
 
     async def finish_meeting(meeting_id: int, *, stopped: bool = False) -> None:
-        """§6.9 F-K2: the finish of a meeting the retry ended outside the lifecycle
+        """The local finish of a meeting the retry ended outside the lifecycle
         (``intake.retry.end``: its planned end, a stop, its deadline, its last send): the same
         ``_finish`` as a lifecycle end, keyed by its last bot session. A meeting that never had a
         session had no bot: nothing to finish. Each end is finished once
         (``repo.claim_finish``: the finished status and that session, marked in the claim's own
-        transaction), so a second call for the same end is a no-op.
+        transaction), so a second call for the same end is a no-op. The subscriber webhook
+        already committed with the status write that ended the meeting.
         ``stopped``: the user's stop drove it (``user_stop``), else the scheduler did."""
         from .lifecycle.machine import BotStatus, MeetingRecord, StatusChange
 
@@ -808,7 +692,8 @@ def _mount_lifecycle(
         force_terminal_on_destroy: bool = False,
     ) -> tuple[int, dict]:
         """Apply ONE lifecycle.v1 event to the FSM + run every side effect (persist, finalize,
-        webhook deliver, ws publish, copilot reap), returning ``(status_code, content)``.
+        ws publish, copilot reap), returning ``(status_code, content)``. The subscriber
+        webhook is the outbox row the status write commits with the status.
 
         This is the SINGLE in-process entry the FSM advance flows through — the HTTP endpoint
         ``POST /bots/internal/callback/lifecycle`` (the bot's own callback) is a thin wrapper around
@@ -916,17 +801,16 @@ def _mount_lifecycle(
                 )
         rec = change.record
         # Build + record the status_change envelope only on a REAL advance — an idempotent replay
-        # (change.no_op, e.g. the bot's 3x terminal retry) must NOT double-count it. The persist, the
-        # webhook deliver, and the ws publish below are already no_op-gated (they hang off meeting_row,
-        # set only on a real persist), so end-user delivery is exactly-once; this keeps the in-process
-        # envelope log honest too.
+        # (change.no_op, e.g. the bot's 3x terminal retry) must NOT double-count it. The persist
+        # and the ws publish below run only on a real advance, so this in-process log stays honest.
+        # Subscriber delivery is the outbox row that persist writes with the status.
         envelope = None
         if not change.no_op:
             envelope = build_status_change_envelope(change)
             app.state.status_change_webhooks.append(envelope)
         # Persist the FSM advance to the DB meeting row → durable + queryable (GET /meetings reflects
         # it, survives a restart), not only the in-process MeetingStore. Best-effort: a DB hiccup must
-        # never fail the bot's lifecycle callback (the in-process FSM + webhook already advanced).
+        # never fail the bot's lifecycle callback (the in-process FSM already advanced).
         # On an idempotent replay (change.no_op) the FSM did not actually advance — skip the
         # re-persist + re-deliver so a redelivered terminal does not fire a duplicate webhook /
         # publish. We still return 200 (handled below) — the redelivery is acknowledged as a no-op.

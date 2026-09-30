@@ -1,15 +1,7 @@
-"""#841 — the per-user delivery ledger: real deliveries appear in Delivery History.
+"""The old per-user delivery ledger.
 
-The bug (owner-witnessed, prod v0.12.15 walk): webhooks ARE delivered to the receiver, but the
-dashboard's Delivery History showed none of them — the core reported every outcome (#815→#817) only
-as a rotating ``logevent.v1`` system log, while the dashboard read a *different* store nothing wrote
-real deliveries to. "Delivered 27 / Failed 0" was an artifact of stale rows.
-
-The fix (point of introduction — the dispatcher): the lifecycle callback records each delivery
-outcome into a per-user ledger, and ``GET /webhooks/deliveries`` serves it. These evals drive the
-SAME app the production composition root builds (real ``WebhookSink`` → fake in-memory receiver, no
-network), assert a real delivery lands in the ledger read surface with its #817 outcome, and hold
-the P14 line (host only — never the URL or the secret).
+The lifecycle callback does not write it. Subscriber delivery is ``webhook_outbox``. These
+tests hold the read route's owner scope and the ledger's own host-only rule.
 """
 from __future__ import annotations
 
@@ -41,8 +33,9 @@ def _app(repo, receiver, ledger):
 
 # ── the fix: a real delivery appears in the user-visible history ────────────────────────────────
 
-def test_real_delivery_appears_in_delivery_history(goldens, receiver):
-    """A real delivery (not the Test button) appears in GET /webhooks/deliveries, outcome+code."""
+def test_the_callback_does_not_fill_the_old_delivery_history(goldens, receiver):
+    """A lifecycle advance does not POST meeting.data.webhook_url and does not write the
+    old per-user ledger. Subscriber delivery is the outbox."""
     repo, ledger = InMemoryMeetingRepo(), InMemoryDeliveryLedger()
     _seed(repo, session_uid="sess-uid", data={
         "webhook_url": "https://hook.example/x", "webhook_secret": "s3cr3t",
@@ -50,62 +43,27 @@ def test_real_delivery_appears_in_delivery_history(goldens, receiver):
     })
     client = TestClient(via_gateway(_app(repo, receiver, ledger)))
 
-    # Drive the FSM advance → the callback delivers meeting.status_change to the receiver (200)...
     r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
-    assert len(receiver.received) == 1, "receiver should have gotten the real delivery"
-
-    # ...and the SAME delivery is now queryable on the user-facing history surface.
+    assert receiver.received == []
     h = client.get("/webhooks/deliveries", headers={"X-User-Id": "1"})
     assert h.status_code == 200, h.text
-    rows = h.json()["deliveries"]
-    assert len(rows) == 1, f"the real delivery should be in Delivery History, got {rows}"
-    row = rows[0]
-    assert row["event_type"] == "meeting.status_change"
-    assert row["outcome"] == "delivered"
-    assert row["status_code"] == 200
-    assert row["target_host"] == "hook.example"
-    assert row["created_at"]
-
-    # P14: host only — the URL and the secret NEVER land in a ledger row.
-    blob = str(row).lower()
-    assert "s3cr3t" not in blob
-    assert "/x" not in row.get("target_host", "")
-    assert "webhook_url" not in row and "webhook_secret" not in row
+    assert h.json()["deliveries"] == []
 
 
-def test_suppressed_delivery_recorded_with_its_named_outcome(goldens, receiver):
-    """A suppressed delivery (unsubscribed event) appears with its #817 outcome — no HTTP happened.
-
-    The user asking "why didn't my webhook fire?" reads "suppressed", not silence."""
-    repo, ledger = InMemoryMeetingRepo(), InMemoryDeliveryLedger()
-    _seed(repo, session_uid="sess-uid", data={
-        "webhook_url": "https://hook.example/x", "webhook_secret": "s3cr3t",
-        # subscribes to completed only → meeting.status_change is SUPPRESSED
-        "webhook_events": {"meeting.completed": True, "meeting.status_change": False},
-    })
-    client = TestClient(via_gateway(_app(repo, receiver, ledger)))
-
-    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
-    assert r.status_code == 200, r.text
-    assert receiver.received == [], "a suppressed event must never reach the wire"
-
-    h = client.get("/webhooks/deliveries", headers={"X-User-Id": "1"})
-    rows = h.json()["deliveries"]
-    assert len(rows) == 1
-    assert rows[0]["outcome"] == "suppressed"
-    assert rows[0]["status_code"] is None
-
-
-def test_delivery_history_is_owner_scoped(goldens, receiver):
+def test_delivery_history_is_owner_scoped(receiver):
     """The history is scoped to X-User-Id — another user never sees this user's deliveries."""
     repo, ledger = InMemoryMeetingRepo(), InMemoryDeliveryLedger()
-    _seed(repo, session_uid="sess-uid", user_id=1, data={
-        "webhook_url": "https://hook.example/x", "webhook_secret": "s3cr3t",
-        "webhook_events": {"meeting.status_change": True},
-    })
+    record = build_delivery_record(
+        event_type="meeting.status_change",
+        event_id="evt_scope",
+        target_host="hook.example",
+        outcome="delivered",
+        status_code=200,
+        meeting_id=7,
+    )
+    asyncio.run(ledger.record(1, record))
     client = TestClient(via_gateway(_app(repo, receiver, ledger)))
-    client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
 
     assert client.get("/webhooks/deliveries", headers={"X-User-Id": "1"}).json()["deliveries"]
     assert client.get("/webhooks/deliveries", headers={"X-User-Id": "2"}).json()["deliveries"] == []

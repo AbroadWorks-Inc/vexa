@@ -650,8 +650,8 @@ class SqlAlchemyMeetingRepo:
             # post-commit; reading it in _row_to_dict would trigger implicit async IO (MissingGreenlet).
             # The other write adapters (create_meeting/set_bot_container/reopen) follow the same pattern.
             await db.refresh(m)
-            # Return the updated row so the lifecycle callback can deliver the per-user webhook from
-            # meeting.data (and the stop route gets a clean dict) without a second query.
+            # Return the updated row for the callback's local finish steps. The subscriber
+            # webhook is the outbox row write_status already inserted in this transaction.
             return _row_to_dict(m)
 
     async def count_active_bots(self, *, user_id, exclude_meeting_id=None) -> int:

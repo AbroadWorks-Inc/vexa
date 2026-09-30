@@ -96,9 +96,10 @@ def test_the_filter_names_every_internal_key_by_its_constant():
     assert set(INTERNAL_KEYS) <= _INTERNAL_DATA_KEYS
 
 
-async def test_a_finished_meeting_s_webhooks_never_carry_its_finish_marker():
-    """The finish writes ``data.finished_end`` before it posts the system hook and the
-    per-user ``webhook_url``: neither payload carries it."""
+async def test_a_finished_meeting_does_not_post_a_second_webhook():
+    """The finish stores ``data.finished_end`` and does not post the system hook or the
+    per-user ``webhook_url``. The subscriber body is the outbox row from the status write,
+    and that projection is already checked to omit the marker."""
     from types import SimpleNamespace
 
     from meeting_api import create_app
@@ -129,6 +130,4 @@ async def test_a_finished_meeting_s_webhooks_never_carry_its_finish_marker():
     )
     await app.state.finish_meeting(meeting["id"])
     assert FINISHED_END in repo._meetings[meeting["id"]]["data"]
-    assert len(delivered) == 2  # the system hook and the per-user webhook_url
-    for payload in delivered:
-        _assert_absent(payload)
+    assert delivered == []

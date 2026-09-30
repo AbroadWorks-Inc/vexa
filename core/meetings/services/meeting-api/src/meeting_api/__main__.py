@@ -10,8 +10,8 @@ control-plane background loops alongside the HTTP app via the FastAPI lifespan:
     moves immutable live segments from the redis hash ``meeting:{id}:segments`` into the
     ``transcriptions`` table (upsert on segment identity; redis trimmed only after the confirmed
     write) and drains the copilot's ``proc:meeting:{id}`` notes into ``meeting.data`` JSONB.
-  * **webhook retry-drain** — one ``drain_retry_queue`` sweep per interval over the redis retry
-    queue (failed ``meeting.status_change`` deliveries are retried with backoff).
+  * **webhook retry-drain** — drains the old redis retry queue. The finish path does not enqueue
+    onto it. Subscriber delivery is the publisher and the sender below, from ``webhook_outbox``.
   * **webhook publisher** (§1.8) — single-flight: turns unpublished ``webhook_outbox`` rows into
     ``webhook_deliveries`` rows, one per matching active subscriber (``intake.outbox``).
   * **webhook sender** (§1.8) — one per replica: claims due ``webhook_deliveries`` rows with a lease
@@ -184,7 +184,11 @@ def build_production_app():
         secret_key=os.getenv("S3_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY"),
     )
 
-    # Per-user webhook delivery (WebhookSink: SSRF-guard → event-filter → sign → POST → enqueue-retry).
+    # Legacy per-user and system sinks. The lifecycle callback does not post them: a subscriber
+    # (the exporter) is delivered from webhook_outbox by the publisher and the sender below.
+    # These objects stay so an operator tuple that is half-set still refuses to boot, and so a
+    # redis retry queued before this process started can still drain. Nothing enqueues a new
+    # meeting event onto them.
     # httpx transport; failures route to the redis RetryQueue the background drain loop sweeps.
     # WH2: the transport is IP-PINNED — it re-resolves + re-validates the host at connect time and
     # dials the validated IP (preserving Host + TLS SNI), closing the DNS-rebinding TOCTOU window
@@ -201,9 +205,8 @@ def build_production_app():
 
     system_webhook_sink = build_system_webhook_from_env(redis_client)
 
-    # #841: the per-user delivery ledger — the queryable record GET /webhooks/deliveries serves.
-    # A per-user capped Redis list; the lifecycle callback records each delivery outcome so the
-    # dashboard's Delivery History reflects real deliveries, not just its own Test button.
+    # #841: GET /webhooks/deliveries still reads this Redis list. The lifecycle callback no longer
+    # writes it. Subscriber delivery state is webhook_deliveries, written by the outbox publisher.
     from .webhooks import RedisDeliveryLedger
 
     delivery_ledger = RedisDeliveryLedger(redis_client)

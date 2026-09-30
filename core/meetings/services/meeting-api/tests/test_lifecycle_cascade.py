@@ -4,8 +4,8 @@ multi-module chain fires coherently end to end (not just each seam in isolation)
   POST /bots ─bot_spawn─► (workload spawned, session created)
             ─lifecycle callback: joining → active → completed─►
                 ├─ sessions/repo: the DB status is durably persisted (rehydrate-safe)
-                ├─ webhooks:      each advance delivers a sealed meeting.status_change (HMAC-signed) to the
-                │                 per-user URL — through the SAME event-filter the gateway config drives
+                ├─ webhooks:      the callback does not post the per-user URL. Subscribers are
+                │                 delivered from the outbox row the status write commits.
                 └─ ws fan-out:    each advance publishes a 0.10.6 meeting.status frame to bm:{id}:status
 
 Everything runs over ``meeting_api.create_app`` (the SHIPPED handlers of every module) via TestClient,
@@ -115,30 +115,10 @@ def test_full_meeting_lifecycle_cascade():
     assert [f["payload"]["status"] for f in frames] == ["joining", "active", "completed"]
     assert all(f["type"] == "meeting.status" and f["meeting"]["id"] == meeting_id for f in frames)
 
-    # ── 5. webhook delivery — each advance delivered a signed meeting.status_change to the per-user URL ──
-    status_deliveries = [d for d in webhook.deliveries
-                         if d["body"]["event_type"] == "meeting.status_change"]
-    assert len(status_deliveries) == 3, \
-        f"expected 3 status_change deliveries, got {len(status_deliveries)}"
-    for d in status_deliveries:
-        assert d["url"] == HOOK_URL
-        assert "x-webhook-signature" in d["headers"], "delivery must be HMAC-signed"
-    last = status_deliveries[-1]["body"]
-    assert last["data"]["status_change"]["new_status"] == "completed" or \
-        last["data"]["meeting"]["status"] == "completed", f"terminal payload: {last['data']}"
+    # ── 5. the per-user URL is not a second sender ──
+    assert webhook.deliveries == []
 
-    # ── 5b. TYPED events ride alongside, per the user's event filter: this user opted into
-    # meeting.status_change only, so meeting.started is SUPPRESSED by the filter, while
-    # meeting.completed (the default-enabled event) delivers with the post-meeting envelope.
-    typed_deliveries = [d for d in webhook.deliveries
-                        if d["body"]["event_type"] != "meeting.status_change"]
-    assert [d["body"]["event_type"] for d in typed_deliveries] == ["meeting.completed"]
-    completed = typed_deliveries[0]["body"]
-    assert completed["data"]["meeting"]["status"] == "completed"
-    assert "status_change" not in completed["data"], "post-meeting envelope carries {meeting} only"
-    assert "x-webhook-signature" in typed_deliveries[0]["headers"]
-
-    # ── 6. the in-process envelope log mirrors the deliveries exactly (one per REAL advance) ──
+    # ── 6. the in-process envelope log records one status change per real advance ──
     # (proves no double-count on the cascade — the no_op guard held)
     envelopes = client.app.state.status_change_webhooks
     assert len(envelopes) == 3

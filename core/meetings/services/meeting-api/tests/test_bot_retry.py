@@ -413,8 +413,7 @@ async def test_a_retried_session_sends_bot_retry_and_no_meeting_level_side_effec
     assert typed["event_type"] == "bot.retry"
     assert typed["data"]["meeting"]["status"] == "requested"
     assert typed["data"]["status_change"]["to"] == "failed"
-    assert sinks.user[-2:] == ["meeting.status_change", "bot.retry"]
-    assert sinks.system == []
+    assert sinks.user == [] and sinks.system == []
     assert sinks.finalized == [] and sinks.reaped == [] and sinks.published == []
 
 
@@ -440,8 +439,7 @@ async def test_a_lost_bot_on_its_last_attempt_is_bot_failed_everywhere(monkeypat
     app, sinks, row = await _drive("last_lost", [JOINING, ACTIVE, lost], monkeypatch)
     assert row["status"] == "failed"
     assert app.state.typed_webhooks[-1]["event_type"] == "bot.failed"
-    assert sinks.system == ["bot.failed"]
-    assert sinks.user[-1] == "bot.failed"
+    assert sinks.system == [] and sinks.user == []
     assert sinks.finalized == [row["id"]] and len(sinks.reaped) == 1
     assert "meeting.completed" not in sinks.published
 
@@ -456,11 +454,11 @@ async def test_a_refused_stale_terminal_reaches_no_system_sink_and_no_flows(
     assert sinks.finalized == [] and sinks.reaped == []
 
 
-async def test_a_normal_end_still_reaches_every_sink_once(monkeypatch):
+async def test_a_normal_end_finishes_once_and_posts_no_webhook(monkeypatch):
     done = ({"status": "completed", "completion_reason": "left_alone"}, False)
     _, sinks, row = await _drive("normal", [JOINING, ACTIVE, done, done], monkeypatch)
     assert row["status"] == "completed"
-    assert sinks.system == ["meeting.completed"]
+    assert sinks.system == [] and sinks.user == []
     assert sinks.published.count("meeting.completed") == 1
     assert sinks.finalized == [row["id"]]
 
@@ -469,14 +467,14 @@ async def test_a_normal_end_still_reaches_every_sink_once(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("status", "event", "flows"),
+    ("status", "flows"),
     [
-        ("failed", "bot.failed", []),
-        ("completed", "meeting.completed", ["meeting.completed"]),
+        ("failed", []),
+        ("completed", ["meeting.completed"]),
     ],
 )
 async def test_a_meeting_ended_outside_the_lifecycle_runs_every_finish_step(
-    monkeypatch, status, event, flows
+    monkeypatch, status, flows
 ):
     from meeting_api import create_app
     from meeting_api import events as events_mod
@@ -507,15 +505,15 @@ async def test_a_meeting_ended_outside_the_lifecycle_runs_every_finish_step(
     )
     await app.state.finish_meeting(meeting["id"])
     assert sinks.finalized == [meeting["id"]]
-    assert sinks.system == [event]
-    assert sinks.user == [event]
+    assert sinks.system == [] and sinks.user == []
     assert sinks.published == flows
     assert sinks.reaped == [f"tc:meeting:{meeting['id']}"]
 
 
 async def test_a_meeting_end_is_finished_once_however_often_the_finish_is_asked():
-    """M7: a second finish of the same meeting end is a no-op: one system-hook post, one
-    reap. A continued meeting's next end is a new end, finished again."""
+    """A second finish of the same meeting end is a no-op: one finalize, one reap.
+    A continued meeting's next end is a new end, finished again. The subscriber
+    webhook is the outbox row from the status write, so this finish posts none."""
     from meeting_api import create_app
     from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
 
@@ -538,13 +536,13 @@ async def test_a_meeting_end_is_finished_once_however_often_the_finish_is_asked(
     )
     await app.state.finish_meeting(mid)
     await app.state.finish_meeting(mid, stopped=True)
-    assert sinks.system == ["bot.failed"]
+    assert sinks.system == []
     assert sinks.finalized == [mid] and sinks.reaped == [f"tc:meeting:{mid}"]
     await repo.create_session(
         meeting_id=mid, session_uid="sess-2"
     )  # continued, ended again
     await app.state.finish_meeting(mid)
-    assert sinks.system == ["bot.failed", "bot.failed"]
+    assert sinks.system == []
     assert len(sinks.reaped) == 2
 
 
