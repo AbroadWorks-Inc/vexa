@@ -9,6 +9,7 @@
 import type { Page } from "playwright";
 import { joinGoogleMeeting } from "./googlemeet/join";
 import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent } from "./googlemeet/admission";
+import { announceGoogleMeetAdmission } from "./googlemeet/chat";
 import { prepareForRecording, leaveGoogleMeet } from "./googlemeet/leave";
 import { startGoogleRemovalMonitor } from "./googlemeet/removal";
 import { joinMicrosoftTeams } from "./msteams/join";
@@ -131,6 +132,12 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     throw new Error(
       `Unsupported platform '${platform}' — this join layer drives google_meet, teams, zoom, jitsi`,
     );
+  }
+
+  // Meet chat only. Teams, Zoom, and Jitsi keep their own chat surfaces.
+  // announceGoogleMeetAdmission swallows its own errors.
+  if (admitted && platform === "google_meet") {
+    await announceGoogleMeetAdmission(page);
   }
 
   return { admitted: !!admitted, state: admitted ? "admitted" : "awaiting_admission" };

@@ -474,6 +474,45 @@ export const googlePeopleButtonSelectors: string[] = [
   'button[data-tooltip*="Participants"]'
 ];
 
+// Chat openers, tried in order. "Chat with everyone" is the documented toggle.
+// "Send a message to everyone" is the same control's tooltip on newer Meet.
+// These run inside page.evaluate (document.querySelector), so they are plain CSS.
+export const googleChatOpenButtonSelectors: string[] = [
+  'button[aria-label="Chat with everyone"]',
+  '[role="button"][aria-label="Chat with everyone"]',
+  'button[aria-label="In-call messages"]',
+  '[role="button"][aria-label="In-call messages"]',
+  'button[data-tooltip="Chat with everyone"]',
+  'button[aria-label="Send a message to everyone"]',
+  '[role="button"][aria-label="Send a message to everyone"]',
+];
+
+// The message field. A textarea on current Meet; a textbox when the composer
+// is contenteditable. The panel is closed until the opener is clicked.
+export const googleChatComposerSelectors: string[] = [
+  'textarea[aria-label="Send a message to everyone"]',
+  'textarea[aria-label="Send a message"]',
+  'textarea[aria-label^="Send a message"]',
+  'div[role="textbox"][aria-label="Send a message to everyone"]',
+  'div[role="textbox"][aria-label="Send a message"]',
+  'div[role="textbox"][aria-label^="Send a message"]',
+  'div[contenteditable="true"][aria-label^="Send a message"]',
+];
+
+// The send control next to the composer. Specific labels come before
+// "Send a message to everyone", which is also an opener tooltip.
+export const googleChatSendButtonSelectors: string[] = [
+  'button[aria-label="Send a message"]',
+  'button[aria-label="Send message"]',
+  'button[aria-label="Send"]',
+  '[role="button"][aria-label="Send a message"]',
+  '[role="button"][aria-label="Send message"]',
+  '[role="button"][aria-label="Send"]',
+  'button[data-tooltip="Send a message"]',
+  'button[aria-label="Send a message to everyone"]',
+  '[role="button"][aria-label="Send a message to everyone"]',
+];
+
 // EXECUTION-CONTEXT DECLARATION — consumed by src/shared/selector-validity.test.ts.
 // Arrays named here ship into page.evaluate and run through
 // document.querySelector, so the gate additionally CSS-parses them: a
@@ -484,5 +523,8 @@ export const googlePeopleButtonSelectors: string[] = [
 export const browserContextSelectorArrays: string[] = [
   'googleLeaveButtonMatchers',
   'googleLobbyIconGlyphSelectors',
+  'googleChatOpenButtonSelectors',
+  'googleChatComposerSelectors',
+  'googleChatSendButtonSelectors',
 ];
 
