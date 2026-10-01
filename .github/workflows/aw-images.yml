@@ -1,19 +1,20 @@
 name: AW images — build & push
 
 # ────────────────────────────────────────────────────────────────
-# Builds AW Bots' own five images and pushes them to GHCR:
+# Builds AW Bots' own six images and pushes them to GHCR:
 #
 #   ghcr.io/voyantt-consultancy-services-llp/aw-bots-meeting-api
 #   ghcr.io/voyantt-consultancy-services-llp/aw-bots-bot
 #   ghcr.io/voyantt-consultancy-services-llp/aw-bots-exporter
 #   ghcr.io/voyantt-consultancy-services-llp/aw-bots-gateway
 #   ghcr.io/voyantt-consultancy-services-llp/aw-bots-admin-api
+#   ghcr.io/voyantt-consultancy-services-llp/aw-bots-runtime
 #
 # Everything else AW Bots runs is upstream's published vexaai/* images.
 #
 # When it runs, and which tags it pushes:
 #
-#   push to development   -> :<commit sha>            all five images
+#   push to development   -> :<commit sha>            all six images
 #   manual run            -> :<commit sha> + :<tag>   the images you pick, e.g. tag v0.1.1
 #
 # There is no :latest or other moving tag. The deployment (aw-notetaker
@@ -47,7 +48,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, meeting-api, bot, exporter, gateway, admin-api]
+        options: [all, meeting-api, bot, exporter, gateway, admin-api, runtime]
 
 # A newer push to development supersedes a build still running for an older one.
 # Manual runs are never cancelled.
@@ -176,6 +177,39 @@ jobs:
           cache-from: type=gha,scope=aw-bots-admin-api
           cache-to: type=gha,scope=aw-bots-admin-api,mode=max
 
+  # The runtime starts the bot pods. Upstream's vexaai/v012-runtime ran here until 2026-10-01;
+  # ours adds the exited-pod reaper (core/runtime: a Succeeded or Failed bot pod is deleted once
+  # its exit is recorded, so the meeting node can scale to zero). Build context is its own folder
+  # (pyproject.toml, uv.lock, src/), like admin-api.
+  runtime:
+    needs: tags
+    if: ${{ github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'runtime' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+      - name: Image references
+        id: refs
+        env:
+          SUFFIXES: ${{ needs.tags.outputs.suffixes }}
+        run: |
+          REFS=""
+          for S in ${SUFFIXES}; do REFS="${REFS}${REG}/aw-bots-runtime:${S},"; done
+          echo "refs=${REFS%,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7
+        with:
+          context: core/runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.refs.outputs.refs }}
+          cache-from: type=gha,scope=aw-bots-runtime
+          cache-to: type=gha,scope=aw-bots-runtime,mode=max
+
   exporter:
     needs: tags
     if: ${{ github.event_name == 'push' || inputs.images == 'all' || inputs.images == 'exporter' }}
@@ -258,7 +292,7 @@ jobs:
           for S in ${SUFFIXES}; do docker push "${REG}/aw-bots-bot:${S}"; done
 
   summary:
-    needs: [tags, meeting-api, exporter, bot, gateway, admin-api]
+    needs: [tags, meeting-api, exporter, bot, gateway, admin-api, runtime]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -270,6 +304,7 @@ jobs:
           R_EXP: ${{ needs.exporter.result }}
           R_GW: ${{ needs.gateway.result }}
           R_ADM: ${{ needs.admin-api.result }}
+          R_RUN: ${{ needs.runtime.result }}
         run: |
           {
             echo "### AW images"
@@ -281,12 +316,13 @@ jobs:
             echo "| aw-bots-exporter | ${R_EXP} | ${SUFFIXES} |"
             echo "| aw-bots-gateway | ${R_GW} | ${SUFFIXES} |"
             echo "| aw-bots-admin-api | ${R_ADM} | ${SUFFIXES} |"
+            echo "| aw-bots-runtime | ${R_RUN} | ${SUFFIXES} |"
             echo ""
             echo "Nothing is deployed. To roll a tag out, set it in aw-notetaker"
-            echo "deployment/base/aw-bots/values.yaml (meeting-api, bot, gateway, admin-api) and"
+            echo "deployment/base/aw-bots/values.yaml (meeting-api, bot, gateway, admin-api, runtime) and"
             echo "deployment/base/aw-exporter/deployment.yaml (exporter), then follow the runbook"
             echo "(deployment/base/aw-bots/README.md, \"Upgrading our images\")."
           } >> "$GITHUB_STEP_SUMMARY"
-          for R in "$R_API" "$R_BOT" "$R_EXP" "$R_GW" "$R_ADM"; do
+          for R in "$R_API" "$R_BOT" "$R_EXP" "$R_GW" "$R_ADM" "$R_RUN"; do
             if [ "$R" = "failure" ] || [ "$R" = "cancelled" ]; then exit 1; fi
           done

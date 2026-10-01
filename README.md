@@ -202,7 +202,7 @@ One Helm install runs all of these. Each service is its own Docker image.
 | **gateway** (API front door) | built from this repo | **ours** (the `/v2` routes, new scopes, signed identity, write limit) |
 | **admin-api** (users, API keys, settings) | built from this repo | **ours** (webhook subscriptions, new scopes, checks the signed identity) |
 | **meeting-api** | built from this repo | **ours** (accepts `speaker-activity`; the `/v2` intake and webhooks) |
-| runtime (starts bot pods) | `vexaai/v012-runtime` | upstream |
+| **runtime** (starts bot pods) | built from this repo | **ours** (deletes a bot pod once it has exited, so the meeting node can scale to zero) |
 | **bot** | built from this repo | **ours** (writes `speaker-activity.jsonl`) |
 | terminal (web console) | `vexaai/v012-terminal` | upstream |
 | agent-api, dashboard, flows | `vexaai/*` | upstream; all three **off** for us (we don't use Vexa's AI agents) |
