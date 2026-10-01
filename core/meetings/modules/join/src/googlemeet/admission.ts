@@ -74,6 +74,19 @@ export const CAPTCHA_SOLVE_GRACE_MS = 120_000;
 // bot's pages never share the clock and nothing leaks after the page is gone.
 const captchaSuppressionSince = new WeakMap<object, number>();
 
+// Google Meet withdraws an unanswered "Ask to join" about 10 minutes after the knock: the page
+// logs `DisconnectedError, EndCause = 72` and the waiting room disappears with nothing in its
+// place — no denial copy, no in-call controls (seven of seven bots on 2026-10-01, each at exactly
+// +10:00 after the knock). A real admission replaces the lobby with the meeting UI within a few
+// seconds and a denial shows its copy at once, so a lobby that has been gone this long with
+// neither means the join request expired. That is a typed `lobby_timeout` (the JoinDriver's
+// `awaiting_admission_timeout`: nobody answered, a legit retry with a fresh knock) — not the rest
+// of the lobby budget on a dead page and then `join_failure`, the join layer's own failure class.
+export const KNOCK_LOST_GRACE_MS = 20_000;
+const KNOCK_LOST_MESSAGE =
+  "Google Meet withdrew the join request: the waiting room vanished with no admission and no denial " +
+  "(Meet drops an unanswered 'Ask to join' after about 10 minutes)";
+
 export type GoogleRejectionReason = "host_denial" | "error_page" | "captcha_unsolved";
 export type GoogleRejectionVerdict = {
   rejected: boolean;
@@ -423,6 +436,7 @@ export async function waitForGoogleMeetingAdmission(
       const checkInterval = 2000; // Check every 2 seconds for faster detection
       const startTime = Date.now();
       let unknownStateDuration = 0;
+      let lobbyLostMs = 0; // how long the lobby has been gone with neither an admission nor a denial
       const effectiveTimeout = () => timeout + getEscalationExtensionMs();
 
       while (Date.now() - startTime < effectiveTimeout()) {
@@ -445,16 +459,25 @@ export async function waitForGoogleMeetingAdmission(
             return true;
           }
 
-          // Keep waiting if neither admitted nor rejected
+          // Neither admitted nor rejected: the knock may have expired (see KNOCK_LOST_GRACE_MS).
+          lobbyLostMs += checkInterval;
+          if (lobbyLostMs >= KNOCK_LOST_GRACE_MS) {
+            log(`⏱️ Google Meet waiting room gone for ${Math.round(lobbyLostMs / 1000)}s with no admission and no denial — the join request expired`);
+            throw new AdmissionError("lobby_timeout", KNOCK_LOST_MESSAGE);
+          }
         } else {
           unknownStateDuration = 0;
+          lobbyLostMs = 0;
         }
 
-        // Escalation check
-        const elapsedMs = Date.now() - startTime;
-        const escalation = checkEscalation(elapsedMs, timeout, unknownStateDuration);
-        if (escalation) {
-          await triggerEscalation(botConfig, escalation.reason);
+        // Escalation check. Not while the lobby-lost clock runs: a verdict is seconds away, and
+        // an expired knock is nothing a human over VNC can answer (no request is pending).
+        if (lobbyLostMs === 0) {
+          const elapsedMs = Date.now() - startTime;
+          const escalation = checkEscalation(elapsedMs, timeout, unknownStateDuration);
+          if (escalation) {
+            await triggerEscalation(botConfig, escalation.reason);
+          }
         }
 
         // Wait before next check
@@ -524,9 +547,12 @@ export async function waitForGoogleMeetingAdmission(
       }
 
       if (stillInWaitingRoom) {
-        // Re-run the waiting room loop with the remaining time
+        // Re-run the waiting room loop with the remaining time. This is the path a bot sent
+        // ahead of the meeting takes (the first poll sees no lobby; the lobby appears a tick
+        // later), so it must notice an expired knock too — see KNOCK_LOST_GRACE_MS.
         const checkInterval = 2000;
         const startTime2 = Date.now();
+        let lobbyLostMs = 0;
         while (Date.now() - startTime2 < timeout) {
           await throwIfGoogleAdmissionRejected(page, "late waiting-room polling");
 
@@ -534,8 +560,19 @@ export async function waitForGoogleMeetingAdmission(
           if (!stillWaiting) {
             const admissionFound2 = await checkForGoogleAdmissionIndicators(page);
             if (admissionFound2) return true;
+            lobbyLostMs += checkInterval;
+            if (lobbyLostMs === checkInterval) {
+              log("Google Meet waiting room indicator disappeared (late path) - checking if bot was admitted or rejected...");
+            }
+            if (lobbyLostMs >= KNOCK_LOST_GRACE_MS) {
+              log(`⏱️ Google Meet waiting room gone for ${Math.round(lobbyLostMs / 1000)}s with no admission and no denial — the join request expired`);
+              throw new AdmissionError("lobby_timeout", KNOCK_LOST_MESSAGE);
+            }
+          } else {
+            lobbyLostMs = 0;
           }
           await page.waitForTimeout(checkInterval);
+          log(`Still in Google Meet waiting room (late path)... ${Math.round((Date.now() - startTime2) / 1000)}s elapsed`);
         }
       }
     }
@@ -561,6 +598,11 @@ export async function waitForGoogleMeetingAdmission(
     log("📸 Screenshot taken: No meeting indicators found after timeout");
     if (lobbyStillVisible) {
       throw new AdmissionError("lobby_timeout", "Bot is still in the Google Meet waiting room after timeout — host did not admit");
+    }
+    if (stillInWaitingRoom) {
+      // The bot WAS in the lobby and it is gone without an admission or a denial: the knock
+      // expired unanswered. That is the host's silence, not a join-layer failure.
+      throw new AdmissionError("lobby_timeout", KNOCK_LOST_MESSAGE);
     }
     throw new AdmissionError("join_failure", "Bot failed to join the Google Meet meeting — no meeting indicators found within timeout");
 
