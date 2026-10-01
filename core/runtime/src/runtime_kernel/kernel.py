@@ -11,6 +11,8 @@ Quotas (O-RT-2): create() rejects the N+1th active workload for an owner via the
 count_for_owner."""
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -52,6 +54,9 @@ class StartFailed(Exception):
         super().__init__(reason)
 
 
+log = logging.getLogger("runtime_kernel")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -80,6 +85,9 @@ class Runtime:
         self.owner_quota = owner_quota
         # Live, non-serializable backend handles. Empty on a fresh process (post-restart).
         self._handles: dict[str, WorkloadHandle] = {}
+        # One observer records an exit and removes the pod. A second reader must not
+        # see the deleted pod and store that as a clean exit.
+        self._exit_lock = threading.Lock()
 
     def _emit(self, workload_id: str, state: RuntimeState, **kw) -> RuntimeEvent:
         ev = RuntimeEvent(workloadId=workload_id, state=state, at=_now(), **kw)
@@ -224,25 +232,108 @@ class Runtime:
 
     def get(self, workload_id: str) -> WorkloadStatus:
         record = self._record(workload_id)
-        status = record.status
-        # A running record with NO in-process handle (restart) re-derives one from the substrate,
-        # so the exit-reflection below stays truthful across a runtime recreate.
-        handle = (
-            self._handle_for(workload_id)
-            if status.state == RuntimeState.running
-            else self._handles.get(workload_id)
-        )
-        # reflect a workload that exited on its own (only observable while we hold a live handle)
-        if status.state == RuntimeState.running and handle is not None:
+        if record.status.state != RuntimeState.running:
+            return record.status
+        with self._exit_lock:
+            record = self._record(workload_id)
+            status = record.status
+            if status.state != RuntimeState.running:
+                return status
+            # A running record with NO in-process handle (restart) re-derives one from the
+            # substrate, so the exit-reflection below stays truthful across a runtime recreate.
+            handle = self._handle_for(workload_id)
+            if handle is None:
+                return status
             code = self.backend.exit_code(handle)
-            if code is not None:
-                status.state = RuntimeState.stopped
-                status.exitCode = code
-                status.stoppedAt = _now()
-                status.stopReason = StopReason.completed if code == 0 else StopReason.failed
-                self._persist(record.spec, status)
-                self._emit(workload_id, RuntimeState.stopped, exitCode=code, stopReason=status.stopReason)
-        return status
+            if code is None:
+                return status
+            # Store the exit, then drop the pod. A later read uses the stored code.
+            self._remember_exit(workload_id, code)
+            self._reap(handle, code)
+            stored = self.store.get(workload_id)
+            return stored.status if stored is not None else status
+
+    def _remember_exit(self, workload_id: str, code: int) -> None:
+        """Record a self-exit that was read while the pod still existed.
+
+        A record that is already past ``running`` keeps the code it has. Callers
+        hold ``_exit_lock``.
+        """
+        reason = StopReason.completed if code == 0 else StopReason.failed
+        record = self.store.get(workload_id)
+        if record is None:
+            spec = WorkloadSpec(workloadId=workload_id, profile="adopted", env={})
+            status = WorkloadStatus(
+                workloadId=workload_id, profile=spec.profile,
+                state=RuntimeState.stopped, backend=self.backend.name,
+                exitCode=code, stoppedAt=_now(), stopReason=reason,
+            )
+            self._persist(spec, status)
+            self._emit(workload_id, RuntimeState.stopped, exitCode=code, stopReason=reason)
+            return
+        status = record.status
+        if status.state != RuntimeState.running:
+            return
+        status.state = RuntimeState.stopped
+        status.exitCode = code
+        status.stoppedAt = _now()
+        status.stopReason = reason
+        self._persist(record.spec, status)
+        self._emit(workload_id, RuntimeState.stopped, exitCode=code, stopReason=reason)
+
+    def _reap(self, handle: WorkloadHandle, code: int) -> bool:
+        """Drop an already-exited pod. False when this backend has no reaper, or the delete failed.
+
+        The caller stores the exit code before this. A failed delete stays unreaped
+        so a later pass can try again.
+        """
+        reaper = getattr(self.backend, "reap_exited", None)
+        if reaper is None:
+            return False
+        try:
+            return bool(reaper(handle, code))
+        except Exception:  # noqa: BLE001 — the stored exit stands even if the pod delete fails
+            log.warning("reap of exited workload %s failed", handle.id, exc_info=True)
+            return False
+
+    def reap_exited_workloads(self) -> int:
+        """Remove pods whose containers have exited, after their exit is stored.
+
+        Runs on the k8s backend only. A Failed pod and a Succeeded pod are both
+        removed: either one keeps the meeting node from scaling to zero. The
+        non-zero exit's container log is copied to the runtime log by the backend
+        before the delete. Returns how many pods this pass removed.
+        """
+        reaper = getattr(self.backend, "reap_exited", None)
+        lister = getattr(self.backend, "list_workload_containers", None)
+        if reaper is None or lister is None:
+            return 0
+        try:
+            discovered = lister()
+        except Exception:  # noqa: BLE001 — a listing failure leaves the pods for the next pass
+            log.warning("exited-pod listing failed", exc_info=True)
+            return 0
+        removed = 0
+        for info in discovered:
+            if info.get("phase") not in ("Succeeded", "Failed"):
+                continue
+            workload_id = info.get("workload_id")
+            name = info.get("name")
+            if not workload_id or not name:
+                continue
+            raw_code = info.get("exit_code")
+            code = int(raw_code) if raw_code is not None else (
+                0 if info.get("phase") == "Succeeded" else 1
+            )
+            with self._exit_lock:
+                self._remember_exit(str(workload_id), code)
+                handle = self._handles.get(str(workload_id))
+                if handle is None:
+                    handle = WorkloadHandle(id=str(workload_id), impl=name)
+                    self._handles[str(workload_id)] = handle
+                if self._reap(handle, code):
+                    removed += 1
+        return removed
 
     def list(self) -> list[WorkloadStatus]:
         return [self.get(r.spec.workloadId) for r in self.store.list()]

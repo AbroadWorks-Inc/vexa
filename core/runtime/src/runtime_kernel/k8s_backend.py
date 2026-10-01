@@ -10,6 +10,7 @@ merge replaces the generated container wholesale and strips its image, env and c
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from typing import Optional
@@ -18,6 +19,13 @@ from .backend import WorkloadHandle
 from .models import Resources
 from .mounts import k8s_volume_mounts
 from .profiles import Runnable
+
+log = logging.getLogger("runtime_kernel.k8s")
+
+# How much of a failed pod's own log is copied into the runtime log before the pod
+# object is deleted. The full stream is already in the node log store; this tail is
+# what an operator can still read from the runtime pod after the bot pod is gone.
+_LOG_TAIL_BYTES = 4096
 
 MANAGED_LABEL = "runtime.managed"
 WORKLOAD_ID_LABEL = "runtime.workload_id"
@@ -278,6 +286,9 @@ class K8sBackend:
     def __init__(self, name_prefix: str = "vexa-", namespace: Optional[str] = None) -> None:
         self._prefix = name_prefix
         self._ns = namespace
+        # Pod names already reaped this life. A second observation must not log the
+        # tail again. start() drops the name: a respawn reuses it.
+        self._reaped: set[str] = set()
 
     def _pname(self, workload_id: str) -> str:
         return f"{self._prefix}{workload_id}"            # must be DNS-1123 (lowercase alnum + '-')
@@ -313,6 +324,9 @@ class K8sBackend:
             overlay_env={**env, **_runtime_scheduling_env()},
         )
         _kubectl("create", "-f", "-", *self._ns_args(), stdin=json.dumps(pod))
+        # The name now belongs to this new pod. Keeping the previous reap mark
+        # would skip the next exit and leave that pod on the node.
+        self._reaped.discard(name)
         return WorkloadHandle(id=workload_id, impl=name)
 
     def find(self, workload_id: str) -> Optional[WorkloadHandle]:
@@ -356,6 +370,7 @@ class K8sBackend:
                     "name": meta.get("name", self._pname(wid)),
                     "running": running,
                     "exit_code": exit_code,
+                    "phase": phase,
                 })
             return out
         except Exception:  # noqa: BLE001 — discovery is a boot aid; it must never crash the boot
@@ -403,6 +418,42 @@ class K8sBackend:
                      *self._ns_args(), check=False),
             f"kubectl delete pod {name}",
         )
+
+    def _log_tail(self, name: str) -> str:
+        """The container's own log, clipped. Empty when kubectl cannot read it.
+
+        Read this before ``cleanup``. Deleting the pod drops ``kubectl logs`` for it.
+        """
+        result = _kubectl("logs", name, "--tail=200", *self._ns_args(), check=False)
+        if result.returncode != 0:
+            return ""
+        text = (result.stdout or "").strip()
+        if len(text) > _LOG_TAIL_BYTES:
+            text = text[-_LOG_TAIL_BYTES:]
+        return text
+
+    def reap_exited(self, h: WorkloadHandle, code: int) -> bool:
+        """Delete a pod whose container has already exited.
+
+        A Succeeded pod and a Failed pod both keep a node from scaling to zero.
+        The exit code is the caller's to store first. A non-zero exit's log tail
+        is written here, on the runtime, before the pod object is removed.
+        Returns whether this call removed it. A repeat is a no-op.
+        """
+        name = h._impl  # type: ignore[attr-defined]
+        if not isinstance(name, str) or name in self._reaped:
+            return False
+        # The tail has to be copied before cleanup: deleting the pod drops kubectl logs.
+        if code != 0:
+            tail = self._log_tail(name)
+            log.error(
+                "workload %s exited %s — pod %s container log tail:\n%s",
+                h.id, code, name, tail or "<no container log>",
+            )
+        self.cleanup(h)
+        self._reaped.add(name)
+        log.info("removed exited pod %s for workload %s (exit %s)", name, h.id, code)
+        return True
 
     def cleanup(self, h: WorkloadHandle) -> None:
         """Reclaim the pod. Raises unless kubectl accepted the delete or the pod is already gone.

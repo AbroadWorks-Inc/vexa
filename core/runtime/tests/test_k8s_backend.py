@@ -1,6 +1,7 @@
 """Kubernetes backend. The lifecycle test needs a real cluster and is skipped without one.
 The kubectl-answer tests stub kubectl and run anywhere."""
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -110,6 +111,240 @@ def test_a_running_pod_stays_running(monkeypatch):
         code=0, stdout=json.dumps({"status": {"phase": "Running"}}),
     ))
     assert runtime.get("w1").state is RuntimeState.running
+
+
+def test_a_failed_pod_keeps_its_log_and_is_then_deleted(monkeypatch, caplog):
+    """The exit is stored before the pod object is removed, and a later read keeps it.
+
+    kubectl answers NotFound with exit 0. Deleting first would wipe a real failure.
+    """
+    body = {"status": {"phase": "Failed", "containerStatuses": [
+        {"state": {"terminated": {"exitCode": 1}}},
+    ]}}
+    calls: list[tuple] = []
+    gone = {"pod": False}
+
+    def fake_kubectl(*args, check=True, stdin=None):
+        calls.append(tuple(args))
+        if args[0] == "logs":
+            assert not gone["pod"]
+            return SimpleNamespace(
+                returncode=0, stdout="DisconnectedError EndCause 72\n", stderr="",
+            )
+        if args[0] == "delete":
+            stored = runtime.store.get("w1").status
+            assert stored.state is RuntimeState.stopped
+            assert stored.exitCode == 1
+            gone["pod"] = True
+            return SimpleNamespace(returncode=0, stdout="deleted", stderr="")
+        if gone["pod"]:
+            return SimpleNamespace(
+                returncode=1, stdout="",
+                stderr='Error from server (NotFound): pods "vexa-w1" not found',
+            )
+        return SimpleNamespace(returncode=0, stdout=json.dumps(body), stderr="")
+
+    runtime = _running_runtime(monkeypatch, fake_kubectl)
+    with caplog.at_level(logging.INFO, logger="runtime_kernel.k8s"):
+        got = runtime.get("w1")
+    assert got.state is RuntimeState.stopped
+    assert got.exitCode == 1
+    assert got.stopReason is StopReason.failed
+    kinds = [c[0] for c in calls]
+    assert kinds.index("logs") < kinds.index("delete")
+    assert "DisconnectedError EndCause 72" in caplog.text
+    assert "removed exited pod vexa-w1" in caplog.text
+    again = runtime.get("w1")
+    assert again.exitCode == 1
+    assert again.stopReason is StopReason.failed
+    assert [c[0] for c in calls].count("delete") == 1
+
+
+def test_a_succeeded_pod_is_removed_without_copying_its_log(monkeypatch, caplog):
+    calls: list[str] = []
+
+    def fake_kubectl(*args, check=True, stdin=None):
+        calls.append(args[0])
+        if args[0] == "logs":
+            raise AssertionError("a clean exit does not copy the container log")
+        if args[0] == "get":
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"status": {"phase": "Succeeded"}}), stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runtime = _running_runtime(monkeypatch, fake_kubectl)
+    with caplog.at_level(logging.INFO, logger="runtime_kernel.k8s"):
+        got = runtime.get("w1")
+    assert got.state is RuntimeState.stopped
+    assert got.exitCode == 0
+    assert got.stopReason is StopReason.completed
+    assert calls.count("delete") == 1
+    assert "removed exited pod vexa-w1" in caplog.text
+
+
+def test_a_running_pod_is_not_deleted(monkeypatch):
+    calls: list[str] = []
+
+    def fake_kubectl(*args, check=True, stdin=None):
+        calls.append(args[0])
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"status": {"phase": "Running"}}), stderr="",
+        )
+
+    runtime = _running_runtime(monkeypatch, fake_kubectl)
+    assert runtime.get("w1").state is RuntimeState.running
+    assert "delete" not in calls
+    assert "logs" not in calls
+
+
+def _pod_item(name: str, workload_id: str, phase: str, exit_code: int | None = None) -> dict:
+    status: dict = {"phase": phase}
+    if exit_code is not None:
+        status["containerStatuses"] = [{"state": {"terminated": {"exitCode": exit_code}}}]
+    return {
+        "metadata": {
+            "name": name,
+            "labels": {"runtime.managed": "true", "runtime.workload_id": workload_id},
+        },
+        "status": status,
+    }
+
+
+def test_reap_removes_finished_pods_and_leaves_live_ones(monkeypatch, caplog):
+    pods = {"items": [
+        _pod_item("vexa-live", "live", "Running"),
+        _pod_item("vexa-pend", "pend", "Pending"),
+        _pod_item("vexa-fail", "fail", "Failed", 1),
+        _pod_item("vexa-ok", "ok", "Succeeded", 0),
+        {"metadata": {"name": "vexa-nolabel", "labels": {"runtime.managed": "true"}},
+         "status": {"phase": "Failed"}},
+    ]}
+    deleted: list[str] = []
+    holder: dict = {}
+
+    def fake_kubectl(*args, check=True, stdin=None):
+        if args[0] == "get" and args[1] == "pods":
+            return SimpleNamespace(returncode=0, stdout=json.dumps(pods), stderr="")
+        if args[0] == "logs":
+            assert args[1] == "vexa-fail"
+            return SimpleNamespace(returncode=0, stdout="denied your request\n", stderr="")
+        if args[0] == "delete":
+            name = args[2]
+            wid = {"vexa-fail": "fail", "vexa-ok": "ok"}[name]
+            stored = holder["runtime"].store.get(wid).status
+            assert stored.state is RuntimeState.stopped
+            assert stored.exitCode == (1 if wid == "fail" else 0)
+            deleted.append(name)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    runtime = Runtime(backend=K8sBackend(namespace="ns"), profiles={})
+    holder["runtime"] = runtime
+    runtime.store.set(WorkloadRecord(
+        spec=WorkloadSpec(workloadId="fail", profile="meeting-bot", env={}),
+        status=WorkloadStatus(
+            workloadId="fail", profile="meeting-bot",
+            state=RuntimeState.running, backend=BackendKind.k8s,
+        ),
+        owner="",
+    ))
+    with caplog.at_level(logging.INFO, logger="runtime_kernel.k8s"):
+        removed = runtime.reap_exited_workloads()
+    assert removed == 2
+    assert deleted == ["vexa-fail", "vexa-ok"]
+    failed = runtime.store.get("fail").status
+    assert failed.state is RuntimeState.stopped
+    assert failed.exitCode == 1
+    assert failed.stopReason is StopReason.failed
+    assert failed.profile == "meeting-bot"
+    finished = runtime.store.get("ok").status
+    assert finished.state is RuntimeState.stopped
+    assert finished.exitCode == 0
+    assert finished.profile == "adopted"
+    assert finished.stopReason is StopReason.completed
+    assert runtime.store.get("live") is None
+    assert runtime.store.get("pend") is None
+    assert "denied your request" in caplog.text
+    assert runtime.reap_exited_workloads() == 0
+    assert deleted == ["vexa-fail", "vexa-ok"]
+
+
+def test_a_respawned_pod_is_reaped_again_when_it_exits(monkeypatch, caplog):
+    """The pod name is prefix + workload id. A second life must not count as already reaped."""
+    phase = {"value": "Running"}
+    deletes: list[str] = []
+
+    def fake_kubectl(*args, check=True, stdin=None):
+        if args[0] == "create":
+            phase["value"] = "Running"
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[0] == "get" and args[1] == "pod":
+            if phase["value"] == "Running":
+                body = {"status": {"phase": "Running"}}
+            else:
+                body = {"status": {"phase": "Failed", "containerStatuses": [
+                    {"state": {"terminated": {"exitCode": 1}}},
+                ]}}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(body), stderr="")
+        if args[0] == "logs":
+            return SimpleNamespace(returncode=0, stdout=f"life-{len(deletes) + 1}\n", stderr="")
+        if args[0] == "delete":
+            deletes.append(args[2])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    runtime = Runtime(
+        backend=K8sBackend(namespace="ns"),
+        profiles={"meeting-bot": Runnable(image="bot:1")},
+    )
+    spec = WorkloadSpec(workloadId="w1", profile="meeting-bot", env={})
+    assert runtime.create(spec).state is RuntimeState.running
+    phase["value"] = "Failed"
+    with caplog.at_level(logging.ERROR, logger="runtime_kernel.k8s"):
+        first = runtime.get("w1")
+    assert first.exitCode == 1
+    assert deletes == ["vexa-w1"]
+    assert "life-1" in caplog.text
+    assert runtime.create(spec).state is RuntimeState.running
+    phase["value"] = "Failed"
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="runtime_kernel.k8s"):
+        second = runtime.get("w1")
+    assert second.exitCode == 1
+    assert second.stopReason is StopReason.failed
+    assert deletes == ["vexa-w1", "vexa-w1"]
+    assert "life-2" in caplog.text
+
+
+def test_a_failed_delete_is_retried_on_the_next_pass(monkeypatch):
+    pods = {"items": [_pod_item("vexa-fail", "fail", "Failed", 1)]}
+    deletes = {"n": 0}
+
+    def fake_kubectl(*args, check=True, stdin=None):
+        if args[0] == "get" and args[1] == "pods":
+            return SimpleNamespace(returncode=0, stdout=json.dumps(pods), stderr="")
+        if args[0] == "logs":
+            return SimpleNamespace(returncode=0, stdout="join timeout\n", stderr="")
+        if args[0] == "delete":
+            deletes["n"] += 1
+            if deletes["n"] == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="apiserver timeout")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(k8s_backend, "_kubectl", fake_kubectl)
+    runtime = Runtime(backend=K8sBackend(namespace="ns"), profiles={})
+    assert runtime.reap_exited_workloads() == 0
+    stored = runtime.store.get("fail").status
+    assert stored.state is RuntimeState.stopped
+    assert stored.exitCode == 1
+    assert runtime.reap_exited_workloads() == 1
+    assert deletes["n"] == 2
+    assert runtime.reap_exited_workloads() == 0
+    assert deletes["n"] == 2
 
 
 @pytest.mark.skipif(not _k8s_ok(), reason="no reachable kubernetes cluster")
