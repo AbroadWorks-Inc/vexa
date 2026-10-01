@@ -18,7 +18,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isMixedLanePlatform, type Invocation } from './config.js';
+import { captureLane, type Invocation } from './config.js';
 import { rmsOf } from './capture-bridge.js';
 import { imageVersion, signalEvent } from './telemetry.js';
 
@@ -87,7 +87,7 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
     v: 1,
     session_uid: sessionUid,
     platform: inv.platform,
-    lane: isMixedLanePlatform(inv.platform) ? 'mixed' : 'gmeet',
+    lane: captureLane(inv.platform),
     native_meeting_id: inv.nativeMeetingId ?? sessionUid,
     started_at: new Date(now()).toISOString(),
     image_version: imageVersion(),

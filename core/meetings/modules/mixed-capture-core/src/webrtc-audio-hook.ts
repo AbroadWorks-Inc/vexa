@@ -70,7 +70,12 @@ export function installRemoteAudioHook(opts: WebRtcAudioHookOptions = {}): boole
       if (!event.track || event.track.kind !== 'audio') return;
       if (win.__vexaMirroredTrackIds.has(event.track.id)) return;   // already mirrored (both track paths fire)
       win.__vexaMirroredTrackIds.add(event.track.id);
-      const stream = (event.streams && event.streams[0]) || new MediaStream([event.track]);
+      // Always our own MediaStream. event.streams[0] is shared by every track
+      // on that receiver, and the per-track tap dedupes by stream id, so two
+      // speakers on one stream collapse to one channel and one recording.
+      const stream = new MediaStream([event.track]);
+      const eventStreamCount = event.streams ? event.streams.length : 0;
+      const sharedId = event.streams && event.streams[0] ? event.streams[0].id : 'none';
 
       const audioEl = document.createElement('audio');
       audioEl.autoplay = true;
@@ -82,14 +87,19 @@ export function installRemoteAudioHook(opts: WebRtcAudioHookOptions = {}): boole
       audioEl.style.width = '1px';
       audioEl.style.height = '1px';
       audioEl.srcObject = stream;
-      audioEl.play?.().catch(() => { /* autoplay may defer */ });
+      const played = audioEl.play?.();
+      if (played && typeof played.catch === 'function') {
+        played.catch((err: unknown) => {
+          log(`[Audio Hook] play() rejected for track ${event.track.id.substring(0, 8)}: ${String(err)}`);
+        });
+      }
 
       if (document.body) document.body.appendChild(audioEl);
       else document.addEventListener('DOMContentLoaded', () => document.body?.appendChild(audioEl), { once: true });
 
       (win.__vexaInjectedAudioElements as HTMLAudioElement[]).push(audioEl);
       (win.__vexaCapturedRemoteAudioStreams as MediaStream[]).push(stream);
-      log(`[Audio Hook] mirrored remote audio track ${event.track.id.substring(0, 8)} (${win.__vexaInjectedAudioElements.length} total)`);
+      log(`[Audio Hook] mirrored remote audio track ${event.track.id.substring(0, 8)} (captured=${win.__vexaInjectedAudioElements.length} eventStreams=${eventStreamCount} shared=${sharedId} own=${stream.id ?? 'new'})`);
     } catch (e: any) {
       log(`[Audio Hook] track error: ${e?.message || e}`);
     }

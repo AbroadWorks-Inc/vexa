@@ -85,5 +85,22 @@ pc.emit({ track: { id: 'video-1', kind: 'video' }, streams: [] });
 check('video tracks are ignored', win.__vexaCapturedRemoteAudioStreams.length === 2,
   `n=${win.__vexaCapturedRemoteAudioStreams.length}`);
 
+// Two track ids delivered on ONE event.streams entry must not collapse to that
+// shared stream. The per-track tap dedupes by stream id.
+const shared = new win.MediaStream([{ id: 'a' }, { id: 'b' }]);
+const trackA = { id: 'track-a', kind: 'audio' };
+const trackB = { id: 'track-b', kind: 'audio' };
+pc.emit({ track: trackA, streams: [shared] });
+pc.emit({ track: trackB, streams: [shared] });
+const captured = win.__vexaCapturedRemoteAudioStreams;
+check('two tracks that share one event stream become two captured streams',
+  captured.length === 4, `n=${captured.length}`);
+check('neither captured stream is the shared event stream',
+  captured[2] !== shared && captured[3] !== shared);
+check('each captured stream carries only its own track',
+  captured[2].getAudioTracks().length === 1 && captured[2].getAudioTracks()[0].id === 'track-a'
+  && captured[3].getAudioTracks().length === 1 && captured[3].getAudioTracks()[0].id === 'track-b',
+  JSON.stringify(captured.slice(2).map((s: any) => s.getAudioTracks().map((t: any) => t.id))));
+
 if (failed) { console.error(`\n❌ webrtc-dedup: ${failed} check(s) FAILED.`); process.exit(1); }
 console.log('\n✅ webrtc-dedup: each remote audio track is mirrored exactly once, so the mixer cannot sum a track with itself.');

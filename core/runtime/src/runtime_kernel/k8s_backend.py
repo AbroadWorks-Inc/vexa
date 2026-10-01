@@ -167,6 +167,32 @@ def resource_requirements(resources: Optional[Resources]) -> Optional[dict]:
     return block or None
 
 
+# Same default as the bot's deriveMaxActiveMs. Fifteen minutes lets that exit flush
+# the recording before Kubernetes SIGKILLs a wedged loop. Counted from pod start.
+_DEFAULT_ACTIVE_CAP_S = 4 * 60 * 60
+_ACTIVE_DEADLINE_GRACE_S = 15 * 60
+
+
+def _meeting_bot_deadline_seconds(env: dict[str, str]) -> Optional[int]:
+    """Backstop for a meeting bot only. Other workloads return None.
+
+    ``BOT_MAX_ACTIVE_MS`` replaces the 4h default, matching the bot process.
+    A non-numeric value keeps the default rather than dropping the deadline.
+    """
+    if "VEXA_BOT_CONFIG" not in env:
+        return None
+    cap_s = _DEFAULT_ACTIVE_CAP_S
+    raw = env.get("BOT_MAX_ACTIVE_MS", "").strip()
+    if raw:
+        try:
+            ms = int(raw)
+        except ValueError:
+            ms = 0
+        if ms > 0:
+            cap_s = (ms + 999) // 1000
+    return cap_s + _ACTIVE_DEADLINE_GRACE_S
+
+
 def build_pod(
     *,
     name: str,
@@ -217,12 +243,20 @@ def build_pod(
         metadata["namespace"] = namespace
 
     # restart=Never: the kernel owns restart policy, so the Pod must not resurrect itself.
+    # Meeting bots also get a deadline. Agent workers do not: their lifetime is the
+    # profile's max_lifetime_sec, enforced in-process, and a meeting-bot cap would reap them.
     pod: dict = {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": metadata,
-        "spec": {"containers": [container], "restartPolicy": "Never"},
+        "spec": {
+            "containers": [container],
+            "restartPolicy": "Never",
+        },
     }
+    deadline = _meeting_bot_deadline_seconds(env)
+    if deadline is not None:
+        pod["spec"]["activeDeadlineSeconds"] = deadline
 
     overlay_source = env if overlay_env is None else overlay_env
     overlay = (pod_overrides(overlay_source, container_name=name) or {}).get("spec", {})

@@ -5,11 +5,11 @@
   "description": "The VERBATIM raw capture signal teed at the bot's capture bridge BEFORE the pipeline — the exact stream a live bug rides on, stored so it replays through the same pipeline OFFLINE (O-TEL-2). One session = a SessionHeader followed by N records (JSONL-on-disk); a record is a CapturedFrame (audio) or a HintEvent (a `type`-tagged out-of-band speaker hint). Each frame mirrors the @vexa/capture-codec binary frame shape: pcm is base64 of the Float32 PCM bytes (little-endian), so a frame round-trips through the codec encode→decode→same.",
   "$defs": {
     "Lane": {
-      "description": "Which pipeline lane the frame feeds — gmeet (per-channel, glow-named) or mixed (one stream, named from hints).",
-      "enum": ["gmeet", "mixed"]
+      "description": "Which pipeline lane the frame feeds — gmeet (per-channel, glow-named), pertrack (Zoom, one named track per person) or mixed (one stream, named from hints).",
+      "enum": ["gmeet", "mixed", "pertrack"]
     },
     "HintEvent": {
-      "description": "One OUT-OF-BAND speaker hint as it crossed the capture bridge. The mixed lane (zoom/teams/jitsi) carries a single audio stream and names it from active-speaker hints that arrive on their OWN channel, independent of the audio frames — so a session that stored only CapturedFrames could never reproduce attribution offline. gmeet binds its glow name onto the frame itself and emits no HintEvent. `t` shares the audio frames' epoch-ms clock (the bridge's clock contract), which is what lets a replay re-window the hints against the same audio.",
+      "description": "One OUT-OF-BAND speaker hint as it crossed the capture bridge. Teams and Jitsi (mixed) carry one audio stream and name it from these hints, which arrive on their own channel, so a session of only CapturedFrames cannot reproduce attribution offline. Zoom (pertrack) names its frames directly; its hints are the active-speaker tape. gmeet binds its glow name onto the frame itself and emits no HintEvent. `t` shares the audio frames' epoch-ms clock (the bridge's clock contract), which is what lets a replay re-window the hints against the same audio.",
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "t", "name"],

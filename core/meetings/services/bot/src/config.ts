@@ -47,6 +47,16 @@ export function isPerTrackLanePlatform(p: Platform | string): boolean {
   return p === 'zoom';
 }
 
+/** What the activity header and the captured-signal tape record.
+ *  Zoom's frames are named per track, so they are not the mixed lane. */
+export type CaptureLane = 'gmeet' | 'mixed' | 'pertrack';
+
+export function captureLane(p: Platform | string): CaptureLane {
+  if (isPerTrackLanePlatform(p)) return 'pertrack';
+  if (isMixedLanePlatform(p)) return 'mixed';
+  return 'gmeet';
+}
+
 export interface AutomaticLeave {
   waitingRoomTimeout?: number;
   noOneJoinedTimeout?: number;

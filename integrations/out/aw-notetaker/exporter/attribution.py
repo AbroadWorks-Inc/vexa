@@ -9,6 +9,7 @@ instead of `VexaSegment`/`speaker_events` for the participant roster.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from exporter.activity import ActivityEvent
 from exporter.schemas import (
@@ -137,14 +138,21 @@ def _build_dominant_speaker_timeline(
 
 
 def _intervals_from_points(
-    events: list[SpeakerEvent], duration_sec: float
+    events: list[SpeakerEvent],
+    duration_sec: float,
+    hangover_ms: int = 700,
 ) -> list[tuple[str, int, int]]:
-    """Collapse runs of same-speaker points into closed (name, start_ms, end_ms).
+    """Collapse consecutive same-speaker points into [first, last + hangover].
 
-    Used for Teams: one mixed audio stream means the per-track audio-activity
-    boundary machine never arms, so speaker changes have to be read off the
-    point timeline instead. Each run closes at the next speaker's first
-    point; the final run closes at the recording's `duration_sec`.
+    A run is every consecutive point of one speaker, including points a couple
+    of seconds apart: Zoom and Teams hints tick about every 2 s, and splitting
+    those would invent a turn change inside one person's speech. The interval
+    ends at the run's own last point plus `hangover_ms`. When the next speaker
+    starts sooner than that, the end clips to their first point so two runs
+    never overlap. The end is also clipped to `duration_sec` when the hangover
+    would run past the file. It is never defaulted to the recording end: the
+    silence after the last point, and the silence between turns, stays
+    unassigned so the worker's gap-word rule can place it.
 
     Zero-length runs are dropped (the worker requires `end > start`). A
     genuine tie — two different speakers at the same instant — is resolved
@@ -153,7 +161,7 @@ def _intervals_from_points(
     speaker.
     """
     ordered = sorted(events, key=lambda ev: (ev.relative_sec, ev.speaker_id))
-    session_end_ms = max(0, int(round(duration_sec * 1000)))
+    duration_ms = max(0, int(round(duration_sec * 1000)))
     out: list[tuple[str, int, int]] = []
     i = 0
     while i < len(ordered):
@@ -162,13 +170,16 @@ def _intervals_from_points(
         j = i + 1
         while j < len(ordered) and ordered[j].speaker_name == name:
             j += 1
-        stop_ms = (
-            int(round(ordered[j].relative_sec * 1000))
-            if j < len(ordered)
-            else session_end_ms
-        )
-        if stop_ms > start_ms:
-            out.append((name, start_ms, stop_ms))
+        last_ms = int(round(ordered[j - 1].relative_sec * 1000))
+        end_ms = last_ms + hangover_ms
+        if j < len(ordered):
+            next_ms = int(round(ordered[j].relative_sec * 1000))
+            if next_ms < end_ms:
+                end_ms = next_ms
+        if end_ms > duration_ms:
+            end_ms = duration_ms
+        if end_ms > start_ms:
+            out.append((name, start_ms, end_ms))
         i = j
     return out
 
@@ -182,6 +193,7 @@ def build_speaker_timeline(
     recording_started_at: datetime,
     recording_ended_at: datetime,
     min_dominant_utterance_ms: int,
+    hangover_ms: int = 700,
 ) -> SpeakerTimelineFile:
     duration_sec = (recording_ended_at - recording_started_at).total_seconds()
     origin_ms = int(recording_started_at.timestamp() * 1000)
@@ -236,14 +248,21 @@ def build_speaker_timeline(
             earliest.relative_sec = 0.0
             earliest.timestamp_ms = origin_ms
 
-    # Teams: derive intervals from the point runs. One mixed audio stream
-    # means the audio-activity path never arms for Teams, so without this the
-    # worker falls back to "whoever spoke at the segment's first instant owns
-    # the whole segment". Gated the same as the anchor above, and must run
-    # after it: the anchor may already have zeroed the earliest point, and
-    # the first interval should start there.
-    if platform == "teams" and not paired_intervals and len(distinct_speakers) >= 2:
-        paired_intervals = _intervals_from_points(timeline_events, duration_sec)
+    # No paired audio (Teams' mixed lane, or any file that only has hints):
+    # derive intervals from the point runs once two speakers are named.
+    # Intervals from points are worse than intervals from frames, and better
+    # than nothing — without them the worker gives a whole segment to whoever
+    # was speaking at its first instant. Must run after the anchor: the anchor
+    # may already have zeroed the earliest point, and the first interval
+    # should start there. One named speaker stays points-only.
+    intervals_source: Literal["audio", "points"] | None = (
+        "audio" if paired_intervals else None
+    )
+    if not paired_intervals and len(distinct_speakers) >= 2:
+        paired_intervals = _intervals_from_points(
+            timeline_events, duration_sec, hangover_ms
+        )
+        intervals_source = "points" if paired_intervals else None
 
     # Clip to the recording: an activity event may start slightly before audio
     # t=0 (a real Meet tape had a speaker's first START at -8ms). Clamp
@@ -273,6 +292,8 @@ def build_speaker_timeline(
             clipped_intervals, key=lambda iv: (iv[1], iv[2], iv[0])
         )
     ]
+    if not speaker_intervals:
+        intervals_source = None
 
     return SpeakerTimelineFile(
         room_name=room_name,
@@ -285,6 +306,7 @@ def build_speaker_timeline(
         participants=participants,
         speaker_timeline=timeline_events,
         speaker_intervals=speaker_intervals,
+        speaker_intervals_source=intervals_source,
     )
 
 

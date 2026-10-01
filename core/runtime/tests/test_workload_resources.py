@@ -169,6 +169,7 @@ def test_pod_carries_resources_and_every_pre_existing_field():
     }
     spec = pod["spec"]
     assert spec["restartPolicy"] == "Never"          # the kernel owns restart policy
+    assert spec["activeDeadlineSeconds"] == 15300   # 4h in-process cap, plus 15 min
     assert spec["tolerations"] == [{"key": "vexa", "operator": "Exists"}]
     assert spec["nodeSelector"] == {"pool": "bots"}
     assert spec["volumes"], "workspace store volume survived"
@@ -190,6 +191,19 @@ def test_pod_without_resources_omits_the_field_entirely():
     assert "resources" not in pod["spec"]["containers"][0]
     assert "namespace" not in pod["metadata"]
     assert "command" not in pod["spec"]["containers"][0]   # image ENTRYPOINT is authoritative
+    assert "activeDeadlineSeconds" not in pod["spec"]      # not a meeting bot
+
+
+def test_meeting_bot_deadline_follows_bot_max_active_ms():
+    pod = build_pod(
+        name="vexa-mtg",
+        workload_id="mtg",
+        runnable=Runnable(image="img"),
+        env={"VEXA_BOT_CONFIG": "{}", "BOT_MAX_ACTIVE_MS": "21600000"},
+        namespace=None,
+        resources=None,
+    )
+    assert pod["spec"]["activeDeadlineSeconds"] == 6 * 60 * 60 + 15 * 60
 
 
 def test_runtime_scheduling_env_shapes_the_pod_without_becoming_container_config(monkeypatch):

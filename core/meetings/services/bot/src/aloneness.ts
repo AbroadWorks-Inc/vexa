@@ -44,6 +44,13 @@ export interface RemoteAudioActivitySnapshot {
    *  remote track legitimately flaps `muted` between talk spurts (DTX): a bot must not conclude the
    *  room emptied because it sampled the gap. */
   streamsPresentAt?: number;
+  /** Last roster-coverage participant count, self excluded. Independent of stream presence:
+   *  Teams keeps mainAudio connected after the room empties, and the voice-outline counter is 0
+   *  whenever nobody is talking. Undefined until a coverage report arrives. */
+  rosterParticipants?: number;
+  /** When that coverage report arrived. It does not go stale: coverage is emitted only on change,
+   *  so this timestamp is the start of the current count. */
+  rosterObservedAt?: number;
 }
 
 export interface RemoteAudioActivitySource {
@@ -62,6 +69,8 @@ export interface RemoteAudioActivityTap extends RemoteAudioActivitySource {
    *  unknown), and a tap that does not implement it — a test double, an embedder's own — keeps
    *  compiling and keeps today's behaviour. */
   observeStreamPresence?(count: number): void;
+  /** Roster-coverage participant count (self excluded). Optional, like stream presence. */
+  observeRoster?(participants: number): void;
 }
 
 /** `capture-fault` = "these streams are connected and we are hearing NOTHING from them" — the bot is
@@ -106,14 +115,22 @@ export function createRemoteAudioActivityTap(options: {
     },
     unavailable(): void {
       // What the PAGE said about the room is not invalidated by our capture dying, so the presence
-      // fields survive (they age out on their own staleness). Everything capture owns is dropped —
-      // `available: false` is the fail-closed state, and it short-circuits every adapter.
+      // fields survive (they age out on their own staleness). The roster report survives with them:
+      // it is a fact about the room, and it must not expire on the 30s stream staleness. Everything
+      // capture owns is dropped — `available: false` is the fail-closed state, and it short-circuits
+      // every adapter.
       state = {
         available: false,
         streamsConnected: state.streamsConnected,
         streamsObservedAt: state.streamsObservedAt,
         streamsPresentAt: state.streamsPresentAt,
+        rosterParticipants: state.rosterParticipants,
+        rosterObservedAt: state.rosterObservedAt,
       };
+    },
+    observeRoster(participants: number): void {
+      if (!Number.isFinite(participants) || participants < 0) return;
+      state = { ...state, rosterParticipants: participants, rosterObservedAt: now() };
     },
     observeStreamPresence(count: number): void {
       if (!Number.isFinite(count) || count < 0) return;
@@ -193,6 +210,17 @@ export function createDeafCaptureGuardAdapter(options: { stalenessMs?: number } 
       if (now - snapshot.streamsPresentAt > stalenessMs) return 'alone';         // streams are gone (row 2)
       if (snapshot.lastRemoteFrameAt !== undefined && now - snapshot.lastRemoteFrameAt < windowMs) {
         return 'alone';                                                          // capture is delivering
+      }
+      // Teams keeps one stream connected after everyone leaves, so the row above holds the bot
+      // until the 4h cap. The roster is a separate report. Zero participants (the bot's own tile
+      // already excluded) for the whole silence window means the room is empty: abstain and let
+      // the silence adapter leave. A positive count keeps the hold — people are there and we may
+      // be deaf. No report at all keeps today's hold (#1192). Do not apply the 30s stream
+      // staleness here; coverage is emitted only when the count changes.
+      if (snapshot.rosterParticipants === 0
+        && snapshot.rosterObservedAt !== undefined
+        && now - snapshot.rosterObservedAt >= windowMs) {
+        return 'alone';
       }
       return 'capture-fault';
     },

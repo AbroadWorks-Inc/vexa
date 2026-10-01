@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -54,6 +55,10 @@ class SpeakerTimelineFile(BaseModel):
     participants: list[TimelineParticipant]
     speaker_timeline: list[SpeakerEvent]
     speaker_intervals: list[SpeakerInterval] = []
+    # Additive. "audio" intervals come from named frames; "points" from the
+    # hint-run fallback. Absent when the file has no intervals. The worker's
+    # existing reader ignores a field it does not know.
+    speaker_intervals_source: Literal["audio", "points"] | None = None
 
 
 class HostInfo(BaseModel):

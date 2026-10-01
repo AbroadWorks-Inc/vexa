@@ -71,6 +71,8 @@ export class MediaRecorderChunker implements RecordingTap {
   private chunkSeq = 0;
   private pending: Blob[] = [];
   private resolveFinalChunk: (() => void) | null = null;
+  /** True once onstop has finished the final chunk. An already-inactive recorder still waits for it. */
+  private finalChunkSettled = false;
   private mimeType = "audio/webm";
   /**
    * The webm EBML init segment retained from the FIRST self-describing blob (chunk 0:
@@ -203,6 +205,7 @@ export class MediaRecorderChunker implements RecordingTap {
       } catch (err: any) {
         blog(`[record-chunker] final chunk callback failed: ${err?.message || err}`);
       } finally {
+        this.finalChunkSettled = true;
         if (this.resolveFinalChunk) { this.resolveFinalChunk(); this.resolveFinalChunk = null; }
       }
     };
@@ -213,7 +216,7 @@ export class MediaRecorderChunker implements RecordingTap {
 
   async stop(): Promise<void> {
     if (!this.recorder) { blog("[record-chunker] stop() before start() — ignoring"); return; }
-    if (this.recorder.state === "inactive") { blog("[record-chunker] recorder already inactive"); return; }
+    if (this.finalChunkSettled) return;
 
     const finalChunkPromise = new Promise<void>((resolve) => {
       this.resolveFinalChunk = resolve;
@@ -225,8 +228,12 @@ export class MediaRecorderChunker implements RecordingTap {
       }, 10000);
     });
 
-    try { this.recorder.stop(); }
-    catch (err: any) { blog(`[record-chunker] recorder.stop() threw: ${err?.message || err}`); }
+    // A stream that already ended leaves the recorder inactive and queues onstop.
+    // Returning here drops the open timeslice and the final chunk.
+    if (this.recorder.state !== "inactive") {
+      try { this.recorder.stop(); }
+      catch (err: any) { blog(`[record-chunker] recorder.stop() threw: ${err?.message || err}`); }
+    }
 
     await finalChunkPromise;
   }
@@ -300,7 +307,7 @@ export interface CreateRecordingTapOptions extends RecordingTapOptions {
  * (bot, extension): find every audio element → combine → `MediaRecorderChunker`
  * → recording.v1 chunks via `onChunk`. Recording is platform-agnostic — it
  * records the whole meeting mix — so this is ONE generic tap, not per-lane.
- * (Zoom records via node PulseAudio in @vexa/recording, no browser tap.)
+ * (Zoom passes the live per-track mix as opts.stream; otherwise the element snapshot is used.)
  *
  * Pass `opts.stream` to record a ready stream directly (skips the element
  * combine); otherwise it finds + combines the page's audio elements.

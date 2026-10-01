@@ -110,14 +110,15 @@ const sameShape = (obj: unknown, expected: Record<string, unknown>): boolean => 
   check('isCapped() is true', w.isCapped() === true);
 }
 
-// ── 5) Lane: zoom/teams header to lane:"mixed" ────────────────────────────────────────────────────
+// ── 5) Lane: zoom is pertrack; teams stays mixed ──────────────────────────────────────────────────
 {
+  const expected: Record<string, string> = { zoom: 'pertrack', teams: 'mixed' };
   for (const platform of ['zoom', 'teams']) {
     const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
     const w = createSpeakerActivityWriter(invOf(platform), { dir, now: () => 0 });
     await w.close();
     const header = readLines(w.path)[0];
-    check(`platform ${platform} → header lane:"mixed"`, header.lane === 'mixed', JSON.stringify(header));
+    check(`platform ${platform} → header lane:"${expected[platform]}"`, header.lane === expected[platform], JSON.stringify(header));
   }
 }
 

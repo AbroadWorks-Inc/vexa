@@ -1735,3 +1735,110 @@ def test_duplicate_and_crossed_events_for_one_meeting_export_once(
     assert queue.pending_ids() == []
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["state"] == "handed_off"
+
+
+def _split_wav(dst: Path, loud_s: float, silent_s: float, value: int = 3000) -> None:
+    """Mono s16: `loud_s` of `value`, then `silent_s` of silence. Rate 100."""
+    rate = 100
+    loud = value.to_bytes(2, "little", signed=True) * int(loud_s * rate)
+    silent = b"\x00\x00" * int(silent_s * rate)
+    with wave.open(str(dst), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(loud + silent)
+
+
+def test_a_quiet_long_turn_is_audio_mismatch_and_is_not_handed_off(
+    storage: Storage,
+) -> None:
+    """Ann is loud for her 15 s; Bo's 15 s is silence. Both intervals are
+    written. /process is not called. The report is failed."""
+    storage_path = _put_master(storage, 91, "uid-91")
+    origin = _origin_ms()
+    _put_activity(
+        storage,
+        "uid-91",
+        [
+            header("pertrack"),
+            frame(origin, "Ann Lee", 0.1, ch=0, dur_ms=15_000),
+            frame(origin + 15_000, "Bo", 0.1, ch=1, dur_ms=15_000),
+        ],
+    )
+
+    def transcode(src: Path, dst: Path) -> None:
+        _split_wav(dst, 15, 15)
+
+    notetaker = FakeNotetaker()
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage,
+        _api_for(91, storage_path),
+        notetaker,
+        transcode=transcode,
+        export_result=export_result,
+    )
+
+    result = export_meeting(_envelope(), deps)
+
+    assert result.state == "audio_mismatch"
+    assert notetaker.calls == []
+    assert export_result.calls[0][0] == MEETING_UUID
+    assert export_result.calls[0][1] == "failed"
+    assert export_result.calls[0][2] == S3_PATH
+    assert export_result.calls[0][3] is not None
+    assert "Bo" in export_result.calls[0][3]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["state"] == "audio_mismatch"
+    assert marker["speaker_activity"] == "audio_mismatch"
+    assert set(marker["speaker_levels"]) == {"Ann Lee", "Bo"}
+    assert marker["speaker_levels"]["Bo"]["rms"] < 0.026
+    assert marker["speaker_levels"]["Ann Lee"]["rms"] >= 0.026
+    timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
+    assert {i["speaker_name"] for i in timeline["speaker_intervals"]} == {
+        "Ann Lee",
+        "Bo",
+    }
+    assert timeline["speaker_intervals_source"] == "audio"
+
+
+def test_both_long_turns_loud_still_hands_off(storage: Storage) -> None:
+    storage_path = _put_master(storage, 92, "uid-92")
+    origin = _origin_ms()
+    _put_activity(
+        storage,
+        "uid-92",
+        [
+            header("pertrack"),
+            frame(origin, "Ann Lee", 0.1, ch=0, dur_ms=15_000),
+            frame(origin + 15_000, "Bo", 0.1, ch=1, dur_ms=15_000),
+        ],
+    )
+
+    def transcode(src: Path, dst: Path) -> None:
+        write_constant_wav(dst, 30, 3000)
+
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, _api_for(92, storage_path), notetaker, transcode=transcode)
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["speaker_activity"] == "ok"
+
+
+def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(
+    storage: Storage,
+) -> None:
+    """The gate is strict: 10 s of silence is not a mismatch."""
+    storage_path = _put_master(storage, 93, "uid-93")
+    _put_activity(
+        storage,
+        "uid-93",
+        [header(), frame(_origin_ms(), "Ann Lee", 0.1, dur_ms=10_000)],
+    )
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, _api_for(93, storage_path), notetaker)
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]

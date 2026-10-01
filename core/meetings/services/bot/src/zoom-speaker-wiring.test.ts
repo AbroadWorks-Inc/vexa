@@ -93,12 +93,31 @@ g.window = g;   // the bundle hangs VexaBrowserUtils on window too
 // Two remote participant streams, both live — the per-track lane's input, and the presence oracle's.
 const remoteStream = (id: string) => ({ id, getAudioTracks: () => [{ id: `${id}-a`, readyState: 'live', muted: false }] });
 g.__vexaCapturedRemoteAudioStreams = [remoteStream('stream-1'), remoteStream('stream-2')];
-// The per-track tap's AudioContext: enough surface for one source + one processor per track.
+// The per-track tap's AudioContext: one source + one processor per track, and the
+// mix destination the recorder taps.
+const mixConnects: string[] = [];
+let mixConnectFailures = 0;
+let trackCtxClosed = false;
 (g as any).AudioContext = class {
   destination = {};
   resume(): void { /* no-op */ }
-  close(): void { /* no-op */ }
-  createMediaStreamSource(): unknown { return { connect: () => { /* */ }, disconnect: () => { /* */ } }; }
+  close(): void { trackCtxClosed = true; }
+  createMediaStreamDestination(): unknown {
+    return { stream: { id: 'per-track-mix', getAudioTracks: () => [] } };
+  }
+  createMediaStreamSource(stream: { id: string }): unknown {
+    return {
+      connect: (dest: { stream?: { id: string } }) => {
+        if (dest?.stream?.id !== 'per-track-mix') return;
+        if (stream.id === 'stream-1' && mixConnectFailures === 0) {
+          mixConnectFailures++;
+          throw new Error('mix connect failed');
+        }
+        mixConnects.push(stream.id);
+      },
+      disconnect: () => { /* */ },
+    };
+  }
   createScriptProcessor(): unknown {
     return { onaudioprocess: null, connect: () => { /* */ }, disconnect: () => { /* */ } };
   }
@@ -192,6 +211,12 @@ check('presence reaches the aloneness tap — 2 live remote streams (RED before 
 check('the per-track topology crossed as DATA (2 tracks captured)',
   observations.some((o) => o.observation.type === 'pertrack-topology' && o.observation.streams === 2),
   JSON.stringify(observations.map((o) => o.observation.type)));
+check('both remote streams are connected to the recording mix',
+  mixConnectFailures === 1 && mixConnects.includes('stream-1') && mixConnects.includes('stream-2'),
+  JSON.stringify({ mixConnects, mixConnectFailures }));
+check('the recording mix stream is published for startRecording',
+  (g as any).__vexaPerTrackMixStream?.id === 'per-track-mix',
+  String((g as any).__vexaPerTrackMixStream?.id));
 
 // A single-poll flicker must NOT cross the boundary (the debounce holds at wiring altitude).
 setSpeaker('Dave'); tick(2);
@@ -201,7 +226,10 @@ setSpeaker('Dave'); tick(1);    // back before confirm
 check('boundary: a single-poll flicker (Eve) never crosses', !spoken.slice(before).some((s) => s.name === 'Eve'),
   JSON.stringify(spoken.slice(before)));
 
+(g as any).__vexaRecordingTap = { stop: async () => { /* recording still owns the mix context */ } };
 await stop();
+check('capture stop leaves the mix context open while a recording tap is live',
+  !trackCtxClosed && (g as any).__vexaTrackCtx != null);
 (g as any).setInterval = realSetInterval;
 (g as any).clearInterval = realClearInterval;
 

@@ -389,6 +389,50 @@ function fixture(windowMs = 1_000, extra: {
   check('the shipped guard defaults to a 30s presence staleness',
     deafCaptureGuardAdapter.evaluate({ ...base, streamsObservedAt: 10_000 - DEFAULT_STREAM_PRESENCE_STALENESS_MS - 1, streamsPresentAt: 0 }, 10_000, 1_000) === 'alone'
     && DEFAULT_STREAM_PRESENCE_STALENESS_MS === 30_000);
+  check('a roster that was never reported still objects',
+    guard.evaluate(base, 10_000, 1_000) === 'capture-fault');
+  check('a positive roster keeps the deaf hold',
+    guard.evaluate({ ...base, rosterParticipants: 2, rosterObservedAt: 0 }, 10_000, 1_000) === 'capture-fault');
+  check('roster zero inside the window still objects',
+    guard.evaluate({ ...base, rosterParticipants: 0, rosterObservedAt: 9_500 }, 10_000, 1_000) === 'capture-fault');
+  check('roster zero for the whole window abstains',
+    guard.evaluate({ ...base, rosterParticipants: 0, rosterObservedAt: 8_000 }, 10_000, 1_000) === 'alone');
+}
+
+// Empty Teams room: mainAudio stays connected, the roster says nobody else is there.
+{
+  const f = fixture(1_000, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 5_000 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(1);
+  f.activity.observeRoster(0);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_001); f.scheduler.tick();
+  check('an empty roster for the window leaves; the deaf guard does not hold it', fired === 1);
+}
+{
+  const f = fixture(1_000, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 5_000 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(1);
+  f.activity.observeRoster(2);
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_001); f.scheduler.tick();
+  check('a roster that still has people keeps the deaf hold', fired === 0);
+  check('…and still says capture-fault', f.logs.some((l) => l.includes('capture-fault suspected')));
+}
+{
+  const clock = new FakeClock();
+  const tap = createRemoteAudioActivityTap({ now: clock.now });
+  tap.observeRoster(0);
+  tap.ready();
+  check('ready keeps the roster report',
+    tap.snapshot().rosterParticipants === 0 && tap.snapshot().rosterObservedAt === 0);
+  tap.unavailable();
+  check('unavailable keeps the roster report',
+    tap.snapshot().available === false && tap.snapshot().rosterParticipants === 0 && tap.snapshot().rosterObservedAt === 0);
+  tap.observeRoster(Number.NaN);
+  check('a nonsense roster report is ignored', tap.snapshot().rosterParticipants === 0);
 }
 
 // The tap's two clocks: arrival (capture liveness) and presence (someone spoke) move independently.

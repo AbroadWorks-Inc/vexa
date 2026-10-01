@@ -99,6 +99,25 @@ async function main() {
     if (cF.base64 !== '') fails.push(`final chunk body=${JSON.stringify(cF.base64)} (want empty)`);
   }
 
+  // The capture graph can end the recorder (state inactive) before stop() runs.
+  // The final chunk still has to be delivered when onstop follows.
+  const ended: RecordingChunk[] = [];
+  const endedChunker = new MediaRecorderChunker({
+    stream: {} as any,
+    timesliceMs: 1000,
+    onChunk: async (c) => { ended.push(c); return true; },
+  });
+  await endedChunker.start();
+  const endedMr = endedChunker.getMediaRecorder() as unknown as FakeMediaRecorder;
+  endedMr.state = 'inactive';
+  let stopResolved = false;
+  const stopping = endedChunker.stop().then(() => { stopResolved = true; });
+  await new Promise((r) => setTimeout(r, 20));
+  if (stopResolved) fails.push('stop() resolved before onstop on an already-inactive recorder');
+  endedMr.onstop?.();
+  await stopping;
+  if (!ended.some((c) => c.isFinal)) fails.push('an already-inactive recorder dropped the final chunk');
+
   console.log(`chunks: ${JSON.stringify(got.map((c) => ({ seq: c.chunkSeq, final: c.isFinal, bytes: decode(c.base64).length })))}`);
   if (fails.length) {
     console.log('❌ FAIL — ' + fails.join('; '));

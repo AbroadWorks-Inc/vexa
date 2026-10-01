@@ -15,8 +15,11 @@ skipped (logged; nothing written, nothing reported).
 
 The outcome is reported through the gateway (`export_result.py`) after it is
 recorded in `_export.json`: `handed_off` after `/process`, `failed` when a
-completed meeting has no audio or a meeting has more recordings than
-`EXPORT_MAX_RECORDINGS`. A re-run of a handed-off folder only reports again.
+completed meeting has no audio, a meeting has more recordings than
+`EXPORT_MAX_RECORDINGS`, or a speaker with more than 10 s of timeline
+coverage is missing from the wav (`audio_mismatch`). A re-run of a
+handed-off folder only reports again. `audio_mismatch` is not `handed_off`,
+so a later re-enqueue runs the check again.
 
 A meeting can have several bot sessions (a bot failed and a new one joined,
 §6.9 F-K2); each session with audio has its own recording. They make ONE
@@ -31,7 +34,9 @@ always starts from the same inputs.
 
 from __future__ import annotations
 
+import audioop
 import logging
+import math
 import tempfile
 import wave
 from collections.abc import Callable, Mapping
@@ -43,7 +48,12 @@ from typing import Any, Literal
 from exporter import __version__
 from exporter.activity import ActivityEvent, parse_activity, speech_events
 from exporter.activity import names as activity_names
-from exporter.attribution import build_participants, build_speaker_timeline
+from exporter.attribution import (
+    _intervals_from_points,
+    build_participants,
+    build_speaker_timeline,
+)
+from exporter.schemas import SpeakerTimelineFile
 from exporter.audio import join_wavs
 from exporter.config import Settings
 from exporter.export_result import ExportResultPort
@@ -62,8 +72,16 @@ EMPTY_ACTIVITY_AUDIO_S = 180.0
 ACTIVITY_FILE = "speaker-activity.jsonl"
 
 State = Literal[
-    "handed_off", "no_audio", "too_many_recordings", "skipped", "already_done"
+    "handed_off",
+    "no_audio",
+    "too_many_recordings",
+    "skipped",
+    "already_done",
+    "audio_mismatch",
 ]
+# A speaker must have strictly more than this much timeline coverage before
+# their wav RMS can fail the export. Shorter turns stay a hand-off.
+_MISMATCH_MIN_COVERAGE_S = 10.0
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 # A meeting's `speaker_activity` is its worst session's, in this order.
 _ACTIVITY_SEVERITY: tuple[ActivityState, ...] = ("ok", "capped", "invalid", "missing")
@@ -301,6 +319,71 @@ def _held_to(
     return held
 
 
+def _speaker_levels(
+    wav_path: Path, timeline: SpeakerTimelineFile, hangover_ms: int
+) -> dict[str, dict[str, float]]:
+    """RMS of the mono s16 wav inside each speaker's coverage.
+
+    Intervals are the windows. When the timeline has none, point runs use the
+    same closure as the interval fallback (last point plus hangover, clipped
+    to the next speaker). A speaker is included only when that coverage is
+    strictly longer than 10 s. The wav is read span by span; the whole file
+    is not held as a Python list.
+    """
+    if timeline.speaker_intervals:
+        spans = [
+            (
+                iv.speaker_name,
+                int(round(iv.start_sec * 1000)),
+                int(round(iv.end_sec * 1000)),
+            )
+            for iv in timeline.speaker_intervals
+        ]
+    else:
+        spans = _intervals_from_points(
+            timeline.speaker_timeline, timeline.duration_sec, hangover_ms
+        )
+    by_name: dict[str, list[tuple[int, int]]] = {}
+    for name, start_ms, end_ms in spans:
+        by_name.setdefault(name, []).append((start_ms, end_ms))
+
+    levels: dict[str, dict[str, float]] = {}
+    with wave.open(str(wav_path), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            logger.warning(
+                "audio_mismatch_skipped reason=wav_not_mono_s16 channels=%s width=%s",
+                wav.getnchannels(),
+                wav.getsampwidth(),
+            )
+            return {}
+        rate = wav.getframerate()
+        nframes = wav.getnframes()
+        for name, windows in by_name.items():
+            sum_sq = 0.0
+            count = 0
+            for start_ms, end_ms in windows:
+                start = max(0, int(start_ms * rate / 1000))
+                end = min(nframes, int(end_ms * rate / 1000))
+                if end <= start:
+                    continue
+                wav.setpos(start)
+                raw = wav.readframes(end - start)
+                samples = len(raw) // 2
+                if samples == 0:
+                    continue
+                rms = audioop.rms(raw, 2)
+                sum_sq += float(rms) * float(rms) * samples
+                count += samples
+            coverage_s = count / rate if rate else 0.0
+            if coverage_s <= _MISMATCH_MIN_COVERAGE_S or count == 0:
+                continue
+            levels[name] = {
+                "coverage_s": round(coverage_s, 3),
+                "rms": round(math.sqrt(sum_sq / count) / 32768.0, 6),
+            }
+    return levels
+
+
 def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     settings = deps.settings
     storage = deps.storage
@@ -437,123 +520,164 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             retention=AUDIO,
         )
 
-    recording_started_at = datetime.fromtimestamp(
-        sessions[0].origin_ms / 1000, tz=timezone.utc
-    )
-    recording_ended_at = recording_started_at + timedelta(seconds=wav_duration_s)
-    room_name = str(m.get("meeting_url") or m["room"])
-
-    # Each session's events stay inside its own span, so none lands in a gap;
-    # the timeline clips the outer ends to the recording.
-    events: list[ActivityEvent] = []
-    speaker_names: list[str] = []
-    states: list[ActivityState] = []
-    last = len(sessions) - 1
-    for i, (session, (start_ms, end_ms)) in enumerate(zip(sessions, spans)):
-        state, session_events, session_names = _session_activity(
-            session, start_ms, deps, vexa_meeting_id
+        recording_started_at = datetime.fromtimestamp(
+            sessions[0].origin_ms / 1000, tz=timezone.utc
         )
-        events += _held_to(
-            session_events,
-            start_ms if i > 0 else None,
-            end_ms if i < last else None,
+        recording_ended_at = recording_started_at + timedelta(seconds=wav_duration_s)
+        room_name = str(m.get("meeting_url") or m["room"])
+
+        # Each session's events stay inside its own span, so none lands in a gap;
+        # the timeline clips the outer ends to the recording.
+        events: list[ActivityEvent] = []
+        speaker_names: list[str] = []
+        states: list[ActivityState] = []
+        last = len(sessions) - 1
+        for i, (session, (start_ms, end_ms)) in enumerate(zip(sessions, spans)):
+            state, session_events, session_names = _session_activity(
+                session, start_ms, deps, vexa_meeting_id
+            )
+            events += _held_to(
+                session_events,
+                start_ms if i > 0 else None,
+                end_ms if i < last else None,
+            )
+            speaker_names += session_names
+            states.append(state)
+        activity_state = max(states, key=_ACTIVITY_SEVERITY.index)
+        if (
+            activity_state == "ok"
+            and not events
+            and wav_duration_s > EMPTY_ACTIVITY_AUDIO_S
+        ):
+            logger.warning(
+                "speaker_activity_empty vexa_meeting_id=%s audio_s=%d",
+                vexa_meeting_id,
+                round(wav_duration_s),
+            )
+
+        timeline = build_speaker_timeline(
+            events,
+            platform=platform,
+            meeting_id=meeting_uuid,
+            room_name=room_name,
+            recording_started_at=recording_started_at,
+            recording_ended_at=recording_ended_at,
+            min_dominant_utterance_ms=settings.min_dominant_utterance_ms,
+            hangover_ms=settings.speech_hangover_ms,
         )
-        speaker_names += session_names
-        states.append(state)
-    activity_state = max(states, key=_ACTIVITY_SEVERITY.index)
-    if (
-        activity_state == "ok"
-        and not events
-        and wav_duration_s > EMPTY_ACTIVITY_AUDIO_S
-    ):
-        logger.warning(
-            "speaker_activity_empty vexa_meeting_id=%s audio_s=%d",
-            vexa_meeting_id,
-            round(wav_duration_s),
+        participants = build_participants(
+            speaker_names,
+            platform=platform,
+            meeting_id=meeting_uuid,
+            joined_at=recording_started_at,
+            host_email=None,
         )
 
-    timeline = build_speaker_timeline(
-        events,
-        platform=platform,
-        meeting_id=meeting_uuid,
-        room_name=room_name,
-        recording_started_at=recording_started_at,
-        recording_ended_at=recording_ended_at,
-        min_dominant_utterance_ms=settings.min_dominant_utterance_ms,
-    )
-    participants = build_participants(
-        speaker_names,
-        platform=platform,
-        meeting_id=meeting_uuid,
-        joined_at=recording_started_at,
-        host_email=None,
-    )
-
-    storage.put_json(
-        settings.export_bucket,
-        base + "speaker_timeline.json",
-        timeline.model_dump(mode="json"),
-        retention=METADATA,
-    )
-    storage.put_json(
-        settings.export_bucket,
-        base + "participants.json",
-        participants.model_dump(mode="json"),
-        retention=METADATA,
-    )
-    storage.put_json(
-        settings.export_bucket, base + "meeting.json", m, retention=METADATA
-    )
-    storage.put_json(
-        settings.export_bucket,
-        base + "recordings.json",
-        {"recordings": recs},
-        retention=METADATA,
-    )
-
-    # A meeting whose bot ran with live transcription has segments; one
-    # without has none, and gets no file.
-    transcript = deps.meeting_api.transcript(vexa_meeting_id)
-    if transcript is not None and transcript.get("segments"):
         storage.put_json(
             settings.export_bucket,
-            base + "live_transcript.json",
-            transcript,
+            base + "speaker_timeline.json",
+            timeline.model_dump(mode="json"),
+            retention=METADATA,
+        )
+        storage.put_json(
+            settings.export_bucket,
+            base + "participants.json",
+            participants.model_dump(mode="json"),
+            retention=METADATA,
+        )
+        storage.put_json(
+            settings.export_bucket, base + "meeting.json", m, retention=METADATA
+        )
+        storage.put_json(
+            settings.export_bucket,
+            base + "recordings.json",
+            {"recordings": recs},
             retention=METADATA,
         )
 
-    if settings.debug:
-        for session in sessions:
-            signal_dst = base + "signal/"
-            if len(sessions) > 1:
-                signal_dst += session.session_uid + "/"
-            for key in storage.list_keys(settings.vexa_bucket, session.signal_prefix):
-                storage.copy(
-                    settings.vexa_bucket,
-                    key,
-                    settings.export_bucket,
-                    signal_dst + key[len(session.signal_prefix) :],
-                    retention=AUDIO,
-                )
+        # A meeting whose bot ran with live transcription has segments; one
+        # without has none, and gets no file.
+        transcript = deps.meeting_api.transcript(vexa_meeting_id)
+        if transcript is not None and transcript.get("segments"):
+            storage.put_json(
+                settings.export_bucket,
+                base + "live_transcript.json",
+                transcript,
+                retention=METADATA,
+            )
 
-    deps.notetaker.process(meeting_uuid, base, platform)
+        if settings.debug:
+            for session in sessions:
+                signal_dst = base + "signal/"
+                if len(sessions) > 1:
+                    signal_dst += session.session_uid + "/"
+                for key in storage.list_keys(
+                    settings.vexa_bucket, session.signal_prefix
+                ):
+                    storage.copy(
+                        settings.vexa_bucket,
+                        key,
+                        settings.export_bucket,
+                        signal_dst + key[len(session.signal_prefix) :],
+                        retention=AUDIO,
+                    )
 
-    finished = deps.now()
-    storage.put_json(
-        settings.export_bucket,
-        base + "_export.json",
-        {
-            "state": "handed_off",
-            "meeting_id": meeting_uuid,
-            "vexa_meeting_id": vexa_meeting_id,
-            "exported_at": finished.isoformat(),
-            "elapsed_s": (finished - started).total_seconds(),
-            "exporter_version": __version__,
-            "speaker_activity": activity_state,
-            "speaker_activity_events": len(events),
-            "audio_recordings": len(audio_recs),
-        },
-        retention=METADATA,
-    )
-    deps.export_result.report(meeting_uuid, "handed_off", s3_path)
-    return ExportResult("handed_off", folder)
+        levels = _speaker_levels(wav_path, timeline, settings.speech_hangover_ms)
+        quiet = {
+            name: row
+            for name, row in levels.items()
+            if row["rms"] < settings.rms_speech_threshold
+        }
+        if quiet:
+            finished = deps.now()
+            detail = ", ".join(
+                f"{name} rms={row['rms']:.4f} coverage_s={row['coverage_s']}"
+                for name, row in sorted(levels.items())
+            )
+            error = f"audio_mismatch: {detail}"
+            logger.error(
+                "audio_mismatch vexa_meeting_id=%s %s",
+                vexa_meeting_id,
+                detail,
+            )
+            storage.put_json(
+                settings.export_bucket,
+                base + "_export.json",
+                {
+                    "state": "audio_mismatch",
+                    "meeting_id": meeting_uuid,
+                    "vexa_meeting_id": vexa_meeting_id,
+                    "exported_at": finished.isoformat(),
+                    "elapsed_s": (finished - started).total_seconds(),
+                    "exporter_version": __version__,
+                    "speaker_activity": "audio_mismatch",
+                    "speaker_activity_events": len(events),
+                    "audio_recordings": len(audio_recs),
+                    "speaker_levels": levels,
+                },
+                retention=METADATA,
+            )
+            deps.export_result.report(meeting_uuid, "failed", s3_path, error)
+            return ExportResult("audio_mismatch", folder)
+
+        deps.notetaker.process(meeting_uuid, base, platform)
+
+        finished = deps.now()
+        storage.put_json(
+            settings.export_bucket,
+            base + "_export.json",
+            {
+                "state": "handed_off",
+                "meeting_id": meeting_uuid,
+                "vexa_meeting_id": vexa_meeting_id,
+                "exported_at": finished.isoformat(),
+                "elapsed_s": (finished - started).total_seconds(),
+                "exporter_version": __version__,
+                "speaker_activity": activity_state,
+                "speaker_activity_events": len(events),
+                "audio_recordings": len(audio_recs),
+            },
+            retention=METADATA,
+        )
+        deps.export_result.report(meeting_uuid, "handed_off", s3_path)
+        return ExportResult("handed_off", folder)

@@ -24,8 +24,8 @@ One JSON object per line:
 
 | Line | Shape | When |
 |---|---|---|
-| header (first line) | `{"type":"speaker_activity_header","v":1,"session_uid","platform","lane":"gmeet"\|"mixed","native_meeting_id","started_at","image_version"}` | at bot start |
-| frame | `{"t":<epoch ms>,"ch":<channel>,"name":"<display name>"?,"rms":<0..1, 5 dp>,"dur_ms":<int>}` | every captured audio frame (Meet names it; Zoom/Teams frames are unnamed) |
+| header (first line) | `{"type":"speaker_activity_header","v":1,"session_uid","platform","lane":"gmeet"\|"mixed"\|"pertrack","native_meeting_id","started_at","image_version"}` | at bot start |
+| frame | `{"t":<epoch ms>,"ch":<channel>,"name":"<display name>"?,"rms":<0..1, 5 dp>,"dur_ms":<int>}` | every captured audio frame (Meet names it; Zoom per-track frames are named; Teams frames stay unnamed) |
 | hint | `{"type":"hint","t":<epoch ms>,"name":"<display name>","isEnd":true?}` | Zoom/Teams active-speaker signal |
 | capped | `{"type":"capped","t":<epoch ms>,"bytes":<n>}` | once, if the safety ceiling is ever reached; nothing is written after it |
 
@@ -43,7 +43,7 @@ One JSON object per line:
 | `core/meetings/services/bot/src/index.ts` | Always create the writer. At teardown: close it, then upload it **before** the debug tape files (smallest and most important first, inside the SIGTERM grace). |
 | `core/meetings/services/bot/src/signal-upload.ts` | New part `speaker-activity`, uploaded whether or not the debug tape exists. |
 | `core/meetings/services/meeting-api/…/recordings/jsonb.py` | Add `"speaker-activity"` to the accepted signal parts (today unknown parts get 422). |
-| `integrations/out/aw-notetaker/exporter/` | Read `speaker-activity.jsonl` instead of `captured-signal.jsonl`. Wait for it (`ACTIVITY_WAIT_SECONDS`). States `ok`, `missing` (error log `speaker_activity_missing`), `invalid`, `capped`; `_export.json.speaker_activity_events` counts the events derived, and an `ok` file with none on audio longer than 180 s logs the warning `speaker_activity_empty`. Only named gmeet-lane frames are kept in memory. The old tape reader is removed. |
+| `integrations/out/aw-notetaker/exporter/` | Read `speaker-activity.jsonl` instead of `captured-signal.jsonl`. Wait for it (`ACTIVITY_WAIT_SECONDS`). States `ok`, `missing` (error log `speaker_activity_missing`), `invalid`, `capped`; `_export.json.speaker_activity_events` counts the events derived, and an `ok` file with none on audio longer than 180 s logs the warning `speaker_activity_empty`. Named frames are kept on every lane (`gmeet`, `mixed`, `pertrack`); unnamed frames are counted and not stored. A file with no named frame still uses hints. Point-derived intervals are `[first point, last point + speech hangover]`, clipped to the next speaker when that is sooner, and never closed at the recording end. `speaker_intervals_source` is `"audio"` or `"points"`. The old tape reader is removed. |
 | Deployment (rollout step, with the new bot) | Deploy in the order meeting-api → bot → exporter. Turn the debug tape off by default (`capture_signal=false` platform setting in admin-api) when the new bot ships: meeting-api's signal janitor evicts whole `signal/<u>/<m>/<s>/` prefixes oldest-first (50 GiB budget), which include `speaker-activity.jsonl`, and with the tape on only ~200 sessions fit. The alternative is a larger `SIGNAL_TAPE_BUDGET_BYTES`. |
 
 ## Out of scope

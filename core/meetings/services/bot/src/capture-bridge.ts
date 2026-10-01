@@ -37,7 +37,7 @@ import {
 } from '@vexa/remote-browser';
 import { getJoinBrowserArgs } from '@vexa/join';
 import type { RecordingMasterFormat } from '@vexa/recording';
-import { isMixedLanePlatform, isPerTrackLanePlatform, type Invocation } from './config.js';
+import { captureLane, isMixedLanePlatform, isPerTrackLanePlatform, type CaptureLane, type Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
 import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
@@ -71,7 +71,7 @@ export function makeRemoteAudioEnergyTap(activity?: RemoteAudioActivityTap) {
  * overhead, the proven O6 capture path is byte-for-byte unchanged. captureFrame is fire-and-forget;
  * a tap throw is swallowed so it can NEVER reach the pipeline.
  */
-export function makeTelemetryTap(lane: 'gmeet' | 'mixed', telemetry?: TelemetrySink) {
+export function makeTelemetryTap(lane: CaptureLane, telemetry?: TelemetrySink) {
   let seq = 0;
   return (speakerIndex: number, pcm: Float32Array, ts: number, speakerName?: string, hint?: string): void => {
     if (!telemetry) return;   // unset ⇒ one branch, nothing computed (never alter the capture path)
@@ -191,7 +191,7 @@ export interface ObservationRecord {
   t: number;
   /** Which producer emitted it: 'teams-speakers' · 'teams-captions' · 'mixed' · 'csrc' · 'bot'. */
   source: string;
-  lane: 'gmeet' | 'mixed';
+  lane: CaptureLane;
   observation: Record<string, unknown>;
 }
 
@@ -207,7 +207,7 @@ export type ObservationCapableSink = TelemetrySink & { captureObservation?: (rec
  * it would make the sidecar quietly disagree with the log. Clock guard as everywhere else.
  */
 export function makeObservationSink(
-  lane: 'gmeet' | 'mixed',
+  lane: CaptureLane,
   telemetry?: ObservationCapableSink,
   warn: (m: string) => void = (m) => console.warn(m),
   /** The ONE observation the lane consumes rather than merely stores: a roster display name.
@@ -720,7 +720,7 @@ export async function startCaptureBridge(
   const perTrack = isPerTrackLanePlatform(inv.platform);   // Zoom: per-track through the per-channel lane
   const useMix = mixed && !perTrack;                        // Teams/Jitsi: the pyannote mixed lane
   const jitsi = inv.platform === 'jitsi';
-  const lane: 'gmeet' | 'mixed' = mixed ? 'mixed' : 'gmeet';
+  const lane: CaptureLane = captureLane(inv.platform);
 
   // ── O-TEL-1 raw-signal tap (a DUAL-sink) ──────────────────────────────────────────────────
   // When a TelemetrySink is wired, tee each raw frame to it BEFORE the pipeline consumes it, so a
@@ -784,7 +784,12 @@ export async function startCaptureBridge(
   const { sink: onObservation, crossed: obsBridgeCrossed } = makeObservationSink(
     lane, telemetry, undefined,
     mixed ? (name, tMs) => pipeline.recordRosterName?.(name, tMs) : undefined,
-    mixed ? (named, participants, tMs) => pipeline.recordRosterCoverage?.(named, participants, tMs) : undefined,
+    mixed ? (named, participants, tMs) => {
+      pipeline.recordRosterCoverage?.(named, participants, tMs);
+      // The leave decision reads this count, not the voice-outline "observing N".
+      // Coverage is emitted only when it changes, so the tap keeps the last value.
+      activity?.observeRoster?.(participants);
+    } : undefined,
   );
   // C1: the four hint hops on one periodic, cumulative counter line —
   // page-emitted lives in the page console ([TeamsSpeakers]/[JitsiSpeakers] logs);
@@ -828,8 +833,8 @@ export async function startCaptureBridge(
     if (isMixed) {
       // Zoom/Teams/Jitsi ride the WebRTC hook (installRemoteAudioHook, installed pre-nav), which mirrors
       // each remote participant's audio track into w.__vexaCapturedRemoteAudioStreams AND into a hidden
-      // <audio data-vexa-injected> element (that latter copy is what the recorder taps — untouched by
-      // either path below). Two transcription topologies split here:
+      // <audio data-vexa-injected> element. Zoom records the per-track mix destination below.
+      // Teams and Jitsi still record that element. Two transcription topologies split here:
       //   • PER-TRACK (Zoom — confirmed live: multi-stream, stable per-participant, 0 teardowns): capture
       //     EACH track on its OWN channel and name it from the active-speaker hints, through the SAME
       //     per-channel, name-at-onset engine Google Meet uses. A track = one speaker (ground truth), so
@@ -925,20 +930,48 @@ export async function startCaptureBridge(
         w.__vexaTrackTopology = n;
         w.__vexaObservation?.('pertrack', { type: 'pertrack-topology', streams: n, tMs: Date.now() }, Date.now());
       };
-      const setupPerTrack = (): void => {
-        reportPerTrackPresence();
-        const streams = (w.__vexaCapturedRemoteAudioStreams || []) as Array<{ id: string }>;
-        if (!streams.length) return;
-        if (!w.__vexaTrackCtx) {
+      const ensureTrackCtx = (): boolean => {
+        if (w.__vexaTrackCtx) return true;
+        try {
           w.__vexaTrackCtx = new (globalThis as any).AudioContext({ sampleRate: 16000 });
           w.__vexaTrackCtx.resume?.();
           w.__vexaTrackCaps = new Map();
           w.__vexaTrackNextCh = 0;
+          return true;
+        } catch (e: any) {
+          w.logBot?.('[pertrack] audio context failed: ' + String(e));
+          return false;
         }
+      };
+      const connectMix = (entry: { ch: number; src: any; mixed: boolean; streamId: string }): void => {
+        if (entry.mixed || !w.__vexaPerTrackMixDest) return;
+        try {
+          entry.src.connect(w.__vexaPerTrackMixDest);
+          entry.mixed = true;
+          w.__vexaPerTrackMixCount = (w.__vexaPerTrackMixCount || 0) + 1;
+          w.__vexaObservation?.('pertrack', {
+            type: 'pertrack-mix-connected',
+            channel: entry.ch,
+            streamId: entry.streamId,
+            connected: w.__vexaPerTrackMixCount,
+            tMs: Date.now(),
+          }, Date.now());
+        } catch (mixErr: any) {
+          // Leave mixed false so the 2s rescan retries. The activity tap is already up.
+          w.logBot?.('[pertrack] mix connect failed ch=' + entry.ch + ': ' + String(mixErr));
+        }
+      };
+      const setupPerTrack = (): void => {
+        reportPerTrackPresence();
+        const streams = (w.__vexaCapturedRemoteAudioStreams || []) as Array<{ id: string }>;
+        if (!streams.length) return;
+        if (!ensureTrackCtx()) return;
         const ctx = w.__vexaTrackCtx;
         const SR = 16000, SILENCE = 0.005;
         for (const s of streams) {
-          if (!s || w.__vexaTrackCaps.has(s.id)) continue;
+          if (!s) continue;
+          const existing = w.__vexaTrackCaps.get(s.id);
+          if (existing) { connectMix(existing); continue; }
           const ch: number = w.__vexaTrackNextCh++;
           try {
             const src = ctx.createMediaStreamSource(s);
@@ -968,7 +1001,10 @@ export async function startCaptureBridge(
             };
             src.connect(proc);
             proc.connect(ctx.destination);                     // pull the processor (it outputs silence)
-            w.__vexaTrackCaps.set(s.id, { ch, src, proc });
+            // Silence stays in the recording graph. Only the activity frames are gated above.
+            const entry = { ch, src, proc, mixed: false, streamId: s.id };
+            connectMix(entry);
+            w.__vexaTrackCaps.set(s.id, entry);
             w.logBot?.('[pertrack] capturing ch=' + ch + ' (' + w.__vexaTrackCaps.size + ' track(s))');
             reportPerTrackTopology();
             w.__vexaRemoteAudioReady?.();
@@ -981,8 +1017,53 @@ export async function startCaptureBridge(
           }
         }
       };
+      const ensurePerTrackGraph = (): boolean => {
+        if (w.__vexaPerTrackMixDest) return true;
+        if (!ensureTrackCtx()) {
+          w.__vexaObservation?.('pertrack', { type: 'pertrack-mix-failed', error: 'audio context failed', tMs: Date.now() }, Date.now());
+          return false;
+        }
+        try {
+          // Created on the tap context before any stream exists, so recording
+          // (which starts after capture) does not fall back to the element snapshot.
+          // A track that connects after MediaRecorder has started is still recorded.
+          w.__vexaPerTrackMixDest = w.__vexaTrackCtx.createMediaStreamDestination();
+          w.__vexaPerTrackMixStream = w.__vexaPerTrackMixDest.stream;
+          w.__vexaPerTrackMixCount = 0;
+          return true;
+        } catch (e: any) {
+          w.logBot?.('[pertrack] mix destination failed: ' + String(e));
+          w.__vexaObservation?.('pertrack', { type: 'pertrack-mix-failed', error: String(e), tMs: Date.now() }, Date.now());
+          return false;
+        }
+      };
+      ensurePerTrackGraph();
       setupPerTrack();
       w.__vexaMixRescan = (globalThis as any).setInterval(setupPerTrack, 2000); // pick up late-joining tracks
+      // A paused element is why a track can be in the activity file and absent from the webm.
+      w.__vexaPerTrackElementTimer = (globalThis as any).setInterval(() => {
+        try {
+          const els = (globalThis as any).document?.querySelectorAll?.('audio[data-vexa-injected]') || [];
+          const states: Array<Record<string, unknown>> = [];
+          for (const el of els) {
+            const tracks = el?.srcObject?.getAudioTracks?.();
+            states.push({
+              paused: !!el?.paused,
+              readyState: el?.readyState ?? null,
+              muted: !!el?.muted,
+              volume: el?.volume ?? null,
+              tracks: Array.isArray(tracks) ? tracks.length : 0,
+            });
+          }
+          w.__vexaObservation?.('pertrack', {
+            type: 'pertrack-element-state',
+            elements: states.length,
+            states,
+            mix_connected: w.__vexaPerTrackMixCount || 0,
+            tMs: Date.now(),
+          }, Date.now());
+        } catch { /* a diagnostic must not break capture */ }
+      }, 30_000);
       // Zoom's active-speaker DOM watcher — the WHO signal the resolver correlates with per-track energy
       // (also teed to __vexaSpeakerHint for telemetry; the pipeline's recordHint is a no-op on this lane).
       if (isZoom && w.VexaBrowserUtils?.createZoomSpeakers && !w.__vexaZoomSpeakers) {
@@ -1346,6 +1427,7 @@ export async function startCaptureBridge(
       try { w.__vexaJitsiChat?.destroy?.(); w.__vexaJitsiChat = null; } catch { /* best-effort */ }
       try { w.__vexaZoomSpeakers?.destroy?.(); w.__vexaZoomSpeakers = null; } catch { /* best-effort */ }
       try { if (w.__vexaMixRescan) { (globalThis as any).clearInterval(w.__vexaMixRescan); w.__vexaMixRescan = null; } } catch { /* */ }
+      try { if (w.__vexaPerTrackElementTimer) { (globalThis as any).clearInterval(w.__vexaPerTrackElementTimer); w.__vexaPerTrackElementTimer = null; } } catch { /* */ }
       try {
         if (w.__vexaTrackCaps) {
           for (const e of w.__vexaTrackCaps.values()) {
@@ -1354,7 +1436,13 @@ export async function startCaptureBridge(
           w.__vexaTrackCaps = null;
         }
       } catch { /* best-effort */ }
-      try { w.__vexaTrackCtx?.close?.(); w.__vexaTrackCtx = null; } catch { /* best-effort */ }
+      // The Zoom recorder reads this context's mix destination. Closing it here
+      // ends that stream before MediaRecorder is stopped, and the open timeslice
+      // is dropped. The recording stop closes it after the tap has drained.
+      if (!w.__vexaRecordingTap) {
+        try { w.__vexaTrackCtx?.close?.(); w.__vexaTrackCtx = null; } catch { /* best-effort */ }
+        try { w.__vexaPerTrackMixDest = null; w.__vexaPerTrackMixStream = null; w.__vexaPerTrackMixCount = 0; } catch { /* best-effort */ }
+      }
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }
       try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
@@ -1417,25 +1505,36 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
 
   // Page-side: start the generic recording tap (finds + combines the page audio elements).
-  await page.evaluate(async (timesliceMs) => {
+  await page.evaluate(async ({ timesliceMs, perTrack }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (w.VexaBrowserUtils?.createRecordingTap && !w.__vexaRecordingTap) {
-      w.__vexaRecordingTap = w.VexaBrowserUtils.createRecordingTap({
+      const tapOpts: Record<string, unknown> = {
         timesliceMs,
         onChunk: async (c: { base64: string; chunkSeq: number; isFinal: boolean; mimeType: string }) => {
           try { await w.__vexaRecordingChunk(c.base64, c.chunkSeq, c.isFinal, c.mimeType); return true; }
           catch { return false; }
         },
-      });
+      };
+      // Zoom: record the live per-track mix. A track that joins after this
+      // start is connected to the same destination and is in the webm.
+      // Teams and Meet keep the element snapshot.
+      if (perTrack && w.__vexaPerTrackMixStream) {
+        tapOpts.stream = w.__vexaPerTrackMixStream;
+        w.logBot?.('[pertrack] recording the live mix (' + (w.__vexaPerTrackMixCount || 0) + ' track(s) connected)');
+      }
+      w.__vexaRecordingTap = w.VexaBrowserUtils.createRecordingTap(tapOpts);
       await w.__vexaRecordingTap.start();
     }
-  }, timesliceMs).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
+  }, { timesliceMs, perTrack: isPerTrackLanePlatform(inv.platform) }).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
     await page.evaluate(async () => {
       const w = (globalThis as any) as Record<string, any>;
       try { await w.__vexaRecordingTap?.stop?.(); } catch { /* best-effort */ }
+      w.__vexaRecordingTap = null;
+      try { w.__vexaTrackCtx?.close?.(); w.__vexaTrackCtx = null; } catch { /* best-effort */ }
+      try { w.__vexaPerTrackMixDest = null; w.__vexaPerTrackMixStream = null; w.__vexaPerTrackMixCount = 0; } catch { /* best-effort */ }
     }).catch(() => { /* page already gone */ });
   };
 }

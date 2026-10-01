@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 
 from exporter.attribution import build_participants, build_speaker_timeline
 from exporter.schemas import ParticipantsFile, SpeakerEvent, SpeakerTimelineFile
-from exporter.activity import ActivityEvent, EventType
+from exporter.activity import ActivityEvent, EventType, parse_activity, speech_events
+from tests.builders import frame, header, hint
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -42,9 +43,8 @@ def _audio(name: str, event_type: EventType, relative_ms: int) -> ActivityEvent:
 
 
 def _hint(name: str, event_type: EventType, relative_ms: int) -> ActivityEvent:
-    """A point-in-time claim: the mixed-lane hint source, and the reference's
-    untagged/"dom"/"caption" point producers, which all collapse onto "hint"
-    here — never paired into an interval."""
+    """A point-in-time claim. The audio state machine does not pair hints.
+    Two or more named speakers still yield point-derived intervals."""
     return ActivityEvent(name, relative_ms, event_type, "hint")
 
 
@@ -103,9 +103,40 @@ def test_teams_gets_intervals_from_points() -> None:
         seconds=20,
     )
     assert [(i.speaker_name, i.start_sec, i.end_sec) for i in tl.speaker_intervals] == [
-        ("A", 0.0, 9.0),
-        ("B", 9.0, 20.0),
+        ("A", 0.0, 0.7),
+        ("B", 9.0, 9.7),
     ]
+    assert tl.speaker_intervals_source == "points"
+
+
+def test_zoom_named_pertrack_frames_yield_audio_intervals() -> None:
+    """Header lane pertrack, one named frame per channel, plus a hint. The
+    intervals come from the frames and the hint does not add a speaker."""
+    origin = int(T0.timestamp() * 1000)
+    activity = parse_activity(
+        [
+            header("pertrack"),
+            frame(origin, "Ann Lee", 0.2, ch=0, dur_ms=2_000),
+            frame(origin + 3_000, "Bo", 0.2, ch=1, dur_ms=2_000),
+            hint(origin + 100, "Ghost"),
+        ]
+    )
+    events = speech_events(activity, origin, 0.026, 700)
+    tl = build_speaker_timeline(
+        events,
+        platform="zoom",
+        meeting_id="vexa-1",
+        room_name="r",
+        recording_started_at=T0,
+        recording_ended_at=T0 + timedelta(seconds=30),
+        min_dominant_utterance_ms=1500,
+    )
+    assert [(i.speaker_name, i.start_sec, i.end_sec) for i in tl.speaker_intervals] == [
+        ("Ann Lee", 0.0, 2.0),
+        ("Bo", 3.0, 5.0),
+    ]
+    assert tl.speaker_intervals_source == "audio"
+    assert all(p.speaker_name != "Ghost" for p in tl.speaker_timeline)
 
 
 def test_empty_events_give_empty_timeline() -> None:
@@ -545,7 +576,7 @@ def test_collapsed_speaker_timeline_is_byte_identical_regardless_of_intervals() 
     ] == [("Speaker A", 0.0, 20.0), ("Speaker C", 5.0, 6.0), ("Speaker B", 15.0, 40.0)]
 
 
-def test_hint_sourced_events_are_not_turned_into_intervals() -> None:
+def test_hint_points_become_hangover_intervals() -> None:
     ev = [
         _hint("Ann Lee", "SPEAKER_START", 1_000),
         _hint("Ann Lee", "SPEAKER_END", 2_000),
@@ -553,7 +584,12 @@ def test_hint_sourced_events_are_not_turned_into_intervals() -> None:
     ]
     result = _tl(ev)
     assert len(result.speaker_timeline) == 2  # safety-valve path still runs
-    assert result.speaker_intervals == []  # nothing was pairable
+    # Only SPEAKER_START hints become points. Each run ends at its own point
+    # plus the 700 ms hangover, not at the other speaker and not at 60 s.
+    assert [
+        (iv.speaker_name, iv.start_sec, iv.end_sec) for iv in result.speaker_intervals
+    ] == [("Ann Lee", 1.0, 1.7), ("Bo", 3.0, 3.7)]
+    assert result.speaker_intervals_source == "points"
 
 
 def test_unpaired_start_is_bounded_by_session_end() -> None:
@@ -578,12 +614,19 @@ def test_second_start_without_end_produces_two_intervals() -> None:
     ]
 
 
-def test_hint_events_yield_no_intervals() -> None:
+def test_two_hint_speakers_get_hangover_intervals() -> None:
+    """Two hint speakers on Meet yield point intervals. The gap between them
+    is not given to the earlier speaker, and the last run does not run to
+    the end of the recording."""
     ev = [
         _hint("Speaker A", "SPEAKER_START", 0),
         _hint("Speaker B", "SPEAKER_START", 10_000),
     ]
-    assert _tl(ev).speaker_intervals == []
+    result = _tl(ev)
+    assert [
+        (iv.speaker_name, iv.start_sec, iv.end_sec) for iv in result.speaker_intervals
+    ] == [("Speaker A", 0.0, 0.7), ("Speaker B", 10.0, 10.7)]
+    assert result.speaker_intervals_source == "points"
 
 
 def test_audio_intervals_present_excludes_hint_points_from_intervals() -> None:
@@ -597,6 +640,7 @@ def test_audio_intervals_present_excludes_hint_points_from_intervals() -> None:
     assert [
         (iv.speaker_name, iv.start_sec, iv.end_sec) for iv in result.speaker_intervals
     ] == [("Speaker A", 0.0, 5.0)]
+    assert result.speaker_intervals_source == "audio"
 
 
 # ---------------------------------------------------------------------------
@@ -698,9 +742,10 @@ def test_teams_derives_intervals_from_hint_runs() -> None:
     ivs = _tl(ev, platform="teams").speaker_intervals
     assert [(iv.speaker_name, iv.start_sec, iv.end_sec) for iv in ivs] == [
         # Ann Lee starts at 0.0, not 2.0: the t=0 anchor already pulled the
-        # earliest point to the origin, and the interval follows it.
-        ("Ann Lee", 0.0, 10.0),
-        ("Bo", 10.0, 60.0),  # closed at the next speaker's first point
+        # earliest point to the origin. The run ends at that point plus the
+        # 700 ms hangover. The gap until Bo is not hers.
+        ("Ann Lee", 0.0, 0.7),
+        ("Bo", 10.0, 10.7),
     ]
 
 
@@ -717,8 +762,10 @@ def test_a_run_of_points_becomes_one_interval_not_one_each() -> None:
     ivs = _tl(ev, platform="teams").speaker_intervals
     assert len(ivs) == 2, f"5 points must collapse to 2 runs, got {len(ivs)}"
     assert [(iv.speaker_name, iv.start_sec, iv.end_sec) for iv in ivs] == [
-        ("Ann Lee", 0.0, 20.0),
-        ("Bo", 20.0, 60.0),
+        # Ann's points at 1s, 2s and 3s stay one run. The anchor moves the
+        # earliest of them to 0; the run still ends at the last point + 0.7s.
+        ("Ann Lee", 0.0, 3.7),
+        ("Bo", 20.0, 21.7),
     ]
 
 
@@ -758,7 +805,41 @@ def test_teams_with_one_named_speaker_still_emits_no_intervals() -> None:
         _hint("Ann Lee", "SPEAKER_START", 2_000),
         _hint("Ann Lee", "SPEAKER_START", 9_000),
     ]
-    assert _tl(ev, platform="teams").speaker_intervals == []
+    result = _tl(ev, platform="teams")
+    assert result.speaker_intervals == []
+    assert result.speaker_intervals_source is None
+
+
+def test_point_interval_does_not_run_to_the_end_of_the_recording() -> None:
+    """Teams shape: conversation ends at 259.7 s, recording runs to 1560.7 s.
+    The last interval ends at the last point plus hangover."""
+    tl = _tl(
+        [
+            _hint("Ann Lee", "SPEAKER_START", 0),
+            _hint("Bo", "SPEAKER_START", 259_700),
+        ],
+        platform="teams",
+        seconds=1561,
+    )
+    assert [
+        (iv.speaker_name, iv.start_sec, iv.end_sec) for iv in tl.speaker_intervals
+    ] == [("Ann Lee", 0.0, 0.7), ("Bo", 259.7, 260.4)]
+    assert tl.speaker_intervals[-1].end_sec < 261
+    assert tl.speaker_intervals_source == "points"
+
+
+def test_a_point_run_clips_to_the_next_speaker_inside_the_hangover() -> None:
+    tl = _tl(
+        [
+            _hint("Ann Lee", "SPEAKER_START", 0),
+            _hint("Bo", "SPEAKER_START", 400),
+        ],
+        platform="teams",
+        seconds=20,
+    )
+    assert [
+        (iv.speaker_name, iv.start_sec, iv.end_sec) for iv in tl.speaker_intervals
+    ] == [("Ann Lee", 0.0, 0.4), ("Bo", 0.4, 1.1)]
 
 
 # ---------------------------------------------------------------------------

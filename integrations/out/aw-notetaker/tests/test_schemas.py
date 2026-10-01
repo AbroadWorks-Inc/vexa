@@ -24,6 +24,7 @@ def test_field_sets_match_notetaker_contract() -> None:
         "participants",
         "speaker_timeline",
         "speaker_intervals",
+        "speaker_intervals_source",
     ]
     assert list(schemas.ParticipantsFile.model_fields) == [
         "meeting_id",
@@ -84,3 +85,4 @@ def test_speaker_timeline_file_roundtrip_and_defaults() -> None:
         speaker_timeline=[],
     )
     assert default_timeline.speaker_intervals == []
+    assert default_timeline.speaker_intervals_source is None

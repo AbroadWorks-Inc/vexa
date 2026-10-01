@@ -174,8 +174,9 @@ def test_gmeet_with_frames_and_stray_hint_ignores_hint() -> None:
     assert not any(e[0] == "B" for e in events)  # no B speaker
 
 
-def test_mixed_lane_with_frames_and_hints_returns_hints_only() -> None:
-    """mixed lane should use hint events only, ignoring frames (spec §4.3)."""
+def test_named_frames_on_mixed_lane_win_over_hints() -> None:
+    """A named frame wins on the mixed lane. The hint is used only when no
+    named frame was stored."""
     a = parse_activity(
         [
             header("mixed"),
@@ -184,14 +185,28 @@ def test_mixed_lane_with_frames_and_hints_returns_hints_only() -> None:
         ]
     )
     events = [ev(e) for e in speech_events(a, ORIGIN_MS, 0.05, 700)]
-    assert ("B", 100, "SPEAKER_START", "hint") in events
-    assert all(e[3] == "hint" for e in events)  # source is hint only
-    assert not any(e[0] == "A" for e in events)  # no A speaker
+    assert ("A", 0, "SPEAKER_START", "audio") in events
+    assert all(e[3] == "audio" for e in events)
+    assert not any(e[0] == "B" for e in events)
+
+
+def test_named_frames_on_pertrack_lane_win_over_hints() -> None:
+    a = parse_activity(
+        [
+            header("pertrack"),
+            frame(ORIGIN_MS, "Ann", 0.2, ch=0),
+            frame(ORIGIN_MS + 100, "Bo", 0.2, ch=1),
+            hint(ORIGIN_MS + 50, "Ghost"),
+        ]
+    )
+    events = [ev(e) for e in speech_events(a, ORIGIN_MS, 0.05, 700)]
+    assert {e[0] for e in events} == {"Ann", "Bo"}
+    assert all(e[3] == "audio" for e in events)
 
 
 def test_mixed_lane_frames_are_counted_not_stored() -> None:
-    """speech_events never reads mixed-lane frames, so they are not kept in
-    memory; they are still counted."""
+    """Unnamed mixed-lane frames are not kept in memory; they are still
+    counted. With no named frame, hints remain the events."""
     a = parse_activity(
         [
             header("mixed"),

@@ -40,9 +40,9 @@ class ActivityEvent:
 
 @dataclass(slots=True)
 class Activity:
-    """One parsed file. `frames` holds only what `speech_events` reads — named
-    frames on the gmeet lane; every valid frame line is counted in
-    `frame_count`, so a long meeting's unused frames never sit in memory."""
+    """One parsed file. `frames` holds named frames on every lane. Unnamed
+    frames are counted in `frame_count` and not stored, so a long meeting's
+    unused frames never sit in memory."""
 
     lane: str
     started_at: str | None
@@ -102,7 +102,9 @@ def parse_activity(lines: Iterable[str]) -> Activity:
             except (KeyError, ValueError, TypeError):
                 continue
             activity.frame_count += 1
-            if activity.lane != "mixed" and parsed.name:
+            # Named frames are the timeline on every lane, including mixed and
+            # pertrack. Unnamed frames (Teams' server mix) stay counted only.
+            if parsed.name:
                 activity.frames.append(parsed)
     if activity is None:
         raise ValueError("speaker-activity file has no speaker_activity_header")
@@ -125,11 +127,11 @@ def speech_events(
 ) -> list[ActivityEvent]:
     """Extract speaker START/END events from activity.
 
-    If lane is "mixed", emits point events from hints only (spec §4.3).
-    Otherwise analyzes frames using RMS threshold and hangover duration.
-    Returns events sorted by relative_ms, then name.
+    Named frames win on every lane. Hints are used only when the file stored
+    no named frame (Teams' mixed lane, or a Zoom file that never named a
+    channel). Returns events sorted by relative_ms, then name.
     """
-    if activity.lane == "mixed":
+    if not activity.frames:
         out = [
             ActivityEvent(
                 h.name,
