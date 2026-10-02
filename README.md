@@ -49,14 +49,15 @@ with Prosody's speaker timeline.
 the shared Whisper large-v3 transcriber instead. Live transcription is a setting
 (`TRANSCRIBE_ENABLED`), default off for us.
 
+Which service does what, and who may call it, is [docs/aw-bots/architecture.md](docs/aw-bots/architecture.md).
+
 ### The `/v2` API
 
 Apps send meetings to AW Bots through the gateway. **Client developers start with the
 [`/v2` API reference](core/meetings/services/meeting-api/V2-API.md)**: every
-route, field, reply, error and webhook, with `curl` examples and signature-check code. The rules
-behind it are Part 2 of the
-[intake design](integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md);
-they are sealed as `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
+route, field, reply, error and webhook, with `curl` examples and signature-check code.
+How an entry becomes a bot is [docs/aw-bots/meeting-lifecycle.md](docs/aw-bots/meeting-lifecycle.md).
+The sealed contracts are `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
 
 | Call | Scope | Does |
 |---|---|---|
@@ -68,53 +69,13 @@ they are sealed as `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
 | `DELETE /v2/meetings/{id}` | `erase` | Erase a finished meeting's AW Bots data (recording copies in `aw-bots`, transcript rows, entries, webhook rows). Nothing in `aw-chatworks-transcribe` is deleted |
 | `POST /v2/meetings/{id}/export` | `export` | The exporter reports its result |
 
-- **One meeting per link and time.** Entries with the same meeting link at overlapping times are one
-  meeting, within one account: three colleagues with the same invite are three entries, one
-  meeting, one bot. Each meeting has a UUID, used in every reply, webhook, exported file and
-  `/process` call.
-- **One live bot per link.** A meeting due while another bot is still on its link waits, and its bot
-  goes as soon as the link is free. A pasted link joins the meeting already there instead of
-  sending a second bot.
-- **Every request gets a definite answer**: a `result` or an error `code` in the shape
-  `{"error": {"code", "message"}}`. Every meeting that ends without a bot carries a typed reason
-  and the exact message.
-- **Limits per account:** 600 entry writes a minute (the gateway, `429 rate_limited`) and 100 000
-  active entries (`429 quota_exceeded`).
-
-### Webhooks
-
-- **Subscriptions** are managed through the gateway with the `webhooks` scope:
-  `POST/GET /v2/webhooks`, `PATCH/DELETE /v2/webhooks/{id}`, `POST /v2/webhooks/{id}/rotate-secret`,
-  `POST /v2/webhooks/{id}/test` and `GET /v2/webhooks/{id}/deliveries`. The receiver normally
-  supplies its own secret. Secrets are stored encrypted and never shown again.
-- **Every status change is an event**, written in the same transaction as the change. Each event
-  carries the full meeting, an `event_id` and a `sequence` that rises by 1 per meeting.
-- **Signing:** `X-Webhook-Timestamp: <unix seconds>` and
-  `X-Webhook-Signature: sha256=<HMAC-SHA256(secret, "<timestamp>." + body)>`. For 24 hours after a
-  secret is rotated, `X-Webhook-Signature-Previous` carries the same signature under the old
-  secret; a receiver accepts a match on either header and rejects a timestamp more than 300 s off.
-- **Delivery** is at least once and not in order. Retries after a 5xx, 429, timeout or connection
-  error come after the waits in `WEBHOOK_RETRY_SCHEDULE_S` (default 1 min, 5 min, 30 min and 2 h),
-  then the delivery is `dead`; any other answer that
-  isn't 2xx (including a redirect) is `failed`. **Receivers dedupe on `event_id` and ignore an event
-  whose `sequence` is older than one they already applied.**
-- The exporter is a subscriber like the portal (its own subscription and secret). Upstream's
-  system webhook (`VEXA_SYSTEM_WEBHOOK_URL` + `VEXA_SYSTEM_WEBHOOK_SECRET`, both or neither) and the
-  per-user `webhook_url` carry upstream's meeting block and retry through Redis; AW sets neither.
+Events, signing, and delivery are [docs/aw-bots/export-and-webhooks.md](docs/aw-bots/export-and-webhooks.md).
 
 ### Keys and signed identity
 
-- **Every client goes through the gateway.** The gateway checks the key's scope, sets `x-user-id`
-  and signs it with the active key of the `GATEWAY_IDENTITY_KEYS` ring, naming it (`kid`), over the
-  user and every other `x-user-*` header it forwards (email, scopes, limits, workspaces, webhook
-  URL, secret and events), the method, path, query and body. meeting-api and admin-api refuse a
-  client request whose signature is missing, wrong, under a kid not in their ring or more than
-  `GATEWAY_IDENTITY_MAX_SKEW_S` (60 s) off their clock, or that carries an identity header twice,
-  so a direct call with `x-user-id` gets 401.
-  Only the bots, the runtime and service-to-service calls reach meeting-api directly: bot status
-  callbacks carry the internal secret, each bot's runtime callback URL carries its own token, and
-  the `/internal/*` routes between admin-api and meeting-api check the internal secret.
-- **One key per consumer**, all under the service user, with only the scopes it needs:
+How the gateway signs `x-user-id`, and how the rings rotate, is
+[docs/aw-bots/security.md](docs/aw-bots/security.md). One key per consumer, all under the service
+user, with only the scopes it needs:
 
   | Key name | Scopes | Where it lives |
   |---|---|---|
@@ -124,9 +85,6 @@ they are sealed as `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
   | `operator` | `webhooks`, `erase` | the operator vault only |
 
   The `/user/*` routes accept only the user scopes `bot`, `tx` and `browser`.
-- **Rotation:** mint a new key with the same name (`expires_in` 365 days), update its Secret, roll
-  the Deployment, then revoke the old key by id. admin-api's metrics show the time left on each
-  named key.
 
 ---
 
@@ -149,11 +107,11 @@ Everything else is upstream Vexa, unchanged.
 | **Webhook subscriptions, scopes and keys.** `/v2/webhooks`, encrypted receiver secrets, new scopes `webhooks`, `erase`, `export`. | `core/identity/services/admin-api`; `core/identity/contracts/identity.v1/` | Each app subscribes on its own; each consumer's key can do only its own job. |
 | **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can't act as any user by setting a header. |
 | **Metrics.** `/metrics` on meeting-api and admin-api (not routed through the gateway). | `meeting_api/metrics.py`, `admin_api/app/metrics.py`; Helm `meetingApi.podAnnotations`, `adminApi.podAnnotations` | Prometheus scrapes them; the alerts live in aw-notetaker. |
-| **Image workflow.** Builds and pushes our five images (meeting-api, bot, exporter, gateway, admin-api) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
+| **Image workflow.** Builds and pushes our six images (meeting-api, bot, exporter, gateway, admin-api, runtime) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
-The design and the reasoning behind each decision live in
-[`integrations/out/aw-notetaker/docs/`](integrations/out/aw-notetaker/docs/README.md).
+The handbook is [`docs/aw-bots/`](docs/aw-bots/README.md). Decisions are
+[`docs/aw-bots/decisions/`](docs/aw-bots/decisions/README.md).
 
 ---
 
@@ -210,7 +168,8 @@ One Helm install runs all of these. Each service is its own Docker image.
 | **exporter** | built from `integrations/out/aw-notetaker` | **ours**, deployed next to the chart |
 
 Our images go to GHCR, under the names `ghcr.io/voyantt-consultancy-services-llp/aw-bots-meeting-api`,
-`…/aw-bots-bot`, `…/aw-bots-exporter`, `…/aw-bots-gateway` and `…/aw-bots-admin-api`.
+`…/aw-bots-bot`, `…/aw-bots-exporter`, `…/aw-bots-gateway`, `…/aw-bots-admin-api` and
+`…/aw-bots-runtime`.
 **The gateway and admin-api need our images, like meeting-api:** upstream's `vexaai/v012-gateway` and
 `vexaai/v012-admin-api` don't have the `/v2` routes, the new scopes or the signed identity, and the
 new meeting-api refuses every client request that upstream's gateway forwards unsigned. Our Helm
@@ -222,7 +181,7 @@ values must point `gateway.image` and `adminApi.image` at them.
 
 | Trigger | Tags pushed |
 |---|---|
-| Push to `development` | `:<commit sha>` for all five images |
+| Push to `development` | `:<commit sha>` for all six images |
 | Manual run (Actions → Run workflow: branch, tag e.g. `v0.1.1`, `all` or one image) | `:<commit sha>` and `:<tag>` |
 
 To build one image with a version tag, for example the gateway or admin-api, use the manual run
@@ -260,6 +219,10 @@ docker build --platform linux/amd64 -f core/gateway/services/gateway/Dockerfile 
 docker build --platform linux/amd64 -t $REG/aw-bots-admin-api:$TAG core/identity/services/admin-api
 docker push $REG/aw-bots-gateway:$TAG
 docker push $REG/aw-bots-admin-api:$TAG
+
+# runtime (context: core/runtime) — starts the bot pods and deletes them after they exit.
+docker build --platform linux/amd64 -t $REG/aw-bots-runtime:$TAG core/runtime
+docker push $REG/aw-bots-runtime:$TAG
 ```
 
 Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our change adds one small source file and
@@ -332,43 +295,11 @@ this fork. The step-by-step runbook is `deployment/base/aw-bots/README.md` there
 | `deployment/aws/iam/abroadworks-aw-bots-meeting-api-role/`, `…/abroadworks-aw-exporter-role/` | IAM roles (IRSA) |
 | `deployment/aws/s3-lifecycle/aw-bots-lifecycle.json` | 14-day expiry for the `aw-bots` bucket |
 
-In outline:
-
-1. **Buckets and IAM.** Bucket `aw-bots` gets a 14-day expiry on `recordings/` and `signal/`. It holds
-   Vexa's own files; the clean per-meeting folders are in `aw-chatworks-transcribe`, whose existing
-   lifecycle rules expire objects by their `retention-class` tag. Create two IAM roles (IRSA):
-   - meeting-api reads and writes `aw-bots`. The role attaches through `meetingApi.serviceAccount`.
-   - The exporter reads `aw-bots` and writes `aw-chatworks-transcribe`, including
-     `s3:PutObjectTagging`.
-2. **Two Karpenter NodePools of AW Bots' own**, so it shares no machines with anything else in the
-   cluster: `aw-bots-services` (one node for the chart's services, Postgres, Redis and the
-   exporter) and `aw-bots-meetings` (bot pods). Both amd64 and **on-demand only** (never spot: a
-   reclaimed node kills the meeting). Nodes are removed only when empty, so a live bot is never
-   evicted.
-3. **Install AW Bots.** `helm upgrade --install aw-bots deploy/helm/charts/vexa -n aw-bots -f <our values file>`.
-   The values file lives in aw-notetaker; it sets the table above and points at our images.
-4. **Deploy the exporter** from its manifests: one replica, `strategy: Recreate`.
-5. **Set the debug tape off** (`capture_signal=false`).
-6. **Create one AW Bots service account** (admin-api). Every meeting is created under this one account,
-   which is what stops two bots joining the same shared meeting. Mint its four named keys
-   (`calendar-dispatcher`, `portal`, `exporter`, `operator`; see [Keys and signed identity](#keys-and-signed-identity))
-   into their Secrets. Operators, too, reach admin-api's `/user/*` routes through the gateway: a
-   direct call with an API key (for example over a port-forward) gets 401.
-
-When upgrading our images separately, roll out the gateway and admin-api first, then meeting-api, then
-the bot, then the exporter. The new meeting-api refuses the unsigned requests an old gateway forwards;
-a new bot needs a meeting-api that accepts its speaker file; the exporter needs the export route and
-bots that write a speaker file.
-
-**Bringing in the intake and webhooks release** follows the rollout order in Part 5 of the
-[intake design](integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md),
-with no meeting in progress until the exporter's subscription exists. In short: the database
-migration (`MIGRATION-0008`) first; the gateway identity ring and the webhook key ring into
-`aw-bots-secrets` before any `helm upgrade`; our gateway and admin-api images, with the system
-webhook off in the same upgrade; the four keys; drain the exporter queue with the old exporter;
-then meeting-api and the bot, and only after them the exporter's `EXPORTER_WEBHOOK_SECRET`, the new
-exporter and its subscription (see its [README](integrations/out/aw-notetaker/README.md)). The
-commands are aw-notetaker's runbook, steps 9–18.
+Install order, secrets, and upgrades are the runbook. When the images are rolled separately, roll
+the gateway and admin-api first, then meeting-api, then the runtime (its own image and
+`runtime.browserImage`, which is the bot), then the exporter. The new meeting-api refuses the
+unsigned requests an old gateway forwards. A new bot image is the one the runtime starts, and it
+needs a meeting-api that accepts its speaker file. The exporter needs the export route.
 
 ---
 
@@ -414,11 +345,9 @@ The full suite additionally starts the whole stack in Docker, which needs the mi
 
 ## Docs
 
-- [Design](integrations/out/aw-notetaker/docs/2026-09-23-aw-rearchitecture-design.md): the architecture, decisions, deployment settings and risks.
-- [Meeting intake and webhooks design](integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md): the `/v2` API, webhooks, keys, signed identity and the rollout order.
+- [Handbook](docs/aw-bots/README.md): architecture, lifecycle, recording, webhooks, security, data, and alerts. Current behavior.
 - [`/v2` API reference](core/meetings/services/meeting-api/V2-API.md): for client developers — every route, field, reply, error and webhook, with examples.
-- [Speaker activity design](integrations/out/aw-notetaker/docs/2026-09-23-speaker-activity-design.md): the who-spoke-when file.
-- [Completion report](integrations/out/aw-notetaker/docs/2026-09-23-aw-exporter-completion-report.md): what was built, how it was checked, what is pending.
+- [Decisions](docs/aw-bots/decisions/README.md) and the [archive](docs/aw-bots/archive/README.md) of the dated designs.
 - Upstream Vexa docs: [`docs/docs`](docs/docs) and [docs.vexa.ai](https://docs.vexa.ai).
 
 ## License

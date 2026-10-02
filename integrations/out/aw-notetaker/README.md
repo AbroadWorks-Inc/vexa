@@ -6,12 +6,9 @@ and hands it off to `notetaker-worker` via `POST /process`. The meeting's UUID i
 file and in the hand-off. It learns that a meeting finished from its own aw-bots `/v2/webhooks`
 subscription, like the portal. It reads meeting-api and reports the export result
 (`POST /v2/meetings/{uuid}/export`) through the gateway with its own key (scopes `tx` + `export`),
-never with `X-User-Id` or the internal secret (design
-[`docs/2026-09-25-meeting-intake-and-webhooks-design.md`](docs/2026-09-25-meeting-intake-and-webhooks-design.md) §1.9, §2.7, §6.9 F-X).
-
-Spec: [`docs/2026-09-23-aw-rearchitecture-design.md`](docs/2026-09-23-aw-rearchitecture-design.md)
-(§4), [`docs/2026-09-23-speaker-activity-design.md`](docs/2026-09-23-speaker-activity-design.md).
-Plan: [`docs/2026-09-23-aw-exporter-plan.md`](docs/2026-09-23-aw-exporter-plan.md).
+never with `X-User-Id` or the internal secret. The living description is the
+[handbook](../../../docs/aw-bots/export-and-webhooks.md). The dated designs are in the
+[archive](../../../docs/aw-bots/archive/README.md).
 
 ## The trigger: a `/v2/webhooks` subscription (design §2.7, §6.9 F-X)
 - **Delivery.** aw-bots posts each event (webhook.v1 `MeetingEvent`) to `POST /hooks/vexa` from

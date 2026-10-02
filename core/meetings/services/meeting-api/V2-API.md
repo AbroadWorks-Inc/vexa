@@ -2,7 +2,7 @@
 
 - **Date:** 2026-09-29. Served by meeting-api (`src/meeting_api/intake/`, `src/meeting_api/webhooks/`) through the gateway; webhook subscriptions are stored by admin-api.
 - **For:** anyone who writes a client of aw-bots: the calendar module, the portal, or any other app.
-- **Where the rules come from:** the [meeting intake and webhooks design](../../../../integrations/out/aw-notetaker/docs/2026-09-25-meeting-intake-and-webhooks-design.md) Part 2, and the sealed contracts [`intake.v1`](../../../../core/meetings/contracts/intake.v1/) and [`webhook.v1`](../../../../core/meetings/contracts/webhook.v1/). When this page and a sealed contract disagree, the contract wins.
+- **Where the rules come from:** the [handbook](../../../../docs/aw-bots/README.md) ([lifecycle](../../../../docs/aw-bots/meeting-lifecycle.md), [webhooks](../../../../docs/aw-bots/export-and-webhooks.md)) and the sealed contracts [`intake.v1`](../../../../core/meetings/contracts/intake.v1/) and [`webhook.v1`](../../../../core/meetings/contracts/webhook.v1/). When this page and a sealed contract disagree, the contract wins. The 25 Sep design is in the [archive](../../../../docs/aw-bots/archive/2026-09-25-meeting-intake-and-webhooks-design.md).
 
 Contents: [Part 1 — Meeting intake API](#part-1--meeting-intake-api) · [Part 2 — Webhooks API](#part-2--webhooks-api)
 
