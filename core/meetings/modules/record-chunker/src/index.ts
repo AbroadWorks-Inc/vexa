@@ -307,7 +307,8 @@ export interface CreateRecordingTapOptions extends RecordingTapOptions {
  * (bot, extension): find every audio element → combine → `MediaRecorderChunker`
  * → recording.v1 chunks via `onChunk`. Recording is platform-agnostic — it
  * records the whole meeting mix — so this is ONE generic tap, not per-lane.
- * (Zoom passes the live per-track mix as opts.stream; otherwise the element snapshot is used.)
+ * (Zoom, Teams and Jitsi pass their lane's live mix as opts.stream; the gmeet lane uses the
+ * element snapshot.)
  *
  * Pass `opts.stream` to record a ready stream directly (skips the element
  * combine); otherwise it finds + combines the page's audio elements.

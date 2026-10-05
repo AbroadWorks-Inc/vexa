@@ -98,12 +98,23 @@ g.__vexaCapturedRemoteAudioStreams = [remoteStream('stream-1'), remoteStream('st
 const mixConnects: string[] = [];
 let mixConnectFailures = 0;
 let trackCtxClosed = false;
+// The constant source that keeps the mix destination rendering from creation (so the recorder's
+// clock starts at admission, not at the first track): its offset, where it connected, whether started.
+const keepAlive = { offset: NaN, connectedTo: '', started: false };
 (g as any).AudioContext = class {
   destination = {};
   resume(): void { /* no-op */ }
   close(): void { trackCtxClosed = true; }
   createMediaStreamDestination(): unknown {
     return { stream: { id: 'per-track-mix', getAudioTracks: () => [] } };
+  }
+  createConstantSource(): unknown {
+    const node = {
+      offset: { set value(v: number) { keepAlive.offset = v; }, get value() { return keepAlive.offset; } },
+      connect: (dest: { stream?: { id: string } }) => { keepAlive.connectedTo = dest?.stream?.id ?? ''; },
+      start: () => { keepAlive.started = true; },
+    };
+    return node;
   }
   createMediaStreamSource(stream: { id: string }): unknown {
     return {
@@ -217,6 +228,9 @@ check('both remote streams are connected to the recording mix',
 check('the recording mix stream is published for startRecording',
   (g as any).__vexaPerTrackMixStream?.id === 'per-track-mix',
   String((g as any).__vexaPerTrackMixStream?.id));
+check('the mix destination renders from creation: a constant-zero source is connected and started',
+  keepAlive.offset === 0 && keepAlive.connectedTo === 'per-track-mix' && keepAlive.started,
+  JSON.stringify(keepAlive));
 
 // A single-poll flicker must NOT cross the boundary (the debounce holds at wiring altitude).
 setSpeaker('Dave'); tick(2);

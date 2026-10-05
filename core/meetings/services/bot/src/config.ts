@@ -57,6 +57,18 @@ export function captureLane(p: Platform | string): CaptureLane {
   return 'gmeet';
 }
 
+/** Where the page-side recorder reads its audio. The per-track and mixed lanes record the LIVE
+ *  graph their PCM capture reads — one audio graph, two sinks — so a track that arrives after the
+ *  recorder started is in the recording. Only the gmeet lane records its page media elements. The
+ *  ONE predicate `startRecording` reads; never restate it inline. */
+export type RecordingSource = 'pertrack-mix' | 'mixed-mix' | 'element-snapshot';
+
+export function recordingSource(p: Platform | string): RecordingSource {
+  if (isPerTrackLanePlatform(p)) return 'pertrack-mix';
+  if (isMixedLanePlatform(p)) return 'mixed-mix';
+  return 'element-snapshot';
+}
+
 export interface AutomaticLeave {
   waitingRoomTimeout?: number;
   noOneJoinedTimeout?: number;
