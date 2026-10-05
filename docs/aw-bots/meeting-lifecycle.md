@@ -17,8 +17,9 @@ is its UUID. Recordings and some internal keys still use the integer `meetings.i
 `PUT /v2/entries` creates or updates. `POST /v2/entries/remove` removes one entry. A content hash
 lets a sender push the same entry again and change nothing.
 
-`meet.abroadworks.com` is on `ENTRY_BLOCKED_HOSTS` (the code default and our values). Intake
-refuses that host. Jitsi stays on its own pipeline.
+`ENTRY_BLOCKED_HOSTS` is empty (the code default and our Helm value). A Jitsi link on a host in
+`VEXA_JITSI_HOSTS`, including `meet.abroadworks.com`, takes the same `PUT /v2/entries` path as
+Meet, Teams, and Zoom. A host on the block list is still `platform_not_enabled`.
 
 ## When the bot goes
 
@@ -82,10 +83,9 @@ that recorded a session and never wrote it ends `start_failed` after the same gr
 
 Google Meet admission (`core/meetings/modules/join/src/googlemeet/admission.ts`):
 
-- The host's "denied your request" is `awaiting_admission_rejected`.
-- An unanswered knock whose lobby disappears is `awaiting_admission_timeout` after
-  `KNOCK_LOST_GRACE_MS` (20 seconds), rather than waiting out the whole lobby budget.
-- A timeout with no meeting and no lobby is `join_failure`.
+- The host's "denied your request" is `awaiting_admission_rejected`. The bot exits and does not post a chat into the meeting.
+- Google Meet withdraws an unanswered "Ask to join" about 10 minutes after the knock. The waiting room disappears, with no denial and no in-call controls. The page logs `DisconnectedError`, `EndCause = 72`. A lobby that has been gone for `KNOCK_LOST_GRACE_MS` (20 seconds) with neither an admission nor a denial is `awaiting_admission_timeout`. The retry sends a new knock. The bot does not keep polling that page until the lobby budget ends.
+- A page with no meeting and no lobby at the end of the budget is `join_failure`.
 
 `awaiting_admission_rejected` and `awaiting_admission_timeout` are still bot failures, so an
 entry-managed meeting retries them until the send budget is used. The alerts treat both as the

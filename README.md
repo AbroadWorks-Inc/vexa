@@ -1,6 +1,6 @@
 # AW Bots
 
-AbroadWorks's meeting bots. A bot joins a **Google Meet, Microsoft Teams or Zoom** call before it
+AbroadWorks's meeting bots. A bot joins a **Google Meet, Microsoft Teams, Zoom, or Jitsi** call before it
 starts, records the audio and notes **who was speaking when**. After the call, the meeting goes to the
 AW notetaker pipeline, which produces a **named transcript and a summary**.
 
@@ -9,9 +9,8 @@ Apache-2.0). We run Vexa as-is wherever we can and keep our own changes small an
 (see [What we changed](#what-we-changed)). Upstream's original README is kept in
 [`README.upstream.md`](README.upstream.md).
 
-**Jitsi** (meet.abroadworks.com) does not use AW Bots. It has its own pipeline (Jibri records,
-Prosody supplies who-spoke-when), which feeds the **same** `notetaker-worker`, so all four platforms
-end up with the same kind of transcript.
+Jitsi, including `meet.abroadworks.com`, uses the same bot. `VEXA_JITSI_HOSTS` lists that host so
+the link parses. `ENTRY_BLOCKED_HOSTS` is empty, so intake does not refuse it.
 
 ---
 
@@ -256,7 +255,7 @@ Every setting lives in configuration, not code:
 | Exporter ↔ AW Bots | `GATEWAY_URL` + `EXPORTER_API_KEY` (the `exporter` key, scopes `tx` + `export`); `EXPORTER_WEBHOOK_SECRET` (the secret of its subscription) | the gateway's in-cluster URL; key from Secret `aw-bots-key-exporter` |
 | Signed identity | `GATEWAY_IDENTITY_KEYS` (a key ring in the webhook ring's format) on the gateway, meeting-api and admin-api (one value); `GATEWAY_IDENTITY_ACTIVE_KEY` (the kid it signs with) on the gateway; `GATEWAY_IDENTITY_MAX_SKEW_S` (the replay window, 60 s) on meeting-api and admin-api, set the same | **required**: without them the gateway refuses to start and meeting-api and admin-api refuse every client request. Rotation: add the new key to the ring on all three and roll; switch the active kid on the gateway and roll; later drop the old key and roll |
 | Webhook secret encryption | `WEBHOOK_SECRET_ENC_KEYS` (a key ring) and `WEBHOOK_SECRET_ENC_ACTIVE_KEY`, on meeting-api and admin-api, read only from an existing Secret | required for webhook subscriptions; unset, subscriptions are off and the services log why |
-| Intake | `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES` (meeting-api); `INTAKE_RATE_LIMIT_PER_MIN` (gateway) | 30 days, 3600 s, `meet.abroadworks.com` until the Jitsi cutover, 100 000, 600 |
+| Intake | `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES` (meeting-api); `INTAKE_RATE_LIMIT_PER_MIN` (gateway) | 30 days, 3600 s, empty (no host refused), 100 000, 600 |
 | Webhooks | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (meeting-api, admin-api); `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS` (admin-api) | `portal.notetaker.svc.cluster.local,aw-exporter.aw-bots.svc.cluster.local`, 20, 30 days |
 | Webhook retention batches | `WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE`, `WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES` (admin-api): rows per delete batch, and the per-run cap of batches of each delete | 1000, 100 |
 | Webhook delivery | `WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S`, `WEBHOOK_SEND_TIMEOUT_S`, `WEBHOOK_LEASE_S` (more than the send timeout + 5 s), `WEBHOOK_CLAIM_LIMIT` (meeting-api) | `60,300,1800,7200`, 4, 5 s, 10 s, 60 s, 50 |

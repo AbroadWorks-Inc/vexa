@@ -78,9 +78,12 @@ A meeting-bot pod (env contains `VEXA_BOT_CONFIG`) gets `activeDeadlineSeconds`:
 measured from pod start. Agent pods do not get this deadline.
 
 The reaper in `runtime_kernel` stores the exit code, then deletes `Succeeded` and `Failed` bot
-pods. A non-zero exit copies `kubectl logs --tail=200` into the runtime log first (clipped to
-4096 characters). It reaps once at boot, after adopt, and then every 30 seconds. Docker and
-process backends have no reaper.
+pods. `kubectl` shows exit code 1 as `Error` and exit code 0 as `Completed`. The container is
+not restarted (`restartPolicy: Never`). Each send is its own pod, so one meeting can leave
+several exited pods. The reaper removes them after the exit is stored, which lets the meetings
+pool scale down. A non-zero exit copies `kubectl logs --tail=200` into the runtime log first
+(clipped to 4096 characters). It reaps once at boot, after adopt, and then every 30 seconds.
+Docker and process backends have no reaper.
 
 A failed `kubectl get` is not exit code 0. Only a NotFound answer means the pod is gone. A failed
 delete raises, so meeting-api does not treat a still-running pod as removed
