@@ -88,6 +88,30 @@ def test_mixed_lane_hints_are_points() -> None:
         ("A", 900, "SPEAKER_END", "hint"),
         ("B", 1000, "SPEAKER_START", "hint"),
     ]
+    assert all(e.kind is None for e in speech_events(a, ORIGIN_MS, 0.05, 700))
+
+
+def test_hint_kind_is_copied_and_unknown_kind_is_dropped() -> None:
+    """kind is levels or dominant. Anything else is absent, same as no key."""
+    a = parse_activity(
+        [
+            header("mixed"),
+            hint(ORIGIN_MS + 10, "A", kind="levels"),
+            hint(ORIGIN_MS + 900, "A", is_end=True, kind="levels"),
+            hint(ORIGIN_MS + 1000, "B", kind="dominant"),
+            hint(ORIGIN_MS + 2000, "C", kind="nope"),
+            hint(ORIGIN_MS + 3000, "D"),
+        ]
+    )
+    assert [h.kind for h in a.hints] == ["levels", "levels", "dominant", None, None]
+    events = speech_events(a, ORIGIN_MS, 0.05, 700)
+    assert [(e.name, e.event_type, e.kind) for e in events] == [
+        ("A", "SPEAKER_START", "levels"),
+        ("A", "SPEAKER_END", "levels"),
+        ("B", "SPEAKER_START", "dominant"),
+        ("C", "SPEAKER_START", None),
+        ("D", "SPEAKER_START", None),
+    ]
 
 
 def test_bad_line_skipped_and_names() -> None:

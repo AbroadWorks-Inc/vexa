@@ -46,8 +46,8 @@ never named a channel.
 - When nothing paired and at least two speakers are named, derives intervals from the point runs.
   Each run ends at its last point plus `SPEECH_HANGOVER_MS` (default 700) and is clipped so it
   does not overlap the next speaker or the recording.
-- Sets `speaker_intervals_source` to `audio`, `points`, or leaves it unset when there are no
-  intervals.
+- Sets `speaker_intervals_source` to `audio`, `points`, or `levels` (point runs whose every
+  hint is kind `levels`), or leaves it unset when there are no intervals.
 - For Zoom and Teams with at least two named speakers, anchors the earliest point to the start
   of the recording. Meet's timeline is left as captured.
 

@@ -255,14 +255,24 @@ def build_speaker_timeline(
     # was speaking at its first instant. Must run after the anchor: the anchor
     # may already have zeroed the earliest point, and the first interval
     # should start there. One named speaker stays points-only.
-    intervals_source: Literal["audio", "points"] | None = (
+    intervals_source: Literal["audio", "points", "levels"] | None = (
         "audio" if paired_intervals else None
     )
     if not paired_intervals and len(distinct_speakers) >= 2:
         paired_intervals = _intervals_from_points(
             timeline_events, duration_sec, hangover_ms
         )
-        intervals_source = "points" if paired_intervals else None
+        # "levels" only when these intervals came from hints and every one of
+        # those hints was a level sample. A missing kind, a dominant flag, or
+        # a mix stays "points". An empty hint list must not count: all([])
+        # would mark a no-hint point timeline as levels.
+        hint_events = [ev for ev in events if ev.source == "hint"]
+        if not paired_intervals:
+            intervals_source = None
+        elif hint_events and all(ev.kind == "levels" for ev in hint_events):
+            intervals_source = "levels"
+        else:
+            intervals_source = "points"
 
     # Clip to the recording: an activity event may start slightly before audio
     # t=0 (a real Meet tape had a speaker's first START at -8ms). Clamp

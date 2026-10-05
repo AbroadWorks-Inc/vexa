@@ -86,3 +86,24 @@ def test_speaker_timeline_file_roundtrip_and_defaults() -> None:
     )
     assert default_timeline.speaker_intervals == []
     assert default_timeline.speaker_intervals_source is None
+
+
+def test_speaker_intervals_source_accepts_audio_points_and_levels() -> None:
+    now = datetime(2026, 9, 23, 10, 30, 0)
+    for source in ("audio", "points", "levels"):
+        timeline = schemas.SpeakerTimelineFile(
+            room_name="levels-room",
+            meeting_id="meeting789",
+            platform="jitsi",
+            recording_started_at=now,
+            recording_ended_at=datetime(2026, 9, 23, 10, 45, 0),
+            duration_sec=900.0,
+            start_time=0.0,
+            participants=[],
+            speaker_timeline=[],
+            speaker_intervals_source=source,
+        )
+        restored = schemas.SpeakerTimelineFile.model_validate(
+            timeline.model_dump(mode="json")
+        )
+        assert restored.speaker_intervals_source == source
