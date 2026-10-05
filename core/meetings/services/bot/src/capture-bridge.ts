@@ -117,11 +117,11 @@ export function makeSpeakerHintSink(
   /** WHO WAS TALKING WHEN, with no audio — independent of the debug tape above, and always on.
    *  Teed with the same post-guard `t` telemetry receives, for the same reason. */
   speakerActivity?: SpeakerActivityWriter,
-): { sink: (name: string, tMs?: number, isEnd?: boolean) => void; crossed: () => number } {
+): { sink: (name: string, tMs?: number, isEnd?: boolean, kind?: string) => void; crossed: () => number } {
   let crossed = 0;
   return {
     crossed: () => crossed,
-    sink: (name: string, tMs?: number, isEnd?: boolean): void => {
+    sink: (name: string, tMs?: number, isEnd?: boolean, kind?: string): void => {
       crossed++;
       let t = tMs ?? Date.now();
       const skew = Math.abs(t - Date.now());
@@ -129,7 +129,7 @@ export function makeSpeakerHintSink(
         warn(`[bot] hint-clock-skew: hint tMs=${t} is ${Math.round(skew / 1000)}s off the epoch audio clock — page emitted a non-epoch timestamp; re-stamping (name=${name})`);
         t = Date.now();
       }
-      try { speakerActivity?.hint(t, name, isEnd); } catch { /* speaker-activity must not break capture */ }
+      try { speakerActivity?.hint(t, name, isEnd, kind); } catch { /* speaker-activity must not break capture */ }
       if (telemetry?.captureHint) {
         try { telemetry.captureHint({ type: 'hint', t, name, isEnd, lane: 'mixed' }); }
         catch { /* telemetry must not break capture */ }
@@ -1379,15 +1379,15 @@ export async function startCaptureBridge(
         }
       }
       if (isJitsi) {
-        // Jitsi contributes the WHO + chat signals the mixed audio can't carry:
-        // dominant-speaker changes name the pyannote clusters ('dom-active' hints),
-        // and chat messages cross to the Node side as transcript `chat` segments.
+        // Jitsi contributes the WHO + chat signals the mixed audio can't carry.
+        // The fifth onSpeaking argument is "levels" or "dominant"; it is stored as
+        // kind on the hint line and is not a pipeline hint kind.
         if (w.VexaBrowserUtils?.createJitsiSpeakers && !w.__vexaJitsiSpeakers) {
           w.__vexaJitsiSpeakers = w.VexaBrowserUtils.createJitsiSpeakers({
             selfName: botName,
             log: (m: string) => w.logBot?.('[JitsiSpeakers] ' + m),
-            onSpeaking: (name: string, _id: string, isEnd: boolean, tMs: number) =>
-              w.__vexaSpeakerHint?.(name, tMs, isEnd),
+            onSpeaking: (name: string, _id: string, isEnd: boolean, tMs: number, source?: string) =>
+              w.__vexaSpeakerHint?.(name, tMs, isEnd, source),
           });
         }
         if (w.VexaBrowserUtils?.createJitsiChat && !w.__vexaJitsiChat) {
