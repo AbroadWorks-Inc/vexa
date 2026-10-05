@@ -84,10 +84,12 @@ def frame(t: int, name: str | None, rms: float, ch: int = 0, dur_ms: int = 256) 
     return json.dumps(row)
 
 
-def hint(t: int, name: str, is_end: bool = False) -> str:
+def hint(t: int, name: str, is_end: bool = False, kind: str | None = None) -> str:
     row: dict[str, object] = {"type": "hint", "t": t, "name": name}
     if is_end:
         row["isEnd"] = True
+    if kind is not None:
+        row["kind"] = kind
     return json.dumps(row)
 
 

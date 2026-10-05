@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 EventType = Literal["SPEAKER_START", "SPEAKER_END"]
 Source = Literal["audio", "hint"]
+HintKind = Literal["levels", "dominant"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -28,6 +29,7 @@ class Hint:
     t: int
     name: str
     is_end: bool
+    kind: HintKind | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -36,6 +38,7 @@ class ActivityEvent:
     relative_ms: int
     event_type: EventType
     source: Source
+    kind: HintKind | None = None
 
 
 @dataclass(slots=True)
@@ -81,11 +84,18 @@ def parse_activity(lines: Iterable[str]) -> Activity:
         if line_type == "hint":
             if row.get("name"):
                 try:
+                    raw_kind = row.get("kind")
+                    kind: HintKind | None = None
+                    if raw_kind == "levels":
+                        kind = "levels"
+                    elif raw_kind == "dominant":
+                        kind = "dominant"
                     activity.hints.append(
                         Hint(
                             int(row["t"]),
                             str(row["name"]),
                             bool(row.get("isEnd", False)),
+                            kind,
                         )
                     )
                 except (KeyError, ValueError, TypeError):
@@ -138,6 +148,7 @@ def speech_events(
                 h.t - origin_ms,
                 "SPEAKER_END" if h.is_end else "SPEAKER_START",
                 "hint",
+                h.kind,
             )
             for h in activity.hints
         ]

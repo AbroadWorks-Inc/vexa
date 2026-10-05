@@ -109,6 +109,49 @@ def test_teams_gets_intervals_from_points() -> None:
     assert tl.speaker_intervals_source == "points"
 
 
+def _jitsi_hint_timeline(kinds: list[str | None]) -> SpeakerTimelineFile:
+    """Alice then Bob, from mixed-lane hint lines. kinds matches start, end, start."""
+    origin = int(T0.timestamp() * 1000)
+    specs = [
+        (origin + 1_000, "Alice", False),
+        (origin + 2_000, "Alice", True),
+        (origin + 3_000, "Bob", False),
+    ]
+    lines = [header("mixed")]
+    for (t, name, is_end), kind in zip(specs, kinds, strict=True):
+        lines.append(hint(t, name, is_end=is_end, kind=kind))
+    activity = parse_activity(lines)
+    events = speech_events(activity, origin, 0.026, 700)
+    return build_speaker_timeline(
+        events,
+        platform="jitsi",
+        meeting_id="vexa-1",
+        room_name="r",
+        recording_started_at=T0,
+        recording_ended_at=T0 + timedelta(seconds=30),
+        min_dominant_utterance_ms=1500,
+    )
+
+
+def test_level_hints_mark_intervals_as_levels() -> None:
+    tl = _jitsi_hint_timeline(["levels", "levels", "levels"])
+    assert [(i.speaker_name, i.start_sec, i.end_sec) for i in tl.speaker_intervals] == [
+        ("Alice", 1.0, 1.7),
+        ("Bob", 3.0, 3.7),
+    ]
+    assert tl.speaker_intervals_source == "levels"
+
+
+def test_hints_without_kind_stay_points() -> None:
+    tl = _jitsi_hint_timeline([None, None, None])
+    assert tl.speaker_intervals_source == "points"
+
+
+def test_mixed_hint_kinds_stay_points() -> None:
+    tl = _jitsi_hint_timeline(["levels", "dominant", "levels"])
+    assert tl.speaker_intervals_source == "points"
+
+
 def test_zoom_named_pertrack_frames_yield_audio_intervals() -> None:
     """Header lane pertrack, one named frame per channel, plus a hint. The
     intervals come from the frames and the hint does not add a speaker."""

@@ -28,8 +28,9 @@ export interface SpeakerActivityWriter {
   /** One captured audio frame. Meet names it at capture time; Zoom/Teams frames arrive
    *  unnamed and are attributed later from hints. Never throws; a no-op once close() has run. */
   frame(ch: number, pcm: Float32Array, ts: number, name?: string): void;
-  /** A mixed-lane active-speaker signal (Zoom/Teams). Never throws; a no-op once close() has run. */
-  hint(t: number, name: string, isEnd?: boolean): void;
+  /** A mixed-lane active-speaker signal. `kind` is "levels" or "dominant" for Jitsi.
+   *  Omit it for every other caller. Never throws; a no-op once close() has run. */
+  hint(t: number, name: string, isEnd?: boolean, kind?: string): void;
   /** True once the size ceiling stopped the writer. The meeting is unaffected. */
   isCapped(): boolean;
   /** Flush any buffered lines and stop the flush timer. Idempotent; never throws. Capture
@@ -176,10 +177,14 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
         push(line);
       } catch (e) { if (faults++ < 5) log(`frame write failed: ${String(e)}`); }
     },
-    hint(t, name, isEnd): void {
+    hint(t, name, isEnd, kind): void {
       if (disabled || capped || closed) return;
       try {
-        const rec: Record<string, unknown> = { type: 'hint', t, name, ...(isEnd !== undefined ? { isEnd } : {}) };
+        const rec: Record<string, unknown> = {
+          type: 'hint', t, name,
+          ...(isEnd !== undefined ? { isEnd } : {}),
+          ...(kind === 'levels' || kind === 'dominant' ? { kind } : {}),
+        };
         const line = JSON.stringify(rec) + '\n';
         if (!admit(line)) return;
         push(line);

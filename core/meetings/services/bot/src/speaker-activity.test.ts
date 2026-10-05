@@ -204,6 +204,31 @@ const sameShape = (obj: unknown, expected: Record<string, unknown>): boolean => 
     JSON.stringify(hintLines));
 }
 
+// ── 10b) kind is written only when the hint names its source ─────────────────────────────────────
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('jitsi'), { dir, now: () => 0 });
+  w.hint(1000, 'Alice', false, 'levels');
+  w.hint(2000, 'Bob', false);
+  const received: Array<{ name: string; t: number; isEnd?: boolean; kind?: string }> = [];
+  const pipelineStub = {
+    recordHint: (name: string, t: number, isEnd?: boolean): void => { received.push({ name, t, isEnd }); },
+  };
+  const { sink } = makeSpeakerHintSink(pipelineStub, () => { /* quiet */ }, undefined, w);
+  sink('Cara', Date.now(), true, 'levels');
+  await w.close();
+
+  const hintLines = readLines(w.path).filter((l) => l.type === 'hint');
+  check('a levels hint writes kind',
+    hintLines.some((l) => l.name === 'Alice' && l.kind === 'levels'), JSON.stringify(hintLines));
+  check('a hint without a source has no kind key',
+    hintLines.some((l) => l.name === 'Bob' && !('kind' in l)), JSON.stringify(hintLines));
+  check('makeSpeakerHintSink forwards kind levels',
+    hintLines.some((l) => l.name === 'Cara' && l.kind === 'levels' && l.isEnd === true), JSON.stringify(hintLines));
+  check('kind is not passed into recordHint',
+    received.length === 1 && received[0].name === 'Cara' && !('kind' in received[0]), JSON.stringify(received));
+}
+
 // ── 11) makeSpeakerHintSink taps the writer: skew re-stamping applies to the written t ───────────
 {
   const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));

@@ -681,7 +681,7 @@
   {
    "key": "ENTRY_BLOCKED_HOSTS",
    "class": "defaulted",
-   "default": "meet.abroadworks.com",
+   "default": "",
    "description": "intake (§1.3): comma-separated meeting-link hostnames refused with platform_not_enabled; empty ⇒ none refused",
    "targets": ["helm"]
   },
