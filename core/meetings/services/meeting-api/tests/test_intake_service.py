@@ -436,7 +436,7 @@ def test_settings_defaults(monkeypatch):
         max_days_ahead=30,
         join_now_adopt_ahead_s=3600,
         lead_s=DEFAULT_LEAD_S,
-        blocked_hosts=frozenset({"meet.abroadworks.com"}),
+        blocked_hosts=frozenset(),
         max_active_entries=100_000,
         send_max_attempts=3,
         send_retry_backoff_s=60,
@@ -494,7 +494,7 @@ def test_every_intake_setting_is_declared_in_config_v1():
     declared = {k["key"]: k for k in json.loads(path.read_text())["keys"]}
     assert declared["ENTRY_MAX_DAYS_AHEAD"]["default"] == "30"
     assert declared["JOIN_NOW_ADOPT_AHEAD_S"]["default"] == "3600"
-    assert declared["ENTRY_BLOCKED_HOSTS"]["default"] == "meet.abroadworks.com"
+    assert declared["ENTRY_BLOCKED_HOSTS"]["default"] == ""
     assert declared["INTAKE_MAX_ACTIVE_ENTRIES"]["default"] == "100000"
     assert "AUTO_JOIN_LEAD_S" in declared
 

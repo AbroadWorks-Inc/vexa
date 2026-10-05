@@ -73,7 +73,7 @@ class IntakeSettings:
     def from_env(cls) -> IntakeSettings:
         """The settings from the environment; a value the entry service can't run on raises
         ``SettingsError`` (checked when meeting-api boots)."""
-        blocked = os.getenv("ENTRY_BLOCKED_HOSTS", "meet.abroadworks.com")
+        blocked = os.getenv("ENTRY_BLOCKED_HOSTS", "")
         delay_min_s = seconds("INTAKE_CONFLICT_DELAY_MIN_S", "0.01", zero=True)
         delay_max_s = seconds("INTAKE_CONFLICT_DELAY_MAX_S", "0.05")
         if delay_min_s > delay_max_s:
