@@ -197,6 +197,140 @@ async function main() {
   fakeState["features/base/participants"].remote.delete("p3");
   fakeState["features/base/participants"].dominantSpeaker = undefined;
 
+  // ── real level reader: no injected readLevels. A mute stops Jitsi's events,
+  // so a cached loud value must not keep the turn. ─────────────────────────────
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  const waitFor = async (cond: () => boolean) => {
+    const start = realNow();
+    while (!cond()) {
+      if (realNow() - start > 500) return false;
+      await sleep(5);
+    }
+    return true;
+  };
+  const fakeTrack = () => {
+    const listeners = new Set<(level: number) => void>();
+    let offs = 0;
+    return {
+      on(event: string, cb: (level: number) => void) {
+        if (event === "track.audioLevelsChanged") listeners.add(cb);
+      },
+      off(event: string, cb: (level: number) => void) {
+        if (event === "track.audioLevelsChanged") {
+          offs++;
+          listeners.delete(cb);
+        }
+      },
+      emit(level: number) {
+        for (const cb of [...listeners]) cb(level);
+      },
+      get offs() { return offs; },
+    };
+  };
+  const aliceTrack = fakeTrack();
+  const bobTrack = fakeTrack();
+  const aliceEntry: any = {
+    participantId: "p1", mediaType: "audio", local: false, muted: false, jitsiTrack: aliceTrack,
+  };
+  const bobEntry: any = {
+    participantId: "p2", mediaType: "audio", local: false, muted: false, jitsiTrack: bobTrack,
+  };
+  fakeState["features/base/tracks"] = [aliceEntry, bobEntry];
+  const trackEvents: Array<{ name: string; isEnd: boolean; source?: string }> = [];
+  const fromTracks = createJitsiSpeakers({
+    selfName: "Vexa",
+    pollMs: 10,
+    heartbeatMs: 60_000,
+    onSpeaking: (name, _id, isEnd, _tMs, source) => trackEvents.push({ name, isEnd, source }),
+  });
+  try {
+    aliceTrack.emit(0.5);
+    check(
+      "a level event names the speaker after the hold",
+      await waitFor(() => trackEvents.some((e) => e.name === "Alice" && !e.isEnd && e.source === "levels")),
+      JSON.stringify(trackEvents),
+    );
+
+    const freshCount = trackEvents.length;
+    now += 1000;
+    await sleep(40);
+    check(
+      "a level 1s old still names Alice",
+      fromTracks.getState().current === "Alice" && trackEvents.length === freshCount,
+      JSON.stringify(trackEvents),
+    );
+    now += 1;
+    check(
+      "an entry whose last event is older than 1s stops winning",
+      await waitFor(() => fromTracks.getState().current === null && trackEvents.some((e) => e.name === "Alice" && e.isEnd)),
+      `current=${String(fromTracks.getState().current)} ${JSON.stringify(trackEvents)}`,
+    );
+
+    aliceTrack.emit(0.9);
+    bobTrack.emit(0.3);
+    check(
+      "Alice's fresh level beats Bob",
+      await waitFor(() => fromTracks.getState().current === "Alice"),
+      JSON.stringify(trackEvents),
+    );
+    trackEvents.length = 0;
+    aliceEntry.muted = true;
+    check(
+      "a muted track does not win",
+      await waitFor(() =>
+        fromTracks.getState().current === "Bob"
+        && trackEvents.some((e) => e.name === "Alice" && e.isEnd && e.source === "levels")
+        && trackEvents.some((e) => e.name === "Bob" && !e.isEnd && e.source === "levels")
+        && !trackEvents.some((e) => e.name === "Alice" && !e.isEnd)),
+      JSON.stringify(trackEvents),
+    );
+
+    aliceEntry.muted = false;
+    aliceTrack.emit(0.95);
+    check(
+      "Alice wins again from a new level",
+      await waitFor(() => fromTracks.getState().current === "Alice"),
+      JSON.stringify(trackEvents),
+    );
+    const aliceOffs = aliceTrack.offs;
+    trackEvents.length = 0;
+    fakeState["features/base/tracks"] = [bobEntry];
+    check(
+      "removing a track calls off",
+      await waitFor(() => aliceTrack.offs === aliceOffs + 1),
+      `offs ${aliceTrack.offs}`,
+    );
+    check(
+      "a removed track stops winning",
+      await waitFor(() => trackEvents.some((e) => e.name === "Alice" && e.isEnd) && fromTracks.getState().current === "Bob"),
+      JSON.stringify(trackEvents),
+    );
+    trackEvents.length = 0;
+    fakeState["features/base/tracks"] = [aliceEntry, bobEntry];
+    await sleep(60);
+    check(
+      "removing a track clears its cache",
+      !trackEvents.some((e) => e.name === "Alice") && fromTracks.getState().current === "Bob",
+      JSON.stringify(trackEvents),
+    );
+
+    const aliceBeforeDestroy = aliceTrack.offs;
+    const bobBeforeDestroy = bobTrack.offs;
+    fromTracks.destroy();
+    check(
+      "destroy() calls off on every bound track",
+      aliceTrack.offs === aliceBeforeDestroy + 1 && bobTrack.offs === bobBeforeDestroy + 1,
+      `alice ${aliceTrack.offs} bob ${bobTrack.offs}`,
+    );
+  } finally {
+    fromTracks.destroy();
+    Date.now = realNow;
+    delete fakeState["features/base/tracks"];
+    fakeState["features/base/participants"].dominantSpeaker = undefined;
+  }
+
   // ── chat: history primes silently; new messages emit once ────────────────────
   fakeState["features/chat"].messages = [
     { id: "m1", displayName: "Alice", message: "hello from before the bot joined", messageType: "remote", timestamp: 1 },

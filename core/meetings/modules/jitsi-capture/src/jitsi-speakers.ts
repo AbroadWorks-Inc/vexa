@@ -9,9 +9,11 @@
  * Signal, layered newest-truth-first:
  *  1. Per-participant audio level. Remote audio tracks in
  *     `features/base/tracks` emit `track.audioLevelsChanged`. The loudest named
- *     participant above JITSI_SPEECH_LEVEL wins. A change, including silence,
- *     must hold for CONFIRM_POLLS before a hint is emitted. The dominant-speaker
- *     flag is not read while any level sample is present.
+ *     participant above JITSI_SPEECH_LEVEL wins. A sample older than 1 s is
+ *     absent, and a muted track reads as 0, so a cached loud value cannot keep
+ *     the turn. A change, including silence, must hold for CONFIRM_POLLS before
+ *     a hint is emitted. The dominant-speaker flag is not read while any level
+ *     sample is present.
  *  2. The app's own redux state — `APP.store.getState()['features/base/participants']`
  *     carries `dominantSpeaker` (participant id) and the participant name map.
  *     Used only when no level has arrived. Polled (the store shape is stable
@@ -32,6 +34,8 @@ export const JITSI_SPEECH_LEVEL = 0.1;
 export const CONFIRM_POLLS = 2;
 /** lib-jitsi-meet emits this on each audio track. */
 const TRACK_AUDIO_LEVEL = "track.audioLevelsChanged";
+/** A cached level older than this is absent. Mute often stops the events. */
+const LEVEL_FRESH_MS = 1000;
 
 export type JitsiHintSource = "levels" | "dominant";
 
@@ -163,26 +167,33 @@ function participantsFromStore(): { map: Map<string, JitsiNamedParticipant>; sel
 }
 
 /** Subscribe to remote audio tracks' level events. The redux list is the public
- *  track set; levels themselves are not stored there. */
+ *  track set; levels themselves are not stored there. A cached level is used
+ *  for LEVEL_FRESH_MS only. `muted: true` reads as 0 even when the cache is loud. */
 function installLevelReader(): { read: () => JitsiLevelSample[]; stop: () => void } {
-  const cache = new Map<string, number>();
+  const cache = new Map<string, { level: number; at: number }>();
   const bound = new Map<object, { id: string; off: () => void }>();
 
-  const sync = () => {
+  const trackList = (): any[] => {
     const app = (globalThis as any).APP;
     const tracks = app?.store?.getState?.()?.["features/base/tracks"];
-    const list: any[] = Array.isArray(tracks) ? tracks : [];
+    return Array.isArray(tracks) ? tracks : [];
+  };
+  const remoteAudio = (entry: any): boolean => {
+    if (!entry || entry.local === true) return false;
+    if (entry.mediaType && entry.mediaType !== "audio") return false;
+    return typeof entry.participantId === "string" && !!entry.jitsiTrack;
+  };
+
+  const sync = () => {
     const live = new Set<object>();
-    for (const entry of list) {
-      if (!entry || entry.local === true) continue;
-      if (entry.mediaType && entry.mediaType !== "audio") continue;
-      const id = entry.participantId;
+    for (const entry of trackList()) {
+      if (!remoteAudio(entry)) continue;
+      const id = entry.participantId as string;
       const jt = entry.jitsiTrack;
-      if (typeof id !== "string" || !jt) continue;
       live.add(jt);
       if (bound.has(jt)) continue;
       const cb = (level: number) => {
-        if (typeof level === "number") cache.set(id, level);
+        if (typeof level === "number") cache.set(id, { level, at: Date.now() });
       };
       const listen = jt.on || jt.addListener || jt.addEventListener;
       if (typeof listen !== "function") continue;
@@ -206,8 +217,25 @@ function installLevelReader(): { read: () => JitsiLevelSample[]; stop: () => voi
 
   return {
     read: () => {
-      try { sync(); } catch { return []; }
-      return [...cache.entries()].map(([id, level]) => ({ id, level }));
+      try {
+        sync();
+        const now = Date.now();
+        const out: JitsiLevelSample[] = [];
+        for (const entry of trackList()) {
+          if (!remoteAudio(entry)) continue;
+          const id = entry.participantId as string;
+          if (entry.muted === true) {
+            out.push({ id, level: 0 });
+            continue;
+          }
+          const cached = cache.get(id);
+          if (!cached || now - cached.at > LEVEL_FRESH_MS) continue;
+          out.push({ id, level: cached.level });
+        }
+        return out;
+      } catch {
+        return [];
+      }
     },
     stop: () => {
       for (const rec of bound.values()) rec.off();
