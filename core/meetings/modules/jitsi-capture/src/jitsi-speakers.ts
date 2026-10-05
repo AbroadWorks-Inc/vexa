@@ -7,12 +7,16 @@
  * and importable by any other embedder of a Jitsi page.
  *
  * Signal, layered newest-truth-first:
- *  1. The app's own redux state — `APP.store.getState()['features/base/participants']`
- *     carries `dominantSpeaker` (participant id) and the participant name map. This
- *     is the SAME state jitsi's UI renders from, needs no filmstrip in the DOM, and
- *     survives reskins. Polled (the store shape is stable across versions; the
- *     subscribe API is not worth coupling to).
- *  2. DOM fallback for builds that strip the APP global: the active tile carries a
+ *  1. Per-participant audio level. Remote audio tracks in
+ *     `features/base/tracks` emit `track.audioLevelsChanged`. The loudest named
+ *     participant above JITSI_SPEECH_LEVEL wins. A change, including silence,
+ *     must hold for CONFIRM_POLLS before a hint is emitted. The dominant-speaker
+ *     flag is not read while any level sample is present.
+ *  2. The app's own redux state — `APP.store.getState()['features/base/participants']`
+ *     carries `dominantSpeaker` (participant id) and the participant name map.
+ *     Used only when no level has arrived. Polled (the store shape is stable
+ *     across versions; the subscribe API is not worth coupling to).
+ *  3. DOM fallback for builds that strip the APP global: the active tile carries a
  *     `dominant-speaker` class; its display-name node carries the name.
  *
  * Speaking start/stop events per participant feed the ChunkedTranscriber's name
@@ -22,23 +26,74 @@
  * re-asserted while dominant, or every commit past the grace loses its name.
  */
 
+/** Jitsi torture treats a remote level above this as audible. Absolute, for the first live run. */
+export const JITSI_SPEECH_LEVEL = 0.1;
+/** A new speaker, or silence, must hold this many polls before a hint is emitted. */
+export const CONFIRM_POLLS = 2;
+/** lib-jitsi-meet emits this on each audio track. */
+const TRACK_AUDIO_LEVEL = "track.audioLevelsChanged";
+
+export type JitsiHintSource = "levels" | "dominant";
+
+export interface JitsiLevelSample {
+  id: string;
+  level: number;
+}
+
+export interface JitsiNamedParticipant {
+  id: string;
+  name: string;
+}
+
 export interface JitsiSpeakersOptions {
   /** Local participant / bot display name — the bot's own tile is never reported. */
   selfName?: string;
   /** Speaking state change: isEnd=false → started speaking, isEnd=true → stopped.
-   *  tMs = wall-clock at emit. */
-  onSpeaking: (name: string, id: string, isEnd: boolean, tMs: number) => void;
+   *  tMs = wall-clock at emit. `source` is omitted by older callers. */
+  onSpeaking: (name: string, id: string, isEnd: boolean, tMs: number, source?: JitsiHintSource) => void;
   log?: (msg: string) => void;
   /** Poll interval (ms). Default 400 — dominant-speaker changes are second-scale. */
   pollMs?: number;
   /** Re-assert interval for a STILL-dominant speaker (ms). Default 2000 — the
    *  binder's heartbeat contract (must beat its open-turn grace). */
   heartbeatMs?: number;
+  /** Latest per-participant levels. Empty, or omitted, keeps the dominant-speaker poll.
+   *  A non-empty list is the speaker signal and the dominant flag is not read. */
+  readLevels?: () => JitsiLevelSample[];
 }
 
 export interface JitsiSpeakers {
   destroy(): void;
-  getState(): { mode: "redux" | "dom" | null; current: string | null; changes: number };
+  getState(): { mode: "redux" | "dom" | null; current: string | null; changes: number; source: JitsiHintSource | null };
+}
+
+/** The loud participant strictly above JITSI_SPEECH_LEVEL, or null.
+ *  `selfId` is never returned. An id missing from `participants` is ignored.
+ *  An exact tie on the winning level returns null. */
+export function selectJitsiSpeaker(
+  levels: readonly JitsiLevelSample[],
+  participants: ReadonlyMap<string, JitsiNamedParticipant>,
+  selfId: string | null,
+): { id: string; name: string } | null {
+  let best: { id: string; name: string; level: number } | null = null;
+  let tie = false;
+  for (const sample of levels) {
+    if (selfId !== null && sample.id === selfId) continue;
+    if (!(sample.level > JITSI_SPEECH_LEVEL)) continue;
+    const person = participants.get(sample.id);
+    const name = person?.name?.trim();
+    if (!name) continue;
+    if (best && sample.level === best.level && sample.id !== best.id) {
+      tie = true;
+      continue;
+    }
+    if (!best || sample.level > best.level) {
+      best = { id: sample.id, name, level: sample.level };
+      tie = false;
+    }
+  }
+  if (!best || tie) return null;
+  return { id: best.id, name: best.name };
 }
 
 // The dominant tile's marker class (stock jitsi filmstrip) + display-name nodes.
@@ -89,46 +144,141 @@ function dominantFromDom(): { id: string; name: string } | null {
   }
 }
 
+function participantsFromStore(): { map: Map<string, JitsiNamedParticipant>; selfId: string | null } {
+  const map = new Map<string, JitsiNamedParticipant>();
+  let selfId: string | null = null;
+  try {
+    const app = (globalThis as any).APP;
+    const p = app?.store?.getState?.()?.["features/base/participants"];
+    if (p?.local?.id) selfId = String(p.local.id);
+    if (typeof p?.remote?.forEach === "function") {
+      p.remote.forEach((participant: { id?: string; name?: string }, key: string) => {
+        const id = String(participant?.id ?? key);
+        const name = (participant?.name || "").trim();
+        if (name) map.set(id, { id, name });
+      });
+    }
+  } catch { /* store missing or mid-replace */ }
+  return { map, selfId };
+}
+
+/** Subscribe to remote audio tracks' level events. The redux list is the public
+ *  track set; levels themselves are not stored there. */
+function installLevelReader(): { read: () => JitsiLevelSample[]; stop: () => void } {
+  const cache = new Map<string, number>();
+  const bound = new Map<object, { id: string; off: () => void }>();
+
+  const sync = () => {
+    const app = (globalThis as any).APP;
+    const tracks = app?.store?.getState?.()?.["features/base/tracks"];
+    const list: any[] = Array.isArray(tracks) ? tracks : [];
+    const live = new Set<object>();
+    for (const entry of list) {
+      if (!entry || entry.local === true) continue;
+      if (entry.mediaType && entry.mediaType !== "audio") continue;
+      const id = entry.participantId;
+      const jt = entry.jitsiTrack;
+      if (typeof id !== "string" || !jt) continue;
+      live.add(jt);
+      if (bound.has(jt)) continue;
+      const cb = (level: number) => {
+        if (typeof level === "number") cache.set(id, level);
+      };
+      const listen = jt.on || jt.addListener || jt.addEventListener;
+      if (typeof listen !== "function") continue;
+      listen.call(jt, TRACK_AUDIO_LEVEL, cb);
+      const off = () => {
+        try { jt.off?.(TRACK_AUDIO_LEVEL, cb); } catch { /* already gone */ }
+        try { jt.removeListener?.(TRACK_AUDIO_LEVEL, cb); } catch { /* already gone */ }
+        try { jt.removeEventListener?.(TRACK_AUDIO_LEVEL, cb); } catch { /* already gone */ }
+      };
+      bound.set(jt, { id, off });
+    }
+    for (const [jt, rec] of bound) {
+      if (live.has(jt)) continue;
+      rec.off();
+      bound.delete(jt);
+    }
+    const still = new Set<string>();
+    for (const rec of bound.values()) still.add(rec.id);
+    for (const id of cache.keys()) if (!still.has(id)) cache.delete(id);
+  };
+
+  return {
+    read: () => {
+      try { sync(); } catch { return []; }
+      return [...cache.entries()].map(([id, level]) => ({ id, level }));
+    },
+    stop: () => {
+      for (const rec of bound.values()) rec.off();
+      bound.clear();
+      cache.clear();
+    },
+  };
+}
+
 export function createJitsiSpeakers(opts: JitsiSpeakersOptions): JitsiSpeakers {
   const log = opts.log || (() => {});
   const self = (opts.selfName || "").trim().toLowerCase();
   let current: { id: string; name: string } | null = null;
   let mode: "redux" | "dom" | null = null;
   let changes = 0;
+  let activeSource: JitsiHintSource | null = null;
 
   const heartbeatMs = opts.heartbeatMs ?? 2000;
   let lastAssertMs = 0;
+  let pendingKey: string | null = null;
+  let pendingCount = 0;
+  const levels = opts.readLevels ? null : installLevelReader();
 
-  const emit = (name: string, id: string, isEnd: boolean) => {
-    try { opts.onSpeaking(name, id, isEnd, Date.now()); } catch { /* never break capture */ }
+  const emit = (name: string, id: string, isEnd: boolean, source: JitsiHintSource) => {
+    try { opts.onSpeaking(name, id, isEnd, Date.now(), source); } catch { /* never break capture */ }
   };
 
-  const tick = () => {
-    let d = dominantFromRedux();
-    if (d) mode = "redux";
-    else { d = dominantFromDom(); if (d) mode = mode ?? "dom"; }
-
-    // The bot's own speech (TTS) must not name segments after the bot.
-    if (d && self && d.name.trim().toLowerCase() === self) d = null;
-
-    const changed = (d?.id ?? null) !== (current?.id ?? null);
-    if (!changed) {
-      // HEARTBEAT: a still-dominant speaker is re-asserted so the binder's open
-      // hint turn never decays while they keep talking.
+  const consider = (next: { id: string; name: string } | null, source: JitsiHintSource) => {
+    const key = next?.id ?? null;
+    if (key === pendingKey) pendingCount++;
+    else { pendingKey = key; pendingCount = 1; }
+    if (pendingCount < CONFIRM_POLLS) return;
+    activeSource = source;
+    if ((current?.id ?? null) === key) {
       if (current && Date.now() - lastAssertMs >= heartbeatMs) {
-        emit(current.name, current.id, false);
+        emit(current.name, current.id, false, source);
         lastAssertMs = Date.now();
       }
       return;
     }
-    if (current) emit(current.name, current.id, true);
-    if (d) {
-      emit(d.name, d.id, false);
+    if (current) emit(current.name, current.id, true, source);
+    if (next) {
+      emit(next.name, next.id, false, source);
       lastAssertMs = Date.now();
-      log(`dominant speaker → ${d.name}`);
+      log(source === "levels" ? `level speaker → ${next.name}` : `dominant speaker → ${next.name}`);
     }
-    current = d;
+    current = next;
     changes++;
+  };
+
+  const tick = () => {
+    let samples: JitsiLevelSample[] = [];
+    let levelReadFailed = false;
+    try {
+      samples = (opts.readLevels ?? levels?.read)?.() ?? [];
+    } catch {
+      levelReadFailed = true;
+      samples = [];
+    }
+    if (!levelReadFailed && samples.length > 0) {
+      mode = "redux";
+      const { map, selfId } = participantsFromStore();
+      consider(selectJitsiSpeaker(samples, map, selfId), "levels");
+      return;
+    }
+
+    let d = dominantFromRedux();
+    if (d) mode = "redux";
+    else { d = dominantFromDom(); if (d) mode = mode ?? "dom"; }
+    if (d && self && d.name.trim().toLowerCase() === self) d = null;
+    consider(d, "dominant");
   };
 
   const poll = setInterval(tick, opts.pollMs ?? 400);
@@ -137,11 +287,12 @@ export function createJitsiSpeakers(opts: JitsiSpeakersOptions): JitsiSpeakers {
   return {
     destroy() {
       clearInterval(poll);
-      if (current) emit(current.name, current.id, true);
+      levels?.stop();
+      if (current) emit(current.name, current.id, true, activeSource ?? "dominant");
       current = null;
     },
     getState() {
-      return { mode, current: current?.name ?? null, changes };
+      return { mode, current: current?.name ?? null, changes, source: activeSource };
     },
   };
 }
