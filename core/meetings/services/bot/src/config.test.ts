@@ -10,7 +10,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv } from './config.js';
+import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource } from './config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_DIR = join(HERE, '..', '..', '..', 'contracts', 'invocation.v1', 'golden');
@@ -92,3 +92,19 @@ console.log('\n✅ config (L1/L2): the goldens parse, the env helper round-trips
   }, (message) => invalidWarnings.push(message));
   check('invalid speaker-stream values fall back loudly', invalid === undefined && invalidWarnings.length === 2, invalidWarnings.join('; '));
 }
+
+// ── recordingSource: the ONE predicate that says where the page-side recorder reads its audio ──
+// Zoom records the live per-track mix; Teams and Jitsi record the live mixed-lane graph (the same
+// destination the PCM capture reads); only the gmeet lane keeps the media-element snapshot. A mixed
+// lane that snapshots elements records whatever the page had at admission — on Jitsi that was 45
+// preloaded sound effects or the JVB's silent placeholder, never the participants (2026-10-05 RCA).
+{
+  const rs = (p: string): string => { try { return String(recordingSource(p)); } catch (e) { return `threw: ${(e as Error).message}`; } };
+  check('recordingSource: zoom records the per-track mix', rs('zoom') === 'pertrack-mix', rs('zoom'));
+  check('recordingSource: teams records the mixed-lane graph', rs('teams') === 'mixed-mix', rs('teams'));
+  check('recordingSource: jitsi records the mixed-lane graph', rs('jitsi') === 'mixed-mix', rs('jitsi'));
+  check('recordingSource: google_meet keeps the element snapshot', rs('google_meet') === 'element-snapshot', rs('google_meet'));
+}
+
+console.log(failed === 0 ? '\n✅ config: all green' : `\n❌ config: ${failed} failure(s)`);
+process.exit(failed === 0 ? 0 : 1);

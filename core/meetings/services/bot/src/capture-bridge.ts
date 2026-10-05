@@ -37,7 +37,7 @@ import {
 } from '@vexa/remote-browser';
 import { getJoinBrowserArgs } from '@vexa/join';
 import type { RecordingMasterFormat } from '@vexa/recording';
-import { captureLane, isMixedLanePlatform, isPerTrackLanePlatform, type CaptureLane, type Invocation } from './config.js';
+import { captureLane, isMixedLanePlatform, isPerTrackLanePlatform, recordingSource, type CaptureLane, type Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
 import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
@@ -830,6 +830,16 @@ export async function startCaptureBridge(
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
   await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
     const w = (globalThis as any) as Record<string, any>;
+    // A destination with no input renders nothing, and a MediaRecorder on it emits no data until
+    // the first source connects — the recording's t=0 would be the first participant's track, not
+    // admission, and every speaker label would be off by that gap. A constant-zero source keeps the
+    // graph rendering silence from the moment it exists, so both sinks' clocks start at admission.
+    const keepRendering = (ctx: any, dest: any): void => {
+      const silence = ctx.createConstantSource();
+      silence.offset.value = 0;
+      silence.connect(dest);
+      silence.start();
+    };
     if (isMixed) {
       // Zoom/Teams/Jitsi ride the WebRTC hook (installRemoteAudioHook, installed pre-nav), which mirrors
       // each remote participant's audio track into w.__vexaCapturedRemoteAudioStreams AND into a hidden
@@ -1028,6 +1038,7 @@ export async function startCaptureBridge(
           // (which starts after capture) does not fall back to the element snapshot.
           // A track that connects after MediaRecorder has started is still recorded.
           w.__vexaPerTrackMixDest = w.__vexaTrackCtx.createMediaStreamDestination();
+          keepRendering(w.__vexaTrackCtx, w.__vexaPerTrackMixDest);
           w.__vexaPerTrackMixStream = w.__vexaPerTrackMixDest.stream;
           w.__vexaPerTrackMixCount = 0;
           return true;
@@ -1110,6 +1121,23 @@ export async function startCaptureBridge(
         }
         try { w.__vexaStreamPresence?.(live); } catch { /* presence must never break capture */ }
       };
+      const ensureMixGraph = (): boolean => {
+        if (w.__vexaMixDest) return true;
+        try {
+          w.__vexaMixCtx = new (globalThis as any).AudioContext({ sampleRate: 16000 });
+          w.__vexaMixCtx.resume?.();
+          w.__vexaMixDest = w.__vexaMixCtx.createMediaStreamDestination();
+          keepRendering(w.__vexaMixCtx, w.__vexaMixDest);
+          w.__vexaMixSeen = new Set();
+          return true;
+        } catch (e: any) {
+          w.__vexaMixCtx = null;
+          w.__vexaMixDest = null;
+          w.logBot?.('[mixed] audio graph failed: ' + String(e));
+          w.__vexaObservation?.('mixed', { type: 'mix-graph-failed', error: String(e), tMs: Date.now() }, Date.now());
+          return false;
+        }
+      };
       const setupMix = (): void => {
         reportStreamPresence();
         let streams = (w.__vexaCapturedRemoteAudioStreams || []) as Array<any>;
@@ -1178,12 +1206,7 @@ export async function startCaptureBridge(
           w.__vexaMixTopology = n;
           w.__vexaObservation?.('mixed', { type: 'mix-topology', streams: n, tMs: Date.now() }, Date.now());
         };
-        if (!w.__vexaMixCtx) {
-          w.__vexaMixCtx = new (globalThis as any).AudioContext({ sampleRate: 16000 });
-          w.__vexaMixCtx.resume?.();
-          w.__vexaMixDest = w.__vexaMixCtx.createMediaStreamDestination();
-          w.__vexaMixSeen = new Set();
-        }
+        if (!ensureMixGraph()) return;
         for (const s of streams) {
           if (!s || w.__vexaMixSeen.has(s.id)) continue;
           try {
@@ -1243,6 +1266,11 @@ export async function startCaptureBridge(
             .catch((e: any) => { w.__vexaMixedCapture = null; w.logBot?.('[mixed] capture start failed: ' + String(e)); });
         }
       };
+      // The lane's ONE audio graph, built before any remote track exists: the PCM capture and the
+      // recorder are two sinks on this destination, and the recorder starts on it at admission.
+      // Every stream the rescan connects later reaches both sinks. Shared with `startRecording`
+      // (`__vexaMixDest`) and closed by whichever of capture or recording stops last.
+      ensureMixGraph();
       setupMix();
       w.__vexaMixRescan = (globalThis as any).setInterval(setupMix, 2000); // pick up late-arriving tracks
 
@@ -1444,7 +1472,12 @@ export async function startCaptureBridge(
         try { w.__vexaPerTrackMixDest = null; w.__vexaPerTrackMixStream = null; w.__vexaPerTrackMixCount = 0; } catch { /* best-effort */ }
       }
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }
-      try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
+      // The mixed-lane recorder reads this graph's destination too. Whichever of capture or
+      // recording stops last closes the graph; closing it here under a live tap would end the
+      // recorder's stream and drop the open timeslice.
+      if (!w.__vexaRecordingTap) {
+        try { w.__vexaMixCtx?.close?.(); w.__vexaMixCtx = null; w.__vexaMixDest = null; } catch { /* best-effort */ }
+      }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
     }).catch(() => { /* page already gone */ });
   };
@@ -1478,8 +1511,11 @@ export async function restartMixedCapture(page: Page): Promise<boolean> {
  *
  * The MediaRecorder loop lives in @vexa/record-chunker (bundled into window.VexaBrowserUtils, like
  * the capture bricks). It records the meeting's combined audio mix, base64-encodes each timeslice,
- * and hands it to `onChunk`. We bridge those chunks over the Playwright boundary to `recording.chunk`
- * using the SAME key the orchestrator closes with (`platform/native`); the sink uploads each chunk to
+ * and hands it to `onChunk`. Where that mix comes from is `recordingSource(platform)`: the per-track
+ * and mixed lanes hand the tap the live graph their PCM capture already reads, so every track the
+ * capture connects later is in the recording; the gmeet lane records its page media elements. We
+ * bridge those chunks over the Playwright boundary to `recording.chunk` using the SAME key the
+ * orchestrator closes with (`platform/native`); the sink uploads each chunk to
  * meeting-api the moment it arrives (#491/#412 — every finished part is durable before the meeting
  * ends), and the master is assembled server-side on read. The trailing empty is_final chunk (on
  * stop) is the COMPLETED signal. Started post-admission (on the live meeting page, where the
@@ -1504,8 +1540,8 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     recording.chunk(key, chunkSeq, isFinal, format, bytes);
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
 
-  // Page-side: start the generic recording tap (finds + combines the page audio elements).
-  await page.evaluate(async ({ timesliceMs, perTrack }) => {
+  // Page-side: start the recording tap on the lane's audio source.
+  await page.evaluate(async ({ timesliceMs, source }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (w.VexaBrowserUtils?.createRecordingTap && !w.__vexaRecordingTap) {
       const tapOpts: Record<string, unknown> = {
@@ -1515,17 +1551,27 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
           catch { return false; }
         },
       };
-      // Zoom: record the live per-track mix. A track that joins after this
-      // start is connected to the same destination and is in the webm.
-      // Teams and Meet keep the element snapshot.
-      if (perTrack && w.__vexaPerTrackMixStream) {
+      // The per-track and mixed lanes record the live graph their capture reads. A track that
+      // joins after this start is connected to the same destination and is in the webm. The
+      // gmeet lane records the page's media elements (the tap's own snapshot).
+      if (source === 'pertrack-mix' && w.__vexaPerTrackMixStream) {
         tapOpts.stream = w.__vexaPerTrackMixStream;
         w.logBot?.('[pertrack] recording the live mix (' + (w.__vexaPerTrackMixCount || 0) + ' track(s) connected)');
+      } else if (source === 'mixed-mix') {
+        if (!w.__vexaMixDest?.stream) {
+          // No graph means the capture lane could not build one either; the page's media elements
+          // are not the meeting, so nothing is recorded, and that is said rather than recorded over.
+          w.logBot?.('[mixed] recording not started: the live mix graph is absent');
+          w.__vexaObservation?.('mixed', { type: 'recording-source-absent', tMs: Date.now() }, Date.now());
+          return;
+        }
+        tapOpts.stream = w.__vexaMixDest.stream;
+        w.logBot?.('[mixed] recording the live mix (' + (w.__vexaMixSeen?.size || 0) + ' stream(s) connected)');
       }
       w.__vexaRecordingTap = w.VexaBrowserUtils.createRecordingTap(tapOpts);
       await w.__vexaRecordingTap.start();
     }
-  }, { timesliceMs, perTrack: isPerTrackLanePlatform(inv.platform) }).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
+  }, { timesliceMs, source: recordingSource(inv.platform) }).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
   return async () => {
@@ -1535,6 +1581,11 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       w.__vexaRecordingTap = null;
       try { w.__vexaTrackCtx?.close?.(); w.__vexaTrackCtx = null; } catch { /* best-effort */ }
       try { w.__vexaPerTrackMixDest = null; w.__vexaPerTrackMixStream = null; w.__vexaPerTrackMixCount = 0; } catch { /* best-effort */ }
+      // The mixed-lane graph is shared with the capture; whichever stops last closes it. The
+      // capture's rescan timer is the sign the capture is still running.
+      if (!w.__vexaMixRescan) {
+        try { w.__vexaMixCtx?.close?.(); w.__vexaMixCtx = null; w.__vexaMixDest = null; } catch { /* best-effort */ }
+      }
     }).catch(() => { /* page already gone */ });
   };
 }
