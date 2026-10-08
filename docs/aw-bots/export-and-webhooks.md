@@ -74,8 +74,11 @@ One pass writes:
 |---|---|
 | `master.webm` | Copy of the session master |
 | `audio.wav` | Transcode the worker downloads |
-| `speaker_timeline.json` | From `speaker-activity.jsonl`. See [recording](recording-and-speakers.md). |
+| `speaker_timeline.json` | From `speaker-activity.jsonl`. See [recording](recording-and-speakers.md). Channel-tap lines are not in this timeline. |
 | `participants.json` | Names from that activity |
+| `speaker_activity_frames.json` | Every parsed activity frame the channel transcript needs: `{t_rel, ch, name, rms, dur_ms}`, including frames with no name. Written when the session's activity state is `ok` or `capped`. On Jitsi, a session that has `"src":"channel"` lines writes only those lines, because the mixed-lane frames reuse channel 0. |
+| `channels/ch<N>.wav` | One 16 kHz mono wav per channel number, on the same meeting clock as `audio.wav`, leading silence included. Absent when the bot recorded no `ch<N>` media. |
+| `channels/index.json` | One row per channel: `channel`, `kind` (`gmeet` or `jitsi`), `stream_id`, `offset_s`, and for Jitsi `participant_id` and `display_name` when the first chunk stored them. Written last, after every channel wav. |
 | `meeting.json` | Meeting metadata |
 | `recordings.json` | Recording list |
 | `live_transcript.json` | Only when the meeting has one |
@@ -84,14 +87,24 @@ One pass writes:
 
 Several bot sessions on one meeting are joined into that one folder, up to
 `EXPORT_MAX_RECORDINGS` (the Deployment sets 50). Past that, the export fails
-`too_many_recordings` and writes nothing else.
+`too_many_recordings` and writes nothing else. Channel pieces from those sessions
+share one `channels/ch<N>.wav` per channel number. The index row keeps the earliest
+piece's name.
+
+Channel wavs are built locally before any of them is uploaded (`exporter/job.py`
+`_export_channels`). A failure while fetching, transcoding, or joining logs
+`channel_export_failed` and does not stop the mixed export or `POST /process`.
+No `channels/index.json` means the worker treats the meeting as mixed. Channel wavs
+use the `audio` retention class. `channels/index.json` and
+`speaker_activity_frames.json` use `metadata`.
 
 `POST /process` goes to `NOTETAKER_URL`. The exporter Deployment sets
 `http://notetaker-api.notetaker.svc.cluster.local:8080`. The runbook's prerequisite check is
 that this Service points at `notetaker-worker`. The body is `meeting_id` (the UUID), `s3_path`,
 `platform`, and `idempotency_key` equal to that same UUID (`exporter/notetaker.py`,
-`job.py`). The worker's behavior after that call, including how it maps speaker names, lives in
-the deployment repo. This fork stops at the handoff.
+`job.py`). The worker's behavior after that call, including how it maps speaker names and
+how it uses `channels/index.json`, is `deployment/base/notetaker/worker/README.md` in the
+deployment repo. This fork stops at the handoff.
 
 A meeting already marked `handed_off` is not submitted again. Transport errors and HTTP 5xx are
 retried. HTTP 4xx fails the export.

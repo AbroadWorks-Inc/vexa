@@ -12,3 +12,4 @@ Short records of choices that are still in force. The long argument is in the
 | [0005](0005-webhooks-replace-the-system-hook.md) | Status leaves through `/v2/webhooks` subscriptions. |
 | [0006](0006-signed-gateway-identity.md) | meeting-api and admin-api trust `x-user-id` only with the gateway's signature. |
 | [0007](0007-replace-a-failed-bot-on-the-same-meeting.md) | A bot that fails while the meeting is on is replaced on that same meeting. |
+| [0008](0008-per-speaker-channels.md) | Meet and Jitsi record each remote channel beside the mix. The mixed transcript stays the one users receive until the worker is switched. |

@@ -8,9 +8,10 @@ Image names and the settings table are there too. Route fields are in the
 ## What AW Bots is responsible for
 
 AW Bots joins a Google Meet, Microsoft Teams, Zoom, or Jitsi call, records the mixed audio, and writes
-who was speaking when. When that meeting has a recording, the exporter builds the folder the
-existing AW notetaker reads and calls `POST /process`. The transcript and the summary are produced
-by `notetaker-worker` in the deployment repo.
+who was speaking when. On Google Meet and Jitsi, when the deployment lists the platform, the bot
+also records each remote channel beside that mix. When that meeting has a recording, the exporter
+builds the folder the existing AW notetaker reads and calls `POST /process`. The transcript and the
+summary are produced by `notetaker-worker` in the deployment repo.
 
 `meet.abroadworks.com` is a Jitsi host on `VEXA_JITSI_HOSTS`. Intake does not refuse it.
 

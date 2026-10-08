@@ -35,10 +35,12 @@ capture bridge, and the pipeline share.
 | Teams, Jitsi | `mixed` | The server mix. Frames are unnamed. Hints carry the active speaker. |
 
 Zoom is the only `pertrack` platform (`isPerTrackLanePlatform`). Teams stays on the mix.
+Jitsi's lane for the mixed timeline stays `mixed`. Per-speaker lines on Jitsi are extra; they
+are described under [Per-speaker channels](#per-speaker-channels).
 
-The exporter (`exporter/activity.py`) keeps a named frame on every lane. Hints become the
-timeline only when the file stored no named frame. That is the Teams path, and a Zoom file that
-never named a channel.
+The exporter (`exporter/activity.py`) keeps a named frame on every lane. A line with
+`"src":"channel"` stays out of that timeline. Hints become the timeline only when the file
+stored no named frame. That is the Teams path, and a Zoom file that never named a channel.
 
 `build_speaker_timeline` in `exporter/attribution.py` then:
 
@@ -54,7 +56,50 @@ never named a channel.
 A frame counts as speech at or above `RMS_SPEECH_THRESHOLD` (default 0.026).
 
 `notetaker-worker` reads `speaker_timeline.json` from the export bucket, including
-`speaker_intervals`. This repo does not change that worker.
+`speaker_intervals`. When the export folder also has `channels/index.json`, the worker can
+transcribe each channel. That choice is `CHANNEL_TRANSCRIPT_MODE` in the deployment repo.
+This repo does not change that worker. The handoff of the files is
+[export and webhooks](export-and-webhooks.md).
+
+## Per-speaker channels
+
+Google Meet and Jitsi record each remote channel beside the mixed master. The mixed master
+and `speaker-activity.jsonl` are written on every meeting. Teams stays the server mix. Zoom
+stays `pertrack`.
+
+The switch is `PER_CHANNEL_RECORDING_PLATFORMS` on meeting-api
+(`bot_spawn/service.py` `per_channel_recording_enabled`): a comma-separated list of platform
+names. Unset or empty is off. A channel is recorded only when this bot is recording at all.
+Helm `meetingApi.perChannelRecordingPlatforms` sets the variable. The chart default is `""`.
+Our values set `google_meet,jitsi`.
+
+meeting-api sends `perChannelRecordingEnabled: true` on the invocation only when the platform
+is listed (`bot_spawn/service.py`, `invocation.py`). Off omits the field, so a bot image that
+does not know the field still accepts the invocation. The bot reads
+`inv.perChannelRecordingEnabled` (`capture-bridge.ts` `startRecording`). It does not read an
+environment variable of its own.
+
+| Platform | What is recorded | What the first chunk stores |
+|---|---|---|
+| Google Meet | Each remote audio element `gmeet-capture` is connected to. The channel number is the index that capture assigned (`gmeet-capture.ts` `channels()`). Meet keeps a small rotating pool of those elements. | `channel_kind: gmeet`, `stream_id`. Glow names stay on the ordinary activity frames, which already carry `ch`. |
+| Jitsi | A live remote stream whose id is `remote-audio-<n>` (`record-chunker/src/channel-targets.ts`). The digits are the channel number. `mixedmslabel` is not a channel. | `channel_kind: jitsi`, `stream_id`, and, when the page store has them, `participant_id` and `display_name` (`jitsiNameForStream`). |
+
+The recorder is the same `record-chunker` tap as the master, one continuous recorder per
+channel, same timeslice (`VEXA_RECORDING_TIMESLICE_MS`, default 15000 ms). The page looks for
+new elements every 2 seconds. Each channel uploads as media type `ch<N>`
+(`bot/src/recording.ts`). meeting-api stores that as its own media file under
+`recordings/{user}/{recording}/{session}/ch<N>/` (`recordings/jsonb.py` `chunk_storage_key`)
+and finalizes it with the same `finalize_master` as `audio`. The list prefix includes a
+trailing slash (`recordings/service.py`), so one media type is not concatenated into another
+whose name starts the same way.
+
+Jitsi also appends activity for those channels to `speaker-activity.jsonl`, with
+`"src":"channel"` on the line. One shared `AudioContext` feeds every channel tap. A block
+whose peak is at or below 0.005 is not written. The recorder itself is continuous: that gate
+is only on the activity line. Meet does not add `"src":"channel"` lines. Its existing frames
+already name the channel.
+
+The bot log line when a recorder starts is `[channels] recording ch<N>`.
 
 ## Google Meet recording notice
 
