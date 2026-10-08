@@ -28,11 +28,19 @@ export interface GmeetCaptureOptions {
   findDelayMs?: number;        // default 2000
 }
 
+/** One remote stream and the channel number assigned when it was connected. */
+export interface GmeetChannelRef {
+  streamId: string;
+  index: number;
+}
+
 export interface GmeetCapture {
   start(): Promise<void>;
   stop(): void;
   /** Number of currently-connected participant streams. */
   streamCount(): number;
+  /** Stream id → channel number. A reconnect stores the new index and does not free the old one. */
+  channels(): GmeetChannelRef[];
 }
 
 export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
@@ -46,13 +54,16 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
   let running = false;
   let rescanTimer: ReturnType<typeof setInterval> | null = null;
   const connectedStreamIds = new Set<string>();
+  const channelByStream = new Map<string, number>();
   const contexts: AudioContext[] = [];
   let nextIndex = 0;
 
   function findMediaElements(): HTMLMediaElement[] {
-    return Array.from(document.querySelectorAll('audio, video')).filter((el: any) =>
+    const root = globalThis as any;
+    const MediaStreamRef = root.MediaStream;
+    return Array.from(root.document.querySelectorAll('audio, video')).filter((el: any) =>
       !el.paused &&
-      el.srcObject instanceof MediaStream &&
+      el.srcObject instanceof MediaStreamRef &&
       el.srcObject.getAudioTracks().length > 0
     ) as HTMLMediaElement[];
   }
@@ -64,7 +75,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       const streamId = stream.id;
       if (connectedStreamIds.has(streamId)) return false;
 
-      const ctx = new AudioContext({ sampleRate: SR });
+      const ctx = new (globalThis as any).AudioContext({ sampleRate: SR });
       // Chrome's autoplay policy can create the context SUSPENDED (no user gesture) → the worklet
       // never runs → zero PCM even while people talk. Resume it explicitly. (L4 capture fix.)
       void ctx.resume().then(() => log(`stream ${index} ctx.state=${ctx.state}`)).catch(() => { /* */ });
@@ -83,6 +94,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       }).then((node) => { source.connect(node); node.connect(ctx.destination); })
         .catch((err: any) => console.log(`[gmeet-capture] worklet init failed: ${err?.message}`));
       connectedStreamIds.add(streamId);
+      channelByStream.set(streamId, index);
       contexts.push(ctx);
 
       const track = stream.getAudioTracks()[0];
@@ -133,10 +145,15 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       for (const ctx of contexts) { try { ctx.close(); } catch { /* ignore */ } }
       contexts.length = 0;
       connectedStreamIds.clear();
+      channelByStream.clear();
       nextIndex = 0;
       log('capture stopped');
     },
 
     streamCount(): number { return connectedStreamIds.size; },
+
+    channels(): GmeetChannelRef[] {
+      return Array.from(channelByStream, ([streamId, index]) => ({ streamId, index }));
+    },
   };
 }
