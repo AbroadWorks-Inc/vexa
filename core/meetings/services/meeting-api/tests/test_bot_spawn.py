@@ -162,7 +162,8 @@ async def test_spawn_threads_per_channel_recording_from_deployment_env(
                       native_meeting_id=f"pc-{slug}", redis_url="redis://redis:6379/0",
                       recording_enabled=recording, token_secret=SECRET)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
-    assert inv["perChannelRecordingEnabled"] is expected
+    # Off is left out of the invocation, so a bot image without the field still accepts it.
+    assert inv.get("perChannelRecordingEnabled") is (True if expected else None)
 
 
 def test_invocation_carries_stt_model_when_provided():

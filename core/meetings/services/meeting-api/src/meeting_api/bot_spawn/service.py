@@ -580,7 +580,8 @@ async def request_bot(
     #     userdata prefix).
     authenticated = env_flag("BOT_AUTHENTICATED", False)
     # Per-channel (per-speaker) recording: deployment-scoped per platform, like BOT_AUTHENTICATED.
-    per_channel_recording = per_channel_recording_enabled(platform, recording_enabled)
+    # Sent only when on; off leaves the field out, so a bot image without it still accepts.
+    per_channel_recording = per_channel_recording_enabled(platform, recording_enabled) or None
     auth_userdata_path: Optional[str] = None
     auth_s3: dict[str, Optional[str]] = {}
     if authenticated:
