@@ -17,7 +17,7 @@
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { createBotRecordingSink, type ChunkUploader } from './recording.js';
+import { createBotRecordingSink, type ChannelChunkIdentity, type ChunkUploader } from './recording.js';
 import type { Invocation } from './config.js';
 import type { RecordingMasterFormat } from '@vexa/recording';
 
@@ -163,6 +163,99 @@ async function main(): Promise<void> {
     check('wire: seq order 0,1,2', wire.map((w) => w.chunk_seq).join(',') === '0,1,2', wire.map((w) => w.chunk_seq).join(','));
     check('wire: only the LAST chunk is_final', wire.map((w) => w.is_final).join(',') === 'false,false,true',
       wire.map((w) => w.is_final).join(','));
+  }
+
+  // ── 8) a channel lane is its own seq, media type, and final. The mix lane is unchanged. ──
+  {
+    interface Seen { seq: number; isFinal: boolean; len: number; extra?: { mediaType?: string; metadata?: Record<string, string | number> } }
+    const seen: Seen[] = [];
+    const upload: ChunkUploader = (seq, isFinal, _format, bytes, extra) => {
+      seen.push({ seq, isFinal, len: bytes.length, extra });
+    };
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: upload });
+    const ada: ChannelChunkIdentity = {
+      recorder_start_epoch_ms: 1_700_000_000_000,
+      channel_kind: 'jitsi',
+      stream_id: 'remote-audio-3',
+      participant_id: 'p1',
+      display_name: 'Ada',
+    };
+    const bob: ChannelChunkIdentity = { ...ada, display_name: 'Bob' };
+    sink.chunk('google_meet/ch', 0, false, 'webm', new Uint8Array([1]));
+    sink.channelChunk(3, 1, false, 'webm', new Uint8Array([2]), ada);
+    sink.channelChunk(3, 0, false, 'webm', new Uint8Array([3, 3]), bob);
+    sink.channelChunk(3, 2, false, 'webm', new Uint8Array([4]), bob);
+    sink.close('google_meet/ch');
+    await flush();
+
+    const audio = seen.filter((s) => !s.extra);
+    const channel = seen.filter((s) => s.extra?.mediaType === 'ch3');
+    check('channel: the mix lane carries no extra metadata', audio.length === 2 && audio[0]?.seq === 0 && !audio[0].isFinal && audio[1]?.isFinal && audio[1].seq === 1 && audio[1].len === 0, JSON.stringify(audio));
+    const seq0 = channel.find((s) => s.seq === 0);
+    const meta = seq0?.extra?.metadata;
+    check('channel: seq 0 is media type ch3 with the first identity',
+      !!seq0 && !seq0.isFinal && meta?.recorder_start_epoch_ms === 1_700_000_000_000 && meta.channel_kind === 'jitsi' && meta.stream_id === 'remote-audio-3' && meta.participant_id === 'p1' && meta.display_name === 'Ada',
+      JSON.stringify(seq0));
+    const later = channel.filter((s) => s.seq !== 0 && !s.isFinal);
+    check('channel: a later chunk does not resend identity', later.length === 2 && later.every((s) => s.extra?.metadata === undefined), JSON.stringify(later));
+    const fin = channel.find((s) => s.isFinal);
+    check('channel: close sends one empty final for the channel', !!fin && fin.len === 0 && fin.seq === 3 && fin.extra?.metadata === undefined, JSON.stringify(fin));
+    sink.close('google_meet/ch');
+    await flush();
+    check('channel: a second close adds no further final', seen.filter((s) => s.isFinal).length === 2, String(seen.filter((s) => s.isFinal).length));
+  }
+
+  // ── 9) a bool clock and an over-long name are not identity ──
+  {
+    const seen: { seq: number; extra?: { metadata?: Record<string, string | number> } }[] = [];
+    const upload: ChunkUploader = (seq, _isFinal, _format, _bytes, extra) => { seen.push({ seq, extra }); };
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: upload });
+    sink.channelChunk(0, 0, false, 'webm', new Uint8Array([1]), {
+      recorder_start_epoch_ms: true as unknown as number,
+      channel_kind: 'gmeet',
+      stream_id: 'stream-a',
+      display_name: 'x'.repeat(201),
+    });
+    await flush();
+    const meta = seen[0]?.extra?.metadata;
+    check('channel: a boolean clock is dropped and a 201-char name is dropped',
+      meta?.channel_kind === 'gmeet' && meta.stream_id === 'stream-a' && meta.recorder_start_epoch_ms === undefined && meta.display_name === undefined,
+      JSON.stringify(meta));
+  }
+
+  // ── 10) the default uploader writes media_type into the metadata JSON ──
+  {
+    const wire: Record<string, unknown>[] = [];
+    const server = http.createServer((req, res) => {
+      const parts: Buffer[] = [];
+      req.on('data', (d: Buffer) => parts.push(d));
+      req.on('end', () => {
+        const text = Buffer.concat(parts).toString('latin1');
+        const m = text.match(/name="metadata"[\s\S]*?\r\n\r\n(\{[\s\S]*?\})\r\n/);
+        wire.push(m ? JSON.parse(m[1]) : {});
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok' }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/internal/recordings/upload`;
+    const sink = createBotRecordingSink({
+      inv: inv({ connectionId: 'conn-xyz', meeting_id: 42, recordingUploadUrl: url, internalSecret: 's' }),
+    });
+    sink.chunk('jitsi/w', 0, false, 'webm', new Uint8Array([1]));
+    sink.channelChunk(0, 0, true, 'webm', new Uint8Array(0), {
+      recorder_start_epoch_ms: 42,
+      channel_kind: 'gmeet',
+      stream_id: 'stream-a',
+    });
+    for (let i = 0; i < 100 && wire.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    await new Promise<void>((r) => server.close(() => r()));
+    const audio = wire.find((w) => w.media_type === undefined);
+    const channel = wire.find((w) => w.media_type === 'ch0');
+    check('wire channel: the mix chunk has no media_type', !!audio && audio.chunk_seq === 0 && audio.is_final === false, JSON.stringify(audio));
+    check('wire channel: seq 0 carries ch0 and the clock',
+      !!channel && channel.channel_kind === 'gmeet' && channel.stream_id === 'stream-a' && channel.recorder_start_epoch_ms === 42 && channel.is_final === true,
+      JSON.stringify(channel));
   }
 
   if (failed) { console.error(`\n❌ recording (L3): ${failed} check(s) FAILED.`); process.exit(1); }
