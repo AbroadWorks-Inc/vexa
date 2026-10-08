@@ -395,6 +395,35 @@ async def test_concurrent_chunk_uploads_do_not_lose_updates():
     assert mf["chunk_count"] == 3, f"all 3 chunks must be folded (no lost update), got {mf['chunk_count']}"
 
 
+async def test_concurrent_first_chunks_of_several_media_types_share_one_recording_prefix():
+    """A per-channel bot uploads chunk 0 of `audio`, `ch0` and `ch1` at the same moment. Every
+    object must land under the ONE recording the JSONB keeps, or the audio master is built without
+    chunk 0 (no container header) and cannot be decoded."""
+    import asyncio
+
+    repo, _ = _seeded()
+    storage = _YieldingStorage()
+    await asyncio.gather(*(
+        upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                     data=_counting_wav(seq), media_type=media_type, media_format="wav",
+                     chunk_seq=0, is_final=False)
+        for seq, media_type in enumerate(("audio", "ch0", "ch1"))
+    ))
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=_counting_wav(9), media_type="audio", media_format="wav",
+                       chunk_seq=1, is_final=True)
+
+    recs = [r for r in await repo.get_recordings(MEETING_ID) if r.get("source") == "bot"]
+    assert len(recs) == 1
+    rid = recs[0]["id"]
+    keys = await storage.list("recordings/")
+    assert keys and all(f"/{rid}/" in k for k in keys), keys
+
+    master_key = await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
+    master = await storage.get(master_key)
+    assert master == build_recording_master([_counting_wav(0), _counting_wav(9)], "wav")
+
+
 # ── #509 C2: retrieval serves the assembled master, never the empty final-signal chunk ────────────
 # V1/#491 — a confirmed multi-chunk upload downloads BYTE-COMPLETE via /master and /raw.
 # V2/#412 — every uploaded part is kept; a crashed (no-final) recording still retrieves its parts.
