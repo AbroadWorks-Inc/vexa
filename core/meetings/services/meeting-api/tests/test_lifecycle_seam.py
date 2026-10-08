@@ -35,6 +35,7 @@ from meeting_api.lifecycle.machine import (
     LifecycleSink,
     MeetingStore,
     can_transition,
+    durable_status_repairs_edge,
 )
 from gateway_identity import via_gateway
 from internal_callers import BOT, runtime_callback
@@ -330,6 +331,83 @@ def test_illegal_local_edge_refreshes_newer_db_state_from_another_replica():
     )
     assert response.status_code == 200, response.text
     assert response.json()["meeting_status"] == "completed"
+
+
+def test_legal_local_edge_adopts_a_later_status_from_another_replica():
+    """A replica stuck at `joining` is given `active` after another replica stored
+    `awaiting_admission`. `joining` → `active` looks legal, so the illegal-edge
+    refresh does not run, and a write that names only `joining` is refused. The
+    event is applied again from the stored status, and the meeting becomes active."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    app = create_app(meeting_repo=repo)
+    client = TestClient(app)
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], "awaiting_admission")
+
+    response = _post(client, connection_id="sess-uid", status="active")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["meeting_status"] == "active"
+    assert response.json()["status_transition"][-1]["from"] == "awaiting_admission"
+    assert response.json()["status_transition"][-1]["to"] == "active"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+    active = [
+        env["data"]["status_change"]
+        for env in app.state.status_change_webhooks
+        if env["data"]["status_change"]["new_status"] == "active"
+    ]
+    assert active == [{"old_status": "awaiting_admission", "new_status": "active",
+                       "reason": None, "transition_source": "bot_callback"}]
+
+    done = _post(
+        client, connection_id="sess-uid", status="completed",
+        exit_code=0, completion_reason="left_alone",
+    )
+    assert done.status_code == 200, done.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "completed"
+
+
+def test_legal_local_edge_does_not_overwrite_a_stop():
+    """A replica that last saw `joining` must not move a meeting another replica
+    already moved to `stopping`. `active` is a no-op against that row. `failed`
+    is refused and is not applied again from the stop."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], "stopping")
+
+    active = _post(client, connection_id="sess-uid", status="active")
+    assert active.status_code == 200, active.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "stopping"
+
+    fresh = InMemoryMeetingRepo()
+    stopped = _seed(fresh, status="requested")
+    other = TestClient(create_app(meeting_repo=fresh))
+    assert _post(other, connection_id="sess-uid", status="joining").status_code == 200
+    fresh.set_status(stopped["id"], "stopping")
+    failed = _post(
+        other, connection_id="sess-uid", status="failed",
+        exit_code=1, completion_reason="join_failure",
+    )
+    assert failed.status_code == 200, failed.text
+    assert asyncio.run(fresh.get_status_by_session(session_uid="sess-uid")) == "stopping"
+
+
+def test_durable_status_repairs_only_an_ahead_row():
+    assert durable_status_repairs_edge(
+        BotStatus.JOINING, "awaiting_admission", BotStatus.ACTIVE
+    )
+    assert not durable_status_repairs_edge(
+        BotStatus.ACTIVE, "joining", BotStatus.COMPLETED
+    )
+    assert not durable_status_repairs_edge(
+        BotStatus.JOINING, "stopping", BotStatus.FAILED
+    )
+    assert durable_status_repairs_edge(
+        BotStatus.JOINING, "stopping", BotStatus.ACTIVE
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
