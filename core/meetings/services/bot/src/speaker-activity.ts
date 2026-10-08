@@ -27,7 +27,7 @@ export interface SpeakerActivityWriter {
   path: string;
   /** One captured audio frame. Meet names it at capture time; Zoom/Teams frames arrive
    *  unnamed and are attributed later from hints. Never throws; a no-op once close() has run. */
-  frame(ch: number, pcm: Float32Array, ts: number, name?: string): void;
+  frame(ch: number, pcm: Float32Array, ts: number, name?: string, src?: 'channel'): void;
   /** A mixed-lane active-speaker signal. `kind` is "levels" or "dominant" for Jitsi.
    *  Omit it for every other caller. Never throws; a no-op once close() has run. */
   hint(t: number, name: string, isEnd?: boolean, kind?: string): void;
@@ -162,7 +162,7 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
   let closed = false;
   return {
     path,
-    frame(ch, pcm, ts, name): void {
+    frame(ch, pcm, ts, name, src): void {
       if (disabled || capped || closed) return;
       try {
         const rec: Record<string, unknown> = {
@@ -171,6 +171,9 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
           ...(name !== undefined ? { name } : {}),
           rms: Math.round(rmsOf(pcm) * 1e5) / 1e5,
           dur_ms: Math.round(pcm.length / 16), // 16 kHz capture
+          // A per-channel (remote-stream) frame, told apart from a mix frame of the same channel
+          // number. Every other frame carries no `src` key, byte-identical to before.
+          ...(src === 'channel' ? { src } : {}),
         };
         const line = JSON.stringify(rec) + '\n';
         if (!admit(line)) return;

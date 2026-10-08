@@ -10,7 +10,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource, perChannelRecordingEnabled } from './config.js';
+import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource } from './config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_DIR = join(HERE, '..', '..', '..', 'contracts', 'invocation.v1', 'golden');
@@ -40,6 +40,7 @@ for (const g of goldens) {
   check('full: secret token present (not logged)', typeof full.token === 'string' && full.token.length > 0);
   check('full: transcriptionModel threaded (#522)', full.transcriptionModel === 'whisper-large-v3-turbo', String(full.transcriptionModel));
   check('full: captureSignalEnabled threaded (O-TEL-1)', full.captureSignalEnabled === true, String(full.captureSignalEnabled));
+  check('full: perChannelRecordingEnabled threaded', full.perChannelRecordingEnabled === true, String(full.perChannelRecordingEnabled));
 }
 
 // ── typed access on the jitsi golden (the platform enum accepts jitsi) ──
@@ -106,17 +107,15 @@ console.log('\n✅ config (L1/L2): the goldens parse, the env helper round-trips
   check('recordingSource: google_meet keeps the element snapshot', rs('google_meet') === 'element-snapshot', rs('google_meet'));
 }
 
-// ── per-channel recorders stay off until the env is exactly 1 or true ──
+// ── per-channel recorders: read from the invocation only; absent = off, never from the bot env ──
 {
-  const on = (value: string | undefined): boolean => perChannelRecordingEnabled(
-    value === undefined ? {} : { PER_CHANNEL_RECORDING_ENABLED: value },
-  );
-  check('per-channel recording is off when unset', on(undefined) === false);
-  check('per-channel recording is on for 1', on('1') === true);
-  check('per-channel recording is on for true', on('true') === true);
-  check('per-channel recording rejects TRUE', on('TRUE') === false);
-  check('per-channel recording rejects yes', on('yes') === false);
-  check('per-channel recording rejects 0', on('0') === false);
+  const minimal = JSON.parse(readFileSync(join(GOLDEN_DIR, 'Invocation.minimal.json'), 'utf8')) as Record<string, unknown>;
+  const absent = parseInvocation(JSON.stringify(minimal));
+  check('per-channel recording is absent (off) when the invocation omits it', absent.perChannelRecordingEnabled === undefined);
+  const off = parseInvocation(JSON.stringify({ ...minimal, perChannelRecordingEnabled: false }));
+  check('per-channel recording false rides as false', off.perChannelRecordingEnabled === false);
+  const err = throws(() => parseInvocation(JSON.stringify({ ...minimal, perChannelRecordingEnabled: 'true' })));
+  check('per-channel recording must be a boolean', err instanceof InvocationError, err?.message ?? 'no error');
 }
 
 console.log(failed === 0 ? '\n✅ config: all green' : `\n❌ config: ${failed} failure(s)`);

@@ -165,6 +165,46 @@ def persisted_statuses_for(status: Optional[BotStatus]) -> frozenset:
     `bot_status_from_persisted`): an FSM edge's `from`, as the statuses the row may hold."""
     return frozenset(s for s, b in _PERSISTED_STATUS_TO_BOTSTATUS.items() if b == status)
 
+
+def _reachable(src: Optional[BotStatus], dst: BotStatus) -> bool:
+    """True when `dst` is a later state on some legal path out of `src`."""
+    seen: set[Optional[BotStatus]] = set()
+    stack: list[Optional[BotStatus]] = [src]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        for nxt in LEGAL_TRANSITIONS.get(cur, frozenset()):
+            if nxt == dst:
+                return True
+            if nxt not in seen:
+                stack.append(nxt)
+    return False
+
+
+def durable_status_repairs_edge(
+    local: Optional[BotStatus], durable: Optional[str], target: BotStatus
+) -> bool:
+    """Whether a refused status write should be applied again from the stored row.
+
+    Each meeting-api replica keeps its own record. A replica that last saw
+    `joining` accepts `active` without re-reading, then the write names only
+    `joining`. A row another replica already moved to `awaiting_admission`
+    refuses that write. Re-apply when the stored status is ahead of `local` and
+    the event is legal from it.
+
+    `stopping` maps to ACTIVE, so it counts as ahead of `joining`, but the only
+    repair from a stop is a no-op when the event is already `active`. A `failed`
+    report must not close a stop from here.
+    """
+    mapped = bot_status_from_persisted(durable)
+    if mapped is None or mapped == local or not _reachable(local, mapped):
+        return False
+    if durable == "stopping":
+        return mapped == target
+    return mapped == target or can_transition(mapped, target)
+
 # Stage a record was in maps to the FailureStage to record if it terminates `failed`.
 # (Mirrors the parent's `_failure_stage_from_status`: derive server-side from current
 # state, never trust the bot's stale payload value.)

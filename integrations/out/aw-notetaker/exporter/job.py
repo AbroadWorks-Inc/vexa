@@ -31,8 +31,12 @@ A recording may also carry per-channel media (`ch0`, `ch1`, ...). Each
 channel master is placed on that same meeting clock, leading silence
 included, and written as `channels/ch<N>.wav` with one `channels/index.json`
 row. Every frame that parsed, named or not, is written to
-`speaker_activity_frames.json`. The mixed timeline does not read those
-frames. A meeting with no channel media gets no index.
+`speaker_activity_frames.json`, except that a session with channel-tap frames
+(`"src":"channel"`) writes only those. The mixed timeline does not read
+channel-tap frames. A meeting with no channel media gets no index. Every
+channel wav is built locally before any is uploaded, and the index goes last,
+so a channel that fails (fetch, transcode, join) uploads nothing; it is
+logged and the mixed export and `/process` go on as without channels.
 
 `export_meeting` raises on retryable failure — the caller (the durable
 queue) counts attempts and re-runs; `aw-bots` is never modified, so a re-run
@@ -331,14 +335,12 @@ class _ChannelPiece:
     recording_id: int
 
 
-def _write_channel_wav(
+def _join_channel_wav(
     group: list[_ChannelPiece],
-    base: str,
     tmp: Path,
-    deps: Deps,
     vexa_meeting_id: int,
-) -> None:
-    """One wav for a channel number. Pieces are already in offset order.
+) -> Path:
+    """One local wav for a channel number. Pieces are already in offset order.
 
     A piece that starts before the meeting, or on top of the previous piece,
     is appended after what is already written. The file's t=0 is the meeting
@@ -375,13 +377,7 @@ def _write_channel_wav(
         cursor = start + frames
     dst = tmp / f"ch{channel}.wav"
     join_wavs(parts, dst)
-    deps.storage.upload_file(
-        dst,
-        deps.settings.export_bucket,
-        f"{base}channels/ch{channel}.wav",
-        "audio/wav",
-        retention=AUDIO,
-    )
+    return dst
 
 
 def _export_channels(
@@ -396,7 +392,9 @@ def _export_channels(
 
     One file per channel number across sessions. The earliest piece's identity
     is the index row; a later session that names someone else is logged and
-    does not rename the row.
+    does not rename the row. Nothing is uploaded until every channel wav is
+    built; `index.json` is uploaded last, so it is never published without
+    all of its wavs.
     """
     settings = deps.settings
     pieces: list[_ChannelPiece] = []
@@ -433,12 +431,13 @@ def _export_channels(
     for piece in pieces:
         by_channel.setdefault(piece.channel, []).append(piece)
     index: list[dict[str, Any]] = []
+    wavs: list[tuple[int, Path]] = []
     for channel in sorted(by_channel):
         group = sorted(
             by_channel[channel],
             key=lambda piece: (piece.offset_ms, piece.recording_id),
         )
-        _write_channel_wav(group, base, tmp, deps, vexa_meeting_id)
+        wavs.append((channel, _join_channel_wav(group, tmp, vexa_meeting_id)))
         kept = group[0].row
         index.append(kept)
         for later in group[1:]:
@@ -452,6 +451,14 @@ def _export_channels(
                     later.row.get("display_name"),
                     kept.get("display_name"),
                 )
+    for channel, wav_path in wavs:
+        deps.storage.upload_file(
+            wav_path,
+            settings.export_bucket,
+            f"{base}channels/ch{channel}.wav",
+            "audio/wav",
+            retention=AUDIO,
+        )
     deps.storage.put_json(
         settings.export_bucket,
         base + "channels/index.json",
@@ -766,9 +773,13 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             speaker_names += session_names
             states.append(state)
             if state in ("ok", "capped"):
+                # A session with channel-tap frames (Jitsi) exports only those:
+                # their `ch` matches `channels/ch<N>.wav`, while its mixed-lane
+                # frames reuse ch 0. Otherwise (Meet) every frame is per channel.
+                taps = [frame for frame in captured if frame.source == "channel"]
                 exported_frames.extend(
                     _activity_frame(frame, session.origin_ms, start_ms)
-                    for frame in captured
+                    for frame in (taps or captured)
                 )
         activity_state = max(states, key=_ACTIVITY_SEVERITY.index)
         if (
@@ -821,7 +832,19 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             {"recordings": recs},
             retention=METADATA,
         )
-        _export_channels(sessions, spans, base, Path(tmp_dir), deps, vexa_meeting_id)
+        try:
+            _export_channels(
+                sessions, spans, base, Path(tmp_dir), deps, vexa_meeting_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "channel_export_failed meeting_id=%s vexa_meeting_id=%s "
+                "error_class=%s error=%s; exporting the mixed audio only",
+                meeting_uuid,
+                vexa_meeting_id,
+                type(exc).__name__,
+                exc,
+            )
         if any(state in ("ok", "capped") for state in states):
             storage.put_json(
                 settings.export_bucket,

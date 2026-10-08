@@ -38,6 +38,7 @@ from tests.builders import (
     capped,
     frame,
     header,
+    jitsi_lines,
     meeting_event,
     two_speaker_gmeet_lines,
     wav_samples,
@@ -2025,6 +2026,127 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
 
     assert tag_value(BASE + "channels/ch0.wav") == {"retention-class": "audio"}
     assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
+
+
+class _FailingChannelUpload(Storage):
+    """Uploads `channels/ch1.wav` fails; everything else goes through."""
+
+    def upload_file(
+        self,
+        path: Path,
+        bucket: str,
+        key: str,
+        content_type: str,
+        retention: str | None = None,
+    ) -> None:
+        if key.endswith("channels/ch1.wav"):
+            raise RuntimeError("S3 upload failed")
+        super().upload_file(path, bucket, key, content_type, retention)
+
+
+@pytest.mark.parametrize("failure", ["fetch", "transcode", "join", "upload"])
+def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
+    storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    """ch0 is fine; ch1 fails to download, to transcode, to join (a broken
+    wav), or to upload after ch0.wav is uploaded. The mixed export is handed
+    off as usual and `channels/index.json` is never written. Only an upload
+    failure can leave a wav behind, and without an index the worker ignores
+    it."""
+    if failure == "upload":
+        storage = _FailingChannelUpload(storage._client)
+    storage_path = _put_master(storage, 20, "uid-20")
+    _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
+    ch0_path = "recordings/7/20/uid-20/ch0/master.webm"
+    ch1_path = "recordings/7/20/uid-20/ch1/master.webm"
+    storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
+    if failure != "fetch":
+        storage.put_bytes(VEXA_BUCKET, ch1_path, b"ch1", "video/webm")
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                20,
+                media_files=[
+                    {"type": "audio", "format": "webm"},
+                    {"type": "ch0", "format": "webm", "metadata": {}},
+                    {"type": "ch1", "format": "webm", "metadata": {}},
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={
+            (20, "ch0"): {"storage_path": ch0_path},
+            (20, "ch1"): {"storage_path": ch1_path},
+        },
+    )
+
+    def transcode(src: Path, dst: Path) -> None:
+        body = src.read_bytes()
+        if body == b"ch1":
+            if failure == "transcode":
+                raise RuntimeError("ffmpeg exited 1")
+            if failure == "join":
+                dst.write_bytes(b"not a wav")
+                return
+        write_silent_wav(dst, 10.0 if body == b"ch0" else FAKE_WAV_SECONDS)
+
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, meeting_api, notetaker, transcode=transcode)
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    expected_left = [BASE + "channels/ch0.wav"] if failure == "upload" else []
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == expected_left
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
+        "handed_off"
+    )
+    assert storage.exists(EXPORT_BUCKET, BASE + "audio.wav")
+    assert any(
+        record.getMessage().startswith(
+            f"channel_export_failed meeting_id={MEETING_UUID} vexa_meeting_id=11367 "
+        )
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("mix_named", [True, False])
+def test_channel_tap_frames_change_no_timeline_and_are_the_only_frames_written(
+    storage: Storage, mix_named: bool
+) -> None:
+    """A Jitsi session with tap frames: speaker_timeline.json and
+    participants.json match the same file without them, and
+    speaker_activity_frames.json holds only the tap frames."""
+    origin = _origin_ms()
+    storage_path = _put_master(storage, 20, "uid-20")
+
+    def export(taps: bool) -> tuple[Any, Any, Any]:
+        storage.delete(EXPORT_BUCKET, BASE + "_export.json")
+        _put_activity(
+            storage, "uid-20", jitsi_lines(origin, mix_named=mix_named, taps=taps)
+        )
+        deps = _deps(storage, _api_for(20, storage_path), FakeNotetaker())
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+        return (
+            storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json"),
+            storage.get_json(EXPORT_BUCKET, BASE + "participants.json"),
+            storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json"),
+        )
+
+    timeline, participants, frames = export(taps=True)
+    plain_timeline, plain_participants, plain_frames = export(taps=False)
+
+    assert timeline == plain_timeline
+    assert timeline["speaker_timeline"] or timeline["speaker_intervals"]
+    assert participants == plain_participants
+    assert frames == [
+        {"t_rel": 0.1, "ch": 0, "name": "Tap Zero", "rms": 0.3, "dur_ms": 256},
+        {"t_rel": 0.356, "ch": 0, "name": None, "rms": 0.01, "dur_ms": 256},
+        {"t_rel": 1.6, "ch": 1, "name": "Tap One", "rms": 0.4, "dur_ms": 256},
+        {"t_rel": 5.0, "ch": 1, "name": "Tap One", "rms": 0.4, "dur_ms": 256},
+    ]
+    assert len(plain_frames) == 3
+    assert all(row["ch"] == 0 for row in plain_frames)
 
 
 def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(

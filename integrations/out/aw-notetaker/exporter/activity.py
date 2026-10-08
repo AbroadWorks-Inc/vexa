@@ -26,13 +26,18 @@ class Frame:
 
 @dataclass(slots=True, frozen=True)
 class CapturedFrame:
-    """One parsed activity frame, named or not, with its channel when present."""
+    """One parsed activity frame, named or not, with its channel when present.
+
+    `source` is the line's `src`: `"channel"` for a per-channel tap frame,
+    None for every other frame (the field is absent).
+    """
 
     ts: int
     channel: int | None
     name: str | None
     rms: float
     duration_ms: int
+    source: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -58,7 +63,9 @@ class Activity:
 
     `frames` holds named frames on every lane; speech events are built from
     those only. `captured` holds every frame that parsed, including unnamed
-    ones and the channel number, for the per-channel transcript.
+    ones and the channel number, for the per-channel transcript. Channel-tap
+    frames (`"src":"channel"`) are kept in `captured` only, never in `frames`:
+    on Jitsi they share ch 0 with the mixed lane and must not change it.
     """
 
     lane: str
@@ -134,6 +141,8 @@ def parse_activity(lines: Iterable[str]) -> Activity:
                 channel = None if raw_channel is None else int(raw_channel)
             except (TypeError, ValueError):
                 channel = None
+            raw_source = row.get("src")
+            source = raw_source if isinstance(raw_source, str) else None
             activity.captured.append(
                 CapturedFrame(
                     ts=parsed.ts,
@@ -141,11 +150,13 @@ def parse_activity(lines: Iterable[str]) -> Activity:
                     name=parsed.name,
                     rms=parsed.rms,
                     duration_ms=parsed.duration_ms,
+                    source=source,
                 )
             )
             # Named frames are the timeline on every lane, including mixed and
-            # pertrack. Unnamed frames stay out of `frames`.
-            if parsed.name:
+            # pertrack. Unnamed frames and channel-tap frames stay out of
+            # `frames`.
+            if parsed.name and source != "channel":
                 activity.frames.append(parsed)
     if activity is None:
         raise ValueError("speaker-activity file has no speaker_activity_header")

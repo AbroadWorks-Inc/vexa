@@ -77,11 +77,45 @@ def header(lane: str = "gmeet") -> str:
     )
 
 
-def frame(t: int, name: str | None, rms: float, ch: int = 0, dur_ms: int = 256) -> str:
+def frame(
+    t: int,
+    name: str | None,
+    rms: float,
+    ch: int = 0,
+    dur_ms: int = 256,
+    src: str | None = None,
+) -> str:
     row: dict[str, object] = {"t": t, "ch": ch, "rms": rms, "dur_ms": dur_ms}
     if name is not None:
         row["name"] = name
+    if src is not None:
+        row["src"] = src
     return json.dumps(row)
+
+
+def jitsi_lines(origin_ms: int, *, mix_named: bool, taps: bool) -> list[str]:
+    """A Jitsi-style file: mixed-lane frames on ch 0 (named or not), level
+    hints, and, with `taps`, per-channel tap frames (`"src":"channel"`) on
+    ch 0 and ch 1 that name other people and sit in between."""
+    mix = "Speaker Alpha" if mix_named else None
+    lines = [
+        header("mixed"),
+        hint(origin_ms + 10, "Speaker Alpha", kind="levels"),
+        frame(origin_ms, mix, 0.2),
+        frame(origin_ms + 256, mix, 0.2),
+        hint(origin_ms + 800, "Speaker Alpha", is_end=True, kind="levels"),
+        hint(origin_ms + 1500, "Speaker Beta", kind="levels"),
+        frame(origin_ms + 1500, None, 0.2),
+        hint(origin_ms + 2300, "Speaker Beta", is_end=True, kind="levels"),
+    ]
+    if taps:
+        lines[3:3] = [
+            frame(origin_ms + 100, "Tap Zero", 0.3, ch=0, src="channel"),
+            frame(origin_ms + 356, None, 0.01, ch=0, src="channel"),
+            frame(origin_ms + 1600, "Tap One", 0.4, ch=1, src="channel"),
+            frame(origin_ms + 5000, "Tap One", 0.4, ch=1, src="channel"),
+        ]
+    return lines
 
 
 def hint(t: int, name: str, is_end: bool = False, kind: str | None = None) -> str:

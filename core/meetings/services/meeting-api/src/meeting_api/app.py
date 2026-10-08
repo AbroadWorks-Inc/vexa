@@ -429,6 +429,27 @@ def legacy_meeting_projection(row: dict) -> dict:
     }
 
 
+def _discard_refused_edge(record, change) -> None:
+    """Drop the in-memory edge a conditional write refused, before applying it again.
+
+    ``apply_change`` has already appended that hop to the record. The row did not
+    take it. Replaying the event from the stored status must not persist the hop
+    that was refused.
+    """
+    target = change.new_status
+    if record.history and record.history[-1] == target:
+        record.history.pop()
+    trail = record.status_transition
+    stale_from = change.old_status.value if change.old_status is not None else None
+    if (
+        trail
+        and isinstance(trail[-1], dict)
+        and trail[-1].get("from") == stale_from
+        and trail[-1].get("to") == target.value
+    ):
+        trail.pop()
+
+
 def _mount_lifecycle(
     app: FastAPI,
     sink: LifecycleSink,
@@ -453,7 +474,13 @@ def _mount_lifecycle(
     """
     import jsonschema
 
-    from .lifecycle.machine import IllegalTransition, TransitionSource, persisted_statuses_for
+    from .lifecycle.machine import (
+        IllegalTransition,
+        StatusChange,
+        TransitionSource,
+        durable_status_repairs_edge,
+        persisted_statuses_for,
+    )
     from .lifecycle.provenance import build_service_provenance
     from .lifecycle.receiver import conforms
     from .lifecycle.webhook import build_status_change_envelope, build_typed_envelope
@@ -760,10 +787,12 @@ def _mount_lifecycle(
                 force_terminal_on_destroy=force_terminal_on_destroy,
             )
         except IllegalTransition as first_error:
-            # Multiple API replicas each hold an independent, non-durable FSM. A replica that saw
-            # `joining` can receive `completed` after another replica persisted `active`/`stopping`.
-            # Refresh only after the local edge is illegal: this lets durable state repair a stale
-            # replica without letting a lagging DB read regress a live in-process record.
+            # Two replicas each keep their own record. A replica that saw `joining` can
+            # receive `completed` after another replica stored `active` or `stopping`.
+            # That edge is illegal here, so re-read and apply it again. A legal edge
+            # (`joining` → `active`) is not re-read here: the write below names only
+            # `joining`, and a row already at `awaiting_admission` refuses it. That
+            # refusal is repaired after the write, and only when the stored status is ahead.
             persisted = None
             if connection_id:
                 try:
@@ -800,14 +829,34 @@ def _mount_lifecycle(
                     },
                 )
         rec = change.record
-        # Build + record the status_change envelope only on a REAL advance — an idempotent replay
-        # (change.no_op, e.g. the bot's 3x terminal retry) must NOT double-count it. The persist
-        # and the ws publish below run only on a real advance, so this in-process log stays honest.
-        # Subscriber delivery is the outbox row that persist writes with the status.
-        envelope = None
-        if not change.no_op:
-            envelope = build_status_change_envelope(change)
-            app.state.status_change_webhooks.append(envelope)
+
+        async def _write_status(current: StatusChange):
+            # §1.4: the row changes only from the edge's `from`. A runtime-confirmed
+            # destroy is terminal evidence for any live row, whatever this process last saw.
+            # §6.9 F-K2: a `completed` the runtime drove is a lost bot, not a normal end.
+            if current.no_op or current.record.status is None:
+                return None
+            return await meeting_repo.update_meeting_status(
+                session_uid=current.record.connection_id,
+                status=current.record.status.value,
+                completion_reason=(
+                    current.record.completion_reason.value
+                    if current.record.completion_reason else None
+                ),
+                failure_stage=(
+                    current.record.failure_stage.value
+                    if current.record.failure_stage else None
+                ),
+                data=current.record.data if isinstance(current.record.data, dict) else None,
+                change_reason=current.reason,
+                expected_from=(
+                    None
+                    if current.transition_source is TransitionSource.RUNTIME_DESTROY
+                    else persisted_statuses_for(current.old_status)
+                ),
+                transition_source=current.transition_source.value,
+            )
+
         # Persist the FSM advance to the DB meeting row → durable + queryable (GET /meetings reflects
         # it, survives a restart), not only the in-process MeetingStore. Best-effort: a DB hiccup must
         # never fail the bot's lifecycle callback (the in-process FSM already advanced).
@@ -817,26 +866,91 @@ def _mount_lifecycle(
         meeting_row = None
         if rec.status is not None and not change.no_op:
             try:
-                meeting_row = await meeting_repo.update_meeting_status(
-                    session_uid=rec.connection_id,
-                    status=rec.status.value,
-                    completion_reason=rec.completion_reason.value if rec.completion_reason else None,
-                    failure_stage=rec.failure_stage.value if rec.failure_stage else None,
-                    data=rec.data if isinstance(rec.data, dict) else None,
-                    change_reason=change.reason,
-                    # §1.4: the row changes only from the edge's `from`. A runtime-confirmed destroy
-                    # is terminal evidence for any live row, whatever this process last saw.
-                    expected_from=(
-                        None
-                        if change.transition_source is TransitionSource.RUNTIME_DESTROY
-                        else persisted_statuses_for(change.old_status)
-                    ),
-                    # §6.9 F-K2: a `completed` the runtime drove is a lost bot, not a normal end.
-                    transition_source=change.transition_source.value,
-                )
+                meeting_row = await _write_status(change)
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
                           span="lifecycle.callback", fields={"error": str(e)})
+            # The local edge was legal, so the write named only that `from`. Another
+            # replica may already have stored a later status (`awaiting_admission`
+            # while this copy still says `joining`). Re-read and apply once from the
+            # stored status. A row that is behind this record is left alone: a lagging
+            # read must not walk the meeting backwards.
+            expected_from = (
+                None
+                if change.transition_source is TransitionSource.RUNTIME_DESTROY
+                else persisted_statuses_for(change.old_status)
+            )
+            if meeting_row is None and expected_from is not None and connection_id:
+                durable = None
+                try:
+                    durable = await meeting_repo.get_lifecycle_state_by_session(
+                        session_uid=connection_id
+                    )
+                except Exception as refresh_error:  # noqa: BLE001 — the refused write stands
+                    log_event("lifecycle_refresh_failed", audience="system", level="warning",
+                              span="lifecycle.callback", fields={"error": str(refresh_error)})
+                durable_status = durable.get("status") if isinstance(durable, dict) else None
+                if (
+                    isinstance(durable_status, str)
+                    and durable_status not in expected_from
+                    and durable_status_repairs_edge(
+                        change.old_status, durable_status, change.new_status
+                    )
+                ):
+                    _discard_refused_edge(rec, change)
+                    sink.store.rehydrate(
+                        connection_id,
+                        durable_status,
+                        durable.get("data") if isinstance(durable, dict) else None,
+                        replace_stale=True,
+                    )
+                    try:
+                        retried = sink.apply_change(
+                            body,
+                            transition_source=transition_source,
+                            force_terminal_on_destroy=force_terminal_on_destroy,
+                        )
+                    except IllegalTransition as refreshed_error:
+                        log_event(
+                            "lifecycle_status_reconcile_rejected", audience="system",
+                            level="warning", span="lifecycle.callback",
+                            fields={
+                                "from": change.old_status.value if change.old_status else None,
+                                "durable": durable_status,
+                                "to": change.new_status.value,
+                                "detail": str(refreshed_error),
+                            },
+                        )
+                    else:
+                        change = retried
+                        rec = change.record
+                        log_event(
+                            "lifecycle_status_reconciled", audience="system",
+                            span="lifecycle.callback",
+                            fields={
+                                "durable": durable_status,
+                                "to": change.new_status.value,
+                                "no_op": change.no_op,
+                            },
+                        )
+                        if not change.no_op and rec.status is not None:
+                            try:
+                                meeting_row = await _write_status(change)
+                            except Exception as e:  # noqa: BLE001 — persistence is best-effort
+                                log_event(
+                                    "lifecycle_persist_failed", audience="system",
+                                    level="warning", span="lifecycle.callback",
+                                    fields={"error": str(e)},
+                                )
+        # The envelope is the edge that survived the write. A refused `joining` →
+        # `active` must not be recorded when the stored row was `awaiting_admission`
+        # and the event was applied again from there. An idempotent replay
+        # (change.no_op, e.g. the bot's 3x terminal retry) must NOT double-count it.
+        # Subscriber delivery is the outbox row that persist writes with the status.
+        envelope = None
+        if not change.no_op:
+            envelope = build_status_change_envelope(change)
+            app.state.status_change_webhooks.append(envelope)
         # §6.9 F-K2: the session's terminal is not always the meeting's. A bot failure while the
         # meeting is on sends the row back to `requested` for another bot (`data.bot_retry`), and a
         # lost bot's `completed` on the last attempt ends the row `failed`. Every meeting-level
