@@ -242,6 +242,9 @@ meetingApi:
   # makes every spawned bot restore the provisioned browser session and join signed-in. The BOT_S3
   # values are SCOPED userdata-store credentials, never the deployment's admin S3 creds.
   botAuthenticated: "false"
+  # Per-speaker recording (deployment-scoped): comma-separated platforms (google_meet, jitsi) whose
+  # bots record each remote channel beside the mixed master. Empty is off.
+  perChannelRecordingPlatforms: ""
   botUserdataS3Path: ""
   botS3Endpoint: ""
   botS3Bucket: ""

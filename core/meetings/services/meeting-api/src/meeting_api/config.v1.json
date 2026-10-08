@@ -187,6 +187,16 @@
    ]
   },
   {
+   "key": "PER_CHANNEL_RECORDING_PLATFORMS",
+   "class": "defaulted",
+   "default": "",
+   "description": "deployment-scoped per-speaker recording: comma-separated platforms (google_meet, jitsi) whose bots record each remote channel beside the mixed master. Only when recording is on for that bot; empty or unset is off. Rides invocation.v1 perChannelRecordingEnabled, sent only when on.",
+   "targets": [
+    "compose",
+    "helm"
+   ]
+  },
+  {
    "key": "BOT_AUTHENTICATED",
    "class": "defaulted",
    "default": "false",
