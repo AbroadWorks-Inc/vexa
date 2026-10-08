@@ -2027,6 +2027,88 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
     assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
 
 
+class _FailingChannelUpload(Storage):
+    """Uploads `channels/ch1.wav` fails; everything else goes through."""
+
+    def upload_file(
+        self,
+        path: Path,
+        bucket: str,
+        key: str,
+        content_type: str,
+        retention: str | None = None,
+    ) -> None:
+        if key.endswith("channels/ch1.wav"):
+            raise RuntimeError("S3 upload failed")
+        super().upload_file(path, bucket, key, content_type, retention)
+
+
+@pytest.mark.parametrize("failure", ["fetch", "transcode", "join", "upload"])
+def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
+    storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    """ch0 is fine; ch1 fails to download, to transcode, to join (a broken
+    wav), or to upload after ch0.wav is uploaded. The mixed export is handed
+    off as usual and `channels/index.json` is never written. Only an upload
+    failure can leave a wav behind, and without an index the worker ignores
+    it."""
+    if failure == "upload":
+        storage = _FailingChannelUpload(storage._client)
+    storage_path = _put_master(storage, 20, "uid-20")
+    _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
+    ch0_path = "recordings/7/20/uid-20/ch0/master.webm"
+    ch1_path = "recordings/7/20/uid-20/ch1/master.webm"
+    storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
+    if failure != "fetch":
+        storage.put_bytes(VEXA_BUCKET, ch1_path, b"ch1", "video/webm")
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                20,
+                media_files=[
+                    {"type": "audio", "format": "webm"},
+                    {"type": "ch0", "format": "webm", "metadata": {}},
+                    {"type": "ch1", "format": "webm", "metadata": {}},
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={
+            (20, "ch0"): {"storage_path": ch0_path},
+            (20, "ch1"): {"storage_path": ch1_path},
+        },
+    )
+
+    def transcode(src: Path, dst: Path) -> None:
+        body = src.read_bytes()
+        if body == b"ch1":
+            if failure == "transcode":
+                raise RuntimeError("ffmpeg exited 1")
+            if failure == "join":
+                dst.write_bytes(b"not a wav")
+                return
+        write_silent_wav(dst, 10.0 if body == b"ch0" else FAKE_WAV_SECONDS)
+
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, meeting_api, notetaker, transcode=transcode)
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    expected_left = [BASE + "channels/ch0.wav"] if failure == "upload" else []
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == expected_left
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
+        "handed_off"
+    )
+    assert storage.exists(EXPORT_BUCKET, BASE + "audio.wav")
+    assert any(
+        record.getMessage().startswith(
+            f"channel_export_failed meeting_id={MEETING_UUID} vexa_meeting_id=11367 "
+        )
+        for record in caplog.records
+    )
+
+
 def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(
     storage: Storage,
 ) -> None:
