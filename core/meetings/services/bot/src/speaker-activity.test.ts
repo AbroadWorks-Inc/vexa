@@ -18,7 +18,8 @@ import {
   resolveMaxActivityBytes,
   DEFAULT_MAX_ACTIVITY_BYTES,
 } from './speaker-activity.js';
-import { makeSpeakerHintSink, makeSpeakerActivityFrameTap } from './capture-bridge.js';
+import { makeSpeakerHintSink, makeSpeakerActivityFrameTap, makeChannelActivitySink, startCaptureBridge } from './capture-bridge.js';
+import type { BotPipeline } from './pipeline.js';
 import { ACTIVITY_UPLOAD_SLACK_BYTES } from './signal-upload.js';
 import type { Invocation } from './config.js';
 
@@ -306,6 +307,69 @@ const sameShape = (obj: unknown, expected: Record<string, unknown>): boolean => 
 {
   check('DEFAULT_MAX_ACTIVITY_BYTES is 128 MiB (134217728)', DEFAULT_MAX_ACTIVITY_BYTES === 134217728,
     `${DEFAULT_MAX_ACTIVITY_BYTES}`);
+}
+
+// ── 16) A channel-tap frame carries src:"channel"; every other frame is byte-identical to before ──
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('jitsi'), { dir, now: () => 0 });
+  w.frame(0, Float32Array.of(0.5, -0.5), 1000);
+  w.frame(0, Float32Array.of(0.5, -0.5), 1000, undefined, 'channel');
+  await w.close();
+  const raw = readFileSync(w.path, 'utf8').split('\n').filter((l) => l.length > 0).slice(1);
+  check('a mix frame line has no src key (unchanged bytes)',
+    raw[0] === '{"t":1000,"ch":0,"rms":0.5,"dur_ms":0}', raw[0]);
+  check('a channel frame line carries src:"channel"',
+    raw[1] === '{"t":1000,"ch":0,"rms":0.5,"dur_ms":0,"src":"channel"}', raw[1]);
+}
+
+// ── 17) The __vexaChannelActivity sink writes src:"channel" and rejects a bad channel ───────────
+{
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const w = createSpeakerActivityWriter(invOf('jitsi'), { dir, now: () => 0 });
+  const sink = makeChannelActivitySink(makeSpeakerActivityFrameTap(w));
+  sink(3, [0.5, -0.5], 1000);
+  sink(-1, [0.5], 1000);
+  sink(1.5, [0.5], 1000);
+  await w.close();
+  const frames = readLines(w.path).slice(1);
+  check('the channel sink writes exactly the one valid frame', frames.length === 1, JSON.stringify(frames));
+  check('the channel sink frame is src:"channel" on its channel',
+    sameShape(frames[0], { t: 1000, ch: 3, rms: 0.5, dur_ms: 0, src: 'channel' }), JSON.stringify(frames[0]));
+}
+
+// ── 18) Jitsi with per-channel recording on: the mix activity is still written, channel frames are added ──
+const bridgeCase = async (perChannel: boolean | undefined): Promise<{ lines: Record<string, unknown>[]; exposed: string[] }> => {
+  const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
+  const inv = { ...invOf('jitsi'), ...(perChannel === undefined ? {} : { perChannelRecordingEnabled: perChannel }) } as Invocation;
+  const w = createSpeakerActivityWriter(inv, { dir, now: () => 0 });
+  const fns: Record<string, (...a: unknown[]) => unknown> = {};
+  const page = {
+    async exposeFunction(name: string, fn: (...a: unknown[]) => unknown): Promise<void> { fns[name] = fn; },
+    async evaluate(): Promise<unknown> { return undefined; },   // no page: only the Node-side sinks are driven
+  } as never;
+  const pipeline = {
+    async start() { /* not driven */ }, async stop() { /* not driven */ },
+    feedAudio() { /* not driven */ }, feedMixedAudio() { /* not driven */ }, recordHint() { /* not driven */ },
+  } as unknown as BotPipeline;
+  const stop = await startCaptureBridge(page, inv, pipeline, undefined, undefined, undefined, w);
+  fns.__vexaPerSpeakerAudioData?.(0, [0.5, -0.5], 1000);
+  fns.__vexaChannelActivity?.(0, [0.25, -0.25], 1100);
+  await stop();
+  await w.close();
+  return { lines: readLines(w.path).slice(1), exposed: Object.keys(fns) };
+};
+{
+  const on = await bridgeCase(true);
+  check('flag on: __vexaChannelActivity is exposed for jitsi', on.exposed.includes('__vexaChannelActivity'), on.exposed.join(','));
+  check('flag on: the mix frame is still written, with no src',
+    on.lines.some((l) => sameShape(l, { t: 1000, ch: 0, rms: 0.5, dur_ms: 0 })), JSON.stringify(on.lines));
+  check('flag on: the channel frame is added with src:"channel"',
+    on.lines.some((l) => sameShape(l, { t: 1100, ch: 0, rms: 0.25, dur_ms: 0, src: 'channel' })), JSON.stringify(on.lines));
+  const off = await bridgeCase(undefined);
+  check('flag absent: __vexaChannelActivity is not exposed', !off.exposed.includes('__vexaChannelActivity'), off.exposed.join(','));
+  check('flag absent: the mix frame is written', off.lines.some((l) => sameShape(l, { t: 1000, ch: 0, rms: 0.5, dur_ms: 0 })),
+    JSON.stringify(off.lines));
 }
 
 if (failed) { console.error(`\n❌ speaker-activity: ${failed} check(s) FAILED.`); process.exit(1); }
