@@ -8,6 +8,7 @@ is NO separate recordings table).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -78,6 +79,17 @@ def _now_iso() -> str:
 def new_recording_numeric_id() -> int:
     """A random 12-digit recording id (parent ``new_recording_numeric_id``)."""
     return int(uuid.uuid4().int % 900000000000 + 100000000000)
+
+
+def session_recording_numeric_id(session_uid: str) -> int:
+    """The 12-digit id of a bot session's one recording, derived from the session.
+
+    Chunk objects are stored under this id before the JSONB fold takes its row lock, so every
+    upload of the session must name it without reading the row: the first chunks of several media
+    types (`audio`, `ch0`, …) arrive at the same moment.
+    """
+    digest = int.from_bytes(hashlib.sha256(session_uid.encode("utf-8")).digest()[:8], "big")
+    return digest % 900000000000 + 100000000000
 
 
 def apply_chunk_to_recording(

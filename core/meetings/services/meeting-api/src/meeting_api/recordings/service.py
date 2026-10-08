@@ -26,7 +26,7 @@ from .jsonb import (
     apply_chunk_to_recording,
     chunk_storage_key,
     master_storage_key,
-    new_recording_numeric_id,
+    session_recording_numeric_id,
     signal_tape_key,
 )
 from .ports import RecordingRepo, Storage
@@ -97,7 +97,7 @@ async def upload_chunk(
         (r for r in recordings if r.get("session_uid") == session_uid and r.get("source") == "bot"),
         None,
     )
-    recording_id = existing_rec["id"] if existing_rec else new_recording_numeric_id()
+    recording_id = existing_rec["id"] if existing_rec else session_recording_numeric_id(session_uid)
 
     # Upload the chunk to object storage (idempotent by key; OUTSIDE the row lock).
     key = chunk_storage_key(
