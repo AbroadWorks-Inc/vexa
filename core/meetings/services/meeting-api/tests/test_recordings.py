@@ -182,6 +182,32 @@ async def test_finalize_master_builds_and_stamps():
     assert mf["storage_path"] == master_key
 
 
+async def test_finalize_master_does_not_concatenate_a_sibling_whose_name_starts_alike():
+    """`.../audio` is a prefix of `.../audio2/`. The list must not pull the sibling in."""
+    repo, storage = _seeded()
+    audio = [_counting_wav(1), _counting_wav(2)]
+    rid = None
+    for seq, part in enumerate(audio):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=part, media_type="audio", media_format="wav", chunk_seq=seq, is_final=False,
+        )
+        rid = receipt["recording_id"]
+    await upload_chunk(
+        repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        data=_counting_wav(9), media_type="audio2", media_format="wav",
+        chunk_seq=0, is_final=False,
+    )
+    master_key = await finalize_master(
+        repo, storage, meeting_id=MEETING_ID, recording_id=rid, media_type="audio",
+    )
+    assert storage.blobs[master_key] == build_recording_master(audio, "wav")
+    sibling_key = await finalize_master(
+        repo, storage, meeting_id=MEETING_ID, recording_id=rid, media_type="audio2",
+    )
+    assert storage.blobs[sibling_key] == build_recording_master([_counting_wav(9)], "wav")
+
+
 async def test_upload_before_session_is_pending():
     repo, storage = _seeded()
     receipt = await upload_chunk(

@@ -238,8 +238,11 @@ async def finalize_master(
     media_format = mf.get("format", "wav")
     master_key = master_storage_key(mf["storage_path"], media_format)
 
-    # Gather the chunk objects under the recording's prefix (excluding any prior master).
-    prefix = mf["storage_path"].rsplit("/", 1)[0]
+    # Gather the chunk objects under this media type (excluding any prior master).
+    # S3 Prefix and the in-memory list are startswith with no delimiter, so
+    # `.../audio` also matches `.../audio<anything>/`. The trailing slash keeps
+    # a sibling media type out of this master.
+    prefix = mf["storage_path"].rsplit("/", 1)[0] + "/"
     keys = sorted(
         k for k in await storage.list(prefix) if not k.rsplit("/", 1)[-1].startswith("master.")
     )
