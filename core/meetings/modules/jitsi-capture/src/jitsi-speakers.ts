@@ -166,6 +166,56 @@ function participantsFromStore(): { map: Map<string, JitsiNamedParticipant>; sel
   return { map, selfId };
 }
 
+export interface JitsiStreamName {
+  participantId?: string;
+  displayName?: string;
+}
+
+function jitsiTrackStreamId(track: any): string {
+  try {
+    const id = track?.getOriginalStream?.()?.id || track?.stream?.id || track?.streamId;
+    return typeof id === "string" ? id : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Who owns this remote-audio stream, from the conference store.
+ * No match returns null. A match with no name still returns the participant id.
+ */
+export function jitsiNameForStream(state: unknown, streamId: string): JitsiStreamName | null {
+  if (typeof streamId !== "string" || !streamId) return null;
+  const root = state as {
+    ["features/base/participants"]?: { remote?: { forEach?: (fn: (participant: { id?: string; name?: string }, key: string) => void) => void } };
+    ["features/base/tracks"]?: any[];
+  } | null;
+  const tracks = root?.["features/base/tracks"];
+  if (!Array.isArray(tracks)) return null;
+  const names = new Map<string, string>();
+  const remote = root?.["features/base/participants"]?.remote;
+  if (remote && typeof remote.forEach === "function") {
+    remote.forEach((participant, key) => {
+      const id = String(participant?.id ?? key);
+      const name = (participant?.name || "").trim();
+      if (name) names.set(id, name);
+    });
+  }
+  for (const entry of tracks) {
+    if (!entry || entry.local === true) continue;
+    if (entry.mediaType && entry.mediaType !== "audio") continue;
+    if (jitsiTrackStreamId(entry.jitsiTrack) !== streamId) continue;
+    const participantId = typeof entry.participantId === "string" ? entry.participantId : "";
+    const displayName = participantId ? (names.get(participantId) || "") : "";
+    if (!participantId && !displayName) return null;
+    const found: JitsiStreamName = {};
+    if (participantId) found.participantId = participantId;
+    if (displayName) found.displayName = displayName;
+    return found;
+  }
+  return null;
+}
+
 /** Subscribe to remote audio tracks' level events. The redux list is the public
  *  track set; levels themselves are not stored there. A cached level is used
  *  for LEVEL_FRESH_MS only. `muted: true` reads as 0 even when the cache is loud. */
