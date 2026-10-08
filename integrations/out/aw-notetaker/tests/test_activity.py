@@ -5,7 +5,7 @@ import json
 import pytest
 
 from exporter.activity import ActivityEvent, names, parse_activity, speech_events
-from tests.builders import capped, frame, header, hint
+from tests.builders import capped, frame, header, hint, jitsi_lines
 
 ORIGIN_MS = 1_000_000  # origin epoch ms
 
@@ -304,6 +304,30 @@ def test_unnamed_frames_never_change_gmeet_events() -> None:
     assert speech_events(with_unnamed, ORIGIN_MS, 0.05, 700) == speech_events(
         without, ORIGIN_MS, 0.05, 700
     )
+
+
+@pytest.mark.parametrize("mix_named", [True, False])
+def test_channel_tap_frames_never_enter_the_mixed_timeline(mix_named: bool) -> None:
+    """Jitsi: tap frames share ch 0 with the mixed lane. They are captured
+    with their source, yet frames, names and events are exactly those of the
+    same file without them (with unnamed mix frames, hints stay the events)."""
+    with_taps = parse_activity(jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=True))
+    without = parse_activity(jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=False))
+
+    assert with_taps.frames == without.frames
+    assert names(with_taps) == names(without)
+    assert speech_events(with_taps, ORIGIN_MS, 0.05, 700) == speech_events(
+        without, ORIGIN_MS, 0.05, 700
+    )
+    taps = [(c.channel, c.name) for c in with_taps.captured if c.source == "channel"]
+    assert taps == [(0, "Tap Zero"), (0, None), (1, "Tap One"), (1, "Tap One")]
+    assert all(c.source is None for c in without.captured)
+
+
+def test_a_frame_without_src_has_no_source() -> None:
+    a = parse_activity([header(), frame(ORIGIN_MS, "A", 0.2)])
+    assert a.captured[0].source is None
+    assert [f.name for f in a.frames] == ["A"]
 
 
 def test_activity_dataclasses_use_slots() -> None:

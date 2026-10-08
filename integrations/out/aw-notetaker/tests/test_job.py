@@ -38,6 +38,7 @@ from tests.builders import (
     capped,
     frame,
     header,
+    jitsi_lines,
     meeting_event,
     two_speaker_gmeet_lines,
     wav_samples,
@@ -2107,6 +2108,45 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
         )
         for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("mix_named", [True, False])
+def test_channel_tap_frames_change_no_timeline_and_are_the_only_frames_written(
+    storage: Storage, mix_named: bool
+) -> None:
+    """A Jitsi session with tap frames: speaker_timeline.json and
+    participants.json match the same file without them, and
+    speaker_activity_frames.json holds only the tap frames."""
+    origin = _origin_ms()
+    storage_path = _put_master(storage, 20, "uid-20")
+
+    def export(taps: bool) -> tuple[Any, Any, Any]:
+        storage.delete(EXPORT_BUCKET, BASE + "_export.json")
+        _put_activity(
+            storage, "uid-20", jitsi_lines(origin, mix_named=mix_named, taps=taps)
+        )
+        deps = _deps(storage, _api_for(20, storage_path), FakeNotetaker())
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+        return (
+            storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json"),
+            storage.get_json(EXPORT_BUCKET, BASE + "participants.json"),
+            storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json"),
+        )
+
+    timeline, participants, frames = export(taps=True)
+    plain_timeline, plain_participants, plain_frames = export(taps=False)
+
+    assert timeline == plain_timeline
+    assert timeline["speaker_timeline"] or timeline["speaker_intervals"]
+    assert participants == plain_participants
+    assert frames == [
+        {"t_rel": 0.1, "ch": 0, "name": "Tap Zero", "rms": 0.3, "dur_ms": 256},
+        {"t_rel": 0.356, "ch": 0, "name": None, "rms": 0.01, "dur_ms": 256},
+        {"t_rel": 1.6, "ch": 1, "name": "Tap One", "rms": 0.4, "dur_ms": 256},
+        {"t_rel": 5.0, "ch": 1, "name": "Tap One", "rms": 0.4, "dur_ms": 256},
+    ]
+    assert len(plain_frames) == 3
+    assert all(row["ch"] == 0 for row in plain_frames)
 
 
 def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(

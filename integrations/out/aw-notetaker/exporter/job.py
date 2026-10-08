@@ -31,8 +31,9 @@ A recording may also carry per-channel media (`ch0`, `ch1`, ...). Each
 channel master is placed on that same meeting clock, leading silence
 included, and written as `channels/ch<N>.wav` with one `channels/index.json`
 row. Every frame that parsed, named or not, is written to
-`speaker_activity_frames.json`. The mixed timeline does not read those
-frames. A meeting with no channel media gets no index. Every
+`speaker_activity_frames.json`, except that a session with channel-tap frames
+(`"src":"channel"`) writes only those. The mixed timeline does not read
+channel-tap frames. A meeting with no channel media gets no index. Every
 channel wav is built locally before any is uploaded, and the index goes last,
 so a channel that fails (fetch, transcode, join) uploads nothing; it is
 logged and the mixed export and `/process` go on as without channels.
@@ -772,9 +773,13 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             speaker_names += session_names
             states.append(state)
             if state in ("ok", "capped"):
+                # A session with channel-tap frames (Jitsi) exports only those:
+                # their `ch` matches `channels/ch<N>.wav`, while its mixed-lane
+                # frames reuse ch 0. Otherwise (Meet) every frame is per channel.
+                taps = [frame for frame in captured if frame.source == "channel"]
                 exported_frames.extend(
                     _activity_frame(frame, session.origin_ms, start_ms)
-                    for frame in captured
+                    for frame in (taps or captured)
                 )
         activity_state = max(states, key=_ACTIVITY_SEVERITY.index)
         if (
