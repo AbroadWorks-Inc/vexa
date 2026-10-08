@@ -12,6 +12,7 @@
 export {
   createJitsiSpeakers,
   selectJitsiSpeaker,
+  jitsiNameForStream,
   JITSI_SPEECH_LEVEL,
   CONFIRM_POLLS,
   jitsiDominantTileSelectors,
@@ -23,6 +24,7 @@ export type {
   JitsiHintSource,
   JitsiLevelSample,
   JitsiNamedParticipant,
+  JitsiStreamName,
 } from "./jitsi-speakers.js";
 export {
   createJitsiChat,

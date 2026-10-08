@@ -103,9 +103,9 @@ class MeetingApi:
                 )
             offset += len(page)
 
-    def master(self, recording_id: int) -> dict[str, Any]:
+    def master(self, recording_id: int, media_type: str = "audio") -> dict[str, Any]:
         path = f"/recordings/{recording_id}/master"
-        data = self._get(path, {"type": "audio"}).json()
+        data = self._get(path, {"type": media_type}).json()
         return dict(data)
 
     def transcript(self, meeting_id: int) -> dict[str, Any] | None:

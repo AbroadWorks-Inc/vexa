@@ -177,6 +177,11 @@ def test_meeting_api_master_parses_storage_path() -> None:
     assert seen[0].url.path == "/recordings/11/master"
     assert seen[0].url.params["type"] == "audio"
     assert seen[0].headers["X-API-Key"] == KEY
+    assert (
+        _api(handler).master(recording_id=11, media_type="ch0")["storage_path"]
+        == "aw-bots/x/master.webm"
+    )
+    assert seen[1].url.params["type"] == "ch0"
 
 
 def test_meeting_api_transcript_parses_on_200() -> None:

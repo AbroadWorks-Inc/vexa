@@ -7,6 +7,8 @@ session-resolution seams behave.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -182,6 +184,32 @@ async def test_finalize_master_builds_and_stamps():
     assert mf["storage_path"] == master_key
 
 
+async def test_finalize_master_does_not_concatenate_a_sibling_whose_name_starts_alike():
+    """`.../audio` is a prefix of `.../audio2/`. The list must not pull the sibling in."""
+    repo, storage = _seeded()
+    audio = [_counting_wav(1), _counting_wav(2)]
+    rid = None
+    for seq, part in enumerate(audio):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=part, media_type="audio", media_format="wav", chunk_seq=seq, is_final=False,
+        )
+        rid = receipt["recording_id"]
+    await upload_chunk(
+        repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        data=_counting_wav(9), media_type="audio2", media_format="wav",
+        chunk_seq=0, is_final=False,
+    )
+    master_key = await finalize_master(
+        repo, storage, meeting_id=MEETING_ID, recording_id=rid, media_type="audio",
+    )
+    assert storage.blobs[master_key] == build_recording_master(audio, "wav")
+    sibling_key = await finalize_master(
+        repo, storage, meeting_id=MEETING_ID, recording_id=rid, media_type="audio2",
+    )
+    assert storage.blobs[sibling_key] == build_recording_master([_counting_wav(9)], "wav")
+
+
 async def test_upload_before_session_is_pending():
     repo, storage = _seeded()
     receipt = await upload_chunk(
@@ -223,6 +251,46 @@ def test_upload_route_accepts_valid_token():
     )
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
+
+
+def test_upload_route_keeps_channel_identity_from_the_first_chunk():
+    """The metadata form part reaches the fold. A second chunk cannot rename the channel."""
+    import asyncio
+
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    first = {
+        "session_uid": SESSION_UID,
+        "media_type": "ch0",
+        "media_format": "webm",
+        "chunk_seq": 0,
+        "is_final": False,
+        "sample_rate": 16000,
+        "recorder_start_epoch_ms": 1_700_000_000_000,
+        "channel_kind": "gmeet",
+        "stream_id": "remote-1",
+        "display_name": "Ada",
+        "ignored": "nope",
+    }
+    second = dict(first, chunk_seq=1, display_name="Bob", sample_rate=None)
+    headers = {"Authorization": f"Bearer {token}"}
+    for body in (first, second):
+        posted = client.post(
+            "/internal/recordings/upload",
+            headers=headers,
+            data={"metadata": json.dumps(body)},
+            files={"file": ("c.webm", b"chunk", "video/webm")},
+        )
+        assert posted.status_code == 200, posted.text
+    recs = asyncio.run(repo.get_recordings(MEETING_ID))
+    mf = next(m for m in recs[0]["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"]["display_name"] == "Ada"
+    assert mf["metadata"]["channel_kind"] == "gmeet"
+    assert mf["metadata"]["stream_id"] == "remote-1"
+    assert mf["metadata"]["recorder_start_epoch_ms"] == 1_700_000_000_000
+    assert "ignored" not in mf["metadata"]
+    assert "sample_rate" not in mf["metadata"]
 
 
 # ── G4: object-storage I/O must not block the event loop ─────────────────────────────────────────
@@ -470,6 +538,67 @@ def test_empty_final_fold_never_points_storage_at_signal_chunk():
     assert mf["storage_path"] != signal_key
     assert rec2["status"] == "completed", "empty final still completes the recording"
     assert transitioned is True
+
+
+def _fold_audio(prior, *, chunk_seq, file_size, sample_rate, chunk_metadata=None, storage_path="k"):
+    return apply_chunk_to_recording(
+        prior, recording_id=123, meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID,
+        media_type="ch0", media_format="webm", storage_path=storage_path, file_size=file_size,
+        chunk_seq=chunk_seq, is_final=False, duration_seconds=None, sample_rate=sample_rate,
+        chunk_metadata=chunk_metadata,
+    )
+
+
+def test_channel_identity_sticks_to_the_first_chunk():
+    """Chunk 0 stores the five channel fields beside sample_rate and drops unknown or invalid ones.
+    Chunk 1 may try to rename the speaker; the stored identity stays, and an omitted sample_rate
+    is still dropped (that field is rebuilt from the chunk in hand)."""
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=16000,
+        chunk_metadata={
+            "recorder_start_epoch_ms": 1_700_000_000_000,
+            "channel_kind": "jitsi",
+            "stream_id": "remote-audio-0",
+            "participant_id": "p-1",
+            "display_name": "Ada",
+            "ignored": "nope",
+        },
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {
+        "sample_rate": 16000,
+        "recorder_start_epoch_ms": 1_700_000_000_000,
+        "channel_kind": "jitsi",
+        "stream_id": "remote-audio-0",
+        "participant_id": "p-1",
+        "display_name": "Ada",
+    }
+
+    rejected, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=16000,
+        chunk_metadata={
+            "recorder_start_epoch_ms": True,
+            "channel_kind": "zoom",
+            "stream_id": "",
+            "participant_id": "x" * 201,
+            "display_name": 12,
+        },
+    )
+    rejected_mf = next(m for m in rejected["media_files"] if m["type"] == "ch0")
+    assert rejected_mf["metadata"] == {"sample_rate": 16000}
+
+    renamed, _ = _fold_audio(
+        rec, chunk_seq=1, file_size=50, sample_rate=None,
+        chunk_metadata={"display_name": "Bob", "channel_kind": "gmeet"},
+    )
+    renamed_mf = next(m for m in renamed["media_files"] if m["type"] == "ch0")
+    assert renamed_mf["metadata"] == {
+        "recorder_start_epoch_ms": 1_700_000_000_000,
+        "channel_kind": "jitsi",
+        "stream_id": "remote-audio-0",
+        "participant_id": "p-1",
+        "display_name": "Ada",
+    }
 
 
 async def test_single_final_chunk_downloads_byte_complete():

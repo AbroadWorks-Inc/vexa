@@ -259,6 +259,7 @@ def build_router(
                 media_type=media_type, media_format=media_format,
                 chunk_seq=chunk_seq, is_final=is_final,
                 duration_seconds=duration_seconds, sample_rate=sample_rate,
+                chunk_metadata=meta,
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))

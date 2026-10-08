@@ -5,6 +5,12 @@ import { log, logJSON } from './log';
 import http from 'http';
 import https from 'https';
 
+/** Optional fields a channel chunk adds to the upload metadata. Absent on the mixed master. */
+export interface ChunkUploadExtra {
+  mediaType?: string;
+  metadata?: Record<string, string | number>;
+}
+
 /**
  * RecordingService handles accumulating audio data and producing a WAV file.
  * Works in Node.js context — used directly for Zoom (native audio callback),
@@ -226,12 +232,13 @@ export class RecordingService {
     chunkSeq: number,
     isFinal: boolean,
     format: string = 'webm',
+    extra?: ChunkUploadExtra,
   ): Promise<void> {
     const uploadTimeoutMs = 30_000;
     const durationSeconds = this.startTime > 0 ? (Date.now() - this.startTime) / 1000 : undefined;
 
     const boundary = `----VexaRecordingChunk${Date.now()}${chunkSeq}`;
-    const metadata = JSON.stringify({
+    const metadataObj: Record<string, unknown> = {
       meeting_id: this.meetingId,
       session_uid: this.sessionUid,
       format: format,
@@ -241,7 +248,15 @@ export class RecordingService {
       file_size_bytes: chunkData.length,
       chunk_seq: chunkSeq,
       is_final: isFinal,
-    });
+    };
+    if (typeof extra?.mediaType === 'string' && extra.mediaType) metadataObj.media_type = extra.mediaType;
+    if (extra?.metadata) {
+      for (const [key, value] of Object.entries(extra.metadata)) {
+        if (key in metadataObj || key === 'media_type') continue;
+        metadataObj[key] = value;
+      }
+    }
+    const metadata = JSON.stringify(metadataObj);
 
     const parts: Buffer[] = [];
     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="metadata"\r\nContent-Type: application/json\r\n\r\n`));

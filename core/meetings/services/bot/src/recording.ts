@@ -29,9 +29,18 @@
  * assembler stays in @vexa/recording (the desktop composition root still uses it) — only the cloud
  * bot's wiring changes.
  */
-import { RecordingService, type RecordingMasterFormat } from '@vexa/recording';
+import { RecordingService, type ChunkUploadExtra, type RecordingMasterFormat } from '@vexa/recording';
 import type { Invocation } from './config.js';
 import type { RecordingSink } from './ports.js';
+
+/** Identity from the first chunk of one remote channel. Later chunks copy it forward server-side. */
+export interface ChannelChunkIdentity {
+  recorder_start_epoch_ms?: number;
+  channel_kind?: string;
+  stream_id?: string;
+  participant_id?: string;
+  display_name?: string;
+}
 
 /** The RecordingSink extended with the chunk ingress the capture bridge's MediaRecorder tap pumps
  *  into. The orchestrator only sees close(key); the bridge holds the BotRecordingSink to feed chunks
@@ -39,12 +48,15 @@ import type { RecordingSink } from './ports.js';
 export interface BotRecordingSink extends RecordingSink {
   /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
   chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void;
+  /** One chunk of remote channel `channel` (media type chN). Its own seq, apart from the mix. */
+  channelChunk(channel: number, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, identity?: ChannelChunkIdentity): void;
 }
 
 /** Deliver ONE recording.v1 chunk. The default uploads to inv.recordingUploadUrl via
- *  RecordingService.uploadChunk; tests inject a fake to assert per-chunk delivery without HTTP. */
+ *  RecordingService.uploadChunk; tests inject a fake to assert per-chunk delivery without HTTP.
+ *  `extra` is set only for a channel chunk. */
 export type ChunkUploader = (
-  seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array,
+  seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, extra?: ChunkUploadExtra,
 ) => void | Promise<void>;
 
 export interface RecordingSinkOptions {
@@ -64,12 +76,12 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
   const sessionUid = inv.connectionId ?? '';
   const token = inv.internalSecret ?? '';
   const svc = new RecordingService(meetingId, sessionUid);
-  return async (seq, isFinal, format, bytes) => {
+  return async (seq, isFinal, format, bytes, extra) => {
     if (!url) {
       log(`recording: no recordingUploadUrl — chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
       return;
     }
-    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format);
+    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format, extra);
   };
 }
 
@@ -77,34 +89,93 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
  * Build the recording sink. Each chunk(...) uploads immediately (serialized in seq order); close(key)
  * sends the empty is_final fallback exactly once if the tap never delivered its own final chunk.
  */
+const IDENTITY_TEXT_LIMIT = 200;
+
+function textField(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > IDENTITY_TEXT_LIMIT) return undefined;
+  return trimmed;
+}
+
+/** media_type chN on every channel chunk. Seq 0 also carries the first identity seen for that lane. */
+function channelExtra(channel: number, seq: number, identity: ChannelChunkIdentity | undefined): ChunkUploadExtra {
+  const extra: ChunkUploadExtra = { mediaType: `ch${channel}` };
+  if (seq !== 0 || !identity) return extra;
+  const metadata: Record<string, string | number> = {};
+  const start = identity.recorder_start_epoch_ms;
+  if (typeof start === 'number' && Number.isInteger(start) && start > 0) metadata.recorder_start_epoch_ms = start;
+  if (identity.channel_kind === 'gmeet' || identity.channel_kind === 'jitsi') metadata.channel_kind = identity.channel_kind;
+  const streamId = textField(identity.stream_id);
+  if (streamId) metadata.stream_id = streamId;
+  const participantId = textField(identity.participant_id);
+  if (participantId) metadata.participant_id = participantId;
+  const displayName = textField(identity.display_name);
+  if (displayName) metadata.display_name = displayName;
+  if (Object.keys(metadata).length) extra.metadata = metadata;
+  return extra;
+}
+
+interface UploadLane {
+  queue: Promise<void>;
+  anyChunk: boolean;
+  finalSent: boolean;
+  maxSeq: number;
+  lastFormat: RecordingMasterFormat;
+  identity?: ChannelChunkIdentity;
+}
+
 export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecordingSink {
   const log = opts.log ?? (() => { /* silent by default */ });
   const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log);
 
-  let queue: Promise<void> = Promise.resolve();       // serialize uploads → parts land in seq order
-  let anyChunk = false;                                // did the tap ever deliver a chunk?
-  let finalSent = false;                               // has an is_final chunk been sent? (fallback guard)
-  let maxSeq = -1;                                     // highest seq seen → the fallback's seq
-  let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
+  const makeLane = (): UploadLane => ({
+    queue: Promise.resolve(),
+    anyChunk: false,
+    finalSent: false,
+    maxSeq: -1,
+    lastFormat: 'webm',
+  });
+  const audio = makeLane();
+  const channels = new Map<number, UploadLane>();
 
-  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void => {
-    anyChunk = true;
-    if (isFinal) finalSent = true;
-    if (seq > maxSeq) maxSeq = seq;
-    lastFormat = format;
-    queue = queue
-      .then(() => upload(seq, isFinal, format, bytes))
+  const enqueue = (lane: UploadLane, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, extra?: ChunkUploadExtra): void => {
+    lane.anyChunk = true;
+    if (isFinal) lane.finalSent = true;
+    if (seq > lane.maxSeq) lane.maxSeq = seq;
+    lane.lastFormat = format;
+    lane.queue = lane.queue
+      .then(() => upload(seq, isFinal, format, bytes, extra))
       .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); });
   };
 
+  const fallback = (lane: UploadLane, extra?: ChunkUploadExtra): void => {
+    if (!lane.anyChunk || lane.finalSent) return;
+    enqueue(lane, lane.maxSeq + 1, true, lane.lastFormat, new Uint8Array(0), extra);
+  };
+
   return {
-    chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
+    chunk: (_key, seq, isFinal, format, bytes) => { enqueue(audio, seq, isFinal, format, bytes); },
+    channelChunk: (channel, seq, isFinal, format, bytes, identity) => {
+      if (typeof channel !== 'number' || !Number.isInteger(channel) || channel < 0) {
+        log(`recording: channel ${String(channel)} ignored`);
+        return;
+      }
+      let lane = channels.get(channel);
+      if (!lane) {
+        lane = makeLane();
+        channels.set(channel, lane);
+      }
+      if (identity && !lane.identity) lane.identity = identity;
+      enqueue(lane, seq, isFinal, format, bytes, channelExtra(channel, seq, lane.identity));
+    },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
       // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session
       // (no phantom recording), and at most once (a real is_final already set finalSent).
-      if (!anyChunk || finalSent) return;
-      enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
+      // Each channel lane does the same for its own media type. The mix lane stays media type audio.
+      fallback(audio);
+      for (const [channel, lane] of channels) fallback(lane, { mediaType: `ch${channel}` });
     },
   };
 }

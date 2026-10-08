@@ -9,6 +9,7 @@ import {
   createJitsiSpeakers,
   createJitsiChat,
   sendJitsiChatMessage,
+  jitsiNameForStream,
   selectJitsiSpeaker,
   JITSI_SPEECH_LEVEL,
   CONFIRM_POLLS,
@@ -47,6 +48,32 @@ const fakeState: any = {
 const sent: string[] = [];
 
 async function main() {
+  // ── a remote-audio stream id names its owner from the conference store ──────
+  const store = {
+    "features/base/participants": {
+      remote: new Map([
+        ["p1", { id: "p1", name: "Ada" }],
+        ["p2", { id: "p2", name: "   " }],
+      ]),
+    },
+    "features/base/tracks": [
+      { participantId: "p1", mediaType: "audio", local: false, jitsiTrack: { getOriginalStream: () => ({ id: "remote-audio-2" }) } },
+      { participantId: "p9", mediaType: "audio", local: true, jitsiTrack: { stream: { id: "local-audio" } } },
+      { participantId: "p1", mediaType: "video", local: false, jitsiTrack: { streamId: "remote-audio-2" } },
+      { participantId: "p2", mediaType: "audio", local: false, jitsiTrack: { stream: { id: "remote-audio-5" } } },
+      { participantId: "p3", mediaType: "audio", local: false, jitsiTrack: { streamId: "remote-audio-8" } },
+    ],
+  };
+  const ada = jitsiNameForStream(store, "remote-audio-2");
+  check("getOriginalStream names Ada on channel 2's stream", ada?.participantId === "p1" && ada?.displayName === "Ada", JSON.stringify(ada));
+  check("a local track is not a channel name", jitsiNameForStream(store, "local-audio") === null);
+  const blank = jitsiNameForStream(store, "remote-audio-5");
+  check("a matched track with a blank name still returns the participant id", blank?.participantId === "p2" && blank?.displayName === undefined, JSON.stringify(blank));
+  const unnamed = jitsiNameForStream(store, "remote-audio-8");
+  check("a participant missing from the name map returns the id only", unnamed?.participantId === "p3" && unnamed?.displayName === undefined, JSON.stringify(unnamed));
+  check("an unknown stream returns null", jitsiNameForStream(store, "mixedmslabel") === null);
+  check("an empty stream id returns null", jitsiNameForStream(store, "") === null);
+
   // ── selector: loudest named remote above the threshold ───────────────────────
   const people = new Map<string, { id: string; name: string }>([
     ["p1", { id: "p1", name: "Alice" }],

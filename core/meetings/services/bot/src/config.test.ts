@@ -10,7 +10,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource } from './config.js';
+import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource, perChannelRecordingEnabled } from './config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_DIR = join(HERE, '..', '..', '..', 'contracts', 'invocation.v1', 'golden');
@@ -104,6 +104,19 @@ console.log('\n✅ config (L1/L2): the goldens parse, the env helper round-trips
   check('recordingSource: teams records the mixed-lane graph', rs('teams') === 'mixed-mix', rs('teams'));
   check('recordingSource: jitsi records the mixed-lane graph', rs('jitsi') === 'mixed-mix', rs('jitsi'));
   check('recordingSource: google_meet keeps the element snapshot', rs('google_meet') === 'element-snapshot', rs('google_meet'));
+}
+
+// ── per-channel recorders stay off until the env is exactly 1 or true ──
+{
+  const on = (value: string | undefined): boolean => perChannelRecordingEnabled(
+    value === undefined ? {} : { PER_CHANNEL_RECORDING_ENABLED: value },
+  );
+  check('per-channel recording is off when unset', on(undefined) === false);
+  check('per-channel recording is on for 1', on('1') === true);
+  check('per-channel recording is on for true', on('true') === true);
+  check('per-channel recording rejects TRUE', on('TRUE') === false);
+  check('per-channel recording rejects yes', on('yes') === false);
+  check('per-channel recording rejects 0', on('0') === false);
 }
 
 console.log(failed === 0 ? '\n✅ config: all green' : `\n❌ config: ${failed} failure(s)`);

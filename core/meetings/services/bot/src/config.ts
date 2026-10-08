@@ -69,6 +69,13 @@ export function recordingSource(p: Platform | string): RecordingSource {
   return 'element-snapshot';
 }
 
+/** Extra per-channel MediaRecorders beside the mixed master. Off unless the env is "1" or "true".
+ *  Teams and Zoom never start them. Jitsi stays on the mixed master either way. */
+export function perChannelRecordingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.PER_CHANNEL_RECORDING_ENABLED;
+  return value === '1' || value === 'true';
+}
+
 export interface AutomaticLeave {
   waitingRoomTimeout?: number;
   noOneJoinedTimeout?: number;
