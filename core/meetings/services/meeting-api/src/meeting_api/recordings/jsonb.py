@@ -16,6 +16,59 @@ from typing import Any, Optional
 _STATUS_COMPLETED = "completed"
 _STATUS_IN_PROGRESS = "in_progress"
 _SOURCE_BOT = "bot"
+# Stamped by a per-channel recorder on chunk 0. A later chunk of the same media
+# type must not rename the channel, so these are copied forward and never rewritten.
+_CHANNEL_IDENTITY_KEYS = (
+    "recorder_start_epoch_ms",
+    "channel_kind",
+    "stream_id",
+    "participant_id",
+    "display_name",
+)
+_CHANNEL_KINDS = ("gmeet", "jitsi")
+_CHANNEL_TEXT_LIMIT = 200
+
+
+def channel_identity(raw: Any) -> dict[str, Any]:
+    """Fields a channel recorder may stamp. Anything else is dropped, and the upload still succeeds.
+
+    ``recorder_start_epoch_ms`` is a real int (``bool`` is an int in Python and is rejected).
+    ``channel_kind`` is ``gmeet`` or ``jitsi``. The three names are non-empty strings of at most
+    200 characters.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    kept: dict[str, Any] = {}
+    start = raw.get("recorder_start_epoch_ms")
+    if type(start) is int:
+        kept["recorder_start_epoch_ms"] = start
+    kind = raw.get("channel_kind")
+    if kind in _CHANNEL_KINDS:
+        kept["channel_kind"] = kind
+    for key in ("stream_id", "participant_id", "display_name"):
+        value = raw.get(key)
+        if isinstance(value, str) and value and len(value) <= _CHANNEL_TEXT_LIMIT:
+            kept[key] = value
+    return kept
+
+
+def _media_metadata(
+    sample_rate: Optional[int],
+    chunk_seq: int,
+    chunk_metadata: Optional[dict],
+    prior_same_type: Optional[dict],
+) -> dict[str, Any]:
+    """``sample_rate`` from this chunk, plus channel identity that only chunk 0 may set."""
+    metadata: dict[str, Any] = {"sample_rate": sample_rate} if sample_rate else {}
+    if chunk_seq == 0:
+        metadata.update(channel_identity(chunk_metadata))
+        return metadata
+    prior_meta = (prior_same_type or {}).get("metadata") or {}
+    if isinstance(prior_meta, dict):
+        metadata.update(
+            {key: prior_meta[key] for key in _CHANNEL_IDENTITY_KEYS if key in prior_meta}
+        )
+    return metadata
 
 
 def _now_iso() -> str:
@@ -42,6 +95,7 @@ def apply_chunk_to_recording(
     is_final: bool,
     duration_seconds: Optional[float],
     sample_rate: Optional[int],
+    chunk_metadata: Optional[dict] = None,
 ) -> tuple[dict, bool]:
     """Fold one uploaded chunk into the recording payload.
 
@@ -107,7 +161,9 @@ def apply_chunk_to_recording(
         "duration_seconds": duration_seconds,
         "chunk_seq": chunk_seq,
         "first_chunk_at": first_chunk_at,
-        "metadata": {"sample_rate": sample_rate} if sample_rate else {},
+        # sample_rate is rebuilt from this chunk alone. Starting from the prior dict would keep a
+        # rate a later chunk omitted. Channel identity is the opposite: only chunk 0 may set it.
+        "metadata": _media_metadata(sample_rate, chunk_seq, chunk_metadata, prior_same_type),
         "created_at": _now_iso(),
         "is_final": new_is_final,
         "finalized_at": (prior_same_type or {}).get("finalized_at"),

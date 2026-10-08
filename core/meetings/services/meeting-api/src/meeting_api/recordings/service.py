@@ -69,6 +69,7 @@ async def upload_chunk(
     is_final: bool = True,
     duration_seconds: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    chunk_metadata: Optional[dict] = None,
 ) -> dict:
     """Process ONE recording chunk upload. ``token_meeting_id`` is the verified MeetingToken's
     meeting_id (the route verifies the token before calling this).
@@ -120,6 +121,7 @@ async def upload_chunk(
             session_uid=session_uid, media_type=media_type, media_format=media_format,
             storage_path=key, file_size=len(data), chunk_seq=chunk_seq, is_final=is_final,
             duration_seconds=duration_seconds, sample_rate=sample_rate,
+            chunk_metadata=chunk_metadata,
         )
         others = [r for r in recs if r.get("id") != rid]
         return others + [payload], (payload, transitioned_)
