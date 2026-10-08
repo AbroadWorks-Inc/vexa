@@ -263,6 +263,32 @@ def test_unparseable_frame_is_not_counted() -> None:
     assert a.frame_count == 1
 
 
+def test_captured_keeps_unnamed_frames_and_drops_a_bad_channel() -> None:
+    a = parse_activity(
+        [
+            header(),
+            frame(ORIGIN_MS, None, 0.9, ch=2),
+            frame(ORIGIN_MS + 256, "A", 0.2, ch=0),
+            json.dumps(
+                {
+                    "t": ORIGIN_MS + 512,
+                    "ch": "nope",
+                    "rms": 0.1,
+                    "dur_ms": 256,
+                    "name": "B",
+                }
+            ),
+        ]
+    )
+    assert [f.name for f in a.frames] == ["A", "B"]
+    assert a.frame_count == 3
+    assert [(c.channel, c.name) for c in a.captured] == [
+        (2, None),
+        (0, "A"),
+        (None, "B"),
+    ]
+
+
 def test_unnamed_frames_never_change_gmeet_events() -> None:
     """Dropping unnamed frames at parse time gives the same events as keeping
     them: a speaker's END is its last voiced time either way."""
@@ -284,5 +310,11 @@ def test_activity_dataclasses_use_slots() -> None:
     a = parse_activity(
         [header(), frame(ORIGIN_MS, "A", 0.2), hint(ORIGIN_MS + 10, "B")]
     )
-    for obj in (a, a.frames[0], a.hints[0], speech_events(a, ORIGIN_MS, 0.05, 700)[0]):
+    for obj in (
+        a,
+        a.frames[0],
+        a.hints[0],
+        a.captured[0],
+        speech_events(a, ORIGIN_MS, 0.05, 700)[0],
+    ):
         assert not hasattr(obj, "__dict__"), type(obj).__name__

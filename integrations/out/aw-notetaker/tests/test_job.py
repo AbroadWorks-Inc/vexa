@@ -73,6 +73,7 @@ class FakeMeetingApi:
         master: dict[str, Any] | None = None,
         transcript: dict[str, Any] | None = None,
         masters: dict[int, dict[str, Any]] | None = None,
+        channel_masters: dict[tuple[int, str], dict[str, Any]] | None = None,
     ) -> None:
         self.recordings = recordings if recordings is not None else []
         self._master = master
@@ -80,7 +81,9 @@ class FakeMeetingApi:
         self._transcript = transcript
         self.list_recordings_calls: list[int] = []
         self.master_calls: list[int] = []
+        self.channel_master_calls: list[tuple[int, str]] = []
         self.transcript_calls: list[int] = []
+        self._channel_masters = channel_masters or {}
 
     def list_recordings(
         self, meeting_id: int, max_recordings: int
@@ -90,7 +93,10 @@ class FakeMeetingApi:
             raise TooManyRecordings(meeting_id, max_recordings)
         return self.recordings
 
-    def master(self, recording_id: int) -> dict[str, Any]:
+    def master(self, recording_id: int, media_type: str = "audio") -> dict[str, Any]:
+        if media_type != "audio":
+            self.channel_master_calls.append((recording_id, media_type))
+            return self._channel_masters[(recording_id, media_type)]
         self.master_calls.append(recording_id)
         if self._masters is not None:
             return self._masters[recording_id]
@@ -254,10 +260,15 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
         BASE + "participants.json",
         BASE + "meeting.json",
         BASE + "recordings.json",
+        BASE + "speaker_activity_frames.json",
         BASE + "_export.json",
     }
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"webm-bytes"
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == [
+        {"t_rel": 0.0, "ch": 0, "name": "Ann Lee", "rms": 0.2, "dur_ms": 256},
+        {"t_rel": 0.256, "ch": 0, "name": "Ann Lee", "rms": 0.0, "dur_ms": 256},
+    ]
     wav_bytes = storage.get_bytes(EXPORT_BUCKET, BASE + "audio.wav")
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
         assert wav.getnframes() / wav.getframerate() == FAKE_WAV_SECONDS
@@ -578,6 +589,9 @@ def test_missing_speaker_activity_still_hands_off_with_missing_marker(
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "missing"
+    assert (
+        storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") is None
+    )
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["speaker_timeline"] == []
     assert timeline["participants"] == []
@@ -901,6 +915,9 @@ def test_header_less_activity_hands_off_with_invalid_marker(storage: Storage) ->
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "invalid"
+    assert (
+        storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") is None
+    )
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["speaker_timeline"] == [] and timeline["speaker_intervals"] == []
     participants = storage.get_json(EXPORT_BUCKET, BASE + "participants.json")
@@ -1097,6 +1114,7 @@ def test_export_tags_every_object_with_its_retention_class(storage: Storage) -> 
         "recordings.json",
         "participants.json",
         "speaker_timeline.json",
+        "speaker_activity_frames.json",
         "live_transcript.json",
         "_export.json",
     ):
@@ -1202,6 +1220,7 @@ EXPECTED_KEYS = {
         "participants.json",
         "meeting.json",
         "recordings.json",
+        "speaker_activity_frames.json",
         "_export.json",
     )
 }
@@ -1825,6 +1844,187 @@ def test_both_long_turns_loud_still_hands_off(storage: Storage) -> None:
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "ok"
+
+
+def test_channel_audio_is_padded_onto_the_meeting_clock(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two sessions share ch0. Session B's recorder starts inside A's audio, so
+    that piece is appended and the kept name stays Ada's. ch1 has no recorder
+    clock and sits where B's mixed audio sits, 90 s into the meeting. A `chunk`
+    media file is not a channel."""
+    origin_a = SESSION_A.origin_ms
+    origin_b = SESSION_B.origin_ms
+    recorder_b = origin_b - 85_000  # places ch0 at 5 s, inside A's 10 s piece
+
+    def put(key: str, body: bytes) -> None:
+        storage.put_bytes(VEXA_BUCKET, key, body, "video/webm")
+
+    audio_a = f"recordings/7/{SESSION_A.rec_id}/{SESSION_A.uid}/audio/master.webm"
+    audio_b = f"recordings/7/{SESSION_B.rec_id}/{SESSION_B.uid}/audio/master.webm"
+    ch0_a = f"recordings/7/{SESSION_A.rec_id}/{SESSION_A.uid}/ch0/master.webm"
+    ch0_b = f"recordings/7/{SESSION_B.rec_id}/{SESSION_B.uid}/ch0/master.webm"
+    ch1_b = f"recordings/7/{SESSION_B.rec_id}/{SESSION_B.uid}/ch1/master.webm"
+    put(audio_a, b"webm-a")
+    put(audio_b, b"webm-b")
+    put(ch0_a, b"ch0-a")
+    put(ch0_b, b"ch0-b")
+    put(ch1_b, b"ch1-b")
+    _put_activity(
+        storage,
+        SESSION_A.uid,
+        [
+            header(),
+            frame(origin_a, "Speaker Alpha", 0.2, ch=0),
+            json.dumps({"t": origin_a + 1000, "rms": 0.4, "dur_ms": 256}),
+        ],
+    )
+    _put_activity(
+        storage,
+        SESSION_B.uid,
+        [header(), frame(origin_b, "Speaker Gamma", 0.3, ch=1)],
+    )
+
+    def recording(
+        session: _Session, media_files: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return {
+            "id": session.rec_id,
+            "status": "completed",
+            "created_at": session.created_at,
+            "media_files": media_files,
+        }
+
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            recording(
+                SESSION_B,
+                [
+                    {"type": "audio", "format": "webm"},
+                    {
+                        "type": "ch0",
+                        "format": "webm",
+                        "metadata": {
+                            "recorder_start_epoch_ms": recorder_b,
+                            "channel_kind": "jitsi",
+                            "stream_id": "remote-audio-9",
+                            "display_name": "Bob",
+                            "ignored": "nope",
+                        },
+                    },
+                    {"type": "ch1", "format": "webm", "metadata": {}},
+                ],
+            ),
+            recording(
+                SESSION_A,
+                [
+                    {"type": "audio", "format": "webm"},
+                    {"type": "chunk", "format": "webm"},
+                    {
+                        "type": "ch0",
+                        "format": "webm",
+                        "metadata": {
+                            "recorder_start_epoch_ms": origin_a,
+                            "channel_kind": "jitsi",
+                            "stream_id": "remote-audio-0",
+                            "participant_id": "p-a",
+                            "display_name": "Ada",
+                            "ignored": "nope",
+                        },
+                    },
+                ],
+            ),
+        ],
+        masters={
+            SESSION_A.rec_id: {"storage_path": audio_a},
+            SESSION_B.rec_id: {"storage_path": audio_b},
+        },
+        channel_masters={
+            (SESSION_A.rec_id, "ch0"): {"storage_path": ch0_a},
+            (SESSION_B.rec_id, "ch0"): {"storage_path": ch0_b},
+            (SESSION_B.rec_id, "ch1"): {"storage_path": ch1_b},
+        },
+    )
+    bodies = {
+        b"webm-a": (60.0, 1),
+        b"webm-b": (40.0, 2),
+        b"ch0-a": (10.0, 7),
+        b"ch0-b": (10.0, 8),
+        b"ch1-b": (5.0, 9),
+    }
+
+    def transcode(src: Path, dst: Path) -> None:
+        seconds, value = bodies[src.read_bytes()]
+        write_constant_wav(dst, seconds, value)
+
+    deps = _deps(
+        storage,
+        meeting_api,
+        FakeNotetaker(),
+        transcode=transcode,
+        join_webm=FakeJoinWebm(),
+    )
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert meeting_api.master_calls == [SESSION_A.rec_id, SESSION_B.rec_id]
+    assert meeting_api.channel_master_calls == [
+        (SESSION_A.rec_id, "ch0"),
+        (SESSION_B.rec_id, "ch0"),
+        (SESSION_B.rec_id, "ch1"),
+    ]
+    ch0, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch0.wav"))
+    assert rate == 100
+    assert ch0 == [7] * 1000 + [8] * 1000
+    ch1, _rate = wav_samples(
+        storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch1.wav")
+    )
+    assert ch1 == [0] * 9000 + [9] * 500
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == [
+        {
+            "channel": 0,
+            "kind": "jitsi",
+            "stream_id": "remote-audio-0",
+            "offset_s": 0.0,
+            "participant_id": "p-a",
+            "display_name": "Ada",
+        },
+        {"channel": 1, "kind": "gmeet", "stream_id": "", "offset_s": 90.0},
+    ]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == [
+        {
+            "t_rel": 0.0,
+            "ch": 0,
+            "name": "Speaker Alpha",
+            "rms": 0.2,
+            "dur_ms": 256,
+        },
+        {"t_rel": 1.0, "ch": None, "name": None, "rms": 0.4, "dur_ms": 256},
+        {
+            "t_rel": 90.0,
+            "ch": 1,
+            "name": "Speaker Gamma",
+            "rms": 0.3,
+            "dur_ms": 256,
+        },
+    ]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(message.startswith("channel_overlap ") for message in messages)
+    assert any(
+        message.startswith("channel_display_name_differs ")
+        and "display_name=Bob" in message
+        and "kept=Ada" in message
+        for message in messages
+    )
+
+    def tag_value(key: str) -> dict[str, str]:
+        tags = storage._client.get_object_tagging(Bucket=EXPORT_BUCKET, Key=key)[
+            "TagSet"
+        ]
+        return {tag["Key"]: tag["Value"] for tag in tags}
+
+    assert tag_value(BASE + "channels/ch0.wav") == {"retention-class": "audio"}
+    assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
 
 
 def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(

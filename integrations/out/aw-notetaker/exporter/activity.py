@@ -25,6 +25,17 @@ class Frame:
 
 
 @dataclass(slots=True, frozen=True)
+class CapturedFrame:
+    """One parsed activity frame, named or not, with its channel when present."""
+
+    ts: int
+    channel: int | None
+    name: str | None
+    rms: float
+    duration_ms: int
+
+
+@dataclass(slots=True, frozen=True)
 class Hint:
     t: int
     name: str
@@ -43,14 +54,18 @@ class ActivityEvent:
 
 @dataclass(slots=True)
 class Activity:
-    """One parsed file. `frames` holds named frames on every lane. Unnamed
-    frames are counted in `frame_count` and not stored, so a long meeting's
-    unused frames never sit in memory."""
+    """One parsed file.
+
+    `frames` holds named frames on every lane; speech events are built from
+    those only. `captured` holds every frame that parsed, including unnamed
+    ones and the channel number, for the per-channel transcript.
+    """
 
     lane: str
     started_at: str | None
     frames: list[Frame] = field(default_factory=list)
     hints: list[Hint] = field(default_factory=list)
+    captured: list[CapturedFrame] = field(default_factory=list)
     frame_count: int = 0
     capped: bool = False
 
@@ -112,8 +127,24 @@ def parse_activity(lines: Iterable[str]) -> Activity:
             except (KeyError, ValueError, TypeError):
                 continue
             activity.frame_count += 1
+            # A missing or non-numeric channel is kept as None. The frame
+            # itself still counts: the channel transcript skips it later.
+            raw_channel = row.get("ch")
+            try:
+                channel = None if raw_channel is None else int(raw_channel)
+            except (TypeError, ValueError):
+                channel = None
+            activity.captured.append(
+                CapturedFrame(
+                    ts=parsed.ts,
+                    channel=channel,
+                    name=parsed.name,
+                    rms=parsed.rms,
+                    duration_ms=parsed.duration_ms,
+                )
+            )
             # Named frames are the timeline on every lane, including mixed and
-            # pertrack. Unnamed frames (Teams' server mix) stay counted only.
+            # pertrack. Unnamed frames stay out of `frames`.
             if parsed.name:
                 activity.frames.append(parsed)
     if activity is None:

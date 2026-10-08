@@ -131,6 +131,7 @@ EXPECTED_KEYS = {
     BASE + "participants.json",
     BASE + "meeting.json",
     BASE + "recordings.json",
+    BASE + "speaker_activity_frames.json",
     BASE + "_export.json",
 }
 
