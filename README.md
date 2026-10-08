@@ -33,6 +33,8 @@ the link parses. `ENTRY_BLOCKED_HOSTS` is empty, so intake does not refuse it.
    │  reads the meeting's recordings through the gateway (its own key)
    │  builds  s3://aw-chatworks-transcribe/recordings/<platform>_<meetingId>_<startUTC>/
    │          master.webm · audio.wav · speaker_timeline.json · participants.json · meeting.json …
+   │          and, when the bot recorded per-speaker channels:
+   │          channels/ch<N>.wav · channels/index.json · speaker_activity_frames.json
    │  then calls  POST /process  (meeting UUID)  and reports the result to AW Bots
    ▼
  notetaker-worker ──► transcriber (Whisper large-v3, GPU) ──► notes.json · transcript.txt · summary
@@ -43,6 +45,16 @@ the link parses. `ENTRY_BLOCKED_HOSTS` is empty, so intake does not refuse it.
 doesn't know who is speaking. The bot's `speaker-activity.jsonl` says who was talking at each moment.
 `notetaker-worker` matches the two by time and writes the names. This is the same method Jitsi uses
 with Prosody's speaker timeline.
+
+On Google Meet and Jitsi the bot also records each remote channel beside that mix. The exporter
+adds `channels/ch<N>.wav`, `channels/index.json`, and `speaker_activity_frames.json`. The worker
+setting `CHANNEL_TRANSCRIPT_MODE` is `compare`: users still receive the mixed transcript, and the
+channel transcript is saved beside it as `transcript_channels.txt`. `deliver` makes the channel
+transcript the one users receive. Teams, Zoom, and any meeting without `channels/index.json` stay
+on the mixed path. Detail is in
+[recording and speakers](docs/aw-bots/recording-and-speakers.md) and
+[export and webhooks](docs/aw-bots/export-and-webhooks.md). The worker's own page is
+`deployment/base/notetaker/worker/README.md` in the deployment repo.
 
 **Live transcription is off.** Vexa can transcribe live during the call, but we use the recording and
 the shared Whisper large-v3 transcriber instead. Live transcription is a setting
@@ -94,6 +106,7 @@ Everything else is upstream Vexa, unchanged.
 | Change | Where | Why |
 |---|---|---|
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
+| **Per-speaker channel files.** On Google Meet and Jitsi, when the deployment lists the platform, the bot records each remote channel beside the mixed master (`media_type` `ch<N>`). Jitsi also writes activity lines marked `"src":"channel"`. Those lines do not enter the mixed timeline. The exporter copies each channel into the notetaker folder. | `capture-bridge.ts`, `core/meetings/modules/record-chunker/src/channel-targets.ts`, `meeting_api/bot_spawn/service.py`, `exporter/job.py` | One mixed recording loses words when people talk at once, and a Meet glow name can land on the wrong channel. The mixed folder is still always written. |
 | **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the §2.4 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
@@ -237,6 +250,7 @@ Every setting lives in configuration, not code:
 |---|---|---|
 | Live transcription | Helm values → meeting-api env `TRANSCRIBE_ENABLED` | `false` |
 | Recording | `RECORDING_ENABLED` | `true` |
+| Per-speaker channels | Helm `meetingApi.perChannelRecordingPlatforms` → meeting-api env `PER_CHANNEL_RECORDING_PLATFORMS`. Passed to the bot as `perChannelRecordingEnabled` only when that platform is listed | `google_meet,jitsi` (empty turns it off for every platform) |
 | Storage | `MINIO_BUCKET` + `S3_ENDPOINT` (IAM role on EKS, no static keys) | bucket `aw-bots` |
 | meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
 | "Meeting finished" webhook | the exporter's `/v2/webhooks` subscription (`events: ["meeting.completed", "bot.failed"]`), secret = exporter env `EXPORTER_WEBHOOK_SECRET`; upstream's `VEXA_SYSTEM_WEBHOOK_URL` | subscription URL `http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa`; `VEXA_SYSTEM_WEBHOOK_URL` unset |

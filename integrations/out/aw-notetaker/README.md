@@ -131,6 +131,14 @@ one transcript with speaker names:
   files go to `signal/<session_uid>/`.
 - **One session** is exported from its recording alone: `master.webm` is a server-side copy,
   `audio.wav` its transcode, `signal/*` flat.
+- **Per-speaker channels.** A recording that has `ch<N>` media files also produces
+  `channels/ch<N>.wav` (16 kHz mono, on the same meeting clock, leading silence included)
+  and `channels/index.json`, written after every channel wav. Every parsed activity frame
+  the channel transcript needs goes to `speaker_activity_frames.json`. On Jitsi, a session
+  with `"src":"channel"` lines writes only those. A failure logs `channel_export_failed`
+  and the mixed folder and `/process` still go out. No index means the worker stays on the
+  mixed path. The worker's use of these files is
+  `deployment/base/notetaker/worker/README.md` in the deployment repo.
 
 ## Config (names only — see spec §4.4)
 `GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `EXPORTER_WEBHOOK_SECRET` (the
@@ -145,8 +153,9 @@ IRSA (no static keys).
 
 ## Retention tagging (see spec §3/§7)
 `EXPORT_BUCKET` expires objects by the `retention-class` S3 object tag
-(`exporter/retention.py`): `master.webm` -> `recording-mp4` (30 days), `audio.wav` and
-`EXPORT_DEBUG`'s `signal/*` copies -> `audio` (7 days), every JSON the exporter writes ->
+(`exporter/retention.py`): `master.webm` -> `recording-mp4` (30 days), `audio.wav`,
+`channels/ch<N>.wav`, and `EXPORT_DEBUG`'s `signal/*` copies -> `audio` (7 days), every JSON
+the exporter writes (including `channels/index.json` and `speaker_activity_frames.json`) ->
 `metadata` (365 days). Objects the exporter writes into `VEXA_BUCKET`
 (`aw-exporter/pending/`, `failed/`, `events/`) are never tagged — that bucket has its own prefix
 lifecycle (`events/` markers need to outlive the 48 h a redelivery can come late; they are a few

@@ -12,7 +12,7 @@ Install steps stay in aw-notetaker `deployment/base/aw-bots/README.md`.
 |---|---|
 | [architecture.md](architecture.md) | Which service does what, and who is allowed to call whom |
 | [meeting-lifecycle.md](meeting-lifecycle.md) | Entries, meetings, when a bot is sent, and when it is replaced |
-| [recording-and-speakers.md](recording-and-speakers.md) | Audio, `speaker-activity.jsonl`, Meet / Zoom / Teams, the runtime pod |
+| [recording-and-speakers.md](recording-and-speakers.md) | Audio, `speaker-activity.jsonl`, per-speaker channels, Meet / Zoom / Teams / Jitsi, the runtime pod |
 | [export-and-webhooks.md](export-and-webhooks.md) | Status events, delivery, and the handoff to notetaker-worker |
 | [security.md](security.md) | Signed identity, callback checks, webhook secrets, erasure |
 | [data-and-configuration.md](data-and-configuration.md) | Tables we added, and the settings that are easy to misread |

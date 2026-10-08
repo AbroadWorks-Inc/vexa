@@ -70,6 +70,17 @@ Changing one does not change the other.
 **`NOTETAKER_URL`.** The exporter Deployment sets the host `notetaker-api` in namespace
 `notetaker`. The runbook treats that name as the Service in front of `notetaker-worker`.
 
+**Per-speaker recording.** `PER_CHANNEL_RECORDING_PLATFORMS` is a comma-separated list of
+platform names on meeting-api. Helm `meetingApi.perChannelRecordingPlatforms` sets it.
+The chart default is empty, which is off for every platform. Our values set
+`google_meet,jitsi`. Whitespace around a name is ignored. A platform not in the list,
+and Teams and Zoom, do not get channel files. The bot learns the decision from
+`perChannelRecordingEnabled` on its invocation, and only when the value is true.
+Changing the list and running `helm upgrade` changes the next bot. A bot already in a
+call keeps the invocation it started with. The worker's `CHANNEL_TRANSCRIPT_MODE` is a
+different setting, on the notetaker Deployment in the deployment repo. Recording
+channels does not by itself replace the mixed transcript.
+
 **Image tags.** `global.imageTag` is empty, so each image uses the tag in the values file or,
 for the exporter, in its Deployment. There is no `:latest`.
 
