@@ -107,6 +107,64 @@ def test_invocation_tape_is_independent_of_recording_enabled():
     assert inv["recordingUploadUrl"].endswith("/internal/recordings/upload")
 
 
+def test_invocation_carries_per_channel_recording_enabled_and_strips_only_none():
+    token = mint_meeting_token(1, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    base = dict(_INV_BASE, token=token)
+    on = build_invocation(**base, per_channel_recording_enabled=True)
+    conforms_invocation(on)
+    assert on["perChannelRecordingEnabled"] is True
+    off = build_invocation(**base, per_channel_recording_enabled=False)
+    conforms_invocation(off)
+    assert off["perChannelRecordingEnabled"] is False
+    assert "perChannelRecordingEnabled" not in build_invocation(**base)
+
+
+@pytest.mark.parametrize("raw,platform,recording,expected", [
+    ("", "jitsi", True, False),                      # empty = off
+    ("   ", "jitsi", True, False),
+    ("google_meet,jitsi", "jitsi", True, True),
+    (" google_meet , jitsi ", "google_meet", True, True),   # whitespace trimmed
+    ("google_meet,jitsi", "teams", True, False),     # platform not listed
+    ("google_meet,jitsi", "jitsi", False, False),    # no recording → no channels
+    ("jitsi_x", "jitsi", True, False),               # whole names only
+])
+def test_per_channel_recording_enabled_from_platform_list(raw, platform, recording, expected):
+    from meeting_api.bot_spawn.service import per_channel_recording_enabled
+
+    assert per_channel_recording_enabled(platform, recording, raw=raw) is expected
+
+
+def test_per_channel_recording_enabled_unset_env_is_off(monkeypatch):
+    from meeting_api.bot_spawn.service import per_channel_recording_enabled
+
+    monkeypatch.delenv("PER_CHANNEL_RECORDING_PLATFORMS", raising=False)
+    assert per_channel_recording_enabled("jitsi", True) is False
+    monkeypatch.setenv("PER_CHANNEL_RECORDING_PLATFORMS", "google_meet,jitsi")
+    assert per_channel_recording_enabled("jitsi", True) is True
+
+
+@pytest.mark.parametrize("env,recording,expected,slug", [
+    (None, True, False, "unset"),
+    ("google_meet,jitsi", True, True, "listed"),
+    ("google_meet,jitsi", False, False, "norec"),
+    ("jitsi", True, False, "other"),
+])
+async def test_spawn_threads_per_channel_recording_from_deployment_env(
+    monkeypatch, env, recording, expected, slug
+):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    if env is None:
+        monkeypatch.delenv("PER_CHANNEL_RECORDING_PLATFORMS", raising=False)
+    else:
+        monkeypatch.setenv("PER_CHANNEL_RECORDING_PLATFORMS", env)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                      native_meeting_id=f"pc-{slug}", redis_url="redis://redis:6379/0",
+                      recording_enabled=recording, token_secret=SECRET)
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert inv["perChannelRecordingEnabled"] is expected
+
+
 def test_invocation_carries_stt_model_when_provided():
     """#522: a validating OpenAI-compatible backend (Groq, vLLM) needs its served model id on
     every request. The deployment's choice rides the sealed invocation; absent → omitted, and

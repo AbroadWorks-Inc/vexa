@@ -37,7 +37,7 @@ import {
 } from '@vexa/remote-browser';
 import { getJoinBrowserArgs } from '@vexa/join';
 import type { RecordingMasterFormat } from '@vexa/recording';
-import { captureLane, isMixedLanePlatform, isPerTrackLanePlatform, perChannelRecordingEnabled, recordingSource, type CaptureLane, type Invocation } from './config.js';
+import { captureLane, isMixedLanePlatform, isPerTrackLanePlatform, recordingSource, type CaptureLane, type Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
 import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
@@ -741,7 +741,7 @@ export async function startCaptureBridge(
   // Jitsi mix frames are all channel 0. With per-channel recording on, activity comes from
   // each remote-audio stream instead, or one person's file would be labeled as the mix.
   // The tee and the live pipeline still run. Meet, Teams, and Zoom are unchanged.
-  const recordPerChannelActivity = perChannelRecordingEnabled() && jitsi;
+  const recordPerChannelActivity = inv.perChannelRecordingEnabled === true && jitsi;
   const onPerSpeakerAudio = (speakerIndex: number, samples: number[], tsMs?: number): void => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
@@ -1543,7 +1543,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     const n = raw ? parseInt(raw, 10) : NaN;
     return Number.isFinite(n) && n > 0 ? n : 15000;
   })();
-  const recordChannels = perChannelRecordingEnabled() && (inv.platform === 'google_meet' || inv.platform === 'jitsi');
+  const recordChannels = inv.perChannelRecordingEnabled === true && (inv.platform === 'google_meet' || inv.platform === 'jitsi');
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
   await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
     const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);

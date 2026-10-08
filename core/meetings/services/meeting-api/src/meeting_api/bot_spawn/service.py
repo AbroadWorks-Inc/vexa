@@ -240,6 +240,21 @@ def _capture_signal_from_context(ctx: dict) -> bool:
     return ctx.get("capture_signal") is not False
 
 
+def per_channel_recording_enabled(
+    platform: str, recording_enabled: bool, raw: Optional[str] = None
+) -> bool:
+    """Whether this spawn records each remote channel (per-speaker audio) — DEFAULT OFF.
+
+    Deployment-scoped, per platform: ``PER_CHANNEL_RECORDING_PLATFORMS`` is a comma-separated list
+    of platform names (e.g. ``google_meet,jitsi``; whitespace trimmed). Unset or empty means off for
+    every platform. A channel is a recording, so it is on only when this bot records at all.
+    ``raw`` is a test seam; production reads the environment.
+    """
+    value = os.getenv("PER_CHANNEL_RECORDING_PLATFORMS") if raw is None else raw
+    platforms = {p.strip() for p in (value or "").split(",") if p.strip()}
+    return bool(recording_enabled) and platform in platforms
+
+
 def _bot_name_from_context(ctx: dict) -> Optional[str]:
     """This person's default bot name out of a bot-context body, or None.
 
@@ -564,6 +579,8 @@ async def request_bot(
     #     ride the invocation env into the bot container, so their blast radius must stay the
     #     userdata prefix).
     authenticated = env_flag("BOT_AUTHENTICATED", False)
+    # Per-channel (per-speaker) recording: deployment-scoped per platform, like BOT_AUTHENTICATED.
+    per_channel_recording = per_channel_recording_enabled(platform, recording_enabled)
     auth_userdata_path: Optional[str] = None
     auth_s3: dict[str, Optional[str]] = {}
     if authenticated:
@@ -880,6 +897,7 @@ async def request_bot(
             # O-TEL-1: the tape is INDEPENDENT of recording_enabled — a meeting the user never asked to
             # record still yields a fixture. Both ride the same upload endpoint below.
             capture_signal_enabled=capture_signal_enabled,
+            per_channel_recording_enabled=per_channel_recording,
             recording_upload_url=f"{meeting_api_url}/internal/recordings/upload",
             authenticated=True if authenticated else None,
             userdata_s3_path=auth_userdata_path,
