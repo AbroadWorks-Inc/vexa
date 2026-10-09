@@ -226,20 +226,21 @@ def test_notetaker_body_and_retry_on_5xx() -> None:
         "s3_path": "recordings/x/",
         "platform": "google_meet",
         "idempotency_key": "vexa-1",
+        "rerun": False,
     }
 
 
-def test_notetaker_hands_a_rerun_to_reprocess() -> None:
-    paths: list[str] = []
+def test_notetaker_sends_a_rerun_to_process_with_the_rerun_flag() -> None:
+    sent: list[tuple[str, bool]] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
-        paths.append(req.url.path)
+        sent.append((req.url.path, json.loads(req.content)["rerun"]))
         return httpx.Response(200, json={"status": "accepted"})
 
     nt = Notetaker("http://n", httpx.Client(transport=httpx.MockTransport(handler)))
     nt.process("vexa-1", "recordings/x/", "google_meet")
     nt.process("vexa-1", "recordings/x/", "google_meet", rerun=True)
-    assert paths == ["/process", "/reprocess"]
+    assert sent == [("/process", False), ("/process", True)]
 
 
 def test_meeting_api_reads_one_meeting_by_its_id() -> None:

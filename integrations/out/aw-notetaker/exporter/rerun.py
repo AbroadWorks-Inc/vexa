@@ -8,7 +8,8 @@ now (`GET /v2/meetings/{id}`) and queued with `rerun` in the exporter's own
 durable queue, so the running worker exports it like any meeting — retries,
 backoff and quarantine included — but writes every file again, filling in any an
 earlier export could not write, and hands the folder to notetaker-worker's
-`/reprocess`, which archives the previous outputs and redoes the transcript.
+`/process` with `"rerun": true`, which moves the previous outputs aside and
+redoes the transcript.
 
 A meeting that has not finished, had no bot sent, or never had its bot in the
 meeting is refused and nothing is queued for it; the exit code is 1 when any id

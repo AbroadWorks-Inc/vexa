@@ -60,8 +60,9 @@ Each meeting is read from aw-bots as it is now (`GET /v2/meetings/{id}`, the `tx
 with `rerun` in the same durable queue, so the running worker exports it with the usual retries,
 backoff and quarantine. A rerun ignores `handed_off`: every file is written again from what aw-bots
 holds now, so one an earlier export could not write (a channel whose master timed out) is filled
-in, and the folder goes to `notetaker-worker`'s `/reprocess`, which archives the previous outputs
-under `runs/<processed_at>/` and redoes the transcript, instead of `/process`. A meeting that has
+in, and the folder goes to `notetaker-worker`'s `/process` with `"rerun": true`, which moves the
+previous outputs to `runs/<processed_at>/` and redoes the transcript. While the meeting's previous
+job is still running the worker answers 409, and the queue retries the rerun with its backoff. A meeting that has
 not finished, had no bot sent, or never had its bot in the meeting is refused (`refused <id>:
 <why>`, exit code 1) and nothing is queued for it. A webhook redelivered while a rerun is pending
 keeps it a rerun.

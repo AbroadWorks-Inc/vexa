@@ -24,8 +24,9 @@ so a later re-enqueue runs the check again.
 A rerun (`rerun=True`, queued by `exporter.rerun`) exports even a handed-off
 folder: every file is written again from what aw-bots holds now, so a file
 an earlier export could not write (a channel whose master timed out) is
-filled in, and the folder goes to notetaker-worker's `/reprocess`, which
-redoes the transcript, instead of the idempotent `/process`.
+filled in, and the folder goes to notetaker-worker's `/process` with
+`"rerun": true`, which redoes the transcript where a plain `/process` would be
+an idempotent no-op.
 
 A meeting can have several bot sessions (a bot failed and a new one joined,
 §6.9 F-K2); each session with audio has its own recording. They make ONE

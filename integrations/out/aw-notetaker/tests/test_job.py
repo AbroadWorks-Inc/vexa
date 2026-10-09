@@ -471,7 +471,7 @@ def test_rerun_after_success_is_already_done_and_does_not_reprocess(
     assert notetaker2.calls == []
 
 
-def test_a_rerun_exports_a_handed_off_folder_again_and_hands_it_to_reprocess(
+def test_a_rerun_exports_a_handed_off_folder_again_and_hands_it_on_as_a_rerun(
     storage: Storage,
 ) -> None:
     storage_path = "recordings/7/855958819514/01ba075a-test/audio/master.webm"
