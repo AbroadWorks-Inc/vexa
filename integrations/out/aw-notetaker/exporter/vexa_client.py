@@ -7,6 +7,8 @@ is calling, so the exporter reads the meetings of its key's account.
 
 Routes (forwarded by the gateway to meeting-api/src/meeting_api):
 GET /v2/meetings/{id} (the §2.4 meeting a webhook carries, for a rerun),
+GET /recordings/{id} (one recording in full: the list leaves out each media
+file's `metadata`, where a channel's identity and recorder clock are),
 GET /recordings (paged: `limit`/`offset` in, `has_more` out; every page is
 read, up to the caller's cap), GET /recordings/{id}/master,
 GET /transcripts/by-id/{meeting_id} (spec §4.2 steps 2-3; by-id chosen over
@@ -108,6 +110,10 @@ class MeetingApi:
         """The meeting as aw-bots holds it now: the same §2.4 meeting a webhook's
         `data.meeting` carries."""
         return dict(self._get(f"/v2/meetings/{meeting_id}").json())
+
+    def recording(self, recording_id: int) -> dict[str, Any]:
+        """One recording in full, every media file with its `metadata`."""
+        return dict(self._get(f"/recordings/{recording_id}").json())
 
     def master(self, recording_id: int, media_type: str = "audio") -> dict[str, Any]:
         path = f"/recordings/{recording_id}/master"
