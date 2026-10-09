@@ -1905,13 +1905,15 @@ def test_both_long_turns_loud_still_hands_off(storage: Storage) -> None:
     assert marker["speaker_activity"] == "ok"
 
 
-def test_channel_audio_is_padded_onto_the_meeting_clock(
+def test_channels_are_written_as_recorded_with_their_offset(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Two sessions share ch0. Session B's recorder starts inside A's audio, so
-    that piece is appended and the kept name stays Ada's. ch1's recorder
-    started with session B, so it sits where B's mixed audio sits, 90 s into
-    the meeting. A `chunk` media file is not a channel."""
+    """Two sessions share ch0. Session B's recorder starts inside A's piece,
+    so the two are joined into one opus file with B's piece right after A's,
+    and the kept name stays Ada's. ch1 has one piece: its recorder's master is
+    copied as it stands, and its row says it starts 90 s into the meeting,
+    where B's mixed audio sits. A `chunk` media file is not a channel. Only the
+    joined channel's pieces are decoded, to measure them."""
     origin_a = SESSION_A.origin_ms
     origin_b = SESSION_B.origin_ms
     recorder_b = origin_b - 85_000  # places ch0 at 5 s, inside A's 10 s piece
@@ -2020,16 +2022,21 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
         b"ch1-b": (5.0, 9),
     }
 
+    decoded: list[bytes] = []
+
     def transcode(src: Path, dst: Path) -> None:
-        seconds, value = bodies[src.read_bytes()]
+        body = src.read_bytes()
+        decoded.append(body)
+        seconds, value = bodies[body]
         write_constant_wav(dst, seconds, value)
 
+    join = FakeJoinWebm()
     deps = _deps(
         storage,
         meeting_api,
         FakeNotetaker(),
         transcode=transcode,
-        join_webm=FakeJoinWebm(),
+        join_webm=join,
     )
     with caplog.at_level(logging.WARNING, logger="exporter"):
         assert export_meeting(_envelope(), deps).state == "handed_off"
@@ -2040,13 +2047,17 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
         (SESSION_B.rec_id, "ch0"),
         (SESSION_B.rec_id, "ch1"),
     ]
-    ch0, rate = wav_samples(storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch0.wav"))
-    assert rate == 100
-    assert ch0 == [7] * 1000 + [8] * 1000
-    ch1, _rate = wav_samples(
-        storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch1.wav")
+    assert [body for body in decoded if body.startswith(b"ch")] == [b"ch0-a", b"ch0-b"]
+    assert join.calls[-1] == [(b"ch0-a", 0.0), (b"ch0-b", 0.0)]
+    assert (
+        storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch0.webm") == b"joined-webm"
     )
-    assert ch1 == [0] * 9000 + [9] * 500
+    assert storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch1.webm") == b"ch1-b"
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == [
+        BASE + "channels/ch0.webm",
+        BASE + "channels/ch1.webm",
+        BASE + "channels/index.json",
+    ]
     assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == [
         {
             "channel": 0,
@@ -2055,12 +2066,14 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
             "offset_s": 0.0,
             "participant_id": "p-a",
             "display_name": "Ada",
+            "file": "ch0.webm",
         },
         {
             "channel": 1,
             "kind": "jitsi",
             "stream_id": "remote-audio-1",
             "offset_s": 90.0,
+            "file": "ch1.webm",
         },
     ]
     assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == [
@@ -2095,7 +2108,8 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
         ]
         return {tag["Key"]: tag["Value"] for tag in tags}
 
-    assert tag_value(BASE + "channels/ch0.wav") == {"retention-class": "audio"}
+    assert tag_value(BASE + "channels/ch0.webm") == {"retention-class": "audio"}
+    assert tag_value(BASE + "channels/ch1.webm") == {"retention-class": "audio"}
     assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
 
 
@@ -2111,10 +2125,8 @@ def _gmeet_channel(channel: int) -> dict[str, Any]:
 def test_a_channel_without_its_recorder_identity_is_not_exported(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Meeting 195 (2026-10-09): the channels reached the exporter without
-    channel_kind and recorder clock and were exported as Meet channels at the
-    meeting's start. A channel that cannot be named or placed is not exported:
-    no index, the reason logged, and the mixed export handed off as usual."""
+    """A channel that cannot be named or placed is not exported: no index,
+    the reason logged, and the mixed export handed off as usual."""
     storage_path = _put_master(storage, 21, "uid-21")
     _put_activity(storage, "uid-21", two_speaker_gmeet_lines(_origin_ms()))
     ch0_path = "recordings/7/21/uid-21/ch0/master.webm"
@@ -2149,40 +2161,23 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
     )
 
 
-class _FailingChannelUpload(Storage):
-    """Uploads `channels/ch1.wav` fails; everything else goes through."""
-
-    def upload_file(
-        self,
-        path: Path,
-        bucket: str,
-        key: str,
-        content_type: str,
-        retention: str | None = None,
-    ) -> None:
-        if key.endswith("channels/ch1.wav"):
-            raise RuntimeError("S3 upload failed")
-        super().upload_file(path, bucket, key, content_type, retention)
-
-
-@pytest.mark.parametrize("failure", ["fetch", "transcode", "join", "upload"])
+@pytest.mark.parametrize("failure", ["master", "copy"])
 def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
     storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
-    """ch0 is fine; ch1 fails to download, to transcode, to join (a broken
-    wav), or to upload after ch0.wav is uploaded. The mixed export is handed
-    off as usual and `channels/index.json` is never written. Only an upload
-    failure can leave a wav behind, and without an index the worker ignores
-    it."""
-    if failure == "upload":
-        storage = _FailingChannelUpload(storage._client)
+    """ch0 is fine; ch1's master cannot be built (every master is asked for
+    before any file is written, so nothing is), or its object is missing and
+    the copy fails after ch0 is copied (ch0.webm is left; without an index the
+    worker ignores it). The mixed export is handed off as usual and
+    `channels/index.json` is never written."""
     storage_path = _put_master(storage, 20, "uid-20")
     _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
     ch0_path = "recordings/7/20/uid-20/ch0/master.webm"
     ch1_path = "recordings/7/20/uid-20/ch1/master.webm"
     storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
-    if failure != "fetch":
-        storage.put_bytes(VEXA_BUCKET, ch1_path, b"ch1", "video/webm")
+    channel_masters = {(20, "ch0"): {"storage_path": ch0_path}}
+    if failure == "copy":
+        channel_masters[(20, "ch1")] = {"storage_path": ch1_path}
     meeting_api = FakeMeetingApi(
         recordings=[
             _audio_recording(
@@ -2195,29 +2190,15 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
             )
         ],
         master={"storage_path": storage_path},
-        channel_masters={
-            (20, "ch0"): {"storage_path": ch0_path},
-            (20, "ch1"): {"storage_path": ch1_path},
-        },
+        channel_masters=channel_masters,
     )
-
-    def transcode(src: Path, dst: Path) -> None:
-        body = src.read_bytes()
-        if body == b"ch1":
-            if failure == "transcode":
-                raise RuntimeError("ffmpeg exited 1")
-            if failure == "join":
-                dst.write_bytes(b"not a wav")
-                return
-        write_silent_wav(dst, 10.0 if body == b"ch0" else FAKE_WAV_SECONDS)
-
     notetaker = FakeNotetaker()
-    deps = _deps(storage, meeting_api, notetaker, transcode=transcode)
+    deps = _deps(storage, meeting_api, notetaker)
     with caplog.at_level(logging.WARNING, logger="exporter"):
         assert export_meeting(_envelope(), deps).state == "handed_off"
 
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
-    expected_left = [BASE + "channels/ch0.wav"] if failure == "upload" else []
+    expected_left = [BASE + "channels/ch0.webm"] if failure == "copy" else []
     assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == expected_left
     assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
         "handed_off"
@@ -2229,6 +2210,47 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
         )
         for record in caplog.records
     )
+
+
+def test_a_rerun_over_a_wav_export_indexes_only_the_opus_files(
+    storage: Storage,
+) -> None:
+    """A rerun over an earlier export: the new index names only this export's
+    opus files. The earlier wavs are not deleted (the exporter deletes
+    nothing); no index names them and they expire with their retention."""
+    storage_path = _put_master(storage, 22, "uid-22")
+    _put_activity(storage, "uid-22", two_speaker_gmeet_lines(_origin_ms()))
+    ch0_path = "recordings/7/22/uid-22/ch0/master.webm"
+    storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
+    for stale in ("ch0.wav", "ch5.wav"):
+        storage.put_bytes(EXPORT_BUCKET, BASE + "channels/" + stale, b"x", "audio/wav")
+    storage.put_json(EXPORT_BUCKET, BASE + "channels/index.json", [{"channel": 5}])
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                22,
+                media_files=[
+                    {"type": "audio", "format": "webm"},
+                    {"type": "ch0", "format": "webm", "metadata": _gmeet_channel(0)},
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={(22, "ch0"): {"storage_path": ch0_path}},
+    )
+    deps = _deps(storage, meeting_api, FakeNotetaker())
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == [
+        BASE + "channels/ch0.wav",
+        BASE + "channels/ch0.webm",
+        BASE + "channels/ch5.wav",
+        BASE + "channels/index.json",
+    ]
+    assert [
+        row["file"]
+        for row in storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json")
+    ] == ["ch0.webm"]
 
 
 @pytest.mark.parametrize("mix_named", [True, False])
