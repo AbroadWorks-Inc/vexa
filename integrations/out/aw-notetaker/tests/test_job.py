@@ -2108,6 +2108,60 @@ def _gmeet_channel(channel: int) -> dict[str, Any]:
     }
 
 
+class _LocalFilesAtUpload(Storage):
+    """Records the files in the export's temp folder at each channel upload."""
+
+    def __init__(self, client: Any) -> None:
+        super().__init__(client)
+        self.seen: list[list[str]] = []
+
+    def upload_file(
+        self,
+        path: Path,
+        bucket: str,
+        key: str,
+        content_type: str,
+        retention: str | None = None,
+    ) -> None:
+        if "/channels/" in key:
+            self.seen.append(
+                sorted(p.name for p in path.parent.iterdir() if p.name.startswith("ch"))
+            )
+        super().upload_file(path, bucket, key, content_type, retention)
+
+
+def test_channels_are_built_and_uploaded_one_at_a_time(storage: Storage) -> None:
+    """Meeting 195 (2026-10-09): 19 two-hour channels, each padded onto the
+    meeting clock, filled the exporter's 8 GiB disk when all were built
+    before any upload. At each upload only that channel's wav is on disk."""
+    storage = _LocalFilesAtUpload(storage._client)
+    storage_path = _put_master(storage, 22, "uid-22")
+    _put_activity(storage, "uid-22", two_speaker_gmeet_lines(_origin_ms()))
+    paths = {n: f"recordings/7/22/uid-22/ch{n}/master.webm" for n in range(3)}
+    for n, path in paths.items():
+        storage.put_bytes(VEXA_BUCKET, path, b"ch", "video/webm")
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                22,
+                media_files=[{"type": "audio", "format": "webm"}]
+                + [
+                    {"type": f"ch{n}", "format": "webm", "metadata": _gmeet_channel(n)}
+                    for n in range(3)
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={(22, f"ch{n}"): {"storage_path": paths[n]} for n in range(3)},
+    )
+    deps = _deps(storage, meeting_api, FakeNotetaker())
+
+    assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert storage.seen == [["ch0.wav"], ["ch1.wav"], ["ch2.wav"]]
+    assert len(storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json")) == 3
+
+
 def test_a_channel_without_its_recorder_identity_is_not_exported(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2170,10 +2224,9 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
     storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
     """ch0 is fine; ch1 fails to download, to transcode, to join (a broken
-    wav), or to upload after ch0.wav is uploaded. The mixed export is handed
-    off as usual and `channels/index.json` is never written. Only an upload
-    failure can leave a wav behind, and without an index the worker ignores
-    it."""
+    wav), or to upload. Channels go one at a time, so ch0.wav is already
+    uploaded. The mixed export is handed off as usual and `channels/index.json`
+    is never written; without an index the worker ignores ch0.wav."""
     if failure == "upload":
         storage = _FailingChannelUpload(storage._client)
     storage_path = _put_master(storage, 20, "uid-20")
@@ -2217,8 +2270,9 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
         assert export_meeting(_envelope(), deps).state == "handed_off"
 
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
-    expected_left = [BASE + "channels/ch0.wav"] if failure == "upload" else []
-    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == expected_left
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == [
+        BASE + "channels/ch0.wav"
+    ]
     assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
         "handed_off"
     )

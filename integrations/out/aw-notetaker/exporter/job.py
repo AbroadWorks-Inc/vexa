@@ -41,9 +41,11 @@ row. Every frame that parsed, named or not, is written to
 `speaker_activity_frames.json`, except that a session with channel-tap frames
 (`"src":"channel"`) writes only those. The mixed timeline does not read
 channel-tap frames. A meeting with no channel media gets no index. Every
-channel wav is built locally before any is uploaded, and the index goes last,
-so a channel that fails (fetch, transcode, join) uploads nothing; it is
-logged and the mixed export and `/process` go on as without channels.
+channel's identity is checked before any channel audio is fetched; then one
+channel at a time is fetched, joined, uploaded and deleted locally, and the
+index goes last. A channel that fails is logged, no index is written (a wav
+uploaded before it is ignored without one), and the mixed export and
+`/process` go on as without channels.
 
 `export_meeting` raises on retryable failure — the caller (the durable
 queue) counts attempts and re-runs; `aw-bots` is never modified, so a re-run
@@ -427,6 +429,19 @@ def _join_channel_wav(
     return dst
 
 
+def _fetch_channel_piece(piece: _ChannelPiece, deps: Deps) -> None:
+    """Download one session's `ch<N>` master and transcode it to `piece.wav_path`."""
+    master = deps.meeting_api.master(
+        piece.recording_id, media_type=f"ch{piece.channel}"
+    )
+    webm_path = piece.wav_path.with_suffix(".webm")
+    deps.storage.download_file(
+        deps.settings.vexa_bucket, str(master["storage_path"]), webm_path
+    )
+    deps.transcode(webm_path, piece.wav_path)
+    webm_path.unlink()
+
+
 def _export_channels(
     sessions: list[_Session],
     spans: list[tuple[int, int]],
@@ -435,56 +450,56 @@ def _export_channels(
     deps: Deps,
     vexa_meeting_id: int,
 ) -> None:
-    """Download each `ch<N>` master, pad it onto the meeting clock, and index it.
+    """Download each `ch<N>` master, pad it onto the meeting clock, upload it, and index it.
 
     One file per channel number across sessions. The earliest piece's identity
     is the index row; a later session that names someone else is logged and
-    does not rename the row. Nothing is uploaded until every channel wav is
-    built; `index.json` is uploaded last, so it is never published without
-    all of its wavs.
+    does not rename the row. Every channel's identity is checked before any
+    audio is fetched. Then one channel at a time is fetched, joined, uploaded
+    and deleted, so local disk holds one channel whatever the meeting's length
+    and number of speakers. `index.json` is uploaded last, so it is never
+    published without all of its wavs.
     """
     settings = deps.settings
-    pieces: list[_ChannelPiece] = []
+    by_channel: dict[int, list[_ChannelPiece]] = {}
     for session, (start_ms, _end_ms) in zip(sessions, spans):
-        numbered: list[tuple[int, Mapping[str, Any]]] = []
         for media in session.media_files:
             number = _channel_number(media.get("type"))
-            if number is not None:
-                numbered.append((number, media))
-        for number, media in sorted(numbered, key=lambda item: item[0]):
-            master = deps.meeting_api.master(
-                session.recording_id, media_type=f"ch{number}"
-            )
-            storage_path = str(master["storage_path"])
-            webm_path = tmp / f"ch-{session.recording_id}-{number}.webm"
-            wav_path = tmp / f"ch-{session.recording_id}-{number}.wav"
-            deps.storage.download_file(settings.vexa_bucket, storage_path, webm_path)
-            deps.transcode(webm_path, wav_path)
+            if number is None:
+                continue
             identity = _channel_identity(number, media.get("metadata"))
             offset_ms = _channel_offset_ms(identity, start_ms, session.origin_ms)
-            pieces.append(
+            by_channel.setdefault(number, []).append(
                 _ChannelPiece(
                     channel=number,
                     offset_ms=offset_ms,
-                    wav_path=wav_path,
+                    wav_path=tmp / f"ch-{session.recording_id}-{number}.wav",
                     row=_channel_index_row(number, identity, offset_ms),
                     session_uid=session.session_uid,
                     recording_id=session.recording_id,
                 )
             )
-    if not pieces:
+    if not by_channel:
         return
-    by_channel: dict[int, list[_ChannelPiece]] = {}
-    for piece in pieces:
-        by_channel.setdefault(piece.channel, []).append(piece)
     index: list[dict[str, Any]] = []
-    wavs: list[tuple[int, Path]] = []
     for channel in sorted(by_channel):
         group = sorted(
             by_channel[channel],
             key=lambda piece: (piece.offset_ms, piece.recording_id),
         )
-        wavs.append((channel, _join_channel_wav(group, tmp, vexa_meeting_id)))
+        for piece in group:
+            _fetch_channel_piece(piece, deps)
+        wav_path = _join_channel_wav(group, tmp, vexa_meeting_id)
+        for piece in group:
+            piece.wav_path.unlink()
+        deps.storage.upload_file(
+            wav_path,
+            settings.export_bucket,
+            f"{base}channels/ch{channel}.wav",
+            "audio/wav",
+            retention=AUDIO,
+        )
+        wav_path.unlink()
         kept = group[0].row
         index.append(kept)
         for later in group[1:]:
@@ -498,14 +513,6 @@ def _export_channels(
                     later.row.get("display_name"),
                     kept.get("display_name"),
                 )
-    for channel, wav_path in wavs:
-        deps.storage.upload_file(
-            wav_path,
-            settings.export_bucket,
-            f"{base}channels/ch{channel}.wav",
-            "audio/wav",
-            retention=AUDIO,
-        )
     deps.storage.put_json(
         settings.export_bucket,
         base + "channels/index.json",
