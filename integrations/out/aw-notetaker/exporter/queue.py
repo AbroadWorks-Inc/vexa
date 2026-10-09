@@ -6,7 +6,7 @@ Pending objects live in the VEXA bucket under `aw-exporter/pending/<id>.json`
 "next_attempt_at": epoch seconds float, "last_error": str | None,
 "rerun": bool}`; a restart re-lists that prefix, so an in-flight job always
 resumes. `rerun` (queued by `exporter.rerun`) makes the job export the
-meeting again and hand it to notetaker-worker's /reprocess; a webhook
+meeting again and hand it to notetaker-worker as a rerun; a webhook
 redelivered for the same meeting keeps it. Failed ones
 (>= max_attempts) move to `aw-exporter/failed/<id>.json`. Each queued event
 is recorded under `aw-exporter/events/<event_id>.json` (`meeting_id`,

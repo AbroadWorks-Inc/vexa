@@ -1,11 +1,12 @@
 """Hand-off to the existing notetaker-worker's /process (spec §4.2 step 7).
 
 idempotency_key = meeting_id, so a redelivered webhook or a resumed pending job
-never double-processes a folder. A rerun (`exporter.rerun`) hands the folder to
-/reprocess instead, which skips that gate and redoes the transcript. Retries any httpx.TransportError (connect
-errors and all timeouts — /process is idempotent via idempotency_key, so a
-retry after a timeout is safe) and 5xx (transient); 4xx fails immediately
-(the request itself is wrong, retrying won't help).
+never double-processes a folder. A rerun (`exporter.rerun`) sends `"rerun": true`:
+the worker skips that gate and redoes the transcript. Retries any
+httpx.TransportError (connect errors and all timeouts — /process is idempotent
+via idempotency_key, so a retry after a timeout is safe) and 5xx (transient);
+4xx fails immediately. That includes a rerun's 409 (the meeting's job is still
+running), which the durable queue retries with its backoff.
 """
 
 from __future__ import annotations
@@ -37,18 +38,18 @@ class Notetaker:
     def process(
         self, meeting_id: str, s3_path: str, platform: str, *, rerun: bool = False
     ) -> None:
-        path = "/reprocess" if rerun else "/process"
         body = {
             "meeting_id": meeting_id,
             "s3_path": s3_path,
             "platform": platform,
             "idempotency_key": meeting_id,
+            "rerun": rerun,
         }
         tries = len(_BACKOFF_S) + 1
         for attempt in range(tries):
             try:
                 resp = self._http.post(
-                    f"{self._base_url}{path}", json=body, timeout=_TIMEOUT_S
+                    f"{self._base_url}/process", json=body, timeout=_TIMEOUT_S
                 )
             except httpx.TransportError as exc:
                 if attempt < tries - 1:
