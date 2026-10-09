@@ -320,39 +320,53 @@ def _channel_number(media_type: object) -> int | None:
     return int(rest)
 
 
-def _channel_offset_ms(metadata: object, span_start_ms: int, origin_ms: int) -> int:
-    """Where this channel's recorder sits on the meeting clock.
+class ChannelIdentityMissing(Exception):
+    """A channel reached the exporter without the identity its recorder stamps."""
 
-    The mixed audio of this session was placed at `span_start_ms`. The
-    channel recorder's own start, when the first chunk stored one, is that
-    placement plus how far the recorder started from the session origin.
-    Without that clock the channel sits where the mixed audio sits.
+
+def _channel_identity(channel: int, metadata: object) -> Mapping[str, Any]:
+    """The identity a channel recorder stamps on its first chunk, which
+    meeting-api keeps in the media file's `metadata` (full recording only):
+    the kind (`gmeet`/`jitsi`) and the recorder's start on the epoch clock,
+    plus the stream and the speaker's ids and name when known.
+
+    Without kind and start a channel can be neither named nor placed on the
+    meeting clock, so it raises instead of guessing; the caller then exports
+    the meeting without channels.
     """
     meta = metadata if isinstance(metadata, Mapping) else {}
-    start = meta.get("recorder_start_epoch_ms")
-    if type(start) is int:
-        return span_start_ms + (start - origin_ms)
-    return span_start_ms
+    if meta.get("channel_kind") not in ("gmeet", "jitsi") or (
+        type(meta.get("recorder_start_epoch_ms")) is not int
+    ):
+        raise ChannelIdentityMissing(
+            f"ch{channel} has no channel_kind/recorder_start_epoch_ms in its "
+            f"recording metadata (keys: {sorted(meta)})"
+        )
+    return meta
+
+
+def _channel_offset_ms(
+    identity: Mapping[str, Any], span_start_ms: int, origin_ms: int
+) -> int:
+    """Where this channel's recorder sits on the meeting clock: the session's
+    mixed audio was placed at `span_start_ms`, and the recorder started
+    `recorder_start_epoch_ms - origin_ms` after the session origin (a Jitsi
+    channel starts when its speaker joins)."""
+    return span_start_ms + (int(identity["recorder_start_epoch_ms"]) - origin_ms)
 
 
 def _channel_index_row(
-    channel: int, metadata: object, offset_ms: int
+    channel: int, identity: Mapping[str, Any], offset_ms: int
 ) -> dict[str, Any]:
-    meta = metadata if isinstance(metadata, Mapping) else {}
-    kind = meta.get("channel_kind")
-    if kind not in ("gmeet", "jitsi"):
-        kind = "gmeet"
-    stream_id = meta.get("stream_id")
-    if not isinstance(stream_id, str):
-        stream_id = ""
+    stream_id = identity.get("stream_id")
     row: dict[str, Any] = {
         "channel": channel,
-        "kind": kind,
-        "stream_id": stream_id,
+        "kind": identity["channel_kind"],
+        "stream_id": stream_id if isinstance(stream_id, str) else "",
         "offset_s": round(offset_ms / 1000, 3),
     }
     for key in ("participant_id", "display_name"):
-        value = meta.get(key)
+        value = identity.get(key)
         if isinstance(value, str) and value:
             row[key] = value
     return row
@@ -446,14 +460,14 @@ def _export_channels(
             wav_path = tmp / f"ch-{session.recording_id}-{number}.wav"
             deps.storage.download_file(settings.vexa_bucket, storage_path, webm_path)
             deps.transcode(webm_path, wav_path)
-            metadata = media.get("metadata")
-            offset_ms = _channel_offset_ms(metadata, start_ms, session.origin_ms)
+            identity = _channel_identity(number, media.get("metadata"))
+            offset_ms = _channel_offset_ms(identity, start_ms, session.origin_ms)
             pieces.append(
                 _ChannelPiece(
                     channel=number,
                     offset_ms=offset_ms,
                     wav_path=wav_path,
-                    row=_channel_index_row(number, metadata, offset_ms),
+                    row=_channel_index_row(number, identity, offset_ms),
                     session_uid=session.session_uid,
                     recording_id=session.recording_id,
                 )
@@ -736,6 +750,9 @@ def export_meeting(
         parts = storage_path.split("/")
         owner, session_uid = parts[1], parts[3]
         signal_prefix = f"signal/{owner}/{vexa_meeting_id}/{session_uid}/"
+        # The list keeps only each media file's id, type, format and size;
+        # a channel's identity and recorder clock are in the full recording.
+        full = deps.meeting_api.recording(rec["id"])
         sessions.append(
             _Session(
                 recording_id=rec["id"],
@@ -747,7 +764,7 @@ def export_meeting(
                     settings.vexa_bucket, signal_prefix + ACTIVITY_FILE
                 )
                 is not None,
-                media_files=tuple(rec.get("media_files") or ()),
+                media_files=tuple(full.get("media_files") or ()),
             )
         )
 

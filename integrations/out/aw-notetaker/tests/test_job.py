@@ -67,6 +67,23 @@ def _envelope(**meeting_overrides: Any) -> dict[str, Any]:
     return meeting_event(**meeting_overrides)
 
 
+# meeting-api's GET /recordings keeps only these keys of each media file
+# (meeting_api/recordings/router.py LIST_MEDIA_FILE_KEYS); `metadata` is on
+# GET /recordings/{id} alone. The fake lists the same way, so a test that
+# needs a channel's identity proves the job reads the full recording.
+LIST_MEDIA_FILE_KEYS = ("id", "type", "format", "duration_seconds", "file_size_bytes")
+
+
+def _list_row(recording: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **recording,
+        "media_files": [
+            {k: v for k, v in media.items() if k in LIST_MEDIA_FILE_KEYS}
+            for media in recording.get("media_files", [])
+        ],
+    }
+
+
 class FakeMeetingApi:
     def __init__(
         self,
@@ -92,7 +109,10 @@ class FakeMeetingApi:
         self.list_recordings_calls.append(meeting_id)
         if len(self.recordings) > max_recordings:
             raise TooManyRecordings(meeting_id, max_recordings)
-        return self.recordings
+        return [_list_row(rec) for rec in self.recordings]
+
+    def recording(self, recording_id: int) -> dict[str, Any]:
+        return next(rec for rec in self.recordings if rec["id"] == recording_id)
 
     def master(self, recording_id: int, media_type: str = "audio") -> dict[str, Any]:
         if media_type != "audio":
@@ -1889,9 +1909,9 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Two sessions share ch0. Session B's recorder starts inside A's audio, so
-    that piece is appended and the kept name stays Ada's. ch1 has no recorder
-    clock and sits where B's mixed audio sits, 90 s into the meeting. A `chunk`
-    media file is not a channel."""
+    that piece is appended and the kept name stays Ada's. ch1's recorder
+    started with session B, so it sits where B's mixed audio sits, 90 s into
+    the meeting. A `chunk` media file is not a channel."""
     origin_a = SESSION_A.origin_ms
     origin_b = SESSION_B.origin_ms
     recorder_b = origin_b - 85_000  # places ch0 at 5 s, inside A's 10 s piece
@@ -1951,7 +1971,15 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
                             "ignored": "nope",
                         },
                     },
-                    {"type": "ch1", "format": "webm", "metadata": {}},
+                    {
+                        "type": "ch1",
+                        "format": "webm",
+                        "metadata": {
+                            "recorder_start_epoch_ms": origin_b,
+                            "channel_kind": "jitsi",
+                            "stream_id": "remote-audio-1",
+                        },
+                    },
                 ],
             ),
             recording(
@@ -2028,7 +2056,12 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
             "participant_id": "p-a",
             "display_name": "Ada",
         },
-        {"channel": 1, "kind": "gmeet", "stream_id": "", "offset_s": 90.0},
+        {
+            "channel": 1,
+            "kind": "jitsi",
+            "stream_id": "remote-audio-1",
+            "offset_s": 90.0,
+        },
     ]
     assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == [
         {
@@ -2064,6 +2097,56 @@ def test_channel_audio_is_padded_onto_the_meeting_clock(
 
     assert tag_value(BASE + "channels/ch0.wav") == {"retention-class": "audio"}
     assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
+
+
+def _gmeet_channel(channel: int) -> dict[str, Any]:
+    """The identity a Meet channel recorder stamps on its first chunk."""
+    return {
+        "recorder_start_epoch_ms": _origin_ms(),
+        "channel_kind": "gmeet",
+        "stream_id": f"meet-stream-{channel}",
+    }
+
+
+def test_a_channel_without_its_recorder_identity_is_not_exported(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Meeting 195 (2026-10-09): the channels reached the exporter without
+    channel_kind and recorder clock and were exported as Meet channels at the
+    meeting's start. A channel that cannot be named or placed is not exported:
+    no index, the reason logged, and the mixed export handed off as usual."""
+    storage_path = _put_master(storage, 21, "uid-21")
+    _put_activity(storage, "uid-21", two_speaker_gmeet_lines(_origin_ms()))
+    ch0_path = "recordings/7/21/uid-21/ch0/master.webm"
+    storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                21,
+                media_files=[
+                    {"type": "audio", "format": "webm"},
+                    {
+                        "type": "ch0",
+                        "format": "webm",
+                        "metadata": {"sample_rate": 48000},
+                    },
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={(21, "ch0"): {"storage_path": ch0_path}},
+    )
+    notetaker = FakeNotetaker()
+    deps = _deps(storage, meeting_api, notetaker)
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == []
+    assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+    assert any(
+        "error_class=ChannelIdentityMissing" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 class _FailingChannelUpload(Storage):
@@ -2106,8 +2189,8 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
                 20,
                 media_files=[
                     {"type": "audio", "format": "webm"},
-                    {"type": "ch0", "format": "webm", "metadata": {}},
-                    {"type": "ch1", "format": "webm", "metadata": {}},
+                    {"type": "ch0", "format": "webm", "metadata": _gmeet_channel(0)},
+                    {"type": "ch1", "format": "webm", "metadata": _gmeet_channel(1)},
                 ],
             )
         ],

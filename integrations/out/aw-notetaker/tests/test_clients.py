@@ -243,6 +243,22 @@ def test_notetaker_sends_a_rerun_to_process_with_the_rerun_flag() -> None:
     assert sent == [("/process", False), ("/process", True)]
 
 
+def test_meeting_api_reads_one_recording_in_full() -> None:
+    """The list leaves out each media file's metadata; the detail route has it."""
+    seen: list[str] = []
+    full = {
+        "id": 3,
+        "media_files": [{"type": "ch0", "metadata": {"channel_kind": "jitsi"}}],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url.path)
+        return httpx.Response(200, json=full)
+
+    assert _api(handler).recording(3) == full
+    assert seen == ["/recordings/3"]
+
+
 def test_meeting_api_reads_one_meeting_by_its_id() -> None:
     seen: list[str] = []
 

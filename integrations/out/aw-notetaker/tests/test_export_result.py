@@ -173,6 +173,9 @@ class _MeetingApi:
             }
         ]
 
+    def recording(self, recording_id: int) -> dict[str, Any]:
+        return self.list_recordings(0, 1)[0]
+
     def master(self, recording_id: int) -> dict[str, Any]:
         return {"storage_path": self._storage_path}
 
