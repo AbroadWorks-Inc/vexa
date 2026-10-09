@@ -21,6 +21,12 @@ coverage is missing from the wav (`audio_mismatch`). A re-run of a
 handed-off folder only reports again. `audio_mismatch` is not `handed_off`,
 so a later re-enqueue runs the check again.
 
+A rerun (`rerun=True`, queued by `exporter.rerun`) exports even a handed-off
+folder: every file is written again from what aw-bots holds now, so a file
+an earlier export could not write (a channel whose master timed out) is
+filled in, and the folder goes to notetaker-worker's `/reprocess`, which
+redoes the transcript, instead of the idempotent `/process`.
+
 A meeting can have several bot sessions (a bot failed and a new one joined,
 §6.9 F-K2); each session with audio has its own recording. They make ONE
 folder on one clock: t=0 is the first session's recording origin, each later
@@ -102,6 +108,32 @@ _MISMATCH_MIN_COVERAGE_S = 10.0
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 # A meeting's `speaker_activity` is its worst session's, in this order.
 _ACTIVITY_SEVERITY: tuple[ActivityState, ...] = ("ok", "capped", "invalid", "missing")
+
+
+# The data.meeting fields export_meeting/naming.folder_name need (intake.v1
+# Meeting); a meeting missing any of these is refused before it is queued
+# (webhook intake, rerun) rather than failing (or being quarantined) later.
+_REQUIRED_MEETING_FIELDS = ("id", "platform", "room", "started_at")
+
+
+def not_sent(meeting: Mapping[str, Any]) -> bool:
+    """No bot was ever sent to this meeting: there is nothing to export."""
+    outcome = meeting.get("outcome")
+    return isinstance(outcome, dict) and outcome.get("kind") == "not_sent"
+
+
+def meeting_is_valid(meeting: Mapping[str, Any]) -> bool:
+    """The meeting carries every field the export needs."""
+    for field in _REQUIRED_MEETING_FIELDS:
+        value = meeting.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    upstream_id = meeting.get("upstream_id")
+    return (
+        isinstance(upstream_id, int)
+        and not isinstance(upstream_id, bool)
+        and upstream_id > 0
+    )
 
 
 class NotAV2Meeting(Exception):
@@ -611,7 +643,9 @@ def _speaker_levels(
     return levels
 
 
-def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+def export_meeting(
+    envelope: dict[str, Any], deps: Deps, rerun: bool = False
+) -> ExportResult:
     settings = deps.settings
     storage = deps.storage
     started = deps.now()
@@ -633,7 +667,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
     s3_path = f"s3://{settings.export_bucket}/{base}"
 
     existing = storage.get_json(settings.export_bucket, base + "_export.json")
-    if existing and existing.get("state") == "handed_off":
+    if existing and existing.get("state") == "handed_off" and not rerun:
         deps.export_result.report(meeting_uuid, "handed_off", s3_path)
         return ExportResult("already_done", folder)
 
@@ -918,7 +952,7 @@ def export_meeting(envelope: dict[str, Any], deps: Deps) -> ExportResult:
             deps.export_result.report(meeting_uuid, "failed", s3_path, error)
             return ExportResult("audio_mismatch", folder)
 
-        deps.notetaker.process(meeting_uuid, base, platform)
+        deps.notetaker.process(meeting_uuid, base, platform, rerun=rerun)
 
         finished = deps.now()
         storage.put_json(

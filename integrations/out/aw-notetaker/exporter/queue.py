@@ -3,8 +3,11 @@
 
 Pending objects live in the VEXA bucket under `aw-exporter/pending/<id>.json`
 (`<id>` is the meeting's UUID) as `{"envelope": {...}, "attempts": int,
-"next_attempt_at": epoch seconds float, "last_error": str | None}`; a restart
-re-lists that prefix, so an in-flight job always resumes. Failed ones
+"next_attempt_at": epoch seconds float, "last_error": str | None,
+"rerun": bool}`; a restart re-lists that prefix, so an in-flight job always
+resumes. `rerun` (queued by `exporter.rerun`) makes the job export the
+meeting again and hand it to notetaker-worker's /reprocess; a webhook
+redelivered for the same meeting keeps it. Failed ones
 (>= max_attempts) move to `aw-exporter/failed/<id>.json`. Each queued event
 is recorded under `aw-exporter/events/<event_id>.json` (`meeting_id`,
 `event_type`, `sequence`), so a redelivery of it is recognised
@@ -62,15 +65,16 @@ class PendingQueue:
     def _failed_key(self, meeting_id: str) -> str:
         return f"{_FAILED_PREFIX}{meeting_id}.json"
 
-    def enqueue(self, envelope: dict[str, Any]) -> None:
+    def enqueue(self, envelope: dict[str, Any], *, rerun: bool = False) -> None:
         """Durably enqueue `envelope`. A redelivery of an id already pending
         refreshes the stored envelope only — attempts/next_attempt_at/
         last_error are left alone, so a redelivered webhook never resets an
-        in-progress backoff."""
+        in-progress backoff, and a pending rerun stays a rerun."""
         meeting_id = str(envelope["data"]["meeting"]["id"])
         existing = self.load(meeting_id)
         if existing is not None:
             existing["envelope"] = envelope
+            existing["rerun"] = bool(existing.get("rerun")) or rerun
             self._storage.put_json(
                 self._bucket, self._pending_key(meeting_id), existing
             )
@@ -88,9 +92,10 @@ class PendingQueue:
                 "attempts": 0,
                 "next_attempt_at": 0.0,
                 "last_error": None,
+                "rerun": rerun,
             },
         )
-        logger.info("enqueue: new pending meeting_id=%s", meeting_id)
+        logger.info("enqueue: new pending meeting_id=%s rerun=%s", meeting_id, rerun)
 
     def seen(self, event_id: str) -> bool:
         """True when the event `event_id` was queued before."""
@@ -180,7 +185,7 @@ def _quarantine_marker(
 async def sweep_once(
     queue: PendingQueue,
     deps: Deps,
-    job: Callable[[dict[str, Any], Deps], ExportResult] = export_meeting,
+    job: Callable[[dict[str, Any], Deps, bool], ExportResult] = export_meeting,
     now: Callable[[], float] = time.time,
 ) -> None:
     settings = deps.settings
@@ -196,7 +201,9 @@ async def sweep_once(
             envelope: dict[str, Any] = item["envelope"]
             try:
                 async with semaphore:
-                    await asyncio.to_thread(job, envelope, deps)
+                    await asyncio.to_thread(
+                        job, envelope, deps, bool(item.get("rerun"))
+                    )
             except NotAV2Meeting as exc:
                 attempts = queue.record_failure(
                     meeting_id,

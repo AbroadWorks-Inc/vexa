@@ -488,7 +488,9 @@ def test_the_sweep_backs_off_by_the_setting(storage: Storage) -> None:
     queue = PendingQueue(storage, settings.vexa_bucket)
     queue.enqueue(_envelope())
 
-    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def failing_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         raise RuntimeError("boom")
 
     asyncio.run(
@@ -548,11 +550,34 @@ def test_sweep_once_success_removes_pending(storage: Storage) -> None:
     queue.enqueue(_envelope())
     deps = _deps(storage, settings)
 
-    def fake_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def fake_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         return ExportResult("handed_off", "folder")
 
     asyncio.run(sweep_once(queue, deps, job=fake_job))
 
+    assert queue.pending_ids() == []
+
+
+def test_a_rerun_reaches_the_job_and_a_redelivered_webhook_keeps_it(
+    storage: Storage,
+) -> None:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope(), rerun=True)
+    queue.enqueue(_envelope())
+    seen: list[bool] = []
+
+    def fake_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        seen.append(rerun)
+        return ExportResult("handed_off", "folder")
+
+    asyncio.run(sweep_once(queue, _deps(storage, settings), job=fake_job))
+
+    assert seen == [True]
     assert queue.pending_ids() == []
 
 
@@ -562,7 +587,9 @@ def test_sweep_twice_reaches_max_attempts_and_moves_to_failed(storage: Storage) 
     queue.enqueue(_envelope())
     deps = _deps(storage, settings)
 
-    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def failing_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         raise RuntimeError("boom")
 
     asyncio.run(sweep_once(queue, deps, job=failing_job, now=lambda: 1000.0))
@@ -706,7 +733,9 @@ def test_sweep_once_isolates_per_id_failures(storage: Storage) -> None:
     queue.enqueue(_envelope(id="2", room="bad-meeting"))
     deps = _deps(storage, settings)
 
-    def selective_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def selective_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         if envelope["data"]["meeting"]["id"] == "2":
             raise RuntimeError("boom")
         return ExportResult("handed_off", "folder")
@@ -755,7 +784,9 @@ def test_caplog_shows_job_failure_and_quarantine(
     queue.enqueue(_envelope())
     deps = _deps(storage, settings)
 
-    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def failing_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         raise RuntimeError("boom")
 
     asyncio.run(sweep_once(queue, deps, job=failing_job))
@@ -1003,7 +1034,7 @@ def test_the_export_runs_once_for_a_redelivered_event(storage: Storage) -> None:
     deps = _deps(storage, settings)
     runs: list[str] = []
 
-    def job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def job(envelope: dict[str, Any], deps: Deps, rerun: bool = False) -> ExportResult:
         runs.append(envelope["event_id"])
         return ExportResult("handed_off", FOLDER)
 

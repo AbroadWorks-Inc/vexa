@@ -50,8 +50,25 @@ The subscription carries two events the exporter acts on, and both are exported:
   `handed_off` ends it, so repeated or crossed events (`bot.failed` twice, or `bot.failed` then
   `meeting.completed`) export once.
 
+## Exporting a meeting again (rerun)
+One command, run in the exporter pod; Kubernetes access to the pod is the authority, so the
+exporter opens no endpoint for it:
+
+    kubectl -n aw-bots exec deploy/aw-exporter -- python -m exporter.rerun <meeting-uuid> [...]
+
+Each meeting is read from aw-bots as it is now (`GET /v2/meetings/{id}`, the `tx` scope) and queued
+with `rerun` in the same durable queue, so the running worker exports it with the usual retries,
+backoff and quarantine. A rerun ignores `handed_off`: every file is written again from what aw-bots
+holds now, so one an earlier export could not write (a channel whose master timed out) is filled
+in, and the folder goes to `notetaker-worker`'s `/reprocess`, which archives the previous outputs
+under `runs/<processed_at>/` and redoes the transcript, instead of `/process`. A meeting that has
+not finished, had no bot sent, or never had its bot in the meeting is refused (`refused <id>:
+<why>`, exit code 1) and nothing is queued for it. A webhook redelivered while a rerun is pending
+keeps it a rerun.
+
 ## Through the gateway (design §1.9, §1.10)
-- **Reads.** `GET /recordings`, `GET /recordings/{id}/master` and `GET /transcripts/by-id/{id}` go to
+- **Reads.** `GET /recordings`, `GET /recordings/{id}/master`, `GET /transcripts/by-id/{id}` and,
+  for a rerun, `GET /v2/meetings/{id}` go to
   `GATEWAY_URL` with `X-API-Key: <EXPORTER_API_KEY>`. The key is the `exporter` key (scopes `tx` +
   `export`, Secret `aw-bots-key-exporter`). The gateway checks the scope and tells meeting-api which
   account is calling, so the exporter reads the meetings of its key's account. meeting-api refuses a
