@@ -184,7 +184,9 @@ class _Notetaker:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def process(self, meeting_id: str, s3_path: str, platform: str) -> None:
+    def process(
+        self, meeting_id: str, s3_path: str, platform: str, *, rerun: bool = False
+    ) -> None:
         self.calls.append(meeting_id)
 
 
@@ -306,7 +308,9 @@ def test_a_quarantined_export_reports_failed_with_its_error(storage: Storage) ->
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
 
-    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def failing_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         raise RuntimeError("notetaker 422")
 
     for now in (1000.0, 1e5, 1e6, 1e7, 1e8):
@@ -330,7 +334,9 @@ def test_a_failed_report_that_is_not_accepted_still_quarantines(
     queue = PendingQueue(storage, VEXA_BUCKET)
     queue.enqueue(_envelope())
 
-    def failing_job(envelope: dict[str, Any], deps: Deps) -> ExportResult:
+    def failing_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
         raise RuntimeError("boom")
 
     caplog.set_level(logging.INFO, logger="exporter")

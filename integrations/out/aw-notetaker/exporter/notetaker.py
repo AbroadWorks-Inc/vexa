@@ -1,7 +1,8 @@
 """Hand-off to the existing notetaker-worker's /process (spec §4.2 step 7).
 
 idempotency_key = meeting_id, so a redelivered webhook or a resumed pending job
-never double-processes a folder. Retries any httpx.TransportError (connect
+never double-processes a folder. A rerun (`exporter.rerun`) hands the folder to
+/reprocess instead, which skips that gate and redoes the transcript. Retries any httpx.TransportError (connect
 errors and all timeouts — /process is idempotent via idempotency_key, so a
 retry after a timeout is safe) and 5xx (transient); 4xx fails immediately
 (the request itself is wrong, retrying won't help).
@@ -33,7 +34,10 @@ class Notetaker:
         self._http = http
         self._sleep = sleep
 
-    def process(self, meeting_id: str, s3_path: str, platform: str) -> None:
+    def process(
+        self, meeting_id: str, s3_path: str, platform: str, *, rerun: bool = False
+    ) -> None:
+        path = "/reprocess" if rerun else "/process"
         body = {
             "meeting_id": meeting_id,
             "s3_path": s3_path,
@@ -44,7 +48,7 @@ class Notetaker:
         for attempt in range(tries):
             try:
                 resp = self._http.post(
-                    f"{self._base_url}/process", json=body, timeout=_TIMEOUT_S
+                    f"{self._base_url}{path}", json=body, timeout=_TIMEOUT_S
                 )
             except httpx.TransportError as exc:
                 if attempt < tries - 1:

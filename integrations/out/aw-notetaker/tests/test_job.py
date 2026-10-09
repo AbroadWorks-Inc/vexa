@@ -126,13 +126,19 @@ class FakeExportResult:
 class FakeNotetaker:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
+        self.reruns: list[bool] = []
 
-    def process(self, meeting_id: str, s3_path: str, platform: str) -> None:
+    def process(
+        self, meeting_id: str, s3_path: str, platform: str, *, rerun: bool = False
+    ) -> None:
         self.calls.append((meeting_id, s3_path, platform))
+        self.reruns.append(rerun)
 
 
 class RaisingNotetaker:
-    def process(self, meeting_id: str, s3_path: str, platform: str) -> None:
+    def process(
+        self, meeting_id: str, s3_path: str, platform: str, *, rerun: bool = False
+    ) -> None:
         raise RuntimeError("boom")
 
 
@@ -463,6 +469,38 @@ def test_rerun_after_success_is_already_done_and_does_not_reprocess(
     assert second == ExportResult("already_done", FOLDER)
     assert meeting_api2.list_recordings_calls == []
     assert notetaker2.calls == []
+
+
+def test_a_rerun_exports_a_handed_off_folder_again_and_hands_it_to_reprocess(
+    storage: Storage,
+) -> None:
+    storage_path = "recordings/7/855958819514/01ba075a-test/audio/master.webm"
+    storage.put_bytes(VEXA_BUCKET, storage_path, b"webm-bytes", "video/webm")
+    first = FakeNotetaker()
+    export_meeting(
+        _envelope(),
+        _deps(
+            storage,
+            FakeMeetingApi(
+                recordings=[_audio_recording(855958819514)],
+                master={"storage_path": storage_path},
+            ),
+            first,
+        ),
+    )
+    storage.delete(EXPORT_BUCKET, f"recordings/{FOLDER}/audio.wav")
+
+    meeting_api = FakeMeetingApi(
+        recordings=[_audio_recording(855958819514)],
+        master={"storage_path": storage_path},
+    )
+    rerun = FakeNotetaker()
+    result = export_meeting(_envelope(), _deps(storage, meeting_api, rerun), True)
+
+    assert result == ExportResult("handed_off", FOLDER)
+    assert meeting_api.list_recordings_calls != []
+    assert storage.size(EXPORT_BUCKET, f"recordings/{FOLDER}/audio.wav") is not None
+    assert (first.reruns, rerun.reruns) == ([False], [True])
 
 
 def test_no_audio_recording_marks_no_audio_and_does_not_process(

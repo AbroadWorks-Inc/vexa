@@ -30,47 +30,23 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from exporter import signature
 from exporter.config import Settings
-from exporter.job import Deps
+from exporter.job import Deps, meeting_is_valid, not_sent
 from exporter.queue import PendingQueue, run_worker
 
 logger = logging.getLogger("exporter")
-
-# The data.meeting fields export_meeting/naming.folder_name need (intake.v1
-# Meeting); an envelope missing any of these is rejected at intake rather than
-# being durably enqueued and failing (or being quarantined) later.
-_REQUIRED_MEETING_FIELDS = ("id", "platform", "room", "started_at")
 
 # webhook.v1 MeetingEvent.event_id; it names the event's marker object.
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{64}$")
 
 _EXPORTED_EVENTS = frozenset({"meeting.completed", "bot.failed"})
-
-
-def _not_sent(meeting: Mapping[str, Any]) -> bool:
-    outcome = meeting.get("outcome")
-    return isinstance(outcome, dict) and outcome.get("kind") == "not_sent"
-
-
-def _meeting_is_valid(meeting: Mapping[str, Any]) -> bool:
-    for field in _REQUIRED_MEETING_FIELDS:
-        value = meeting.get(field)
-        if not isinstance(value, str) or not value.strip():
-            return False
-    upstream_id = meeting.get("upstream_id")
-    return (
-        isinstance(upstream_id, int)
-        and not isinstance(upstream_id, bool)
-        and upstream_id > 0
-    )
 
 
 def create_app(
@@ -117,7 +93,7 @@ def create_app(
             return JSONResponse({"status": "ignored"})
         data = envelope.get("data")
         meeting = data.get("meeting") if isinstance(data, dict) else None
-        if isinstance(meeting, dict) and _not_sent(meeting):
+        if isinstance(meeting, dict) and not_sent(meeting):
             logger.info(
                 "not_sent_ignored meeting_id=%s event_type=%s; no bot was sent",
                 meeting.get("id"),
@@ -138,7 +114,7 @@ def create_app(
         if (
             isinstance(meeting, dict)
             and not meeting.get("started_at")
-            and _meeting_is_valid({**meeting, "started_at": "-"})
+            and meeting_is_valid({**meeting, "started_at": "-"})
         ):
             # meeting.completed of a bot that was never in the meeting (e.g.
             # stopped in the lobby): nothing to export, and no delivery fault,
@@ -150,7 +126,7 @@ def create_app(
                 meeting.get("id"),
             )
             return JSONResponse({"status": "ignored"})
-        if not isinstance(meeting, dict) or not _meeting_is_valid(meeting):
+        if not isinstance(meeting, dict) or not meeting_is_valid(meeting):
             logger.warning("webhook rejected: invalid or incomplete data.meeting")
             raise HTTPException(status_code=400, detail="invalid data.meeting")
         event_id = envelope.get("event_id")

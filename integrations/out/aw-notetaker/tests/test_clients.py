@@ -229,6 +229,30 @@ def test_notetaker_body_and_retry_on_5xx() -> None:
     }
 
 
+def test_notetaker_hands_a_rerun_to_reprocess() -> None:
+    paths: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        paths.append(req.url.path)
+        return httpx.Response(200, json={"status": "accepted"})
+
+    nt = Notetaker("http://n", httpx.Client(transport=httpx.MockTransport(handler)))
+    nt.process("vexa-1", "recordings/x/", "google_meet")
+    nt.process("vexa-1", "recordings/x/", "google_meet", rerun=True)
+    assert paths == ["/process", "/reprocess"]
+
+
+def test_meeting_api_reads_one_meeting_by_its_id() -> None:
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url.path)
+        return httpx.Response(200, json={"id": "m-1", "status": "completed"})
+
+    assert _api(handler).meeting("m-1") == {"id": "m-1", "status": "completed"}
+    assert seen == ["/v2/meetings/m-1"]
+
+
 def test_notetaker_4xx_not_retried() -> None:
     n = {"c": 0}
 

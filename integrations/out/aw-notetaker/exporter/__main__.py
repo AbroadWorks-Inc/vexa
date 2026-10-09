@@ -22,13 +22,12 @@ from exporter.storage import Storage
 from exporter.vexa_client import MeetingApi
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    settings = Settings.from_env(os.environ)
+def build_deps(settings: Settings) -> Deps:
+    """The production dependencies, shared by the server and `exporter.rerun`."""
     s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION"))
     storage = Storage(s3_client)
     http_client = httpx.Client(timeout=30)
-    deps = Deps(
+    return Deps(
         settings=settings,
         storage=storage,
         meeting_api=MeetingApi(
@@ -42,7 +41,13 @@ def main() -> None:
         now=lambda: datetime.now(timezone.utc),
         join_webm=join_webm,
     )
-    queue = PendingQueue(storage, settings.vexa_bucket)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    settings = Settings.from_env(os.environ)
+    deps = build_deps(settings)
+    queue = PendingQueue(deps.storage, settings.vexa_bucket)
     app = create_app(settings, queue, deps)
     uvicorn.run(app, host="0.0.0.0", port=8080)
 
