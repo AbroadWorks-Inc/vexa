@@ -804,3 +804,162 @@ def test_a_persisted_path_outside_the_owners_namespace_is_never_deleted():
 
     assert mine in keys
     assert theirs not in keys, "a foreign-owner path must never enter the delete set"
+
+
+# ── streamed master: bounded parallel reads, written in parts ────────────────────────────────────
+
+
+class _ReadTrackingStorage(InMemoryStorage):
+    """Counts chunk reads in flight (each read yields the loop) and how many reads had started when
+    the master's first piece reached ``upload_stream``."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.reads_started = 0
+        self.reads_started_at_first_piece = None
+
+    async def get(self, key: str) -> bytes:
+        import asyncio
+
+        if "/master." not in key:
+            self.reads_started += 1
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            await asyncio.sleep(0)
+            self.in_flight -= 1
+        return await super().get(key)
+
+    async def upload_stream(self, key, pieces, *, content_type):
+        async def watched():
+            async for piece in pieces:
+                if self.reads_started_at_first_piece is None:
+                    self.reads_started_at_first_piece = self.reads_started
+                yield piece
+
+        await super().upload_stream(key, watched(), content_type=content_type)
+
+
+async def _upload_counting_parts(repo, storage, count):
+    rid = None
+    for seq in range(count):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=_counting_wav(seq), media_format="wav", chunk_seq=seq, is_final=False,
+        )
+        rid = receipt["recording_id"]
+    return rid
+
+
+async def test_finalize_reads_chunks_in_parallel_up_to_the_window_and_keeps_their_order():
+    from meeting_api.recordings.service import MASTER_READ_WINDOW
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = _ReadTrackingStorage()
+    parts = 5 * MASTER_READ_WINDOW
+    rid = await _upload_counting_parts(repo, storage, parts)
+
+    master_key = await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
+
+    assert storage.max_in_flight == MASTER_READ_WINDOW
+    assert storage.blobs[master_key] == build_recording_master(
+        [_counting_wav(seq) for seq in range(parts)], "wav"
+    )
+
+
+async def test_finalize_streams_the_master_before_every_chunk_is_read():
+    from meeting_api.recordings.service import MASTER_READ_WINDOW
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = _ReadTrackingStorage()
+    parts = 5 * MASTER_READ_WINDOW
+    rid = await _upload_counting_parts(repo, storage, parts)
+
+    await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
+
+    assert storage.reads_started_at_first_piece <= MASTER_READ_WINDOW + 1 < parts
+
+
+class _MultipartS3Client:
+    """A stub boto3 S3 client that records single and multipart writes; ``fail_part`` makes that
+    part number raise."""
+
+    def __init__(self, fail_part=None):
+        self.fail_part = fail_part
+        self.calls: list[str] = []
+        self.parts: list[tuple[int, int]] = []
+        self.completed_parts = None
+        self.put_body = None
+
+    def put_object(self, **kw):
+        self.calls.append("put_object")
+        self.put_body = kw["Body"]
+        return {}
+
+    def create_multipart_upload(self, **kw):
+        self.calls.append("create_multipart_upload")
+        return {"UploadId": "up-1"}
+
+    def upload_part(self, **kw):
+        self.calls.append("upload_part")
+        if kw["PartNumber"] == self.fail_part:
+            raise RuntimeError("part upload failed")
+        self.parts.append((kw["PartNumber"], len(kw["Body"])))
+        return {"ETag": f"etag-{kw['PartNumber']}"}
+
+    def complete_multipart_upload(self, **kw):
+        self.calls.append("complete_multipart_upload")
+        self.completed_parts = kw["MultipartUpload"]["Parts"]
+        return {}
+
+    def abort_multipart_upload(self, **kw):
+        self.calls.append("abort_multipart_upload")
+        return {}
+
+
+def _s3_over(client):
+    from meeting_api.recordings.adapters import S3Storage
+
+    class _Stub(S3Storage):
+        def _c(self):
+            return client
+
+    return _Stub(bucket="b")
+
+
+async def _mib_pieces(count):
+    for _ in range(count):
+        yield b"\x01" * (1024 * 1024)
+
+
+async def test_s3_upload_stream_below_one_part_is_a_single_put():
+    client = _MultipartS3Client()
+    await _s3_over(client).upload_stream("k", _mib_pieces(3), content_type="video/webm")
+    assert client.calls == ["put_object"]
+    assert len(client.put_body) == 3 * 1024 * 1024
+
+
+async def test_s3_upload_stream_writes_ordered_parts_of_the_part_size_and_a_short_last_one():
+    from meeting_api.recordings.adapters import MULTIPART_PART_BYTES
+
+    client = _MultipartS3Client()
+    await _s3_over(client).upload_stream("k", _mib_pieces(20), content_type="video/webm")
+    mib = 1024 * 1024
+    assert client.parts == [(1, MULTIPART_PART_BYTES), (2, MULTIPART_PART_BYTES), (3, 20 * mib - 2 * MULTIPART_PART_BYTES)]
+    assert client.completed_parts == [
+        {"ETag": "etag-1", "PartNumber": 1},
+        {"ETag": "etag-2", "PartNumber": 2},
+        {"ETag": "etag-3", "PartNumber": 3},
+    ]
+    assert "put_object" not in client.calls
+
+
+async def test_s3_upload_stream_aborts_the_multipart_upload_when_a_part_fails():
+    client = _MultipartS3Client(fail_part=2)
+    with pytest.raises(RuntimeError, match="part upload failed"):
+        await _s3_over(client).upload_stream("k", _mib_pieces(20), content_type="video/webm")
+    assert client.calls[-1] == "abort_multipart_upload"
+    assert "complete_multipart_upload" not in client.calls

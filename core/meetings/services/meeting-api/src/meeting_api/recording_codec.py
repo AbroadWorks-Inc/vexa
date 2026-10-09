@@ -20,6 +20,10 @@ two cores: ``test_recording_golden.py`` (here) and ``golden.test.ts`` (there) bo
 read the SAME vectors and must reproduce them byte-for-byte. Change a builder here
 -> mirror it there, and vice-versa.
 
+Python only: ``MasterWriter`` holds both layouts and the builders are it run over a
+list, so meeting-api can stream a master chunk by chunk (``recordings.finalize_master``)
+and still write exactly the bytes the goldens pin.
+
 Two strategies, dispatched on the wire's recording.v1 ``format``:
 
 * **webm** — BYTE-CONCAT in seq order. The MediaRecorder stream emits a
@@ -34,7 +38,7 @@ from __future__ import annotations
 
 import io
 import struct
-from typing import List, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 # WAV / RIFF container magic: "RIFF" then size (4) then "WAVE".
 _WAV_MAGIC = b"RIFF"
@@ -69,6 +73,83 @@ def _parse_wav_header(buf: bytes) -> Tuple[bytes, int]:
     return fmt_chunk_bytes, declared_data_size
 
 
+def _wav_master_header(fmt_chunk: bytes, total_data: int) -> bytes:
+    """The one master header: ``RIFF<36+total_data>WAVE fmt <16><fmt-chunk>data<total_data>``."""
+    out = io.BytesIO()
+    out.write(_WAV_MAGIC)                          # 0..3   "RIFF"
+    out.write(struct.pack("<I", 36 + total_data))  # 4..7   RIFF size = header(36) + data
+    out.write(_WAV_FORMAT)                         # 8..11  "WAVE"
+    out.write(b"fmt ")                             # 12..15 "fmt "
+    out.write(struct.pack("<I", 16))               # 16..19 fmt chunk size = 16
+    out.write(fmt_chunk)                           # 20..35 16-byte fmt body
+    out.write(b"data")                             # 36..39 "data"
+    out.write(struct.pack("<I", total_data))       # 40..43 data chunk size
+    return out.getvalue()
+
+
+class MasterWriter:
+    """The master, one ALREADY-ordered chunk at a time — the single home of both layouts.
+
+    ``add(chunk)`` returns the master bytes that chunk contributes; ``finish()`` checks the
+    whole once every chunk was added. Joining every ``add`` IS the master the builders below
+    return, so a caller can stream a master of any length without holding it.
+
+    * **webm** — each chunk as-is (byte-concat).
+    * **wav** — the empty final chunk adds nothing; every other chunk adds its PCM payload,
+      and the first one is preceded by the master header. That header carries the total PCM
+      length, so the writer takes every chunk's byte size up front, and ``finish`` raises if
+      the chunks did not hold exactly that much.
+    """
+
+    def __init__(self, media_format: str, chunk_sizes: Sequence[int]):
+        self._wav = (media_format or "").lower() == "wav"
+        self._total_data = sum(
+            size - _WAV_HEADER_BYTES for size in chunk_sizes if size >= _WAV_HEADER_BYTES
+        )
+        self._fmt_chunk: Optional[bytes] = None
+        self._chunks = 0
+        self._wav_chunks = 0
+        self._data_written = 0
+
+    def add(self, chunk: bytes) -> bytes:
+        self._chunks += 1
+        if not self._wav:
+            return chunk
+        if len(chunk) < _WAV_HEADER_BYTES:  # the empty final chunk
+            return b""
+        fmt_chunk, _ = _parse_wav_header(chunk)
+        header = b""
+        if self._fmt_chunk is None:
+            self._fmt_chunk = fmt_chunk
+            header = _wav_master_header(fmt_chunk, self._total_data)
+        elif fmt_chunk != self._fmt_chunk:
+            raise ValueError(f"WAV fmt chunk mismatch at chunk index {self._wav_chunks}")
+        self._wav_chunks += 1
+        payload = chunk[_WAV_HEADER_BYTES:]
+        self._data_written += len(payload)
+        return header + payload
+
+    def finish(self) -> None:
+        if not self._wav:
+            if not self._chunks:
+                raise ValueError("_build_webm_master requires at least one chunk")
+            return
+        if self._fmt_chunk is None:
+            raise ValueError("_build_wav_master requires at least one non-empty chunk")
+        if self._data_written != self._total_data:
+            raise ValueError(
+                f"WAV chunks held {self._data_written} PCM bytes; their sizes declared "
+                f"{self._total_data}"
+            )
+
+
+def _write_master(media_format: str, chunks: Sequence[bytes]) -> bytes:
+    writer = MasterWriter(media_format, [len(c) for c in chunks])
+    master = b"".join([writer.add(c) for c in chunks])
+    writer.finish()
+    return master
+
+
 def _build_wav_master(chunks: Sequence[bytes]) -> bytes:
     """RIFF-aware merge (mirrors ``buildWavMaster``).
 
@@ -80,31 +161,7 @@ def _build_wav_master(chunks: Sequence[bytes]) -> bytes:
     The ``fmt`` body is copied verbatim from the FIRST non-empty chunk; every chunk
     must declare the same ``fmt`` (mismatch -> raise).
     """
-    real = [c for c in chunks if len(c) >= _WAV_HEADER_BYTES]  # skip the empty final chunk
-    if not real:
-        raise ValueError("_build_wav_master requires at least one non-empty chunk")
-
-    fmt_chunk, _ = _parse_wav_header(real[0])
-    payloads: List[bytes] = []
-    for i, c in enumerate(real):
-        c_fmt, _ = _parse_wav_header(c)
-        if c_fmt != fmt_chunk:
-            raise ValueError(f"WAV fmt chunk mismatch at chunk index {i}")
-        payloads.append(c[_WAV_HEADER_BYTES:])
-
-    total_data = sum(len(p) for p in payloads)
-    out = io.BytesIO()
-    out.write(_WAV_MAGIC)                          # 0..3   "RIFF"
-    out.write(struct.pack("<I", 36 + total_data))  # 4..7   RIFF size = header(36) + data
-    out.write(_WAV_FORMAT)                         # 8..11  "WAVE"
-    out.write(b"fmt ")                             # 12..15 "fmt "
-    out.write(struct.pack("<I", 16))               # 16..19 fmt chunk size = 16
-    out.write(fmt_chunk)                           # 20..35 16-byte fmt body
-    out.write(b"data")                             # 36..39 "data"
-    out.write(struct.pack("<I", total_data))       # 40..43 data chunk size
-    for p in payloads:
-        out.write(p)
-    return out.getvalue()
+    return _write_master("wav", chunks)
 
 
 def _build_webm_master(chunks: Sequence[bytes]) -> bytes:
@@ -112,9 +169,7 @@ def _build_webm_master(chunks: Sequence[bytes]) -> bytes:
 
     The empty final chunk concatenates as a no-op.
     """
-    if not chunks:
-        raise ValueError("_build_webm_master requires at least one chunk")
-    return b"".join(chunks)
+    return _write_master("webm", chunks)
 
 
 def _build_recording_master(media_format: str, chunks: Sequence[bytes]) -> bytes:
@@ -122,9 +177,7 @@ def _build_recording_master(media_format: str, chunks: Sequence[bytes]) -> bytes
     ``buildRecordingMaster``. ``wav`` -> RIFF header-merge; anything else
     (i.e. ``webm``) -> byte-concat. Pure: ALREADY-ordered chunks -> master bytes.
     """
-    if (media_format or "").lower() == "wav":
-        return _build_wav_master(chunks)
-    return _build_webm_master(chunks)
+    return _write_master(media_format, chunks)
 
 
 def build_recording_master(chunks: Sequence[bytes], media_format: str) -> bytes:

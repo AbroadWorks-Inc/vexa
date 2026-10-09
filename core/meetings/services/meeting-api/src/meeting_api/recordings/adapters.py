@@ -10,8 +10,13 @@ image-only because constructing ``S3Storage`` does not open a client.
 """
 from __future__ import annotations
 
+import builtins
 import os
-from typing import Optional
+from typing import AsyncIterator, Optional
+
+# Every multipart part but the last must be at least 5 MiB (S3 and MinIO). 8 MiB keeps a
+# streamed master's buffer small and its part count far below the 10,000-part limit.
+MULTIPART_PART_BYTES = 8 * 1024 * 1024
 
 
 class S3Storage:
@@ -46,6 +51,53 @@ class S3Storage:
 
     async def upload(self, key: str, data: bytes, *, content_type: str) -> None:
         await self._run(self._c().put_object, Bucket=self._bucket, Key=key, Body=data, ContentType=content_type)
+
+    async def upload_stream(
+        self, key: str, pieces: AsyncIterator[bytes], *, content_type: str
+    ) -> None:
+        """Buffer ``pieces`` into ``MULTIPART_PART_BYTES`` parts. An object that never fills one
+        part is a single ``put_object``; a larger one is a multipart upload, aborted on any failure
+        so S3 neither publishes a partial object nor keeps the parts."""
+        buffer = bytearray()
+        upload_id: Optional[str] = None
+        parts: list[dict] = []
+        try:
+            async for piece in pieces:
+                buffer += piece
+                if len(buffer) < MULTIPART_PART_BYTES:
+                    continue
+                if upload_id is None:
+                    created = await self._run(
+                        self._c().create_multipart_upload,
+                        Bucket=self._bucket, Key=key, ContentType=content_type,
+                    )
+                    upload_id = created["UploadId"]
+                parts.append(await self._upload_part(key, upload_id, len(parts) + 1, bytes(buffer)))
+                buffer.clear()
+            if upload_id is None:
+                await self.upload(key, bytes(buffer), content_type=content_type)
+                return
+            if buffer:
+                parts.append(await self._upload_part(key, upload_id, len(parts) + 1, bytes(buffer)))
+            await self._run(
+                self._c().complete_multipart_upload,
+                Bucket=self._bucket, Key=key, UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        except BaseException:
+            if upload_id is not None:
+                await self._run(
+                    self._c().abort_multipart_upload,
+                    Bucket=self._bucket, Key=key, UploadId=upload_id,
+                )
+            raise
+
+    async def _upload_part(self, key: str, upload_id: str, number: int, data: bytes) -> dict:
+        part = await self._run(
+            self._c().upload_part,
+            Bucket=self._bucket, Key=key, UploadId=upload_id, PartNumber=number, Body=data,
+        )
+        return {"ETag": part["ETag"], "PartNumber": number}
 
     async def list(self, prefix: str) -> list[str]:
         # S3 (and every S3-compatible backend) caps a single list_objects_v2 response at 1000 keys and
@@ -94,7 +146,7 @@ class S3Storage:
         except ClientError:
             return False
 
-    async def list_detailed(self, prefix: str) -> list[dict]:
+    async def list_detailed(self, prefix: str) -> builtins.list[dict]:
         """Key + Size + LastModified per object, paginated to exhaustion like ``list``.
 
         Size and LastModified ride the SAME response as the keys, so the janitor's whole sweep costs

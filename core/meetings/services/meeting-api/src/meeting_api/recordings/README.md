@@ -4,8 +4,15 @@ Ported from the parent `recordings.internal_upload_recording` + `recording_final
 `recording_jsonb`. The bot streams recording chunks (authenticated by the MeetingToken it carries);
 each chunk lands in object storage and is folded into the recording's JSONB payload under
 `meeting.data['recordings']` — there is **NO separate recordings table**. Finalize concatenates a
-recording's chunks into a master via the golden-locked `build_recording_master` codec (recording.v1)
-and stamps the JSONB media-file.
+recording's chunks into a master via the golden-locked codec (recording.v1) and stamps the JSONB
+media-file.
+
+Finalize streams the master: it reads the chunks `MASTER_READ_WINDOW` (8) at a time, in key order,
+passes each through `MasterWriter` (the codec, one chunk at a time, byte-identical to
+`build_recording_master`), and writes the result with `Storage.upload_stream` — one `put_object`
+below 8 MiB, a multipart upload in 8 MiB parts above it, aborted on any failure. Time and memory
+therefore stay flat for any meeting length: a 2-hour, 450-chunk, 77.5 MB track builds in ~3 s
+(38 s when read one chunk at a time) with the process at ~85 MB.
 
 ## Front door
 - `build_router(repo, storage)` — the mountable routes (the unified app mounts them): POST

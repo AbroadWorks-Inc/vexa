@@ -6,20 +6,26 @@ Port of the parent ``recordings.internal_upload_recording`` + ``recording_finali
     ``session_uid``, upload the chunk to object storage, fold it into the recording's JSONB payload
     (``jsonb.apply_chunk_to_recording``) under a read-modify-write on ``meeting.data['recordings']``,
     and return the upload receipt.
-  * ``finalize_master(...)`` — concatenate a recording media-file's chunks into a master via the
-    golden-locked ``build_recording_master`` codec, upload the master, and stamp the JSONB media-file
-    (``storage_path`` → master key, ``finalized_by``, ``is_final``, ``playback_url``).
+  * ``finalize_master(...)`` — stream a recording media-file's chunks through the golden-locked
+    codec (``MasterWriter``) into the master object, and stamp the JSONB media-file
+    (``storage_path`` → master key, ``finalized_by``, ``is_final``, ``playback_url``). Chunks are
+    read ``MASTER_READ_WINDOW`` at a time and the master is written in parts, so time and memory
+    stay flat however long the meeting ran.
 
 The codec itself (``meeting_api.build_recording_master``, recording.v1) is already ported +
 golden-locked — this module only orchestrates the IO + the JSONB bookkeeping around it.
 """
 from __future__ import annotations
 
+import asyncio
+from collections import deque
+from contextlib import aclosing
 from datetime import datetime, timezone
-from typing import Any, Optional
+from itertools import islice
+from typing import Any, AsyncGenerator, Optional, Sequence
 
 from ..obs import log_event
-from ..recording_codec import build_recording_master
+from ..recording_codec import MasterWriter
 from .jsonb import (
     SIGNAL_TAPE_PARTS,
     SIGNAL_TAPE_PART_FORMATS,
@@ -34,6 +40,11 @@ from .ports import RecordingRepo, Storage
 # Media content types (parent ``recording_codec._media_content_type``, reduced to the core set).
 _CONTENT_TYPES = {"webm": "video/webm", "wav": "audio/wav", "jsonl": "application/x-ndjson",
                   "txt": "text/plain; charset=utf-8"}
+
+# Chunk reads in flight while a master is assembled. A 2-hour track is ~480 chunks; read one at a
+# time it took 38 s (past the gateway's 30 s), 8 at a time 2.4 s, 16 at a time 1.7 s. 8 leaves the
+# storage thread pool free for the live chunk uploads.
+MASTER_READ_WINDOW = 8
 
 # The ``media_type`` that means "a captured-signal tape, not playable media" (O-TEL-1).
 SIGNAL_MEDIA_TYPE = "signal"
@@ -210,6 +221,34 @@ async def upload_signal_tape(
             "meeting_id": meeting_id, "part": part}
 
 
+async def _read_in_order(
+    storage: Storage, keys: Sequence[str], window: int
+) -> AsyncGenerator[bytes, None]:
+    """``storage.get`` of every key, yielded in key order, with at most ``window`` reads in flight."""
+    upcoming = iter(keys)
+    reads = deque(asyncio.create_task(storage.get(k)) for k in islice(upcoming, window))
+    try:
+        while reads:
+            data = await reads.popleft()
+            reads.extend(asyncio.create_task(storage.get(k)) for k in islice(upcoming, 1))
+            yield data
+    finally:
+        for read in reads:
+            read.cancel()
+        await asyncio.gather(*reads, return_exceptions=True)
+
+
+async def _master_pieces(
+    storage: Storage, chunk_objects: Sequence[dict], media_format: str
+) -> AsyncGenerator[bytes, None]:
+    """The master's bytes, chunk by chunk: memory holds the reads in flight, never the master."""
+    writer = MasterWriter(media_format, [o["size"] for o in chunk_objects])
+    keys = [o["key"] for o in chunk_objects]
+    async for chunk in _read_in_order(storage, keys, MASTER_READ_WINDOW):
+        yield writer.add(chunk)
+    writer.finish()
+
+
 async def finalize_master(
     repo: RecordingRepo,
     storage: Storage,
@@ -245,10 +284,12 @@ async def finalize_master(
     # `.../audio` also matches `.../audio<anything>/`. The trailing slash keeps
     # a sibling media type out of this master.
     prefix = mf["storage_path"].rsplit("/", 1)[0] + "/"
-    keys = sorted(
-        k for k in await storage.list(prefix) if not k.rsplit("/", 1)[-1].startswith("master.")
+    chunk_objects = sorted(
+        (o for o in await storage.list_detailed(prefix)
+         if not o["key"].rsplit("/", 1)[-1].startswith("master.")),
+        key=lambda o: o["key"],
     )
-    listed_count = len(keys)
+    listed_count = len(chunk_objects)
     assembled_count = mf.get("assembled_chunk_count")
 
     # Loud guard (#769): the number of chunks we're about to assemble vs what the JSONB fold counted.
@@ -277,9 +318,10 @@ async def finalize_master(
                 fields={"recording_id": recording_id, "media_type": media_type,
                         "prior_assembled_count": assembled_count, "new_count": listed_count},
             )
-        chunks = [await storage.get(k) for k in keys]
-        master_bytes = build_recording_master(chunks, media_format)
-        await storage.upload(master_key, master_bytes, content_type=_content_type(media_format))
+        async with aclosing(_master_pieces(storage, chunk_objects, media_format)) as pieces:
+            await storage.upload_stream(
+                master_key, pieces, content_type=_content_type(media_format)
+            )
 
     # G3 — stamp the media-file finalized ATOMICALLY (read→modify→write under one row lock), so a late
     # concurrent chunk upload can't clobber the finalized master pointer (the master bytes are already
