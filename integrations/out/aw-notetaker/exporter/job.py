@@ -35,15 +35,19 @@ session sits at its own origin's offset from it, and the gaps are silence.
 One session is exported from its recording as it stands.
 
 A recording may also carry per-channel media (`ch0`, `ch1`, ...). Each
-channel master is placed on that same meeting clock, leading silence
-included, and written as `channels/ch<N>.wav` with one `channels/index.json`
-row. Every frame that parsed, named or not, is written to
-`speaker_activity_frames.json`, except that a session with channel-tap frames
-(`"src":"channel"`) writes only those. The mixed timeline does not read
-channel-tap frames. A meeting with no channel media gets no index. Every
-channel wav is built locally before any is uploaded, and the index goes last,
-so a channel that fails (fetch, transcode, join) uploads nothing; it is
-logged and the mixed export and `/process` go on as without channels.
+channel is written as its recorder made it, opus `channels/ch<N>.webm`, with
+one `channels/index.json` row naming the `file` and its `offset_s` on the
+meeting clock; nothing is decoded or padded (a 2-hour, 19-speaker meeting's
+channels are ~270 MB as opus and would be ~3.5 GB as 16 kHz wav). One bot
+session's channel is an S3 copy of its master; a channel several sessions
+recorded is joined into one opus file, one channel at a time. Every frame
+that parsed, named or not, is written to `speaker_activity_frames.json`,
+except that a session with channel-tap frames (`"src":"channel"`) writes only
+those. The mixed timeline does not read channel-tap frames. A meeting with no
+channel media gets no index. The index goes last, so a channel that fails
+(fetch, copy, join) writes no index; it is logged and the mixed export and
+`/process` go on as without channels. The exporter deletes nothing here
+(§1.9): a channel file no index names expires with its retention class.
 
 `export_meeting` raises on retryable failure — the caller (the durable
 queue) counts attempts and re-runs; `aw-bots` is never modified, so a re-run
@@ -376,55 +380,71 @@ def _channel_index_row(
 class _ChannelPiece:
     channel: int
     offset_ms: int
-    wav_path: Path
+    storage_path: str
     row: dict[str, Any]
     session_uid: str
     recording_id: int
 
 
-def _join_channel_wav(
+def _channel_file(
     group: list[_ChannelPiece],
+    base: str,
     tmp: Path,
+    deps: Deps,
     vexa_meeting_id: int,
-) -> Path:
-    """One local wav for a channel number. Pieces are already in offset order.
+) -> str:
+    """Write one channel number's audio to `channels/`; return its file name.
 
-    A piece that starts before the meeting, or on top of the previous piece,
-    is appended after what is already written. The file's t=0 is the meeting
-    clock, so the first piece's offset is leading silence.
+    Pieces are in offset order and the file starts at the first piece's
+    offset. One piece is its recorder's opus master, copied in S3 as it
+    stands. Several are joined into one opus file with the silence between
+    them; a piece that starts on top of the previous one follows it directly.
+    Each piece's length is read from its decode, which is deleted at once, so
+    the disk holds one channel's pieces at a time.
     """
+    settings = deps.settings
     channel = group[0].channel
-    rate = _wav_frames(group[0].wav_path)[1]
-    cursor = 0
-    parts: list[tuple[Path, int]] = []
-    for piece in group:
-        offset = round(piece.offset_ms * rate / 1000)
-        if offset < 0:
-            logger.warning(
-                "channel_before_origin vexa_meeting_id=%s channel=%s "
-                "recording_id=%s offset_ms=%s; placed at the meeting origin",
-                vexa_meeting_id,
-                channel,
-                piece.recording_id,
-                piece.offset_ms,
-            )
-            offset = 0
-        if offset < cursor:
+    name = f"ch{channel}.webm"
+    key = f"{base}channels/{name}"
+    if len(group) == 1:
+        deps.storage.copy(
+            settings.vexa_bucket,
+            group[0].storage_path,
+            settings.export_bucket,
+            key,
+            retention=AUDIO,
+        )
+        return name
+    parts: list[tuple[Path, float]] = []
+    cursor_ms = group[0].offset_ms
+    for i, piece in enumerate(group):
+        webm_path = tmp / f"ch{channel}-{i}.webm"
+        wav_path = tmp / f"ch{channel}-{i}.wav"
+        deps.storage.download_file(settings.vexa_bucket, piece.storage_path, webm_path)
+        deps.transcode(webm_path, wav_path)
+        frames, rate = _wav_frames(wav_path)
+        wav_path.unlink()
+        if piece.offset_ms < cursor_ms:
             logger.warning(
                 "channel_overlap vexa_meeting_id=%s channel=%s recording_id=%s "
                 "overlap_s=%.3f; placed after the previous piece",
                 vexa_meeting_id,
                 channel,
                 piece.recording_id,
-                (cursor - offset) / rate,
+                (cursor_ms - piece.offset_ms) / 1000,
             )
-        start = max(offset, cursor)
-        parts.append((piece.wav_path, start - cursor))
-        frames, _rate = _wav_frames(piece.wav_path)
-        cursor = start + frames
-    dst = tmp / f"ch{channel}.wav"
-    join_wavs(parts, dst)
-    return dst
+        start_ms = max(piece.offset_ms, cursor_ms)
+        parts.append((webm_path, (start_ms - cursor_ms) / 1000))
+        cursor_ms = start_ms + round(frames * 1000 / rate)
+    joined = tmp / name
+    deps.join_webm(parts, joined)
+    deps.storage.upload_file(
+        joined, settings.export_bucket, key, "audio/webm", retention=AUDIO
+    )
+    for path, _silence in parts:
+        path.unlink()
+    joined.unlink()
+    return name
 
 
 def _export_channels(
@@ -435,57 +455,44 @@ def _export_channels(
     deps: Deps,
     vexa_meeting_id: int,
 ) -> None:
-    """Download each `ch<N>` master, pad it onto the meeting clock, and index it.
+    """Write each channel number's opus file and its `channels/index.json` row.
 
     One file per channel number across sessions. The earliest piece's identity
-    is the index row; a later session that names someone else is logged and
-    does not rename the row. Nothing is uploaded until every channel wav is
-    built; `index.json` is uploaded last, so it is never published without
-    all of its wavs.
+    and offset are the index row; a later session that names someone else is
+    logged and does not rename the row. Every channel's identity is checked
+    and every master asked for before any file is written, and the index is
+    written last, so it never names a file this export did not write.
     """
     settings = deps.settings
-    pieces: list[_ChannelPiece] = []
+    numbered: list[tuple[_Session, int, int, Mapping[str, Any]]] = []
     for session, (start_ms, _end_ms) in zip(sessions, spans):
-        numbered: list[tuple[int, Mapping[str, Any]]] = []
         for media in session.media_files:
             number = _channel_number(media.get("type"))
             if number is not None:
-                numbered.append((number, media))
-        for number, media in sorted(numbered, key=lambda item: item[0]):
-            master = deps.meeting_api.master(
-                session.recording_id, media_type=f"ch{number}"
-            )
-            storage_path = str(master["storage_path"])
-            webm_path = tmp / f"ch-{session.recording_id}-{number}.webm"
-            wav_path = tmp / f"ch-{session.recording_id}-{number}.wav"
-            deps.storage.download_file(settings.vexa_bucket, storage_path, webm_path)
-            deps.transcode(webm_path, wav_path)
-            identity = _channel_identity(number, media.get("metadata"))
-            offset_ms = _channel_offset_ms(identity, start_ms, session.origin_ms)
-            pieces.append(
-                _ChannelPiece(
-                    channel=number,
-                    offset_ms=offset_ms,
-                    wav_path=wav_path,
-                    row=_channel_index_row(number, identity, offset_ms),
-                    session_uid=session.session_uid,
-                    recording_id=session.recording_id,
-                )
-            )
-    if not pieces:
-        return
+                identity = _channel_identity(number, media.get("metadata"))
+                numbered.append((session, start_ms, number, identity))
     by_channel: dict[int, list[_ChannelPiece]] = {}
-    for piece in pieces:
-        by_channel.setdefault(piece.channel, []).append(piece)
+    for session, start_ms, number, identity in numbered:
+        master = deps.meeting_api.master(session.recording_id, media_type=f"ch{number}")
+        offset_ms = _channel_offset_ms(identity, start_ms, session.origin_ms)
+        by_channel.setdefault(number, []).append(
+            _ChannelPiece(
+                channel=number,
+                offset_ms=offset_ms,
+                storage_path=str(master["storage_path"]),
+                row=_channel_index_row(number, identity, offset_ms),
+                session_uid=session.session_uid,
+                recording_id=session.recording_id,
+            )
+        )
     index: list[dict[str, Any]] = []
-    wavs: list[tuple[int, Path]] = []
     for channel in sorted(by_channel):
         group = sorted(
             by_channel[channel],
             key=lambda piece: (piece.offset_ms, piece.recording_id),
         )
-        wavs.append((channel, _join_channel_wav(group, tmp, vexa_meeting_id)))
-        kept = group[0].row
+        name = _channel_file(group, base, tmp, deps, vexa_meeting_id)
+        kept = {**group[0].row, "file": name}
         index.append(kept)
         for later in group[1:]:
             if later.row.get("display_name") != kept.get("display_name"):
@@ -498,14 +505,8 @@ def _export_channels(
                     later.row.get("display_name"),
                     kept.get("display_name"),
                 )
-    for channel, wav_path in wavs:
-        deps.storage.upload_file(
-            wav_path,
-            settings.export_bucket,
-            f"{base}channels/ch{channel}.wav",
-            "audio/wav",
-            retention=AUDIO,
-        )
+    if not index:
+        return
     deps.storage.put_json(
         settings.export_bucket,
         base + "channels/index.json",
