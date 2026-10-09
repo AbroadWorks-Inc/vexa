@@ -59,3 +59,33 @@ def test_golden_master(vpath: Path):
     assert got == v["master_sha256"], (
         f'{v["name"]}: Python master diverged from the golden (got {got[:12]}…)'
     )
+
+
+@pytest.mark.parametrize("vpath", _vector_paths(), ids=lambda p: p.stem)
+def test_golden_master_written_chunk_by_chunk(vpath: Path):
+    """``MasterWriter`` — the streamed path finalize uses — writes the same golden bytes."""
+    from meeting_api.recording_codec import MasterWriter
+
+    v = json.loads(vpath.read_text())
+    chunks = [base64.b64decode(c) for c in v["chunks"]]
+    writer = MasterWriter(v["format"], [len(c) for c in chunks])
+    master = b"".join(writer.add(c) for c in chunks)
+    writer.finish()
+    assert hashlib.sha256(master).hexdigest() == v["master_sha256"]
+
+
+def test_a_wav_writer_rejects_chunks_that_do_not_match_their_declared_sizes():
+    from meeting_api.recording_codec import MasterWriter
+
+    wav = next(
+        base64.b64decode(c)
+        for p in _vector_paths()
+        for v in [json.loads(p.read_text())]
+        if v["format"] == "wav"
+        for c in v["chunks"]
+        if len(base64.b64decode(c)) > 44
+    )
+    writer = MasterWriter("wav", [len(wav) + 2])
+    writer.add(wav)
+    with pytest.raises(ValueError, match="declared"):
+        writer.finish()
