@@ -2117,7 +2117,8 @@ def test_channels_are_written_as_recorded_with_their_offset(
 
     assert tag_value(BASE + "channels/ch0.webm") == {"retention-class": "audio"}
     assert tag_value(BASE + "channels/ch1.webm") == {"retention-class": "audio"}
-    assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
+    # The index expires with the files it names.
+    assert tag_value(BASE + "channels/index.json") == {"retention-class": "audio"}
 
 
 def _gmeet_channel(channel: int) -> dict[str, Any]:

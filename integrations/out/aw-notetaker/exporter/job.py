@@ -522,7 +522,7 @@ def _export_channels(
         settings.export_bucket,
         base + "channels/index.json",
         index,
-        retention=METADATA,
+        retention=AUDIO,
     )
 
 
@@ -937,7 +937,7 @@ def export_meeting(
                 settings.export_bucket,
                 base + "channels/index.json",
                 [],
-                retention=METADATA,
+                retention=AUDIO,
             )
         frames_path = Path(tmp_dir) / FRAMES_FILE
         _write_frames_array(frame_parts, frames_path)
