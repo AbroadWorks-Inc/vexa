@@ -363,13 +363,13 @@ const bridgeCase = async (perChannel: boolean | undefined): Promise<{ lines: Rec
 {
   const on = await bridgeCase(true);
   check('flag on: __vexaChannelActivity is exposed for jitsi', on.exposed.includes('__vexaChannelActivity'), on.exposed.join(','));
-  check('flag on: the mix frame is still written, with no src',
-    on.lines.some((l) => sameShape(l, { t: 1000, ch: 0, rms: 0.5, dur_ms: 0 })), JSON.stringify(on.lines));
+  check('flag on: the mix frame is still written, with no src and no channel number',
+    on.lines.some((l) => sameShape(l, { t: 1000, rms: 0.5, dur_ms: 0 })), JSON.stringify(on.lines));
   check('flag on: the channel frame is added with src:"channel"',
     on.lines.some((l) => sameShape(l, { t: 1100, ch: 0, rms: 0.25, dur_ms: 256, src: 'channel' })), JSON.stringify(on.lines));
   const off = await bridgeCase(undefined);
   check('flag absent: __vexaChannelActivity is not exposed', !off.exposed.includes('__vexaChannelActivity'), off.exposed.join(','));
-  check('flag absent: the mix frame is written', off.lines.some((l) => sameShape(l, { t: 1000, ch: 0, rms: 0.5, dur_ms: 0 })),
+  check('flag absent: the mix frame is written, with no channel number', off.lines.some((l) => sameShape(l, { t: 1000, rms: 0.5, dur_ms: 0 })),
     JSON.stringify(off.lines));
 }
 

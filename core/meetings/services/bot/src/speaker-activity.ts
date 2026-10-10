@@ -27,10 +27,10 @@ export interface SpeakerActivityWriter {
   path: string;
   /** One captured audio frame. Meet names it at capture time; Zoom/Teams frames arrive
    *  unnamed and are attributed later from hints. Never throws; a no-op once close() has run. */
-  frame(ch: number, pcm: Float32Array, ts: number, name?: string, src?: 'channel'): void;
+  frame(ch: number | undefined, pcm: Float32Array, ts: number, name?: string, src?: 'channel'): void;
   /** One frame given by its loudness, measured where the audio is (a channel's audio worklet):
    *  the same line `frame` writes, without the samples ever reaching Node. */
-  level(ch: number, rms: number, durMs: number, ts: number, name?: string, src?: 'channel'): void;
+  level(ch: number | undefined, rms: number, durMs: number, ts: number, name?: string, src?: 'channel'): void;
   /** A mixed-lane active-speaker signal. `kind` is "levels" or "dominant" for Jitsi.
    *  Omit it for every other caller. Never throws; a no-op once close() has run. */
   hint(t: number, name: string, isEnd?: boolean, kind?: string): void;
@@ -163,12 +163,14 @@ export function createSpeakerActivityWriter(inv: Invocation, opts: SpeakerActivi
   };
 
   let closed = false;
-  const level = (ch: number, rms: number, durMs: number, ts: number, name?: string, src?: 'channel'): void => {
+  // `ch` is left out of a mixed-audio frame (one combined stream, no channel): only a frame that
+  // belongs to a channel carries a number, so it can never be read as channel 0's.
+  const level = (ch: number | undefined, rms: number, durMs: number, ts: number, name?: string, src?: 'channel'): void => {
     if (disabled || capped || closed) return;
     try {
       const rec: Record<string, unknown> = {
         t: ts,
-        ch,
+        ...(ch !== undefined ? { ch } : {}),
         ...(name !== undefined ? { name } : {}),
         rms: Math.round(rms * 1e5) / 1e5,
         dur_ms: Math.round(durMs),

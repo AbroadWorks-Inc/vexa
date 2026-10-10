@@ -89,7 +89,7 @@ export function makeTelemetryTap(lane: CaptureLane, telemetry?: TelemetrySink) {
  * the pipeline.
  */
 export function makeSpeakerActivityFrameTap(writer?: SpeakerActivityWriter) {
-  return (ch: number, pcm: Float32Array, ts: number, name?: string, src?: 'channel'): void => {
+  return (ch: number | undefined, pcm: Float32Array, ts: number, name?: string, src?: 'channel'): void => {
     try { writer?.frame(ch, pcm, ts, name, src); } catch { /* speaker-activity must not break capture */ }
   };
 }
@@ -753,15 +753,16 @@ export async function startCaptureBridge(
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the
   // Float32Array and stamp the capture time if the page didn't supply one (production stamps
   // Date.now() on the Node side — index.ts:1598–1605).
-  // Jitsi mix frames are all channel 0 and are always written, with or without per-channel
+  // Jitsi mix frames carry no channel number and are always written, with or without per-channel
   // recording: the mix activity carries the proven speaker names. Per-channel activity is ADDED
-  // beside it (`__vexaChannelActivity`, `src:"channel"`), never a replacement.
+  // beside it (`__vexaChannelActivity`, `src:"channel"`, with its channel), never a replacement.
   const onPerSpeakerAudio = (speakerIndex: number, samples: number[], tsMs?: number): void => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
     observeRemoteAudio(pcm);
     tee(speakerIndex, pcm, ts);                                 // O-TEL-1: tap BEFORE the pipeline
-    recordActivity(speakerIndex, pcm, ts);
+    // A mixed-lane frame is the combined stream, not a channel: written with no channel number.
+    recordActivity(useMix ? undefined : speakerIndex, pcm, ts);
     // Teams/Jitsi (useMix): one combined stream → the pyannote mixed lane. Zoom + gmeet: per-channel —
     // an unbound track (name not yet resolved) arrives with no name → the per-channel lane opens the
     // turn UNKNOWN and upgrades it the moment the resolver binds (gmeet-pipeline onset-adopt); the
