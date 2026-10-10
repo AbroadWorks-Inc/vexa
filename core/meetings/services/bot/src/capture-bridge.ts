@@ -97,13 +97,15 @@ export function makeSpeakerActivityFrameTap(writer?: SpeakerActivityWriter) {
 /**
  * Build the Node-side `__vexaChannelActivity` sink: one per-channel (per-remote-stream) activity
  * frame, written with `src:"channel"` so the exporter can tell it from a mix frame (Jitsi mix
- * frames are channel 0, and a Jitsi channel number can also be 0). Rejects a non-integer or
- * negative channel. Never throws.
+ * frames are channel 0, and a Jitsi channel number can also be 0). The page sends the block's
+ * loudness, measured in the channel's audio worklet, and its length in 16 kHz samples: never the
+ * samples. Rejects a non-integer or negative channel and a non-finite level. Never throws.
  */
-export function makeChannelActivitySink(recordActivity: ReturnType<typeof makeSpeakerActivityFrameTap>) {
-  return (ch: number, samples: number[], tsMs?: number): void => {
+export function makeChannelActivitySink(writer?: SpeakerActivityWriter) {
+  return (ch: number, rms: number, samples: number, tsMs?: number): void => {
     if (typeof ch !== 'number' || !Number.isInteger(ch) || ch < 0) return;
-    try { recordActivity(ch, new Float32Array(samples), tsMs ?? Date.now(), undefined, 'channel'); } catch { /* never reaches the page */ }
+    if (!Number.isFinite(rms) || !Number.isFinite(samples)) return;
+    try { writer?.level(ch, rms, samples / 16, tsMs ?? Date.now(), undefined, 'channel'); } catch { /* never reaches the page */ }
   };
 }
 
@@ -822,7 +824,7 @@ export async function startCaptureBridge(
     if (!String(e.message).includes('already registered')) throw e;
   });
   if (inv.perChannelRecordingEnabled === true && jitsi) {
-    await page.exposeFunction('__vexaChannelActivity', makeChannelActivitySink(recordActivity))
+    await page.exposeFunction('__vexaChannelActivity', makeChannelActivitySink(speakerActivity))
       .catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
   }
   await page.exposeFunction('__vexaNamedAudioData', onNamedAudio).catch(() => { /* optional */ });
@@ -1658,7 +1660,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       w.__vexaChannelTaps.push(tap);
       w.logBot?.('[channels] recording ch' + channel + ' ' + streamId);
       await tap.start();
-      if (kind !== 'jitsi' || typeof w.VexaBrowserUtils.createPcmCaptureNode !== 'function' || !w.AudioContext) return;
+      if (kind !== 'jitsi' || typeof w.VexaBrowserUtils.createLevelNode !== 'function' || !w.AudioContext) return;
       try {
         // ONE shared 16 kHz context for every channel's activity tap: Chromium hard-caps concurrent
         // AudioContexts at about 6, so a context per channel would leave the 7th+ speaker with no
@@ -1667,12 +1669,11 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
         const ctx = w.__vexaChannelActivityCtx;
         try { await ctx.resume(); } catch { /* a suspended context emits nothing until the page resumes it */ }
         const src = ctx.createMediaStreamSource(stream);
-        const node = await w.VexaBrowserUtils.createPcmCaptureNode(ctx, (pcm: Float32Array) => {
-          // Silence writes nothing: forward only a block whose peak passes the gmeet-capture SILENCE rule.
-          let peak = 0;
-          for (let i = 0; i < pcm.length; i++) { const a = Math.abs(pcm[i]); if (a > peak) peak = a; }
+        // Loudness is measured in the worklet: one value per 4096-sample block crosses to Node,
+        // never the samples. Silence writes nothing (the gmeet-capture SILENCE peak rule).
+        const node = await w.VexaBrowserUtils.createLevelNode(ctx, (rms: number, peak: number, samples: number) => {
           if (peak <= 0.005) return;
-          try { w.__vexaChannelActivity?.(channel, Array.from(pcm), Date.now()); } catch { /* activity must not stop the recorder */ }
+          try { w.__vexaChannelActivity?.(channel, rms, samples, Date.now()); } catch { /* activity must not stop the recorder */ }
         });
         src.connect(node);
         node.connect(ctx.destination);
