@@ -43,7 +43,8 @@ session's channel is an S3 copy of its master; a channel several sessions
 recorded is joined into one opus file, one channel at a time. Every frame
 that parsed, named or not, is written to `speaker_activity_frames.json`,
 except that a session with channel-tap frames (`"src":"channel"`) writes only
-those. The mixed timeline does not read channel-tap frames. A meeting with no
+those; frames are written to disk as they are read, so memory stays flat
+however long the meeting. The mixed timeline does not read channel-tap frames. A meeting with no
 channel media gets no index. The index goes last, so a channel that fails
 (fetch, copy, join) writes no index; it is logged and the mixed export and
 `/process` go on as without channels. The exporter deletes nothing here
@@ -57,6 +58,7 @@ always starts from the same inputs.
 from __future__ import annotations
 
 import audioop
+import json
 import logging
 import math
 import tempfile
@@ -534,14 +536,17 @@ def _activity_frame(
 
 
 def _session_activity(
-    session: _Session, start_ms: int, deps: Deps, vexa_meeting_id: int
-) -> tuple[ActivityState, list[ActivityEvent], list[str], list[CapturedFrame]]:
+    session: _Session, start_ms: int, deps: Deps, vexa_meeting_id: int, frames_tmp: Path
+) -> tuple[ActivityState, list[ActivityEvent], list[str], Path | None]:
     """The session's speaker events, relative to the meeting clock on which
-    the session starts at `start_ms`, its speaker names, and every parsed frame.
+    the session starts at `start_ms`, its speaker names, and the file its
+    frames were written to as they were read (one JSON frame per line).
 
-    Frames are returned only for a file that parsed (`ok` or `capped`). A
-    missing or invalid file returns none, so the export does not write an
-    empty frame list that would look like silence.
+    A session with channel-tap frames (Jitsi, `"src":"channel"`) gives only
+    those: their `ch` is the channel file's, while its mixed-lane frames reuse
+    ch 0. Otherwise (Meet) every frame is per channel. Frames are given only
+    for a file that parsed (`ok` or `capped`): a missing or invalid file gives
+    none, so no empty frame list looks like silence.
     """
     settings = deps.settings
     if not session.activity_exists:
@@ -550,11 +555,24 @@ def _session_activity(
             vexa_meeting_id,
             session.session_uid,
         )
-        return "missing", [], [], []
+        return "missing", [], [], None
+    taps_path = frames_tmp.with_suffix(".taps.jsonl")
+    rest_path = frames_tmp.with_suffix(".jsonl")
     try:
-        activity = parse_activity(
-            deps.storage.iter_lines(settings.vexa_bucket, session.activity_key)
-        )
+        with taps_path.open("w") as taps, rest_path.open("w") as rest:
+
+            def capture(frame: CapturedFrame) -> None:
+                out = taps if frame.source == "channel" else rest
+                out.write(
+                    json.dumps(_activity_frame(frame, session.origin_ms, start_ms))
+                    + "\n"
+                )
+
+            activity = parse_activity(
+                deps.storage.iter_lines(settings.vexa_bucket, session.activity_key),
+                capture,
+            )
+            has_taps = taps.tell() > 0
         events = speech_events(
             activity,
             session.origin_ms - start_ms,
@@ -563,6 +581,8 @@ def _session_activity(
         )
         speaker_names = activity_names(activity)
     except (KeyError, TypeError, ValueError) as exc:
+        taps_path.unlink(missing_ok=True)
+        rest_path.unlink(missing_ok=True)
         logger.warning(
             "speaker activity invalid vexa_meeting_id=%s session_uid=%s "
             "error_class=%s; exporting without attribution",
@@ -570,7 +590,9 @@ def _session_activity(
             session.session_uid,
             type(exc).__name__,
         )
-        return "invalid", [], [], []
+        return "invalid", [], [], None
+    kept, dropped = (taps_path, rest_path) if has_taps else (rest_path, taps_path)
+    dropped.unlink()
     if activity.capped:
         logger.warning(
             "speaker activity capped vexa_meeting_id=%s session_uid=%s; "
@@ -578,8 +600,23 @@ def _session_activity(
             vexa_meeting_id,
             session.session_uid,
         )
-        return "capped", events, speaker_names, list(activity.captured)
-    return "ok", events, speaker_names, list(activity.captured)
+        return "capped", events, speaker_names, kept
+    return "ok", events, speaker_names, kept
+
+
+def _write_frames_array(parts: list[Path], out: Path) -> None:
+    """One JSON array of every part's frames, in order, streamed to `out`."""
+    with out.open("w") as dst:
+        dst.write("[")
+        first = True
+        for part in parts:
+            with part.open() as src:
+                for line in src:
+                    line = line.rstrip("\n")
+                    if line:
+                        dst.write(line if first else "," + line)
+                        first = False
+        dst.write("]")
 
 
 def _held_to(
@@ -812,11 +849,11 @@ def export_meeting(
         events: list[ActivityEvent] = []
         speaker_names: list[str] = []
         states: list[ActivityState] = []
-        exported_frames: list[dict[str, Any]] = []
+        frame_parts: list[Path] = []
         last = len(sessions) - 1
         for i, (session, (start_ms, end_ms)) in enumerate(zip(sessions, spans)):
-            state, session_events, session_names, captured = _session_activity(
-                session, start_ms, deps, vexa_meeting_id
+            state, session_events, session_names, part = _session_activity(
+                session, start_ms, deps, vexa_meeting_id, Path(tmp_dir) / f"frames-{i}"
             )
             events += _held_to(
                 session_events,
@@ -825,15 +862,8 @@ def export_meeting(
             )
             speaker_names += session_names
             states.append(state)
-            if state in ("ok", "capped"):
-                # A session with channel-tap frames (Jitsi) exports only those:
-                # their `ch` matches `channels/ch<N>.wav`, while its mixed-lane
-                # frames reuse ch 0. Otherwise (Meet) every frame is per channel.
-                taps = [frame for frame in captured if frame.source == "channel"]
-                exported_frames.extend(
-                    _activity_frame(frame, session.origin_ms, start_ms)
-                    for frame in (taps or captured)
-                )
+            if part is not None:
+                frame_parts.append(part)
         activity_state = max(states, key=_ACTIVITY_SEVERITY.index)
         if (
             activity_state == "ok"
@@ -898,11 +928,14 @@ def export_meeting(
                 type(exc).__name__,
                 exc,
             )
-        if any(state in ("ok", "capped") for state in states):
-            storage.put_json(
+        if frame_parts:
+            frames_path = Path(tmp_dir) / FRAMES_FILE
+            _write_frames_array(frame_parts, frames_path)
+            storage.upload_file(
+                frames_path,
                 settings.export_bucket,
                 base + FRAMES_FILE,
-                exported_frames,
+                "application/json",
                 retention=METADATA,
             )
 

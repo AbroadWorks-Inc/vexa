@@ -7,7 +7,7 @@ fallback to the debug capture tape (spec: 2026-09-23-speaker-activity-design.md)
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -62,23 +62,26 @@ class Activity:
     """One parsed file.
 
     `frames` holds named frames on every lane; speech events are built from
-    those only. `captured` holds every frame that parsed, including unnamed
-    ones and the channel number, for the per-channel transcript. Channel-tap
-    frames (`"src":"channel"`) are kept in `captured` only, never in `frames`:
-    on Jitsi they share ch 0 with the mixed lane and must not change it.
+    those only. Every frame that parsed, including unnamed ones and the
+    channel number, goes to `parse_activity`'s `capture` as it is read (for the
+    per-channel transcript), and is not kept. Channel-tap frames
+    (`"src":"channel"`) are captured only, never in `frames`: on Jitsi they
+    share ch 0 with the mixed lane and must not change it.
     """
 
     lane: str
     started_at: str | None
     frames: list[Frame] = field(default_factory=list)
     hints: list[Hint] = field(default_factory=list)
-    captured: list[CapturedFrame] = field(default_factory=list)
     frame_count: int = 0
     capped: bool = False
 
 
-def parse_activity(lines: Iterable[str]) -> Activity:
-    """Parse speaker-activity.v1 lines into an Activity.
+def parse_activity(
+    lines: Iterable[str], capture: Callable[[CapturedFrame], None] | None = None
+) -> Activity:
+    """Parse speaker-activity.v1 lines into an Activity, handing every frame
+    that parsed to `capture` as it is read.
 
     Skips unparseable lines silently. Raises ValueError if no header found.
     A header-only file (the bot left before anyone spoke) is a valid, empty
@@ -143,16 +146,17 @@ def parse_activity(lines: Iterable[str]) -> Activity:
                 channel = None
             raw_source = row.get("src")
             source = raw_source if isinstance(raw_source, str) else None
-            activity.captured.append(
-                CapturedFrame(
-                    ts=parsed.ts,
-                    channel=channel,
-                    name=parsed.name,
-                    rms=parsed.rms,
-                    duration_ms=parsed.duration_ms,
-                    source=source,
+            if capture is not None:
+                capture(
+                    CapturedFrame(
+                        ts=parsed.ts,
+                        channel=channel,
+                        name=parsed.name,
+                        rms=parsed.rms,
+                        duration_ms=parsed.duration_ms,
+                        source=source,
+                    )
                 )
-            )
             # Named frames are the timeline on every lane, including mixed and
             # pertrack. Unnamed frames and channel-tap frames stay out of
             # `frames`.

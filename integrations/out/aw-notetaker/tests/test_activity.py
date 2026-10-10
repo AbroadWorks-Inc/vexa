@@ -4,7 +4,13 @@ import json
 
 import pytest
 
-from exporter.activity import ActivityEvent, names, parse_activity, speech_events
+from exporter.activity import (
+    ActivityEvent,
+    CapturedFrame,
+    names,
+    parse_activity,
+    speech_events,
+)
 from tests.builders import capped, frame, header, hint, jitsi_lines
 
 ORIGIN_MS = 1_000_000  # origin epoch ms
@@ -264,6 +270,7 @@ def test_unparseable_frame_is_not_counted() -> None:
 
 
 def test_captured_keeps_unnamed_frames_and_drops_a_bad_channel() -> None:
+    captured: list[CapturedFrame] = []
     a = parse_activity(
         [
             header(),
@@ -278,11 +285,12 @@ def test_captured_keeps_unnamed_frames_and_drops_a_bad_channel() -> None:
                     "name": "B",
                 }
             ),
-        ]
+        ],
+        captured.append,
     )
     assert [f.name for f in a.frames] == ["A", "B"]
     assert a.frame_count == 3
-    assert [(c.channel, c.name) for c in a.captured] == [
+    assert [(c.channel, c.name) for c in captured] == [
         (2, None),
         (0, "A"),
         (None, "B"),
@@ -311,34 +319,43 @@ def test_channel_tap_frames_never_enter_the_mixed_timeline(mix_named: bool) -> N
     """Jitsi: tap frames share ch 0 with the mixed lane. They are captured
     with their source, yet frames, names and events are exactly those of the
     same file without them (with unnamed mix frames, hints stay the events)."""
-    with_taps = parse_activity(jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=True))
-    without = parse_activity(jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=False))
+    captured_with: list[CapturedFrame] = []
+    captured_without: list[CapturedFrame] = []
+    with_taps = parse_activity(
+        jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=True), captured_with.append
+    )
+    without = parse_activity(
+        jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=False), captured_without.append
+    )
 
     assert with_taps.frames == without.frames
     assert names(with_taps) == names(without)
     assert speech_events(with_taps, ORIGIN_MS, 0.05, 700) == speech_events(
         without, ORIGIN_MS, 0.05, 700
     )
-    taps = [(c.channel, c.name) for c in with_taps.captured if c.source == "channel"]
+    taps = [(c.channel, c.name) for c in captured_with if c.source == "channel"]
     assert taps == [(0, "Tap Zero"), (0, None), (1, "Tap One"), (1, "Tap One")]
-    assert all(c.source is None for c in without.captured)
+    assert all(c.source is None for c in captured_without)
 
 
 def test_a_frame_without_src_has_no_source() -> None:
-    a = parse_activity([header(), frame(ORIGIN_MS, "A", 0.2)])
-    assert a.captured[0].source is None
+    captured: list[CapturedFrame] = []
+    a = parse_activity([header(), frame(ORIGIN_MS, "A", 0.2)], captured.append)
+    assert captured[0].source is None
     assert [f.name for f in a.frames] == ["A"]
 
 
 def test_activity_dataclasses_use_slots() -> None:
+    captured: list[CapturedFrame] = []
     a = parse_activity(
-        [header(), frame(ORIGIN_MS, "A", 0.2), hint(ORIGIN_MS + 10, "B")]
+        [header(), frame(ORIGIN_MS, "A", 0.2), hint(ORIGIN_MS + 10, "B")],
+        captured.append,
     )
     for obj in (
         a,
         a.frames[0],
         a.hints[0],
-        a.captured[0],
+        captured[0],
         speech_events(a, ORIGIN_MS, 0.05, 700)[0],
     ):
         assert not hasattr(obj, "__dict__"), type(obj).__name__
