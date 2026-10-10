@@ -166,7 +166,12 @@ one transcript with speaker names:
 secret of its `/v2/webhooks` subscription),
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `EXPORT_RETRY_BACKOFF_SECONDS`
-(default 30: a failed export waits this × 2^attempts seconds before its next try), `RMS_SPEECH_THRESHOLD`,
+(default 30: a failed export waits this × 2^attempts seconds before its next try),
+`EXPORT_MAX_CRASHES` (default 2: runs that stopped mid-export, the pod killed or out of memory,
+before the meeting is quarantined; a crash raises nothing, so it has its own budget),
+`EXPORT_LEASE_SECONDS` (default 120: a running export's lease, renewed while it runs; one found
+expired is a crash; a stopped worker releases its leases, so a deploy is not one),
+`RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`,
 `ACTIVITY_WAIT_SECONDS`, `EXPORT_MAX_RECORDINGS` (default 50: the meeting's recordings are read
 page by page up to this many; past it the export fails, see below), `AWS_REGION`. S3 access is via
