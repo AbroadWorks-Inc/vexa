@@ -61,11 +61,13 @@ with `rerun` in the same durable queue, so the running worker exports it with th
 backoff and quarantine. A rerun ignores `handed_off`: every file is written again from what aw-bots
 holds now, so one an earlier export could not write (a channel whose master timed out) is filled
 in, and the folder goes to `notetaker-worker`'s `/process` with `"rerun": true`, which moves the
-previous outputs to `runs/<processed_at>/` and redoes the transcript. While the meeting's previous
-job is still running the worker answers 409, and the queue retries the rerun with its backoff. A meeting that has
-not finished, had no bot sent, or never had its bot in the meeting is refused (`refused <id>:
-<why>`, exit code 1) and nothing is queued for it. A webhook redelivered while a rerun is pending
-keeps it a rerun.
+previous outputs to `runs/<processed_at>/` and redoes the transcript. A meeting notetaker-worker
+is transcribing now (`GET /status/{id}` reads `processing`) is refused with `transcription in
+progress for this meeting`, as is every meeting when the worker cannot say; nothing is queued or
+written for it. A meeting that has not finished, had no bot sent, or never had its bot in the
+meeting is refused too (`refused <id>: <why>`, exit code 1). A webhook redelivered while a rerun is
+pending keeps it a rerun, and a rerun asked for while the meeting is exporting stays queued after
+that export. A rerun out of attempts is reported `failed`, never the earlier hand-off.
 
 ## Through the gateway (design §1.9, §1.10)
 - **Reads.** `GET /recordings`, `GET /recordings/{id}/master`, `GET /transcripts/by-id/{id}` and,

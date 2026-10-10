@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from exporter.notetaker import NotetakerError
 from exporter.rerun import NotRerunnable, request_reruns, rerun_envelope
 from exporter.vexa_client import MeetingApiError
 from tests.builders import MEETING_UUID, meeting_v2
@@ -19,6 +20,19 @@ class _Meetings:
         if meeting_id not in self._meetings:
             raise MeetingApiError(404, f"/v2/meetings/{meeting_id}")
         return self._meetings[meeting_id]
+
+
+class _Notetaker:
+    def __init__(
+        self, transcribing: set[str] | None = None, down: bool = False
+    ) -> None:
+        self._transcribing = transcribing or set()
+        self._down = down
+
+    def transcribing(self, meeting_id: str) -> bool:
+        if self._down:
+            raise NotetakerError("transport error: connection refused")
+        return meeting_id in self._transcribing
 
 
 class _Queue:
@@ -69,9 +83,39 @@ def test_each_id_is_queued_as_a_rerun_and_the_refused_ones_are_returned() -> Non
         }
     )
 
-    refused = request_reruns([MEETING_UUID, live, "missing"], meetings, queue)  # type: ignore[arg-type]
+    refused = request_reruns(
+        [MEETING_UUID, live, "missing"], meetings, queue, _Notetaker()  # type: ignore[arg-type]
+    )
 
     assert refused == [live, "missing"]
     assert [
         (envelope["data"]["meeting"]["id"], rerun) for envelope, rerun in queue.queued
     ] == [(MEETING_UUID, True)]
+
+
+def test_a_meeting_being_transcribed_is_refused_and_nothing_is_queued(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A rerun would rewrite the folder under the running job."""
+    queue = _Queue()
+    meetings = _Meetings({MEETING_UUID: meeting_v2(status="completed")})
+
+    refused = request_reruns(
+        [MEETING_UUID], meetings, queue, _Notetaker({MEETING_UUID})  # type: ignore[arg-type]
+    )
+
+    assert refused == [MEETING_UUID]
+    assert queue.queued == []
+    assert "transcription in progress for this meeting" in capsys.readouterr().out
+
+
+def test_a_worker_that_cannot_say_refuses_the_rerun() -> None:
+    queue = _Queue()
+    meetings = _Meetings({MEETING_UUID: meeting_v2(status="completed")})
+
+    refused = request_reruns(
+        [MEETING_UUID], meetings, queue, _Notetaker(down=True)  # type: ignore[arg-type]
+    )
+
+    assert refused == [MEETING_UUID]
+    assert queue.queued == []

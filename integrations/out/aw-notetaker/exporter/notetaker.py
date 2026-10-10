@@ -6,7 +6,8 @@ the worker skips that gate and redoes the transcript. Retries any
 httpx.TransportError (connect errors and all timeouts — /process is idempotent
 via idempotency_key, so a retry after a timeout is safe) and 5xx (transient);
 4xx fails immediately. That includes a rerun's 409 (the meeting's job is still
-running), which the durable queue retries with its backoff.
+running), which the durable queue retries with its backoff; `exporter.rerun`
+asks `transcribing` first, so a rerun is refused before anything is written.
 """
 
 from __future__ import annotations
@@ -64,3 +65,19 @@ class Notetaker:
                     continue
                 raise NotetakerError(f"notetaker {resp.status_code} after retries")
             raise NotetakerError(f"notetaker {resp.status_code}")
+
+    def transcribing(self, meeting_id: str) -> bool:
+        """Whether notetaker-worker is transcribing the meeting now
+        (`GET /status/{id}` reads `processing`). A worker that does not know
+        the meeting (404, e.g. after its restart) is not transcribing it."""
+        try:
+            resp = self._http.get(
+                f"{self._base_url}/status/{meeting_id}", timeout=_TIMEOUT_S
+            )
+        except httpx.TransportError as exc:
+            raise NotetakerError(f"transport error: {exc}") from exc
+        if resp.status_code == 404:
+            return False
+        if resp.status_code // 100 != 2:
+            raise NotetakerError(f"notetaker {resp.status_code}")
+        return bool(resp.json().get("status") == "processing")

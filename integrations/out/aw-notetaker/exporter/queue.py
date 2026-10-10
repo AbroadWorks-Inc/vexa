@@ -277,6 +277,7 @@ async def _run_item(
                     item["envelope"],
                     int(item.get("attempts") or 0),
                     error,
+                    rerun=bool(item.get("rerun")),
                 )
                 return
         if float(item.get("next_attempt_at") or 0.0) > now():
@@ -332,11 +333,21 @@ async def _run_item(
                         queue.fail(meeting_id)
                     else:
                         await _give_up(
-                            queue, deps, meeting_id, envelope, attempts, str(exc)
+                            queue,
+                            deps,
+                            meeting_id,
+                            envelope,
+                            attempts,
+                            str(exc),
+                            rerun=bool(item.get("rerun")),
                         )
                 return
             finally:
                 renewing.cancel()
+            if not item.get("rerun") and (queue.load(meeting_id) or {}).get("rerun"):
+                # A rerun was asked for while this export ran: it stays queued.
+                queue.release(meeting_id, owner)
+                return
             queue.done(meeting_id)
     except Exception:  # noqa: BLE001 - one id's bug must not sink the worker
         logger.exception("unhandled error processing meeting_id=%s", meeting_id)
@@ -366,9 +377,13 @@ async def _give_up(
     envelope: dict[str, Any],
     attempts: int,
     error: str,
+    *,
+    rerun: bool,
 ) -> None:
     """Quarantine a meeting that is out of attempts or crashes."""
-    finished = await _quarantine(envelope, attempts, error, meeting_id, deps)
+    finished = await _quarantine(
+        envelope, attempts, error, meeting_id, deps, rerun=rerun
+    )
     if finished:
         queue.done(meeting_id)
     else:
@@ -394,12 +409,19 @@ async def sweep_once(
 
 
 async def _quarantine(
-    envelope: dict[str, Any], attempts: int, error: str, meeting_id: str, deps: Deps
+    envelope: dict[str, Any],
+    attempts: int,
+    error: str,
+    meeting_id: str,
+    deps: Deps,
+    *,
+    rerun: bool = False,
 ) -> bool:
     """Record the quarantined outcome and report it once. A folder whose
     `_export.json` is already `handed_off` (notetaker-worker has it) keeps
-    that marker and reports `handed_off`; any other gets the `failed` marker
-    and reports `failed`. If the marker can't be read, nothing is written or
+    that marker and reports `handed_off`, unless this was a rerun: the earlier
+    hand-off is not the rerun, so a rerun out of attempts is `failed`. Any
+    other gets the `failed` marker and reports `failed`. If the marker can't be read, nothing is written or
     reported. The queue's retry budget for this meeting is spent, so any of
     these left undone is logged for an operator's re-enqueue, which runs the
     whole job again. True when the item is finished: the folder was handed
@@ -432,7 +454,11 @@ async def _quarantine(
         return False
     state: ReportState
     report_error: str | None
-    if isinstance(existing, dict) and existing.get("state") == "handed_off":
+    if (
+        isinstance(existing, dict)
+        and existing.get("state") == "handed_off"
+        and not rerun
+    ):
         state, report_error = "handed_off", None
         logger.warning(
             "quarantine: meeting_id=%s attempts=%s folder already handed off; "

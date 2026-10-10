@@ -928,6 +928,64 @@ def test_a_stopped_worker_releases_its_lease_so_a_deploy_is_not_a_crash(
     assert "lease" not in item and "crashes" not in item
 
 
+def test_a_rerun_asked_for_while_the_meeting_exports_stays_queued(
+    storage: Storage,
+) -> None:
+    """The export that was running finishes; the rerun requested meanwhile
+    is not lost with it."""
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+
+    def job(envelope: dict[str, Any], deps: Deps, rerun: bool = False) -> ExportResult:
+        queue.enqueue(_envelope(), rerun=True)
+        return ExportResult("handed_off", "folder")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=job, now=lambda: 1000.0)
+    )
+
+    item = queue.load(KEY)
+    assert item is not None, "still queued"
+    assert item["rerun"] is True and "lease" not in item
+
+    reruns: list[bool] = []
+
+    def second(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        reruns.append(rerun)
+        return ExportResult("handed_off", "folder")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=second, now=lambda: 1000.0)
+    )
+    assert reruns == [True]
+    assert queue.pending_ids() == []
+
+
+def test_a_rerun_out_of_attempts_is_failed_not_the_earlier_hand_off(
+    storage: Storage,
+) -> None:
+    settings = _settings(max_attempts=1)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    storage.put_json(EXPORT_BUCKET, BASE + "_export.json", {"state": "handed_off"})
+    queue.enqueue(_envelope(), rerun=True)
+
+    def failing(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        raise RuntimeError("notetaker 409")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=failing, now=lambda: 1000.0)
+    )
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["state"] == "failed" and marker["error"] == "notetaker 409"
+    assert storage.get_json(VEXA_BUCKET, FAILED_KEY) is not None
+
+
 def test_one_long_export_does_not_hold_back_the_others(storage: Storage) -> None:
     import threading
 
