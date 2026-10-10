@@ -33,7 +33,8 @@ import { RecordingService, type ChunkUploadExtra, type RecordingMasterFormat } f
 import type { Invocation } from './config.js';
 import type { RecordingSink } from './ports.js';
 
-/** Identity from the first chunk of one remote channel. Later chunks copy it forward server-side. */
+/** Who a remote channel is. Sent with every chunk of the channel, so losing one chunk loses
+ *  nothing; a field is fixed by the first chunk that knows it and never changed after. */
 export interface ChannelChunkIdentity {
   recorder_start_epoch_ms?: number;
   channel_kind?: string;
@@ -98,10 +99,10 @@ function textField(value: unknown): string | undefined {
   return trimmed;
 }
 
-/** media_type chN on every channel chunk. Seq 0 also carries the first identity seen for that lane. */
-function channelExtra(channel: number, seq: number, identity: ChannelChunkIdentity | undefined): ChunkUploadExtra {
+/** media_type chN and the channel's identity so far, on every channel chunk. */
+function channelExtra(channel: number, identity: ChannelChunkIdentity | undefined): ChunkUploadExtra {
   const extra: ChunkUploadExtra = { mediaType: `ch${channel}` };
-  if (seq !== 0 || !identity) return extra;
+  if (!identity) return extra;
   const metadata: Record<string, string | number> = {};
   const start = identity.recorder_start_epoch_ms;
   if (typeof start === 'number' && Number.isInteger(start) && start > 0) metadata.recorder_start_epoch_ms = start;
@@ -114,6 +115,18 @@ function channelExtra(channel: number, seq: number, identity: ChannelChunkIdenti
   if (displayName) metadata.display_name = displayName;
   if (Object.keys(metadata).length) extra.metadata = metadata;
   return extra;
+}
+
+/** `known` with every field `next` adds that `known` lacks: first value wins, gaps fill in. */
+function withIdentity(
+  known: ChannelChunkIdentity | undefined, next: ChannelChunkIdentity | undefined,
+): ChannelChunkIdentity | undefined {
+  if (!next) return known;
+  const merged: ChannelChunkIdentity = { ...known };
+  for (const [key, value] of Object.entries(next) as [keyof ChannelChunkIdentity, never][]) {
+    if (value !== undefined && merged[key] === undefined) merged[key] = value;
+  }
+  return merged;
 }
 
 interface UploadLane {
@@ -166,8 +179,8 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
         lane = makeLane();
         channels.set(channel, lane);
       }
-      if (identity && !lane.identity) lane.identity = identity;
-      enqueue(lane, seq, isFinal, format, bytes, channelExtra(channel, seq, lane.identity));
+      lane.identity = withIdentity(lane.identity, identity);
+      enqueue(lane, seq, isFinal, format, bytes, channelExtra(channel, lane.identity));
     },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
@@ -175,7 +188,7 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
       // (no phantom recording), and at most once (a real is_final already set finalSent).
       // Each channel lane does the same for its own media type. The mix lane stays media type audio.
       fallback(audio);
-      for (const [channel, lane] of channels) fallback(lane, { mediaType: `ch${channel}` });
+      for (const [channel, lane] of channels) fallback(lane, channelExtra(channel, lane.identity));
     },
   };
 }

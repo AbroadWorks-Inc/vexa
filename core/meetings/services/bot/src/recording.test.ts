@@ -19,7 +19,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createBotRecordingSink, type ChannelChunkIdentity, type ChunkUploader } from './recording.js';
 import type { Invocation } from './config.js';
-import type { RecordingMasterFormat } from '@vexa/recording';
+import type { ChunkUploadExtra, RecordingMasterFormat } from '@vexa/recording';
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = '') => {
@@ -197,9 +197,13 @@ async function main(): Promise<void> {
       !!seq0 && !seq0.isFinal && meta?.recorder_start_epoch_ms === 1_700_000_000_000 && meta.channel_kind === 'jitsi' && meta.stream_id === 'remote-audio-3' && meta.participant_id === 'p1' && meta.display_name === 'Ada',
       JSON.stringify(seq0));
     const later = channel.filter((s) => s.seq !== 0 && !s.isFinal);
-    check('channel: a later chunk does not resend identity', later.length === 2 && later.every((s) => s.extra?.metadata === undefined), JSON.stringify(later));
+    // F3: every chunk carries the identity, and the first value of a field wins (Bob never renames Ada).
+    check('channel: every later chunk carries the same identity',
+      later.length === 2 && later.every((s) => s.extra?.metadata?.display_name === 'Ada' && s.extra?.metadata?.stream_id === 'remote-audio-3'),
+      JSON.stringify(later));
     const fin = channel.find((s) => s.isFinal);
-    check('channel: close sends one empty final for the channel', !!fin && fin.len === 0 && fin.seq === 3 && fin.extra?.metadata === undefined, JSON.stringify(fin));
+    check('channel: close sends one empty final for the channel, with its identity',
+      !!fin && fin.len === 0 && fin.seq === 3 && fin.extra?.metadata?.display_name === 'Ada', JSON.stringify(fin));
     sink.close('google_meet/ch');
     await flush();
     check('channel: a second close adds no further final', seen.filter((s) => s.isFinal).length === 2, String(seen.filter((s) => s.isFinal).length));
@@ -258,7 +262,23 @@ async function main(): Promise<void> {
       JSON.stringify(channel));
   }
 
-  if (failed) { console.error(`\n❌ recording (L3): ${failed} check(s) FAILED.`); process.exit(1); }
+  // ── F3: a name Jitsi resolves after the recorder started reaches the server with the next chunk ──
+{
+  const seen: { seq: number; extra?: ChunkUploadExtra }[] = [];
+  const sink = createBotRecordingSink({
+    inv: inv(), uploadChunk: (seq, _f, _fmt, _b, extra) => { seen.push({ seq, extra }); },
+  });
+  const unnamed: ChannelChunkIdentity = { recorder_start_epoch_ms: 1_700_000_000_000, channel_kind: 'jitsi', stream_id: 'remote-audio-5' };
+  sink.channelChunk(5, 0, false, 'webm', new Uint8Array([1]), unnamed);
+  sink.channelChunk(5, 1, false, 'webm', new Uint8Array([2]), { ...unnamed, participant_id: 'p9', display_name: 'Grace' });
+  await new Promise((r) => setTimeout(r, 0));
+  await new Promise((r) => setTimeout(r, 0));
+  check('late name: chunk 0 has no name', seen[0]?.extra?.metadata?.display_name === undefined, JSON.stringify(seen[0]));
+  check('late name: the next chunk carries it',
+    seen[1]?.extra?.metadata?.display_name === 'Grace' && seen[1]?.extra?.metadata?.participant_id === 'p9', JSON.stringify(seen[1]));
+}
+
+if (failed) { console.error(`\n❌ recording (L3): ${failed} check(s) FAILED.`); process.exit(1); }
   console.log('\n✅ recording (L3): each recording.v1 timeslice uploads immediately (seq-ordered, session_uid==connectionId); a mid-meeting kill leaves every finished part durable; the empty is_final signal is forwarded; close() synthesizes the final signal at most once (injected uploader + real RecordingService HTTP wire · no whole-recording buffering).');
 }
 

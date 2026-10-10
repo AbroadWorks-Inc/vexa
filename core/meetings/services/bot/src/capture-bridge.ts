@@ -1648,7 +1648,12 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       }
       return out;
     };
-    const openChannel = async (channel: number, stream: any, kind: string, streamId: string, participantId?: string, displayName?: string): Promise<void> => {
+    // `nameOf` is asked on every chunk: a name Jitsi resolves after the recorder started is sent
+    // with the next chunk.
+    const openChannel = async (
+      channel: number, stream: any, kind: string, streamId: string,
+      nameOf?: () => { participantId?: string; displayName?: string },
+    ): Promise<void> => {
       if (started.has(channel)) return;
       started.add(channel);
       let startedAt = 0;
@@ -1658,13 +1663,12 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
         onStarted: () => { startedAt = Date.now(); },
         onChunk: async (c: { base64: string; chunkSeq: number; isFinal: boolean; mimeType: string }) => {
           try {
-            let identity: Record<string, string | number> | null = null;
-            if (c.chunkSeq === 0) {
-              identity = { channel_kind: kind, stream_id: streamId };
-              if (startedAt > 0) identity.recorder_start_epoch_ms = startedAt;
-              if (participantId) identity.participant_id = participantId;
-              if (displayName) identity.display_name = displayName;
-            }
+            // Every chunk says who it is: a lost or re-sent chunk 0 costs nothing.
+            const identity: Record<string, string | number> = { channel_kind: kind, stream_id: streamId };
+            if (startedAt > 0) identity.recorder_start_epoch_ms = startedAt;
+            const named = nameOf?.() ?? {};
+            if (named.participantId) identity.participant_id = named.participantId;
+            if (named.displayName) identity.display_name = named.displayName;
             await w.__vexaChannelChunk(channel, c.base64, c.chunkSeq, c.isFinal, c.mimeType, identity);
             return true;
           } catch { return false; }
@@ -1719,14 +1723,15 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
           for (const target of targets) {
             const found = present.find((item) => item.streamId === target.streamId);
             if (!found) continue;
-            let participantId: string | undefined;
-            let displayName: string | undefined;
-            if (typeof w.VexaBrowserUtils.jitsiNameForStream === 'function') {
+            const nameOf = (): { participantId?: string; displayName?: string } => {
+              if (typeof w.VexaBrowserUtils.jitsiNameForStream !== 'function') return {};
               const named = w.VexaBrowserUtils.jitsiNameForStream(w.APP?.store?.getState?.(), target.streamId);
-              if (typeof named?.participantId === 'string' && named.participantId) participantId = named.participantId;
-              if (typeof named?.displayName === 'string' && named.displayName) displayName = named.displayName;
-            }
-            await openChannel(target.channel, found.stream, 'jitsi', target.streamId, participantId, displayName);
+              return {
+                participantId: typeof named?.participantId === 'string' && named.participantId ? named.participantId : undefined,
+                displayName: typeof named?.displayName === 'string' && named.displayName ? named.displayName : undefined,
+              };
+            };
+            await openChannel(target.channel, found.stream, 'jitsi', target.streamId, nameOf);
           }
           // A stream gone from the page is a speaker who left.
           for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { streamId: string }][]) {

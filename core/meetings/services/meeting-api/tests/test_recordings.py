@@ -963,3 +963,44 @@ async def test_s3_upload_stream_aborts_the_multipart_upload_when_a_part_fails():
         await _s3_over(client).upload_stream("k", _mib_pieces(20), content_type="video/webm")
     assert client.calls[-1] == "abort_multipart_upload"
     assert "complete_multipart_upload" not in client.calls
+
+
+def test_a_resent_chunk_0_never_blanks_the_stored_identity():
+    """F3: a re-sent (or defaulted) chunk 0 without identity keeps what is stored."""
+    identity = {"recorder_start_epoch_ms": 1_700_000_000_000, "channel_kind": "jitsi",
+                "stream_id": "remote-audio-2", "display_name": "Ada"}
+    rec, _ = _fold_audio(None, chunk_seq=0, file_size=100, sample_rate=16000, chunk_metadata=identity)
+    again, _ = _fold_audio(rec, chunk_seq=0, file_size=100, sample_rate=16000, chunk_metadata={})
+    mf = next(m for m in again["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"sample_rate": 16000, **identity}
+
+
+def test_a_name_resolved_after_the_recorder_started_is_stored():
+    """F3: chunk 0 had no name; the first chunk that carries one fills it, and it then sticks."""
+    start = {"recorder_start_epoch_ms": 1_700_000_000_000, "channel_kind": "jitsi",
+             "stream_id": "remote-audio-4"}
+    rec, _ = _fold_audio(None, chunk_seq=0, file_size=100, sample_rate=16000, chunk_metadata=start)
+    named, _ = _fold_audio(rec, chunk_seq=1, file_size=50, sample_rate=16000,
+                           chunk_metadata={**start, "participant_id": "p-9", "display_name": "Grace"})
+    later, _ = _fold_audio(named, chunk_seq=2, file_size=50, sample_rate=16000,
+                           chunk_metadata={**start, "display_name": "Someone else"})
+    mf = next(m for m in later["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"]["display_name"] == "Grace"
+    assert mf["metadata"]["participant_id"] == "p-9"
+
+
+def test_a_channel_chunk_without_its_number_is_refused_but_a_whole_upload_is_not():
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def post(meta: dict) -> int:
+        return client.post(
+            "/internal/recordings/upload", headers=headers,
+            data={"metadata": json.dumps({"session_uid": SESSION_UID, **meta})},
+            files={"file": ("c.webm", b"chunk", "video/webm")},
+        ).status_code
+
+    assert post({"media_type": "ch3", "media_format": "webm", "is_final": False}) == 422
+    assert post({"media_type": "audio", "media_format": "webm"}) == 200
