@@ -369,14 +369,12 @@ def _channel_offset_ms(
 def _channel_index_row(
     channel: int, identity: Mapping[str, Any], offset_ms: int
 ) -> dict[str, Any]:
-    stream_id = identity.get("stream_id")
     row: dict[str, Any] = {
         "channel": channel,
         "kind": identity["channel_kind"],
-        "stream_id": stream_id if isinstance(stream_id, str) else "",
         "offset_s": round(offset_ms / 1000, 3),
     }
-    for key in ("participant_id", "display_name"):
+    for key in ("stream_id", "participant_id", "display_name"):
         value = identity.get(key)
         if isinstance(value, str) and value:
             row[key] = value
@@ -488,6 +486,16 @@ def _export_channels(
     for session, start_ms, number, identity in numbered:
         master = deps.meeting_api.master(session.recording_id, media_type=f"ch{number}")
         offset_ms = _channel_offset_ms(identity, start_ms, session.origin_ms)
+        if offset_ms < 0:
+            logger.warning(
+                "channel_offset_negative vexa_meeting_id=%s channel=%s "
+                "recording_id=%s offset_s=%.3f; its recorder started before the "
+                "session's recording origin, the transcriber trims the start",
+                vexa_meeting_id,
+                number,
+                session.recording_id,
+                offset_ms / 1000,
+            )
         by_channel.setdefault(number, []).append(
             _ChannelPiece(
                 channel=number,
@@ -511,12 +519,10 @@ def _export_channels(
             if later.row.get("display_name") != kept.get("display_name"):
                 logger.warning(
                     "channel_display_name_differs vexa_meeting_id=%s channel=%s "
-                    "session_uid=%s display_name=%s kept=%s",
+                    "session_uid=%s; the earliest piece's name is kept",
                     vexa_meeting_id,
                     channel,
                     later.session_uid,
-                    later.row.get("display_name"),
-                    kept.get("display_name"),
                 )
     deps.storage.put_json(
         settings.export_bucket,

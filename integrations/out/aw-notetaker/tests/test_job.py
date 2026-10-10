@@ -2102,12 +2102,11 @@ def test_channels_are_written_as_recorded_with_their_offset(
     ]
     messages = [record.getMessage() for record in caplog.records]
     assert any(message.startswith("channel_overlap ") for message in messages)
-    assert any(
-        message.startswith("channel_display_name_differs ")
-        and "display_name=Bob" in message
-        and "kept=Ada" in message
-        for message in messages
-    )
+    differs = [m for m in messages if m.startswith("channel_display_name_differs ")]
+    assert differs, "the differing name is logged"
+    assert not any(
+        name in m for m in differs for name in ("Bob", "Ada")
+    ), "without the speakers' names"
 
     def tag_value(key: str) -> dict[str, str]:
         tags = storage._client.get_object_tagging(Bucket=EXPORT_BUCKET, Key=key)[
@@ -2328,3 +2327,43 @@ def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(
 
     assert export_meeting(_envelope(), deps).state == "handed_off"
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+
+
+def test_an_index_row_names_only_the_identity_its_recorder_stored() -> None:
+    """No `stream_id` stored means none in the row, not an empty string."""
+    row = job_module._channel_index_row(
+        3, {"channel_kind": "jitsi", "recorder_start_epoch_ms": 1}, 2500
+    )
+    assert row == {"channel": 3, "kind": "jitsi", "offset_s": 2.5}
+
+
+def test_a_channel_that_started_before_the_session_origin_is_logged(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage_path = _put_master(storage, 23, "uid-23")
+    _put_activity(storage, "uid-23", two_speaker_gmeet_lines(_origin_ms()))
+    ch0_path = "recordings/7/23/uid-23/ch0/master.webm"
+    storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
+    early = {**_gmeet_channel(0), "recorder_start_epoch_ms": _origin_ms() - 2000}
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                23,
+                media_files=[
+                    {"type": "audio", "format": "webm"},
+                    {"type": "ch0", "format": "webm", "metadata": early},
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={(23, "ch0"): {"storage_path": ch0_path}},
+    )
+    deps = _deps(storage, meeting_api, FakeNotetaker())
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    row = storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json")[0]
+    assert row["offset_s"] < 0, "kept: the transcriber trims a negative start"
+    assert any(
+        r.getMessage().startswith("channel_offset_negative ") for r in caplog.records
+    )
