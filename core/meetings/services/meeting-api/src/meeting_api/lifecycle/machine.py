@@ -113,8 +113,10 @@ class TransitionSource(str, Enum):
 # status is `joining`, so that is the machine's de-facto entry.
 LEGAL_TRANSITIONS: Dict[Optional[BotStatus], frozenset[BotStatus]] = {
     None: frozenset({BotStatus.JOINING}),  # initial: a record's first event must be `joining`
+    # `needs_help` from `joining`: a blocker met before any waiting room (Zoom's "automated bots
+    # aren't allowed" RTMS wall, a captcha, a consent gate) escalates instead of being refused (#1251).
     BotStatus.JOINING: frozenset(
-        {BotStatus.AWAITING_ADMISSION, BotStatus.ACTIVE, BotStatus.FAILED}
+        {BotStatus.AWAITING_ADMISSION, BotStatus.NEEDS_HELP, BotStatus.ACTIVE, BotStatus.FAILED}
     ),
     BotStatus.AWAITING_ADMISSION: frozenset(
         {BotStatus.ACTIVE, BotStatus.NEEDS_HELP, BotStatus.FAILED}
@@ -604,8 +606,11 @@ class LifecycleSink:
         if to is BotStatus.COMPLETED:
             rec.completion_reason = self._terminal_reason(rec, event)
         elif to is BotStatus.FAILED:
-            # FM-003: derive failure_stage from the stage we were IN, not the payload.
+            # FM-003: derive failure_stage from the stage we were IN, not the payload. `needs_help`
+            # entered from `joining` is a pre-lobby blocker: its stage is `joining`, never the lobby.
             rec.failure_stage = _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)
+            if frm is BotStatus.NEEDS_HELP and BotStatus.AWAITING_ADMISSION not in rec.history:
+                rec.failure_stage = FailureStage.JOINING
             rec.completion_reason = self._terminal_reason(rec, event)
             # The parent builds an `error_details` string on a failed exit when none supplied.
             if rec.error_details is None and (rec.exit_code is not None or rec.reason):
