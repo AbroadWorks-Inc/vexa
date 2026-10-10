@@ -190,7 +190,8 @@ def build_invocation(
         # explicit boolean so a prod bot never has to guess.
         "captureSignalEnabled": capture_signal_enabled,
         # Per-channel (per-speaker) recording: the bot records each remote channel beside the mix.
-        # The spawn path passes an explicit boolean; None is stripped (the bot then reads it as off).
+        # The spawn path sends True when it is on and None when off; None is stripped, so a bot
+        # image without the field still accepts the invocation and reads it as off.
         "perChannelRecordingEnabled": per_channel_recording_enabled,
         "recordingUploadUrl": recording_upload_url,
         "meetingApiCallbackUrl": meeting_api_callback_url,
