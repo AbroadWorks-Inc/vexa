@@ -1558,9 +1558,12 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
   })();
   const recordChannels = inv.perChannelRecordingEnabled === true && (inv.platform === 'google_meet' || inv.platform === 'jitsi');
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
+  const decodeChunk = (base64: string, mimeType: string): { bytes: Uint8Array; format: RecordingMasterFormat } => ({
+    bytes: base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0),
+    format: /wav/i.test(mimeType) ? 'wav' : 'webm',
+  });
   await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
-    const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
-    const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
+    const { bytes, format } = decodeChunk(base64, mimeType);
     recording.chunk(key, chunkSeq, isFinal, format, bytes);
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
   if (recordChannels) {
@@ -1568,8 +1571,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       channel: number, base64: string, chunkSeq: number, isFinal: boolean, mimeType: string,
       identity: { recorder_start_epoch_ms?: number; channel_kind?: string; stream_id?: string; participant_id?: string; display_name?: string } | null,
     ): void => {
-      const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
-      const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
+      const { bytes, format } = decodeChunk(base64, mimeType);
       recording.channelChunk(channel, chunkSeq, isFinal, format, bytes, identity ?? undefined);
     }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
   }
@@ -1615,8 +1617,8 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       w.logBot?.('[channels] createRecordingTap missing — channel recorders skipped');
       return;
     }
-    if (platform === 'jitsi' && typeof w.VexaBrowserUtils.selectChannelTargets !== 'function') {
-      w.logBot?.('[channels] selectChannelTargets missing — channel recorders skipped');
+    if (platform === 'jitsi' && typeof w.VexaBrowserUtils.selectJitsiChannels !== 'function') {
+      w.logBot?.('[channels] selectJitsiChannels missing — channel recorders skipped');
       return;
     }
     const MediaStreamRef = w.MediaStream;
@@ -1711,18 +1713,18 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       scanning = true;
       try {
         const present = mediaStreams();
+        const byId = new Map(present.map((item) => [item.streamId, item]));
         if (platform === 'google_meet') {
           const list = w.__vexaGmeetCapture?.channels?.() ?? [];
           for (const row of list) {
             if (typeof row?.index !== 'number' || typeof row?.streamId !== 'string') continue;
-            const found = present.find((item) => item.streamId === row.streamId && item.audioTracks > 0);
-            if (!found) continue;
+            const found = byId.get(row.streamId);
+            if (!found || found.audioTracks < 1) continue;
             await openChannel(row.index, found.stream, 'gmeet', row.streamId);
           }
         } else if (platform === 'jitsi') {
-          const targets = w.VexaBrowserUtils.selectChannelTargets('jitsi', present);
-          for (const target of targets) {
-            const found = present.find((item) => item.streamId === target.streamId);
+          for (const target of w.VexaBrowserUtils.selectJitsiChannels(present)) {
+            const found = byId.get(target.streamId);
             if (!found) continue;
             const nameOf = (): { participantId?: string; displayName?: string } => {
               if (typeof w.VexaBrowserUtils.jitsiNameForStream !== 'function') return {};
@@ -1736,7 +1738,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
           }
           // A stream gone from the page is a speaker who left.
           for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { streamId: string }][]) {
-            if (!present.some((item) => item.streamId === entry.streamId)) await release(channel);
+            if (!byId.has(entry.streamId)) await release(channel);
           }
         }
       } catch (e) {

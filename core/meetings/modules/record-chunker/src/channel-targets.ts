@@ -40,9 +40,3 @@ export function selectJitsiChannels(candidates: readonly ChannelCandidate[]): Ch
   }
   return out;
 }
-
-/** Per-channel recorders for this platform. Teams, Zoom, and Meet return none. */
-export function selectChannelTargets(platform: string, candidates: readonly ChannelCandidate[]): ChannelTarget[] {
-  if (platform === "jitsi") return selectJitsiChannels(candidates);
-  return [];
-}
