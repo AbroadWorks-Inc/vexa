@@ -222,14 +222,28 @@ def _audio_recordings(
     return sorted(audio, key=lambda rec: (parse_utc(str(rec["created_at"])), rec["id"]))
 
 
-def _wav_duration_s(path: Path) -> float:
-    with wave.open(str(path), "rb") as wav:
-        return wav.getnframes() / wav.getframerate()
-
-
 def _wav_frames(path: Path) -> tuple[int, int]:
     with wave.open(str(path), "rb") as wav:
         return wav.getnframes(), wav.getframerate()
+
+
+def _wav_duration_s(path: Path) -> float:
+    frames, rate = _wav_frames(path)
+    return frames / rate
+
+
+def _placed(pieces: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Lay `(offset, length)` pieces, in order, on one clock: each starts at
+    its offset, or right after the previous piece when it would start on top
+    of it. Returns each piece's `(start, overlap)`, in the input's unit (wav
+    frames for the mixed audio, milliseconds for a channel)."""
+    placed: list[tuple[int, int]] = []
+    cursor = pieces[0][0] if pieces else 0
+    for offset, length in pieces:
+        start = max(offset, cursor)
+        placed.append((start, start - offset))
+        cursor = start + length
+    return placed
 
 
 def _single_session_audio(
@@ -274,22 +288,28 @@ def _joined_sessions_audio(
 
     rate = decoded[0][3]
     first_origin_ms = sessions[0].origin_ms
+    placements = _placed(
+        [
+            (round((session.origin_ms - first_origin_ms) * rate / 1000), frames)
+            for session, (_, _, frames, _) in zip(sessions, decoded)
+        ]
+    )
     cursor = 0
     wav_parts: list[tuple[Path, int]] = []
     webm_parts: list[tuple[Path, float]] = []
     spans: list[tuple[int, int]] = []
-    for session, (webm_path, wav_path, frames, _) in zip(sessions, decoded):
-        offset = round((session.origin_ms - first_origin_ms) * rate / 1000)
-        if offset < cursor:
+    for session, (webm_path, wav_path, frames, _), (start, overlap) in zip(
+        sessions, decoded, placements
+    ):
+        if overlap:
             logger.warning(
                 "session_overlap vexa_meeting_id=%s recording_id=%s session_uid=%s "
                 "overlap_s=%.3f; placed after the previous session",
                 vexa_meeting_id,
                 session.recording_id,
                 session.session_uid,
-                (cursor - offset) / rate,
+                overlap / rate,
             )
-        start = max(offset, cursor)
         silence = start - cursor
         wav_parts.append((wav_path, silence))
         webm_parts.append((webm_path, silence / rate))
@@ -420,27 +440,35 @@ def _channel_file(
             retention=AUDIO,
         )
         return name
-    parts: list[tuple[Path, float]] = []
-    cursor_ms = group[0].offset_ms
+    # A recorder's webm carries no duration: each piece is decoded to measure
+    # it, because the join needs every length before it runs.
+    webms: list[Path] = []
+    lengths_ms: list[int] = []
     for i, piece in enumerate(group):
         webm_path = tmp / f"ch{channel}-{i}.webm"
         wav_path = tmp / f"ch{channel}-{i}.wav"
         deps.storage.download_file(settings.vexa_bucket, piece.storage_path, webm_path)
         deps.transcode(webm_path, wav_path)
-        frames, rate = _wav_frames(wav_path)
+        lengths_ms.append(round(_wav_duration_s(wav_path) * 1000))
         wav_path.unlink()
-        if piece.offset_ms < cursor_ms:
+        webms.append(webm_path)
+    parts: list[tuple[Path, float]] = []
+    cursor_ms = group[0].offset_ms
+    placements = _placed([(p.offset_ms, n) for p, n in zip(group, lengths_ms)])
+    for piece, webm_path, length_ms, (start_ms, overlap_ms) in zip(
+        group, webms, lengths_ms, placements
+    ):
+        if overlap_ms:
             logger.warning(
                 "channel_overlap vexa_meeting_id=%s channel=%s recording_id=%s "
                 "overlap_s=%.3f; placed after the previous piece",
                 vexa_meeting_id,
                 channel,
                 piece.recording_id,
-                (cursor_ms - piece.offset_ms) / 1000,
+                overlap_ms / 1000,
             )
-        start_ms = max(piece.offset_ms, cursor_ms)
         parts.append((webm_path, (start_ms - cursor_ms) / 1000))
-        cursor_ms = start_ms + round(frames * 1000 / rate)
+        cursor_ms = start_ms + length_ms
     joined = tmp / name
     deps.join_webm(parts, joined)
     deps.storage.upload_file(
