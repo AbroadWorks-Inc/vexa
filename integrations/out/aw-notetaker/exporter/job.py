@@ -190,7 +190,6 @@ class _Session:
     origin_ms: int
     signal_prefix: str
     activity_exists: bool
-    media_files: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def activity_key(self) -> str:
@@ -457,7 +456,11 @@ def _export_channels(
 ) -> None:
     """Write each channel number's opus file and its `channels/index.json` row.
 
-    One file per channel number across sessions. The earliest piece's identity
+    A channel's identity and recorder clock are in the full recording (the
+    list keeps only each media file's id, type, format and size), read here,
+    under the caller's guard: a recording that can't be read costs the
+    channels, never the mixed export. One file per channel number across
+    sessions. The earliest piece's identity
     and offset are the index row; a later session that names someone else is
     logged and does not rename the row. Every channel's identity is checked
     and every master asked for before any file is written, and the index is
@@ -466,7 +469,8 @@ def _export_channels(
     settings = deps.settings
     numbered: list[tuple[_Session, int, int, Mapping[str, Any]]] = []
     for session, (start_ms, _end_ms) in zip(sessions, spans):
-        for media in session.media_files:
+        full = deps.meeting_api.recording(session.recording_id)
+        for media in full.get("media_files") or ():
             number = _channel_number(media.get("type"))
             if number is not None:
                 identity = _channel_identity(number, media.get("metadata"))
@@ -751,9 +755,6 @@ def export_meeting(
         parts = storage_path.split("/")
         owner, session_uid = parts[1], parts[3]
         signal_prefix = f"signal/{owner}/{vexa_meeting_id}/{session_uid}/"
-        # The list keeps only each media file's id, type, format and size;
-        # a channel's identity and recorder clock are in the full recording.
-        full = deps.meeting_api.recording(rec["id"])
         sessions.append(
             _Session(
                 recording_id=rec["id"],
@@ -765,7 +766,6 @@ def export_meeting(
                     settings.vexa_bucket, signal_prefix + ACTIVITY_FILE
                 )
                 is not None,
-                media_files=tuple(full.get("media_files") or ()),
             )
         )
 

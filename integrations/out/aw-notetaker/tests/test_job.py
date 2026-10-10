@@ -2161,14 +2161,15 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
     )
 
 
-@pytest.mark.parametrize("failure", ["master", "copy"])
+@pytest.mark.parametrize("failure", ["master", "copy", "recording"])
 def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
     storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
     """ch0 is fine; ch1's master cannot be built (every master is asked for
     before any file is written, so nothing is), or its object is missing and
     the copy fails after ch0 is copied (ch0.webm is left; without an index the
-    worker ignores it). The mixed export is handed off as usual and
+    worker ignores it), or the full recording that holds the channels'
+    identities cannot be read. The mixed export is handed off as usual and
     `channels/index.json` is never written."""
     storage_path = _put_master(storage, 20, "uid-20")
     _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
@@ -2192,6 +2193,12 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
         master={"storage_path": storage_path},
         channel_masters=channel_masters,
     )
+    if failure == "recording":
+
+        def unreadable(recording_id: int) -> dict[str, Any]:
+            raise RuntimeError("gateway 503 /recordings/20")
+
+        meeting_api.recording = unreadable  # type: ignore[method-assign]
     notetaker = FakeNotetaker()
     deps = _deps(storage, meeting_api, notetaker)
     with caplog.at_level(logging.WARNING, logger="exporter"):
