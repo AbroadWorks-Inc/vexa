@@ -288,8 +288,11 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
         BASE + "meeting.json",
         BASE + "recordings.json",
         BASE + "speaker_activity_frames.json",
+        BASE + "live_transcript.json",
+        BASE + "channels/index.json",
         BASE + "_export.json",
     }
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"webm-bytes"
     assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == [
@@ -595,11 +598,12 @@ def test_a_transcript_with_segments_is_written_as_live_transcript(
 
 
 @pytest.mark.parametrize("transcript", [None, {"segments": []}, {}])
-def test_a_meeting_without_transcript_segments_gets_no_live_transcript(
+def test_a_meeting_without_transcript_segments_gets_an_empty_live_transcript(
     storage: Storage, transcript: dict[str, Any] | None
 ) -> None:
     """A bot that ran without live transcription leaves no segments (or no
-    transcript at all, a 404): there is no `live_transcript.json`."""
+    transcript at all, a 404): `live_transcript.json` has no segments, so a
+    rerun never leaves an earlier run's transcript behind."""
     storage_path = _put_master(storage, 3, "uid-2")
     meeting_api = FakeMeetingApi(
         recordings=[_audio_recording(3)],
@@ -612,7 +616,9 @@ def test_a_meeting_without_transcript_segments_gets_no_live_transcript(
 
     assert result.state == "handed_off"
     assert meeting_api.transcript_calls == [11367]
-    assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") is None
+    assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") == {
+        "segments": []
+    }
 
 
 def test_notetaker_failure_propagates_and_leaves_no_handoff_marker(
@@ -648,9 +654,7 @@ def test_missing_speaker_activity_still_hands_off_with_missing_marker(
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "missing"
-    assert (
-        storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") is None
-    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == []
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["speaker_timeline"] == []
     assert timeline["participants"] == []
@@ -974,9 +978,7 @@ def test_header_less_activity_hands_off_with_invalid_marker(storage: Storage) ->
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "invalid"
-    assert (
-        storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") is None
-    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == []
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["speaker_timeline"] == [] and timeline["speaker_intervals"] == []
     participants = storage.get_json(EXPORT_BUCKET, BASE + "participants.json")
@@ -1076,7 +1078,10 @@ def test_audio_is_streamed_via_files_not_held_as_bytes(storage: Storage) -> None
     assert not [k for k in spy.get_bytes_keys if k.endswith((".webm", ".wav"))]
     assert not [k for k in spy.put_bytes_keys if k.endswith((".webm", ".wav"))]
     assert spy.downloads == [BASE + "master.webm"]
-    assert spy.uploads == [(BASE + "audio.wav", "audio/wav")]
+    assert spy.uploads == [
+        (BASE + "audio.wav", "audio/wav"),
+        (BASE + "speaker_activity_frames.json", "application/json"),
+    ]
 
 
 def test_single_audio_recording_logs_no_multi_session_warning(
@@ -1280,6 +1285,8 @@ EXPECTED_KEYS = {
         "meeting.json",
         "recordings.json",
         "speaker_activity_frames.json",
+        "live_transcript.json",
+        "channels/index.json",
         "_export.json",
     )
 }
@@ -2153,7 +2160,10 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
     with caplog.at_level(logging.WARNING, logger="exporter"):
         assert export_meeting(_envelope(), deps).state == "handed_off"
 
-    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == []
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == [
+        BASE + "channels/index.json"
+    ]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     assert any(
         "error_class=ChannelIdentityMissing" in record.getMessage()
@@ -2162,7 +2172,7 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
 
 
 @pytest.mark.parametrize("failure", ["master", "copy", "recording"])
-def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
+def test_a_failed_channel_still_hands_off_the_mixed_export_with_an_empty_index(
     storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
     """ch0 is fine; ch1's master cannot be built (every master is asked for
@@ -2170,7 +2180,7 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
     the copy fails after ch0 is copied (ch0.webm is left; without an index the
     worker ignores it), or the full recording that holds the channels'
     identities cannot be read. The mixed export is handed off as usual and
-    `channels/index.json` is never written."""
+    `channels/index.json` is `[]`, so no earlier run's index survives."""
     storage_path = _put_master(storage, 20, "uid-20")
     _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
     ch0_path = "recordings/7/20/uid-20/ch0/master.webm"
@@ -2206,7 +2216,10 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
 
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     expected_left = [BASE + "channels/ch0.webm"] if failure == "copy" else []
-    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == expected_left
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == sorted(
+        [BASE + "channels/index.json", *expected_left]
+    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
     assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
         "handed_off"
     )

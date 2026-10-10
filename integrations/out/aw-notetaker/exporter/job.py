@@ -44,11 +44,17 @@ recorded is joined into one opus file, one channel at a time. Every frame
 that parsed, named or not, is written to `speaker_activity_frames.json`,
 except that a session with channel-tap frames (`"src":"channel"`) writes only
 those; frames are written to disk as they are read, so memory stays flat
-however long the meeting. The mixed timeline does not read channel-tap frames. A meeting with no
-channel media gets no index. The index goes last, so a channel that fails
-(fetch, copy, join) writes no index; it is logged and the mixed export and
-`/process` go on as without channels. The exporter deletes nothing here
-(§1.9): a channel file no index names expires with its retention class.
+however long the meeting. The mixed timeline does not read channel-tap frames.
+
+Every run writes every file the exporter owns, so a rerun leaves nothing
+stale: `channels/index.json` is `[]` for a meeting with no channel media or
+whose channel step failed (fetch, copy, join: logged, and the mixed export and
+`/process` go on as without channels); `speaker_activity_frames.json` is `[]`
+when no session's activity parsed; `live_transcript.json` has no segments
+when the bot had no live transcription. The index goes last, so it never
+names a file this run did not write. The exporter deletes nothing here
+(§1.9): notetaker-worker removes, on a rerun, the channel files the index no
+longer names.
 
 `export_meeting` raises on retryable failure — the caller (the durable
 queue) counts attempts and re-runs; `aw-bots` is never modified, so a re-run
@@ -466,7 +472,8 @@ def _export_channels(
     and offset are the index row; a later session that names someone else is
     logged and does not rename the row. Every channel's identity is checked
     and every master asked for before any file is written, and the index is
-    written last, so it never names a file this export did not write.
+    written last, so it never names a file this export did not write; it is
+    `[]` for a meeting without channels.
     """
     settings = deps.settings
     numbered: list[tuple[_Session, int, int, Mapping[str, Any]]] = []
@@ -511,8 +518,6 @@ def _export_channels(
                     later.row.get("display_name"),
                     kept.get("display_name"),
                 )
-    if not index:
-        return
     deps.storage.put_json(
         settings.export_bucket,
         base + "channels/index.json",
@@ -545,8 +550,8 @@ def _session_activity(
     A session with channel-tap frames (Jitsi, `"src":"channel"`) gives only
     those: their `ch` is the channel file's, while its mixed-lane frames reuse
     ch 0. Otherwise (Meet) every frame is per channel. Frames are given only
-    for a file that parsed (`ok` or `capped`): a missing or invalid file gives
-    none, so no empty frame list looks like silence.
+    for a file that parsed (`ok` or `capped`); a missing or invalid file gives
+    none.
     """
     settings = deps.settings
     if not session.activity_exists:
@@ -928,27 +933,35 @@ def export_meeting(
                 type(exc).__name__,
                 exc,
             )
-        if frame_parts:
-            frames_path = Path(tmp_dir) / FRAMES_FILE
-            _write_frames_array(frame_parts, frames_path)
-            storage.upload_file(
-                frames_path,
-                settings.export_bucket,
-                base + FRAMES_FILE,
-                "application/json",
-                retention=METADATA,
-            )
-
-        # A meeting whose bot ran with live transcription has segments; one
-        # without has none, and gets no file.
-        transcript = deps.meeting_api.transcript(vexa_meeting_id)
-        if transcript is not None and transcript.get("segments"):
             storage.put_json(
                 settings.export_bucket,
-                base + "live_transcript.json",
-                transcript,
+                base + "channels/index.json",
+                [],
                 retention=METADATA,
             )
+        frames_path = Path(tmp_dir) / FRAMES_FILE
+        _write_frames_array(frame_parts, frames_path)
+        storage.upload_file(
+            frames_path,
+            settings.export_bucket,
+            base + FRAMES_FILE,
+            "application/json",
+            retention=METADATA,
+        )
+
+        # A meeting whose bot ran with live transcription has segments; one
+        # without gets the same file with none.
+        transcript = deps.meeting_api.transcript(vexa_meeting_id)
+        storage.put_json(
+            settings.export_bucket,
+            base + "live_transcript.json",
+            (
+                transcript
+                if transcript and transcript.get("segments")
+                else {"segments": []}
+            ),
+            retention=METADATA,
+        )
 
         if settings.debug:
             for session in sessions:
