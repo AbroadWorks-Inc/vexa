@@ -41,10 +41,10 @@ meeting clock; nothing is decoded or padded (a 2-hour, 19-speaker meeting's
 channels are ~270 MB as opus and would be ~3.5 GB as 16 kHz wav). One bot
 session's channel is an S3 copy of its master; a channel several sessions
 recorded is joined into one opus file, one channel at a time. Every frame
-that parsed, named or not, is written to `speaker_activity_frames.json`,
-except that a session with channel-tap frames (`"src":"channel"`) writes only
-those; frames are written to disk as they are read, so memory stays flat
-however long the meeting. The mixed timeline does not read channel-tap frames.
+that parsed, named or not, is written to `speaker_activity_frames.json` with
+its channel (none for a mixed-lane frame); frames are written to disk as they
+are read, so memory stays flat however long the meeting. On the mixed lane the
+timeline reads only the mix's own frames (no channel).
 
 Every run writes every file the exporter owns, so a rerun leaves nothing
 stale: `channels/index.json` is `[]` for a meeting with no channel media or
@@ -581,11 +581,9 @@ def _session_activity(
     the session starts at `start_ms`, its speaker names, and the file its
     frames were written to as they were read (one JSON frame per line).
 
-    A session with channel-tap frames (Jitsi, `"src":"channel"`) gives only
-    those: their `ch` is the channel file's, while its mixed-lane frames reuse
-    ch 0. Otherwise (Meet) every frame is per channel. Frames are given only
-    for a file that parsed (`ok` or `capped`); a missing or invalid file gives
-    none.
+    Every frame is written with its channel: a channel frame's `ch` is its
+    channel file's, a mixed-lane frame has none. Frames are given only for a
+    file that parsed (`ok` or `capped`); a missing or invalid file gives none.
     """
     settings = deps.settings
     if not session.activity_exists:
@@ -595,13 +593,11 @@ def _session_activity(
             session.session_uid,
         )
         return "missing", [], [], None
-    taps_path = frames_tmp.with_suffix(".taps.jsonl")
-    rest_path = frames_tmp.with_suffix(".jsonl")
+    frames_path = frames_tmp.with_suffix(".jsonl")
     try:
-        with taps_path.open("w") as taps, rest_path.open("w") as rest:
+        with frames_path.open("w") as out:
 
             def capture(frame: CapturedFrame) -> None:
-                out = taps if frame.source == "channel" else rest
                 out.write(
                     json.dumps(_activity_frame(frame, session.origin_ms, start_ms))
                     + "\n"
@@ -611,7 +607,6 @@ def _session_activity(
                 deps.storage.iter_lines(settings.vexa_bucket, session.activity_key),
                 capture,
             )
-            has_taps = taps.tell() > 0
         events = speech_events(
             activity,
             session.origin_ms - start_ms,
@@ -620,8 +615,7 @@ def _session_activity(
         )
         speaker_names = activity_names(activity)
     except (KeyError, TypeError, ValueError) as exc:
-        taps_path.unlink(missing_ok=True)
-        rest_path.unlink(missing_ok=True)
+        frames_path.unlink(missing_ok=True)
         logger.warning(
             "speaker activity invalid vexa_meeting_id=%s session_uid=%s "
             "error_class=%s; exporting without attribution",
@@ -630,8 +624,6 @@ def _session_activity(
             type(exc).__name__,
         )
         return "invalid", [], [], None
-    kept, dropped = (taps_path, rest_path) if has_taps else (rest_path, taps_path)
-    dropped.unlink()
     if activity.capped:
         logger.warning(
             "speaker activity capped vexa_meeting_id=%s session_uid=%s; "
@@ -639,8 +631,8 @@ def _session_activity(
             vexa_meeting_id,
             session.session_uid,
         )
-        return "capped", events, speaker_names, kept
-    return "ok", events, speaker_names, kept
+        return "capped", events, speaker_names, frames_path
+    return "ok", events, speaker_names, frames_path
 
 
 def _write_frames_array(parts: list[Path], out: Path) -> None:
