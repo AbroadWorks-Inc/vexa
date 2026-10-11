@@ -1544,6 +1544,13 @@ export async function restartMixedCapture(page: Page): Promise<boolean> {
  * stop) is the COMPLETED signal. Started post-admission (on the live meeting page, where the
  * participant <audio> elements exist), exactly like the capture bridge.
  */
+/** How long a channel's stream may be missing from the page before its recorder is released:
+ *  30 s by default; VEXA_CHANNEL_GONE_MS overrides it (the boundary test uses a few seconds). */
+function channelGoneMs(): number {
+  const n = parseInt(process.env.VEXA_CHANNEL_GONE_MS ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
+}
+
 export async function startRecording(page: Page, inv: Invocation, recording: BotRecordingSink): Promise<() => Promise<void>> {
   const key = `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`;
   // Recording part interval (ms): the MediaRecorder timeslice = the durable-upload granularity.
@@ -1577,7 +1584,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
   }
 
   // Page-side: start the recording tap on the lane's audio source.
-  await page.evaluate(async ({ timesliceMs, source, recordChannels, platform, channelScanMs }) => {
+  await page.evaluate(async ({ timesliceMs, source, recordChannels, platform, channelScanMs, channelGoneMs }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (w.VexaBrowserUtils?.createRecordingTap && !w.__vexaRecordingTap) {
       const tapOpts: Record<string, unknown> = {
@@ -1626,7 +1633,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     // Jitsi stream id, and so its channel number, is not reused).
     const started = new Set<number>();
     // The live ones: channel -> its recorder, its stream id, and its activity source and node.
-    w.__vexaChannels = new Map<number, { tap: any; streamId: string; src?: any; node?: any }>();
+    w.__vexaChannels = new Map<number, { tap: any; streamId: string; src?: any; node?: any; missingSince?: number }>();
     // A speaker who left: flush the recorder's last chunk and free its source and node, so a long
     // meeting does not keep one recorder and one worklet per person who ever joined.
     const release = async (channel: number): Promise<void> => {
@@ -1736,9 +1743,14 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
             };
             await openChannel(target.channel, found.stream, 'jitsi', target.streamId, nameOf);
           }
-          // A stream gone from the page is a speaker who left.
-          for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { streamId: string }][]) {
-            if (!byId.has(entry.streamId)) await release(channel);
+          // A stream gone from the page for channelGoneMs is a speaker who left. Jitsi gives a
+          // returning participant a new stream id (a new channel), so a released channel is never
+          // needed again; the grace keeps a stream that is only briefly detached recording.
+          const now = Date.now();
+          for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { streamId: string; missingSince?: number }][]) {
+            if (byId.has(entry.streamId)) { entry.missingSince = undefined; continue; }
+            entry.missingSince ??= now;
+            if (now - entry.missingSince >= channelGoneMs) await release(channel);
           }
         }
       } catch (e) {
@@ -1755,6 +1767,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     recordChannels,
     platform: inv.platform,
     channelScanMs: 2000,
+    channelGoneMs: channelGoneMs(),
   }).catch((e) => { console.error(`[bot] recording bridge: page-side start failed: ${String(e)}`); });
 
   // Stop fn: stop the recorder so it flushes the final (isFinal) chunk → master assembly.
