@@ -132,7 +132,9 @@ never guessed: without it, or without `max_concurrent` in it, the spawn fails `i
 (the one exception is the sweep's `AUTO_JOIN_ALLOW_UNCAPPED` opt-in with no identity edge).
 `retry.py` is §6.9 F-K2: a bot that fails while its meeting is on gets a new bot on the SAME
 meeting. `due_at` is the decision: a bot failure (a `failed` session whatever its reason but
-`stopped`, `evicted` and `startup_alone`, or a `completed` the runtime drove, a lost bot) on a
+the `NOT_RETRIED` ones, which a new bot would repeat: `stopped`, `evicted`, `startup_alone`,
+`awaiting_admission_rejected`, `auth_session_missing`, `validation_error`,
+`max_bot_time_exceeded`; or a `completed` the runtime drove, a lost bot) on a
 meeting entries manage that nobody ended (no `stop_requested`, no outcome, live and not
 `stopping`), within `BOT_SEND_MAX_ATTEMPTS` (`send_attempts`, shared with F-K) and with the next bot
 `BOT_SEND_RETRY_BACKOFF_S` from now before the planned end. `retry(tx, …)` is the one writer: one

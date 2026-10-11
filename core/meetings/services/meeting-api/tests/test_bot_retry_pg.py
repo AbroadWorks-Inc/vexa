@@ -254,13 +254,6 @@ RETRIED = [
     pytest.param(
         "awaiting_admission",
         "failed",
-        "awaiting_admission_rejected",
-        "bot_callback",
-        id="lobby-rejected",
-    ),
-    pytest.param(
-        "awaiting_admission",
-        "failed",
         "awaiting_admission_timeout",
         "bot_callback",
         id="lobby-timeout",
@@ -332,6 +325,29 @@ NOT_RETRIED = [
     ),
     pytest.param(
         "active", "completed", "evicted", "runtime_destroy", id="lost-but-evicted"
+    ),
+    pytest.param(
+        "awaiting_admission",
+        "failed",
+        "awaiting_admission_rejected",
+        "bot_callback",
+        id="lobby-rejected",
+    ),
+    pytest.param(
+        "needs_help",
+        "failed",
+        "awaiting_admission_rejected",
+        "bot_callback",
+        id="platform-blocked",
+    ),
+    pytest.param(
+        "joining", "failed", "auth_session_missing", "bot_callback", id="signed-out"
+    ),
+    pytest.param(
+        "requested", "failed", "validation_error", "bot_callback", id="not-a-meeting"
+    ),
+    pytest.param(
+        "active", "completed", "max_bot_time_exceeded", "runtime_destroy", id="time-cap"
     ),
 ]
 
@@ -563,6 +579,12 @@ class _SystemSink:
 
     async def deliver(self, envelope, *, label=""):
         self.events.append(envelope["event_type"])
+
+
+async def _webhook_once(pg: Pg, sink: _SystemSink, mid: int, event_type: str) -> bool:
+    """The subscriber webhook is the outbox row the status write inserts, once; the finish
+    posts nothing to the system hook."""
+    return sink.events == [] and (await pg.types(mid)).count(event_type) == 1
 
 
 async def test_pg_a_lost_workload_through_the_lifecycle_is_bot_retry_only(pg):
@@ -834,7 +856,7 @@ async def test_pg_the_exporters_meeting_completed_fires_once_and_sequence_grows(
         force_terminal_on_destroy=True,
     )
     assert (await pg.row(mid))["status"] == "completed"
-    assert sink.events == ["meeting.completed"]
+    assert await _webhook_once(pg, sink, mid, "meeting.completed")
     sequences = [e["data"]["meeting"]["sequence"] for e in await pg.events(mid)]
     assert sequences == sorted(sequences) and len(set(sequences)) == len(sequences)
     types = await pg.types(mid)
@@ -1181,7 +1203,7 @@ async def test_pg_a_waiting_meeting_ended_at_its_planned_end_is_finished_like_an
     await pg.tick(_gone(), at=_later(181), finish_meeting=app.state.finish_meeting)
     row = await pg.row(mid)
     assert row["status"] == "failed"
-    assert sink.events == ["bot.failed"]
+    assert await _webhook_once(pg, sink, mid, "bot.failed")
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
     assert app.state.typed_webhooks[-1]["data"]["meeting"]["status"] == "failed"
 
@@ -1199,7 +1221,7 @@ async def test_pg_a_stopped_waiting_meeting_is_finished_like_any_end(pg):
     await stop.stop_live(USER, mid, outcome=None)
     assert (await pg.row(mid))["status"] == "failed"
     assert commands.published == []
-    assert sink.events == ["bot.failed"] and finalized == [mid]
+    assert await _webhook_once(pg, sink, mid, "bot.failed") and finalized == [mid]
     assert streams.reaped == [f"tc:meeting:{mid}"]
 
 
@@ -1234,7 +1256,7 @@ async def test_pg_a_waiting_meeting_the_sweep_ends_is_finished_like_any_end(pg):
         item_failures=InMemoryItemFailures(max_failures=5),
     )
     assert (await pg.row(mid))["status"] == "failed"
-    assert sink.events == ["bot.failed"] and finalized == [mid]
+    assert await _webhook_once(pg, sink, mid, "bot.failed") and finalized == [mid]
 
 
 # ── the driver's new bot failing before its claim ───────────────────────────────────────────
@@ -1416,7 +1438,7 @@ async def test_pg_the_last_new_bot_failing_after_its_claim_is_finished_like_any_
     )  # the new bot's create is refused after its claim
     await pg.tick(runtime, at=_later(), finish_meeting=app.state.finish_meeting)
     assert (await pg.row(mid))["status"] == "failed"
-    assert sink.events == ["bot.failed"]
+    assert await _webhook_once(pg, sink, mid, "bot.failed")
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
 
 
@@ -1495,7 +1517,7 @@ async def test_pg_a_claim_whose_spawn_died_after_the_create_names_and_bounds_it(
     assert row["data"]["failure_reason"].startswith("no new bot was sent by ")
     assert _pending(row) == [new]
     assert (await pg.types(mid))[-1] == "bot.failed"
-    assert sink.events == ["bot.failed"]
+    assert await _webhook_once(pg, sink, mid, "bot.failed")
     assert await _deleted_by_the_teardown_sweep(pg, new) == [new]
     assert "unproven_teardown" not in (await pg.row(mid))["data"]
 
@@ -1927,7 +1949,7 @@ async def test_pg_the_driver_finishes_a_stop_its_spawn_hit_as_a_user_stop(pg):
     )
     row = await pg.row(mid)
     assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
-    assert sink.events == ["bot.failed"]
+    assert await _webhook_once(pg, sink, mid, "bot.failed")
     typed = app.state.typed_webhooks[-1]
     assert typed["data"]["status_change"]["transition_source"] == "user_stop"
 
@@ -2154,7 +2176,7 @@ async def test_pg_a_first_send_failing_after_its_claim_is_finished_like_any_end(
     )
     assert (await pg.row(mid))["status"] == "failed"
     assert await pg.sessions(mid)
-    assert sink.events == ["bot.failed"]
+    assert await _webhook_once(pg, sink, mid, "bot.failed")
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
 
 
@@ -2179,7 +2201,7 @@ async def test_pg_a_first_send_a_stop_raced_after_its_session_is_finished_as_a_s
     )
     row = await pg.row(mid)
     assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
-    assert sink.events == ["bot.failed"] and finalized == [mid]
+    assert await _webhook_once(pg, sink, mid, "bot.failed") and finalized == [mid]
     typed = app.state.typed_webhooks[-1]
     assert typed["data"]["status_change"]["transition_source"] == "user_stop"
 
@@ -2188,8 +2210,9 @@ async def test_pg_a_first_send_a_stop_raced_after_its_session_is_finished_as_a_s
 
 
 async def test_pg_two_finishes_of_one_end_run_its_steps_once(pg):
-    """M7: two finishes of the same end racing (a stop and the driver) post the system hook
-    and reap once; the marker is written with the claim, under the row lock."""
+    """M7: two finishes of the same end racing (a stop and the driver) finalize and reap once
+    and post no webhook (the subscriber webhook is the status write's outbox row); the marker is
+    written with the claim, under the row lock."""
     import asyncio
 
     mid, session = await pg.sent(status="active")
@@ -2198,7 +2221,7 @@ async def test_pg_two_finishes_of_one_end_run_its_steps_once(pg):
     await asyncio.gather(
         app.state.finish_meeting(mid), app.state.finish_meeting(mid, stopped=True)
     )
-    assert sink.events == ["bot.failed"]
+    assert sink.events == []
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
     assert (await pg.row(mid))["data"]["finished_end"] == {
         "status": "failed",
@@ -2342,7 +2365,7 @@ async def test_pg_a_join_now_send_ended_after_its_claim_is_finished_like_any_end
     mid = await pg.id_of(reply["meeting"]["id"])
     row = await pg.row(mid)
     assert (row["status"], row["data"]["completion_reason"]) == ("failed", "stopped")
-    assert sink.events == ["bot.failed"]
+    assert await _webhook_once(pg, sink, mid, "bot.failed")
     assert finalized == [mid] and streams.reaped == [f"tc:meeting:{mid}"]
     typed = app.state.typed_webhooks[-1]
     assert typed["data"]["status_change"]["transition_source"] == "user_stop"
