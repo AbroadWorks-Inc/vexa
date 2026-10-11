@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -38,6 +39,9 @@ from .service import (
 #: know to ask; the cap is what keeps it cheap for one who asks for too much.
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
+
+#: A per-channel media type (`ch0`, `ch12`): its chunks must say which chunk they are.
+_CHANNEL_MEDIA = re.compile(r"ch\d+")
 
 #: Per-media-file keys the LIST row keeps. Everything else on a media file describes HOW the bytes
 #: were assembled — `chunk_seq`, `chunk_count`, `last_chunk_size_bytes`, `first_chunk_at`,
@@ -232,6 +236,10 @@ def build_router(
             except SessionNotFound as e:
                 raise HTTPException(status_code=404, detail=str(e))
             return JSONResponse(content=receipt)
+        if chunk_seq is None and "chunk_seq" not in meta and _CHANNEL_MEDIA.fullmatch(media_type):
+            # A channel chunk without its number would default to 0 and land on chunk 0's object.
+            # A whole-recording upload (one file, no chunks) is chunk 0 and keeps the default.
+            raise HTTPException(status_code=422, detail="chunk_seq required for a channel chunk")
         chunk_seq = chunk_seq if chunk_seq is not None else int(meta.get("chunk_seq", 0) or 0)
         is_final = is_final if is_final is not None else bool(meta.get("is_final", True))
         duration_seconds = duration_seconds if duration_seconds is not None else meta.get("duration_seconds")

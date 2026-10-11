@@ -61,11 +61,13 @@ with `rerun` in the same durable queue, so the running worker exports it with th
 backoff and quarantine. A rerun ignores `handed_off`: every file is written again from what aw-bots
 holds now, so one an earlier export could not write (a channel whose master timed out) is filled
 in, and the folder goes to `notetaker-worker`'s `/process` with `"rerun": true`, which moves the
-previous outputs to `runs/<processed_at>/` and redoes the transcript. While the meeting's previous
-job is still running the worker answers 409, and the queue retries the rerun with its backoff. A meeting that has
-not finished, had no bot sent, or never had its bot in the meeting is refused (`refused <id>:
-<why>`, exit code 1) and nothing is queued for it. A webhook redelivered while a rerun is pending
-keeps it a rerun.
+previous outputs to `runs/<processed_at>/` and redoes the transcript. A meeting notetaker-worker
+is transcribing now (`GET /status/{id}` reads `processing`) is refused with `transcription in
+progress for this meeting`, as is every meeting when the worker cannot say; nothing is queued or
+written for it. A meeting that has not finished, had no bot sent, or never had its bot in the
+meeting is refused too (`refused <id>: <why>`, exit code 1). A webhook redelivered while a rerun is
+pending keeps it a rerun, and a rerun asked for while the meeting is exporting stays queued after
+that export. A rerun out of attempts is reported `failed`, never the earlier hand-off.
 
 ## Through the gateway (design §1.9, §1.10)
 - **Reads.** `GET /recordings`, `GET /recordings/{id}/master`, `GET /transcripts/by-id/{id}` and,
@@ -143,8 +145,9 @@ one transcript with speaker names:
   error}` and the export result `failed` with `more than <n> recordings (EXPORT_MAX_RECORDINGS)`.
 - **The other files.** `meeting.json` is the webhook's meeting as sent (the intake.v1 `Meeting`,
   not ours to extend), and `recordings.json` lists every recording as meeting-api returned it.
-  `live_transcript.json` is the meeting's transcript (`GET /transcripts/by-id/{id}`) when it has
-  segments, which only a bot that ran with live transcription leaves. A recording with no audio file (the bot failed before it recorded) is skipped with
+  `live_transcript.json` is the meeting's transcript (`GET /transcripts/by-id/{id}`); only a bot
+  that ran with live transcription leaves segments, otherwise it is `{"segments": []}`. Every run
+  writes every file listed here, empty when there is nothing, so a rerun leaves nothing stale. A recording with no audio file (the bot failed before it recorded) is skipped with
   the log line `recording_skipped … reason=no_audio`. With `EXPORT_DEBUG`, each session's signal
   files go to `signal/<session_uid>/`.
 - **One session** is exported from its recording alone: `master.webm` is a server-side copy,
@@ -155,10 +158,12 @@ one transcript with speaker names:
   `channels/index.json`, written after every channel file; each row names its `file` and
   `offset_s`, where the file starts on the meeting clock. Nothing is decoded or padded: a
   2-hour, 19-speaker meeting's channels are ~270 MB as opus, ~3.5 GB as 16 kHz wav. Every parsed activity frame
-  the channel transcript needs goes to `speaker_activity_frames.json`. On Jitsi, a session
-  with `"src":"channel"` lines writes only those. A failure logs `channel_export_failed`
-  and the mixed folder and `/process` still go out. No index means the worker stays on the
-  mixed path. The worker's use of these files is
+  the channel transcript needs goes to `speaker_activity_frames.json` (`[]` when no session's
+  activity parsed), streamed to disk as it is read. On Jitsi, a session with `"src":"channel"`
+  lines writes only those. A meeting without channels, or whose channel step failed (logged as
+  `channel_export_failed`; the mixed folder and `/process` still go out), gets the index `[]`,
+  and the worker stays on the mixed path. On a rerun the worker removes the channel files the
+  index does not name; the exporter deletes nothing. The worker's use of these files is
   `deployment/base/notetaker/worker/README.md` in the deployment repo.
 
 ## Config (names only — see spec §4.4)
@@ -166,7 +171,12 @@ one transcript with speaker names:
 secret of its `/v2/webhooks` subscription),
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `EXPORT_RETRY_BACKOFF_SECONDS`
-(default 30: a failed export waits this × 2^attempts seconds before its next try), `RMS_SPEECH_THRESHOLD`,
+(default 30: a failed export waits this × 2^attempts seconds before its next try),
+`EXPORT_MAX_CRASHES` (default 2: runs that stopped mid-export, the pod killed or out of memory,
+before the meeting is quarantined; a crash raises nothing, so it has its own budget),
+`EXPORT_LEASE_SECONDS` (default 120: a running export's lease, renewed while it runs; one found
+expired is a crash; a stopped worker releases its leases, so a deploy is not one),
+`RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`,
 `ACTIVITY_WAIT_SECONDS`, `EXPORT_MAX_RECORDINGS` (default 50: the meeting's recordings are read
 page by page up to this many; past it the export fails, see below), `AWS_REGION`. S3 access is via

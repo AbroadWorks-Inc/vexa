@@ -30,7 +30,6 @@ warnings.filterwarnings(
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-import exporter.queue as queue_module  # noqa: E402
 from exporter.app import create_app  # noqa: E402
 from exporter.audio import join_webm  # noqa: E402
 from exporter.config import Settings  # noqa: E402
@@ -748,20 +747,22 @@ def test_sweep_once_isolates_per_id_failures(storage: Storage) -> None:
     assert bad_item["attempts"] == 1
 
 
-def test_run_worker_survives_sweep_once_raising(
+def test_run_worker_survives_listing_the_queue_raising(
     storage: Storage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(sweep_seconds=0.01)
     queue = PendingQueue(storage, settings.vexa_bucket)
     deps = _deps(storage, settings)
     calls = {"n": 0}
+    real = queue.pending_ids
 
-    async def flaky_sweep_once(q: PendingQueue, d: Deps) -> None:
+    def flaky_pending_ids() -> list[str]:
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("boom")
+        return real()
 
-    monkeypatch.setattr(queue_module, "sweep_once", flaky_sweep_once)
+    monkeypatch.setattr(queue, "pending_ids", flaky_pending_ids)
 
     async def scenario() -> None:
         stop = asyncio.Event()
@@ -773,6 +774,256 @@ def test_run_worker_survives_sweep_once_raising(
     asyncio.run(scenario())
 
     assert calls["n"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# Crashes (F1): a run that stops without finishing leaves its lease behind
+# ---------------------------------------------------------------------------
+
+
+def _left_by_a_dead_run(queue: PendingQueue, expires_at: float = 900.0) -> None:
+    item = queue.load(KEY)
+    assert item is not None
+    item["lease"] = {"owner": "dead-pod", "expires_at": expires_at}
+    queue._storage.put_json(VEXA_BUCKET, PENDING_KEY, item)
+
+
+def _ok_job(calls: list[str]) -> Any:
+    def job(envelope: dict[str, Any], deps: Deps, rerun: bool = False) -> ExportResult:
+        calls.append("ran")
+        return ExportResult(state="handed_off", folder="x")
+
+    return job
+
+
+def test_an_expired_lease_counts_a_crash_and_runs_the_meeting_again(
+    storage: Storage,
+) -> None:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+    _left_by_a_dead_run(queue)
+    calls: list[str] = []
+    failing: list[str] = []
+
+    def crash_then_fail(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        failing.append("ran")
+        raise RuntimeError("boom")
+
+    asyncio.run(
+        sweep_once(
+            queue, _deps(storage, settings), job=crash_then_fail, now=lambda: 1000.0
+        )
+    )
+
+    item = queue.load(KEY)
+    assert item is not None
+    assert item["crashes"] == 1, "the dead run is counted"
+    assert failing == ["ran"], "and the meeting runs again"
+    assert "lease" not in item, "a failed run clears its lease"
+    assert item["attempts"] == 1
+    assert calls == []
+
+
+def test_the_second_crash_quarantines_the_meeting_and_it_never_runs_again(
+    storage: Storage,
+) -> None:
+    settings = _settings(max_crashes=2)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+    deps = _deps(storage, settings)
+    calls: list[str] = []
+
+    _left_by_a_dead_run(queue)
+    item = queue.load(KEY)
+    assert item is not None
+    item["crashes"] = 1
+    storage.put_json(VEXA_BUCKET, PENDING_KEY, item)
+
+    asyncio.run(sweep_once(queue, deps, job=_ok_job(calls), now=lambda: 1000.0))
+
+    assert calls == [], "a meeting out of crashes is not run"
+    assert storage.get_json(VEXA_BUCKET, PENDING_KEY) is None
+    failed = storage.get_json(VEXA_BUCKET, FAILED_KEY)
+    assert failed is not None and failed["crashes"] == 2 and "lease" not in failed
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker is not None and marker["state"] == "failed"
+    assert "stopped 2 times" in marker["error"]
+
+    asyncio.run(sweep_once(queue, deps, job=_ok_job(calls), now=lambda: 9000.0))
+    assert calls == []
+
+
+def test_a_lease_that_has_not_expired_is_left_running(storage: Storage) -> None:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+    _left_by_a_dead_run(queue, expires_at=2000.0)
+    calls: list[str] = []
+
+    asyncio.run(
+        sweep_once(
+            queue, _deps(storage, settings), job=_ok_job(calls), now=lambda: 1000.0
+        )
+    )
+
+    assert calls == []
+    item = queue.load(KEY)
+    assert item is not None and "crashes" not in item
+
+
+def test_a_finished_meeting_leaves_no_lease_behind(storage: Storage) -> None:
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+    seen: list[Any] = []
+
+    def job(envelope: dict[str, Any], deps: Deps, rerun: bool = False) -> ExportResult:
+        seen.append((queue.load(KEY) or {}).get("lease"))
+        return ExportResult(state="handed_off", folder="x")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=job, now=lambda: 1000.0)
+    )
+
+    assert (
+        seen[0]["expires_at"] == 1000.0 + settings.lease_seconds
+    ), "leased before it runs"
+    assert queue.pending_ids() == []
+
+
+def test_a_stopped_worker_releases_its_lease_so_a_deploy_is_not_a_crash(
+    storage: Storage,
+) -> None:
+    import threading
+
+    settings = _settings(sweep_seconds=0.01)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+    started, finish = threading.Event(), threading.Event()
+
+    def slow_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        started.set()
+        finish.wait(5)
+        raise RuntimeError("killed with the pod")
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            run_worker(queue, _deps(storage, settings), stop, job=slow_job)
+        )
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+    item = queue.load(KEY)
+    finish.set()
+    assert item is not None
+    assert "lease" not in item and "crashes" not in item
+
+
+def test_a_rerun_asked_for_while_the_meeting_exports_stays_queued(
+    storage: Storage,
+) -> None:
+    """The export that was running finishes; the rerun requested meanwhile
+    is not lost with it."""
+    settings = _settings()
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    queue.enqueue(_envelope())
+
+    def job(envelope: dict[str, Any], deps: Deps, rerun: bool = False) -> ExportResult:
+        queue.enqueue(_envelope(), rerun=True)
+        return ExportResult("handed_off", "folder")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=job, now=lambda: 1000.0)
+    )
+
+    item = queue.load(KEY)
+    assert item is not None, "still queued"
+    assert item["rerun"] is True and "lease" not in item
+
+    reruns: list[bool] = []
+
+    def second(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        reruns.append(rerun)
+        return ExportResult("handed_off", "folder")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=second, now=lambda: 1000.0)
+    )
+    assert reruns == [True]
+    assert queue.pending_ids() == []
+
+
+def test_a_rerun_out_of_attempts_is_failed_not_the_earlier_hand_off(
+    storage: Storage,
+) -> None:
+    settings = _settings(max_attempts=1)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    storage.put_json(EXPORT_BUCKET, BASE + "_export.json", {"state": "handed_off"})
+    queue.enqueue(_envelope(), rerun=True)
+
+    def failing(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    ) -> ExportResult:
+        raise RuntimeError("notetaker 409")
+
+    asyncio.run(
+        sweep_once(queue, _deps(storage, settings), job=failing, now=lambda: 1000.0)
+    )
+
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["state"] == "failed" and marker["error"] == "notetaker 409"
+    assert storage.get_json(VEXA_BUCKET, FAILED_KEY) is not None
+
+
+def test_one_long_export_does_not_hold_back_the_others(storage: Storage) -> None:
+    import threading
+
+    settings = _settings(sweep_seconds=0.01)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    long_id, short_id = "11111111-1111-4111-8111-111111111111", KEY
+    queue.enqueue(_envelope(id=long_id))
+    finish = threading.Event()
+    done: list[str] = []
+
+    def job(envelope: dict[str, Any], deps: Deps, rerun: bool = False) -> ExportResult:
+        meeting_id = envelope["data"]["meeting"]["id"]
+        if meeting_id == long_id:
+            finish.wait(5)
+        done.append(meeting_id)
+        return ExportResult(state="handed_off", folder="x")
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            run_worker(queue, _deps(storage, settings), stop, job=job)
+        )
+        await asyncio.sleep(0.1)
+        queue.enqueue(_envelope())  # arrives while the long one runs
+        for _ in range(200):
+            if short_id in done:
+                break
+            await asyncio.sleep(0.01)
+        finish.set()
+        for _ in range(200):
+            if long_id in done:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+    assert done == [short_id, long_id]
 
 
 def test_caplog_shows_job_failure_and_quarantine(

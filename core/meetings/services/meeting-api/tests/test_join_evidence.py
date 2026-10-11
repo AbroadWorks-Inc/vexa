@@ -433,8 +433,8 @@ def test_needs_help_is_only_proof_of_a_lobby_when_it_was_entered_from_one():
     escalate. Reading the mere presence of ``needs_help`` as proof of a lobby would then stamp a bot
     that never saw a waiting room as ``awaiting_admission_timeout`` / ``host_action`` — filed as *the host
     did not let us in*, and excluded from ``system_failure_rate``: the metric under-reporting our own
-    defects in exactly the cohort #1251 exists to investigate. Driven at the function, because
-    ``LEGAL_TRANSITIONS`` still forbids the edge that makes it reachable.
+    defects in exactly the cohort #1251 exists to investigate. Driven at the function; the FSM
+    path (``joining -> needs_help -> failed``) is pinned in test_lifecycle_machine.py.
     """
     from meeting_api.lifecycle.machine import (
         BotStatus,

@@ -26,6 +26,13 @@ class Settings:
     max_attempts: int = 5
     # A failed export waits this × 2**attempts seconds before its next try.
     retry_backoff_seconds: float = 30.0
+    # Runs that stopped mid-export (the pod was killed or ran out of memory)
+    # before the meeting is moved to failed/: a crash never raises, so it has
+    # its own budget beside max_attempts.
+    max_crashes: int = 2
+    # A running export holds a lease, renewed while it runs; one that expires
+    # unfinished counts as a crash.
+    lease_seconds: float = 120.0
     rms_speech_threshold: float = (
         0.026  # measured on 2026-09-22 Meet recording (spec §4.3)
     )
@@ -62,6 +69,8 @@ class Settings:
             sweep_seconds=float(env.get("EXPORT_SWEEP_SECONDS", "60")),
             max_attempts=int(env.get("EXPORT_MAX_ATTEMPTS", "5")),
             retry_backoff_seconds=float(env.get("EXPORT_RETRY_BACKOFF_SECONDS", "30")),
+            max_crashes=int(env.get("EXPORT_MAX_CRASHES", "2")),
+            lease_seconds=float(env.get("EXPORT_LEASE_SECONDS", "120")),
             rms_speech_threshold=float(env.get("RMS_SPEECH_THRESHOLD", "0.026")),
             speech_hangover_ms=int(env.get("SPEECH_HANGOVER_MS", "700")),
             min_dominant_utterance_ms=int(env.get("MIN_DOMINANT_UTTERANCE_MS", "1500")),

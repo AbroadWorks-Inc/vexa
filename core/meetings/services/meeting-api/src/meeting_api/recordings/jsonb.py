@@ -17,8 +17,9 @@ from typing import Any, Optional
 _STATUS_COMPLETED = "completed"
 _STATUS_IN_PROGRESS = "in_progress"
 _SOURCE_BOT = "bot"
-# Stamped by a per-channel recorder on chunk 0. A later chunk of the same media
-# type must not rename the channel, so these are copied forward and never rewritten.
+# Stamped by a per-channel recorder on every chunk. A field is set by the first chunk that
+# carries it and never rewritten or blanked: a later chunk only fills a field still absent (a
+# name resolved after the recorder started), so a re-sent or lost chunk 0 costs nothing.
 _CHANNEL_IDENTITY_KEYS = (
     "recorder_start_epoch_ms",
     "channel_kind",
@@ -55,20 +56,19 @@ def channel_identity(raw: Any) -> dict[str, Any]:
 
 def _media_metadata(
     sample_rate: Optional[int],
-    chunk_seq: int,
     chunk_metadata: Optional[dict],
     prior_same_type: Optional[dict],
 ) -> dict[str, Any]:
-    """``sample_rate`` from this chunk, plus channel identity that only chunk 0 may set."""
+    """``sample_rate`` from this chunk, plus the channel identity: what earlier chunks stored,
+    and from this chunk only the fields still absent."""
     metadata: dict[str, Any] = {"sample_rate": sample_rate} if sample_rate else {}
-    if chunk_seq == 0:
-        metadata.update(channel_identity(chunk_metadata))
-        return metadata
     prior_meta = (prior_same_type or {}).get("metadata") or {}
     if isinstance(prior_meta, dict):
         metadata.update(
             {key: prior_meta[key] for key in _CHANNEL_IDENTITY_KEYS if key in prior_meta}
         )
+    for key, value in channel_identity(chunk_metadata).items():
+        metadata.setdefault(key, value)
     return metadata
 
 
@@ -174,8 +174,8 @@ def apply_chunk_to_recording(
         "chunk_seq": chunk_seq,
         "first_chunk_at": first_chunk_at,
         # sample_rate is rebuilt from this chunk alone. Starting from the prior dict would keep a
-        # rate a later chunk omitted. Channel identity is the opposite: only chunk 0 may set it.
-        "metadata": _media_metadata(sample_rate, chunk_seq, chunk_metadata, prior_same_type),
+        # rate a later chunk omitted. Channel identity is the opposite: it is never rewritten.
+        "metadata": _media_metadata(sample_rate, chunk_metadata, prior_same_type),
         "created_at": _now_iso(),
         "is_final": new_is_final,
         "finalized_at": (prior_same_type or {}).get("finalized_at"),

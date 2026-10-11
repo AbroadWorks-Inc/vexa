@@ -270,6 +270,38 @@ def test_meeting_api_reads_one_meeting_by_its_id() -> None:
     assert seen == ["/v2/meetings/m-1"]
 
 
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (200, {"status": "processing"}, True),
+        (200, {"status": "completed"}, False),
+        (200, {"status": "failed"}, False),
+        (404, {"detail": "Meeting not found"}, False),
+    ],
+)
+def test_notetaker_transcribing_reads_the_meetings_status(
+    status: int, body: dict[str, Any], expected: bool
+) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        return httpx.Response(status, json=body)
+
+    nt = Notetaker("http://n", httpx.Client(transport=httpx.MockTransport(handler)))
+    assert nt.transcribing("m-1") is expected
+    assert seen == ["GET /status/m-1"]
+
+
+def test_notetaker_transcribing_raises_when_the_worker_cannot_say() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    nt = Notetaker("http://n", httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(NotetakerError):
+        nt.transcribing("m-1")
+
+
 def test_notetaker_4xx_not_retried() -> None:
     n = {"c": 0}
 

@@ -43,11 +43,18 @@ session's channel is an S3 copy of its master; a channel several sessions
 recorded is joined into one opus file, one channel at a time. Every frame
 that parsed, named or not, is written to `speaker_activity_frames.json`,
 except that a session with channel-tap frames (`"src":"channel"`) writes only
-those. The mixed timeline does not read channel-tap frames. A meeting with no
-channel media gets no index. The index goes last, so a channel that fails
-(fetch, copy, join) writes no index; it is logged and the mixed export and
-`/process` go on as without channels. The exporter deletes nothing here
-(§1.9): a channel file no index names expires with its retention class.
+those; frames are written to disk as they are read, so memory stays flat
+however long the meeting. The mixed timeline does not read channel-tap frames.
+
+Every run writes every file the exporter owns, so a rerun leaves nothing
+stale: `channels/index.json` is `[]` for a meeting with no channel media or
+whose channel step failed (fetch, copy, join: logged, and the mixed export and
+`/process` go on as without channels); `speaker_activity_frames.json` is `[]`
+when no session's activity parsed; `live_transcript.json` has no segments
+when the bot had no live transcription. The index goes last, so it never
+names a file this run did not write. The exporter deletes nothing here
+(§1.9): notetaker-worker removes, on a rerun, the channel files the index no
+longer names.
 
 `export_meeting` raises on retryable failure — the caller (the durable
 queue) counts attempts and re-runs; `aw-bots` is never modified, so a re-run
@@ -57,6 +64,7 @@ always starts from the same inputs.
 from __future__ import annotations
 
 import audioop
+import json
 import logging
 import math
 import tempfile
@@ -190,7 +198,6 @@ class _Session:
     origin_ms: int
     signal_prefix: str
     activity_exists: bool
-    media_files: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def activity_key(self) -> str:
@@ -215,14 +222,28 @@ def _audio_recordings(
     return sorted(audio, key=lambda rec: (parse_utc(str(rec["created_at"])), rec["id"]))
 
 
-def _wav_duration_s(path: Path) -> float:
-    with wave.open(str(path), "rb") as wav:
-        return wav.getnframes() / wav.getframerate()
-
-
 def _wav_frames(path: Path) -> tuple[int, int]:
     with wave.open(str(path), "rb") as wav:
         return wav.getnframes(), wav.getframerate()
+
+
+def _wav_duration_s(path: Path) -> float:
+    frames, rate = _wav_frames(path)
+    return frames / rate
+
+
+def _placed(pieces: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Lay `(offset, length)` pieces, in order, on one clock: each starts at
+    its offset, or right after the previous piece when it would start on top
+    of it. Returns each piece's `(start, overlap)`, in the input's unit (wav
+    frames for the mixed audio, milliseconds for a channel)."""
+    placed: list[tuple[int, int]] = []
+    cursor = pieces[0][0] if pieces else 0
+    for offset, length in pieces:
+        start = max(offset, cursor)
+        placed.append((start, start - offset))
+        cursor = start + length
+    return placed
 
 
 def _single_session_audio(
@@ -267,22 +288,28 @@ def _joined_sessions_audio(
 
     rate = decoded[0][3]
     first_origin_ms = sessions[0].origin_ms
+    placements = _placed(
+        [
+            (round((session.origin_ms - first_origin_ms) * rate / 1000), frames)
+            for session, (_, _, frames, _) in zip(sessions, decoded)
+        ]
+    )
     cursor = 0
     wav_parts: list[tuple[Path, int]] = []
     webm_parts: list[tuple[Path, float]] = []
     spans: list[tuple[int, int]] = []
-    for session, (webm_path, wav_path, frames, _) in zip(sessions, decoded):
-        offset = round((session.origin_ms - first_origin_ms) * rate / 1000)
-        if offset < cursor:
+    for session, (webm_path, wav_path, frames, _), (start, overlap) in zip(
+        sessions, decoded, placements
+    ):
+        if overlap:
             logger.warning(
                 "session_overlap vexa_meeting_id=%s recording_id=%s session_uid=%s "
                 "overlap_s=%.3f; placed after the previous session",
                 vexa_meeting_id,
                 session.recording_id,
                 session.session_uid,
-                (cursor - offset) / rate,
+                overlap / rate,
             )
-        start = max(offset, cursor)
         silence = start - cursor
         wav_parts.append((wav_path, silence))
         webm_parts.append((webm_path, silence / rate))
@@ -362,14 +389,12 @@ def _channel_offset_ms(
 def _channel_index_row(
     channel: int, identity: Mapping[str, Any], offset_ms: int
 ) -> dict[str, Any]:
-    stream_id = identity.get("stream_id")
     row: dict[str, Any] = {
         "channel": channel,
         "kind": identity["channel_kind"],
-        "stream_id": stream_id if isinstance(stream_id, str) else "",
         "offset_s": round(offset_ms / 1000, 3),
     }
-    for key in ("participant_id", "display_name"):
+    for key in ("stream_id", "participant_id", "display_name"):
         value = identity.get(key)
         if isinstance(value, str) and value:
             row[key] = value
@@ -415,27 +440,35 @@ def _channel_file(
             retention=AUDIO,
         )
         return name
-    parts: list[tuple[Path, float]] = []
-    cursor_ms = group[0].offset_ms
+    # A recorder's webm carries no duration: each piece is decoded to measure
+    # it, because the join needs every length before it runs.
+    webms: list[Path] = []
+    lengths_ms: list[int] = []
     for i, piece in enumerate(group):
         webm_path = tmp / f"ch{channel}-{i}.webm"
         wav_path = tmp / f"ch{channel}-{i}.wav"
         deps.storage.download_file(settings.vexa_bucket, piece.storage_path, webm_path)
         deps.transcode(webm_path, wav_path)
-        frames, rate = _wav_frames(wav_path)
+        lengths_ms.append(round(_wav_duration_s(wav_path) * 1000))
         wav_path.unlink()
-        if piece.offset_ms < cursor_ms:
+        webms.append(webm_path)
+    parts: list[tuple[Path, float]] = []
+    cursor_ms = group[0].offset_ms
+    placements = _placed([(p.offset_ms, n) for p, n in zip(group, lengths_ms)])
+    for piece, webm_path, length_ms, (start_ms, overlap_ms) in zip(
+        group, webms, lengths_ms, placements
+    ):
+        if overlap_ms:
             logger.warning(
                 "channel_overlap vexa_meeting_id=%s channel=%s recording_id=%s "
                 "overlap_s=%.3f; placed after the previous piece",
                 vexa_meeting_id,
                 channel,
                 piece.recording_id,
-                (cursor_ms - piece.offset_ms) / 1000,
+                overlap_ms / 1000,
             )
-        start_ms = max(piece.offset_ms, cursor_ms)
         parts.append((webm_path, (start_ms - cursor_ms) / 1000))
-        cursor_ms = start_ms + round(frames * 1000 / rate)
+        cursor_ms = start_ms + length_ms
     joined = tmp / name
     deps.join_webm(parts, joined)
     deps.storage.upload_file(
@@ -457,16 +490,22 @@ def _export_channels(
 ) -> None:
     """Write each channel number's opus file and its `channels/index.json` row.
 
-    One file per channel number across sessions. The earliest piece's identity
+    A channel's identity and recorder clock are in the full recording (the
+    list keeps only each media file's id, type, format and size), read here,
+    under the caller's guard: a recording that can't be read costs the
+    channels, never the mixed export. One file per channel number across
+    sessions. The earliest piece's identity
     and offset are the index row; a later session that names someone else is
     logged and does not rename the row. Every channel's identity is checked
     and every master asked for before any file is written, and the index is
-    written last, so it never names a file this export did not write.
+    written last, so it never names a file this export did not write; it is
+    `[]` for a meeting without channels.
     """
     settings = deps.settings
     numbered: list[tuple[_Session, int, int, Mapping[str, Any]]] = []
     for session, (start_ms, _end_ms) in zip(sessions, spans):
-        for media in session.media_files:
+        full = deps.meeting_api.recording(session.recording_id)
+        for media in full.get("media_files") or ():
             number = _channel_number(media.get("type"))
             if number is not None:
                 identity = _channel_identity(number, media.get("metadata"))
@@ -475,6 +514,16 @@ def _export_channels(
     for session, start_ms, number, identity in numbered:
         master = deps.meeting_api.master(session.recording_id, media_type=f"ch{number}")
         offset_ms = _channel_offset_ms(identity, start_ms, session.origin_ms)
+        if offset_ms < 0:
+            logger.warning(
+                "channel_offset_negative vexa_meeting_id=%s channel=%s "
+                "recording_id=%s offset_s=%.3f; its recorder started before the "
+                "session's recording origin, the transcriber trims the start",
+                vexa_meeting_id,
+                number,
+                session.recording_id,
+                offset_ms / 1000,
+            )
         by_channel.setdefault(number, []).append(
             _ChannelPiece(
                 channel=number,
@@ -498,20 +547,16 @@ def _export_channels(
             if later.row.get("display_name") != kept.get("display_name"):
                 logger.warning(
                     "channel_display_name_differs vexa_meeting_id=%s channel=%s "
-                    "session_uid=%s display_name=%s kept=%s",
+                    "session_uid=%s; the earliest piece's name is kept",
                     vexa_meeting_id,
                     channel,
                     later.session_uid,
-                    later.row.get("display_name"),
-                    kept.get("display_name"),
                 )
-    if not index:
-        return
     deps.storage.put_json(
         settings.export_bucket,
         base + "channels/index.json",
         index,
-        retention=METADATA,
+        retention=AUDIO,
     )
 
 
@@ -530,14 +575,17 @@ def _activity_frame(
 
 
 def _session_activity(
-    session: _Session, start_ms: int, deps: Deps, vexa_meeting_id: int
-) -> tuple[ActivityState, list[ActivityEvent], list[str], list[CapturedFrame]]:
+    session: _Session, start_ms: int, deps: Deps, vexa_meeting_id: int, frames_tmp: Path
+) -> tuple[ActivityState, list[ActivityEvent], list[str], Path | None]:
     """The session's speaker events, relative to the meeting clock on which
-    the session starts at `start_ms`, its speaker names, and every parsed frame.
+    the session starts at `start_ms`, its speaker names, and the file its
+    frames were written to as they were read (one JSON frame per line).
 
-    Frames are returned only for a file that parsed (`ok` or `capped`). A
-    missing or invalid file returns none, so the export does not write an
-    empty frame list that would look like silence.
+    A session with channel-tap frames (Jitsi, `"src":"channel"`) gives only
+    those: their `ch` is the channel file's, while its mixed-lane frames reuse
+    ch 0. Otherwise (Meet) every frame is per channel. Frames are given only
+    for a file that parsed (`ok` or `capped`); a missing or invalid file gives
+    none.
     """
     settings = deps.settings
     if not session.activity_exists:
@@ -546,11 +594,24 @@ def _session_activity(
             vexa_meeting_id,
             session.session_uid,
         )
-        return "missing", [], [], []
+        return "missing", [], [], None
+    taps_path = frames_tmp.with_suffix(".taps.jsonl")
+    rest_path = frames_tmp.with_suffix(".jsonl")
     try:
-        activity = parse_activity(
-            deps.storage.iter_lines(settings.vexa_bucket, session.activity_key)
-        )
+        with taps_path.open("w") as taps, rest_path.open("w") as rest:
+
+            def capture(frame: CapturedFrame) -> None:
+                out = taps if frame.source == "channel" else rest
+                out.write(
+                    json.dumps(_activity_frame(frame, session.origin_ms, start_ms))
+                    + "\n"
+                )
+
+            activity = parse_activity(
+                deps.storage.iter_lines(settings.vexa_bucket, session.activity_key),
+                capture,
+            )
+            has_taps = taps.tell() > 0
         events = speech_events(
             activity,
             session.origin_ms - start_ms,
@@ -559,6 +620,8 @@ def _session_activity(
         )
         speaker_names = activity_names(activity)
     except (KeyError, TypeError, ValueError) as exc:
+        taps_path.unlink(missing_ok=True)
+        rest_path.unlink(missing_ok=True)
         logger.warning(
             "speaker activity invalid vexa_meeting_id=%s session_uid=%s "
             "error_class=%s; exporting without attribution",
@@ -566,7 +629,9 @@ def _session_activity(
             session.session_uid,
             type(exc).__name__,
         )
-        return "invalid", [], [], []
+        return "invalid", [], [], None
+    kept, dropped = (taps_path, rest_path) if has_taps else (rest_path, taps_path)
+    dropped.unlink()
     if activity.capped:
         logger.warning(
             "speaker activity capped vexa_meeting_id=%s session_uid=%s; "
@@ -574,8 +639,23 @@ def _session_activity(
             vexa_meeting_id,
             session.session_uid,
         )
-        return "capped", events, speaker_names, list(activity.captured)
-    return "ok", events, speaker_names, list(activity.captured)
+        return "capped", events, speaker_names, kept
+    return "ok", events, speaker_names, kept
+
+
+def _write_frames_array(parts: list[Path], out: Path) -> None:
+    """One JSON array of every part's frames, in order, streamed to `out`."""
+    with out.open("w") as dst:
+        dst.write("[")
+        first = True
+        for part in parts:
+            with part.open() as src:
+                for line in src:
+                    line = line.rstrip("\n")
+                    if line:
+                        dst.write(line if first else "," + line)
+                        first = False
+        dst.write("]")
 
 
 def _held_to(
@@ -751,9 +831,6 @@ def export_meeting(
         parts = storage_path.split("/")
         owner, session_uid = parts[1], parts[3]
         signal_prefix = f"signal/{owner}/{vexa_meeting_id}/{session_uid}/"
-        # The list keeps only each media file's id, type, format and size;
-        # a channel's identity and recorder clock are in the full recording.
-        full = deps.meeting_api.recording(rec["id"])
         sessions.append(
             _Session(
                 recording_id=rec["id"],
@@ -765,7 +842,6 @@ def export_meeting(
                     settings.vexa_bucket, signal_prefix + ACTIVITY_FILE
                 )
                 is not None,
-                media_files=tuple(full.get("media_files") or ()),
             )
         )
 
@@ -812,11 +888,11 @@ def export_meeting(
         events: list[ActivityEvent] = []
         speaker_names: list[str] = []
         states: list[ActivityState] = []
-        exported_frames: list[dict[str, Any]] = []
+        frame_parts: list[Path] = []
         last = len(sessions) - 1
         for i, (session, (start_ms, end_ms)) in enumerate(zip(sessions, spans)):
-            state, session_events, session_names, captured = _session_activity(
-                session, start_ms, deps, vexa_meeting_id
+            state, session_events, session_names, part = _session_activity(
+                session, start_ms, deps, vexa_meeting_id, Path(tmp_dir) / f"frames-{i}"
             )
             events += _held_to(
                 session_events,
@@ -825,15 +901,8 @@ def export_meeting(
             )
             speaker_names += session_names
             states.append(state)
-            if state in ("ok", "capped"):
-                # A session with channel-tap frames (Jitsi) exports only those:
-                # their `ch` matches `channels/ch<N>.wav`, while its mixed-lane
-                # frames reuse ch 0. Otherwise (Meet) every frame is per channel.
-                taps = [frame for frame in captured if frame.source == "channel"]
-                exported_frames.extend(
-                    _activity_frame(frame, session.origin_ms, start_ms)
-                    for frame in (taps or captured)
-                )
+            if part is not None:
+                frame_parts.append(part)
         activity_state = max(states, key=_ACTIVITY_SEVERITY.index)
         if (
             activity_state == "ok"
@@ -898,24 +967,35 @@ def export_meeting(
                 type(exc).__name__,
                 exc,
             )
-        if any(state in ("ok", "capped") for state in states):
             storage.put_json(
                 settings.export_bucket,
-                base + FRAMES_FILE,
-                exported_frames,
-                retention=METADATA,
+                base + "channels/index.json",
+                [],
+                retention=AUDIO,
             )
+        frames_path = Path(tmp_dir) / FRAMES_FILE
+        _write_frames_array(frame_parts, frames_path)
+        storage.upload_file(
+            frames_path,
+            settings.export_bucket,
+            base + FRAMES_FILE,
+            "application/json",
+            retention=METADATA,
+        )
 
         # A meeting whose bot ran with live transcription has segments; one
-        # without has none, and gets no file.
+        # without gets the same file with none.
         transcript = deps.meeting_api.transcript(vexa_meeting_id)
-        if transcript is not None and transcript.get("segments"):
-            storage.put_json(
-                settings.export_bucket,
-                base + "live_transcript.json",
-                transcript,
-                retention=METADATA,
-            )
+        storage.put_json(
+            settings.export_bucket,
+            base + "live_transcript.json",
+            (
+                transcript
+                if transcript and transcript.get("segments")
+                else {"segments": []}
+            ),
+            retention=METADATA,
+        )
 
         if settings.debug:
             for session in sessions:

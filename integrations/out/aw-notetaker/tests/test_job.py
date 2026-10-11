@@ -288,8 +288,11 @@ def test_happy_path_writes_expected_keys_and_hands_off(storage: Storage) -> None
         BASE + "meeting.json",
         BASE + "recordings.json",
         BASE + "speaker_activity_frames.json",
+        BASE + "live_transcript.json",
+        BASE + "channels/index.json",
         BASE + "_export.json",
     }
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     assert storage.get_bytes(EXPORT_BUCKET, BASE + "master.webm") == b"webm-bytes"
     assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == [
@@ -595,11 +598,12 @@ def test_a_transcript_with_segments_is_written_as_live_transcript(
 
 
 @pytest.mark.parametrize("transcript", [None, {"segments": []}, {}])
-def test_a_meeting_without_transcript_segments_gets_no_live_transcript(
+def test_a_meeting_without_transcript_segments_gets_an_empty_live_transcript(
     storage: Storage, transcript: dict[str, Any] | None
 ) -> None:
     """A bot that ran without live transcription leaves no segments (or no
-    transcript at all, a 404): there is no `live_transcript.json`."""
+    transcript at all, a 404): `live_transcript.json` has no segments, so a
+    rerun never leaves an earlier run's transcript behind."""
     storage_path = _put_master(storage, 3, "uid-2")
     meeting_api = FakeMeetingApi(
         recordings=[_audio_recording(3)],
@@ -612,7 +616,9 @@ def test_a_meeting_without_transcript_segments_gets_no_live_transcript(
 
     assert result.state == "handed_off"
     assert meeting_api.transcript_calls == [11367]
-    assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") is None
+    assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") == {
+        "segments": []
+    }
 
 
 def test_notetaker_failure_propagates_and_leaves_no_handoff_marker(
@@ -648,9 +654,7 @@ def test_missing_speaker_activity_still_hands_off_with_missing_marker(
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "missing"
-    assert (
-        storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") is None
-    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == []
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["speaker_timeline"] == []
     assert timeline["participants"] == []
@@ -974,9 +978,7 @@ def test_header_less_activity_hands_off_with_invalid_marker(storage: Storage) ->
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["speaker_activity"] == "invalid"
-    assert (
-        storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") is None
-    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == []
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert timeline["speaker_timeline"] == [] and timeline["speaker_intervals"] == []
     participants = storage.get_json(EXPORT_BUCKET, BASE + "participants.json")
@@ -1076,7 +1078,10 @@ def test_audio_is_streamed_via_files_not_held_as_bytes(storage: Storage) -> None
     assert not [k for k in spy.get_bytes_keys if k.endswith((".webm", ".wav"))]
     assert not [k for k in spy.put_bytes_keys if k.endswith((".webm", ".wav"))]
     assert spy.downloads == [BASE + "master.webm"]
-    assert spy.uploads == [(BASE + "audio.wav", "audio/wav")]
+    assert spy.uploads == [
+        (BASE + "audio.wav", "audio/wav"),
+        (BASE + "speaker_activity_frames.json", "application/json"),
+    ]
 
 
 def test_single_audio_recording_logs_no_multi_session_warning(
@@ -1280,6 +1285,8 @@ EXPECTED_KEYS = {
         "meeting.json",
         "recordings.json",
         "speaker_activity_frames.json",
+        "live_transcript.json",
+        "channels/index.json",
         "_export.json",
     )
 }
@@ -2095,12 +2102,11 @@ def test_channels_are_written_as_recorded_with_their_offset(
     ]
     messages = [record.getMessage() for record in caplog.records]
     assert any(message.startswith("channel_overlap ") for message in messages)
-    assert any(
-        message.startswith("channel_display_name_differs ")
-        and "display_name=Bob" in message
-        and "kept=Ada" in message
-        for message in messages
-    )
+    differs = [m for m in messages if m.startswith("channel_display_name_differs ")]
+    assert differs, "the differing name is logged"
+    assert not any(
+        name in m for m in differs for name in ("Bob", "Ada")
+    ), "without the speakers' names"
 
     def tag_value(key: str) -> dict[str, str]:
         tags = storage._client.get_object_tagging(Bucket=EXPORT_BUCKET, Key=key)[
@@ -2110,7 +2116,8 @@ def test_channels_are_written_as_recorded_with_their_offset(
 
     assert tag_value(BASE + "channels/ch0.webm") == {"retention-class": "audio"}
     assert tag_value(BASE + "channels/ch1.webm") == {"retention-class": "audio"}
-    assert tag_value(BASE + "channels/index.json") == {"retention-class": "metadata"}
+    # The index expires with the files it names.
+    assert tag_value(BASE + "channels/index.json") == {"retention-class": "audio"}
 
 
 def _gmeet_channel(channel: int) -> dict[str, Any]:
@@ -2153,7 +2160,10 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
     with caplog.at_level(logging.WARNING, logger="exporter"):
         assert export_meeting(_envelope(), deps).state == "handed_off"
 
-    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == []
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == [
+        BASE + "channels/index.json"
+    ]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     assert any(
         "error_class=ChannelIdentityMissing" in record.getMessage()
@@ -2161,15 +2171,16 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
     )
 
 
-@pytest.mark.parametrize("failure", ["master", "copy"])
-def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
+@pytest.mark.parametrize("failure", ["master", "copy", "recording"])
+def test_a_failed_channel_still_hands_off_the_mixed_export_with_an_empty_index(
     storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
     """ch0 is fine; ch1's master cannot be built (every master is asked for
     before any file is written, so nothing is), or its object is missing and
     the copy fails after ch0 is copied (ch0.webm is left; without an index the
-    worker ignores it). The mixed export is handed off as usual and
-    `channels/index.json` is never written."""
+    worker ignores it), or the full recording that holds the channels'
+    identities cannot be read. The mixed export is handed off as usual and
+    `channels/index.json` is `[]`, so no earlier run's index survives."""
     storage_path = _put_master(storage, 20, "uid-20")
     _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
     ch0_path = "recordings/7/20/uid-20/ch0/master.webm"
@@ -2192,6 +2203,12 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
         master={"storage_path": storage_path},
         channel_masters=channel_masters,
     )
+    if failure == "recording":
+
+        def unreadable(recording_id: int) -> dict[str, Any]:
+            raise RuntimeError("gateway 503 /recordings/20")
+
+        meeting_api.recording = unreadable  # type: ignore[method-assign]
     notetaker = FakeNotetaker()
     deps = _deps(storage, meeting_api, notetaker)
     with caplog.at_level(logging.WARNING, logger="exporter"):
@@ -2199,7 +2216,10 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_without_an_index(
 
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
     expected_left = [BASE + "channels/ch0.webm"] if failure == "copy" else []
-    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == expected_left
+    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == sorted(
+        [BASE + "channels/index.json", *expected_left]
+    )
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
     assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
         "handed_off"
     )
@@ -2307,3 +2327,43 @@ def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(
 
     assert export_meeting(_envelope(), deps).state == "handed_off"
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
+
+
+def test_an_index_row_names_only_the_identity_its_recorder_stored() -> None:
+    """No `stream_id` stored means none in the row, not an empty string."""
+    row = job_module._channel_index_row(
+        3, {"channel_kind": "jitsi", "recorder_start_epoch_ms": 1}, 2500
+    )
+    assert row == {"channel": 3, "kind": "jitsi", "offset_s": 2.5}
+
+
+def test_a_channel_that_started_before_the_session_origin_is_logged(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    storage_path = _put_master(storage, 23, "uid-23")
+    _put_activity(storage, "uid-23", two_speaker_gmeet_lines(_origin_ms()))
+    ch0_path = "recordings/7/23/uid-23/ch0/master.webm"
+    storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
+    early = {**_gmeet_channel(0), "recorder_start_epoch_ms": _origin_ms() - 2000}
+    meeting_api = FakeMeetingApi(
+        recordings=[
+            _audio_recording(
+                23,
+                media_files=[
+                    {"type": "audio", "format": "webm"},
+                    {"type": "ch0", "format": "webm", "metadata": early},
+                ],
+            )
+        ],
+        master={"storage_path": storage_path},
+        channel_masters={(23, "ch0"): {"storage_path": ch0_path}},
+    )
+    deps = _deps(storage, meeting_api, FakeNotetaker())
+    with caplog.at_level(logging.WARNING, logger="exporter"):
+        assert export_meeting(_envelope(), deps).state == "handed_off"
+
+    row = storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json")[0]
+    assert row["offset_s"] < 0, "kept: the transcriber trims a negative start"
+    assert any(
+        r.getMessage().startswith("channel_offset_negative ") for r in caplog.records
+    )

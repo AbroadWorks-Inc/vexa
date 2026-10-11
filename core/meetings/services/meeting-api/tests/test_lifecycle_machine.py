@@ -27,6 +27,7 @@ def test_legal_edges():
     assert can_transition(BotStatus.JOINING, BotStatus.ACTIVE)  # no waiting room
     assert can_transition(BotStatus.AWAITING_ADMISSION, BotStatus.ACTIVE)
     assert can_transition(BotStatus.AWAITING_ADMISSION, BotStatus.NEEDS_HELP)
+    assert can_transition(BotStatus.JOINING, BotStatus.NEEDS_HELP)  # a pre-lobby blocker (#1251)
     assert can_transition(BotStatus.NEEDS_HELP, BotStatus.ACTIVE)
     assert can_transition(BotStatus.ACTIVE, BotStatus.COMPLETED)
     assert can_transition(BotStatus.ACTIVE, BotStatus.FAILED)
@@ -83,6 +84,29 @@ def test_failed_from_awaiting_admission_stage(goldens):
     sink = LifecycleSink(store=MeetingStore())
     sink.apply(goldens["joining"])
     sink.apply({"connection_id": "sess-uid", "status": "awaiting_admission"})
+    rec = sink.apply(goldens["failed-join"])
+    assert rec.failure_stage is FailureStage.AWAITING_ADMISSION
+
+
+def test_a_block_before_the_lobby_escalates_and_fails_at_the_joining_stage(goldens):
+    """joining → needs_help → failed: Zoom's anti-bot (RTMS) wall shows right after Join, before
+    any waiting room. The blocked report is accepted, the permanent denial ends the meeting, and
+    the failure is filed at `joining`, not as a lobby the host never opened."""
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply(goldens["joining"])
+    blocked = sink.apply({"connection_id": "sess-uid", "status": "needs_help",
+                          "reason": "zoom_requires_rtms"})
+    assert blocked.status is BotStatus.NEEDS_HELP
+    rec = sink.apply(goldens["failed-join"])
+    assert rec.failure_stage is FailureStage.JOINING
+    assert rec.completion_reason is CompletionReason.AWAITING_ADMISSION_REJECTED
+
+
+def test_needs_help_after_the_lobby_still_fails_at_the_lobby_stage(goldens):
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply(goldens["joining"])
+    sink.apply({"connection_id": "sess-uid", "status": "awaiting_admission"})
+    sink.apply({"connection_id": "sess-uid", "status": "needs_help"})
     rec = sink.apply(goldens["failed-join"])
     assert rec.failure_stage is FailureStage.AWAITING_ADMISSION
 

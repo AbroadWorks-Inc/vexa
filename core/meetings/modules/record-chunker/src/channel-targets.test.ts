@@ -2,7 +2,7 @@
  * Channel selection is pure: a stream id either is a Jitsi remote-audio channel
  * or it is not. Run: npx tsx src/channel-targets.test.ts
  */
-import { jitsiChannel, selectChannelTargets, selectJitsiChannels } from "./channel-targets.js";
+import { jitsiChannel, selectJitsiChannels } from "./channel-targets.js";
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = "") => {
@@ -34,11 +34,6 @@ check(
   JSON.stringify(selected),
 );
 
-const candidates = [{ streamId: "remote-audio-3", paused: false, audioTracks: 1 }];
-check("selectChannelTargets on jitsi uses the remote-audio rule", selectChannelTargets("jitsi", candidates).length === 1);
-for (const platform of ["teams", "zoom", "google_meet", ""]) {
-  check(`selectChannelTargets(${platform || "empty"}) is empty`, selectChannelTargets(platform, candidates).length === 0);
-}
 
 if (failed) {
   console.error(`\n❌ channel-targets: ${failed} check(s) FAILED.`);

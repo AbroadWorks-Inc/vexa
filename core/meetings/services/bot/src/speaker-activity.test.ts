@@ -327,15 +327,16 @@ const sameShape = (obj: unknown, expected: Record<string, unknown>): boolean => 
 {
   const dir = mkdtempSync(join(tmpdir(), 'vexa-speaker-activity-'));
   const w = createSpeakerActivityWriter(invOf('jitsi'), { dir, now: () => 0 });
-  const sink = makeChannelActivitySink(makeSpeakerActivityFrameTap(w));
-  sink(3, [0.5, -0.5], 1000);
-  sink(-1, [0.5], 1000);
-  sink(1.5, [0.5], 1000);
+  const sink = makeChannelActivitySink(w);
+  sink(3, 0.5, 4096, 1000);
+  sink(-1, 0.5, 4096, 1000);
+  sink(1.5, 0.5, 4096, 1000);
+  sink(2, Number.NaN, 4096, 1000);
   await w.close();
   const frames = readLines(w.path).slice(1);
   check('the channel sink writes exactly the one valid frame', frames.length === 1, JSON.stringify(frames));
   check('the channel sink frame is src:"channel" on its channel',
-    sameShape(frames[0], { t: 1000, ch: 3, rms: 0.5, dur_ms: 0, src: 'channel' }), JSON.stringify(frames[0]));
+    sameShape(frames[0], { t: 1000, ch: 3, rms: 0.5, dur_ms: 256, src: 'channel' }), JSON.stringify(frames[0]));
 }
 
 // ── 18) Jitsi with per-channel recording on: the mix activity is still written, channel frames are added ──
@@ -354,7 +355,7 @@ const bridgeCase = async (perChannel: boolean | undefined): Promise<{ lines: Rec
   } as unknown as BotPipeline;
   const stop = await startCaptureBridge(page, inv, pipeline, undefined, undefined, undefined, w);
   fns.__vexaPerSpeakerAudioData?.(0, [0.5, -0.5], 1000);
-  fns.__vexaChannelActivity?.(0, [0.25, -0.25], 1100);
+  fns.__vexaChannelActivity?.(0, 0.25, 4096, 1100);
   await stop();
   await w.close();
   return { lines: readLines(w.path).slice(1), exposed: Object.keys(fns) };
@@ -362,13 +363,13 @@ const bridgeCase = async (perChannel: boolean | undefined): Promise<{ lines: Rec
 {
   const on = await bridgeCase(true);
   check('flag on: __vexaChannelActivity is exposed for jitsi', on.exposed.includes('__vexaChannelActivity'), on.exposed.join(','));
-  check('flag on: the mix frame is still written, with no src',
-    on.lines.some((l) => sameShape(l, { t: 1000, ch: 0, rms: 0.5, dur_ms: 0 })), JSON.stringify(on.lines));
+  check('flag on: the mix frame is still written, with no src and no channel number',
+    on.lines.some((l) => sameShape(l, { t: 1000, rms: 0.5, dur_ms: 0 })), JSON.stringify(on.lines));
   check('flag on: the channel frame is added with src:"channel"',
-    on.lines.some((l) => sameShape(l, { t: 1100, ch: 0, rms: 0.25, dur_ms: 0, src: 'channel' })), JSON.stringify(on.lines));
+    on.lines.some((l) => sameShape(l, { t: 1100, ch: 0, rms: 0.25, dur_ms: 256, src: 'channel' })), JSON.stringify(on.lines));
   const off = await bridgeCase(undefined);
   check('flag absent: __vexaChannelActivity is not exposed', !off.exposed.includes('__vexaChannelActivity'), off.exposed.join(','));
-  check('flag absent: the mix frame is written', off.lines.some((l) => sameShape(l, { t: 1000, ch: 0, rms: 0.5, dur_ms: 0 })),
+  check('flag absent: the mix frame is written, with no channel number', off.lines.some((l) => sameShape(l, { t: 1000, rms: 0.5, dur_ms: 0 })),
     JSON.stringify(off.lines));
 }
 

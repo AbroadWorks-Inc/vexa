@@ -82,3 +82,60 @@ export async function createPcmCaptureNode(
   node.port.onmessage = (e: MessageEvent) => onPcm(e.data as Float32Array);
   return node;
 }
+
+/** The loudness processor's registered name (see LEVEL_WORKLET_SRC). */
+export const LEVEL_WORKLET_PROCESSOR = 'vexa-level-capture';
+
+// The same BLOCK as the PCM capture, measured where the audio is: each block's
+// RMS and peak are computed on the audio render thread and posted as two
+// numbers, so a caller that needs only loudness (a channel's activity tap)
+// never moves the samples to the page or across the Playwright boundary.
+export const LEVEL_WORKLET_SRC = `
+class VexaLevelCapture extends AudioWorkletProcessor {
+  constructor() { super(); this._sq = 0; this._peak = 0; this._n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const v = ch[i];
+      this._sq += v * v;
+      const a = v < 0 ? -v : v;
+      if (a > this._peak) this._peak = a;
+      if (++this._n === ${BLOCK}) {
+        this.port.postMessage([Math.sqrt(this._sq / ${BLOCK}), this._peak, ${BLOCK}]);
+        this._sq = 0; this._peak = 0; this._n = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('${LEVEL_WORKLET_PROCESSOR}', VexaLevelCapture);
+`;
+
+const levelModuled = new WeakSet<AudioContext>();
+
+/**
+ * Create a loudness node on `ctx` (16 kHz): `onLevel(rms, peak, samples)` once per
+ * BLOCK of input, computed on the audio thread. Connect a source to it and it to
+ * `ctx.destination`, as with `createPcmCaptureNode`. Bot / in-page MAIN world only
+ * (inline blob: module).
+ */
+export async function createLevelNode(
+  ctx: AudioContext,
+  onLevel: (rms: number, peak: number, samples: number) => void,
+): Promise<AudioWorkletNode> {
+  if (!levelModuled.has(ctx)) {
+    const url = URL.createObjectURL(new Blob([LEVEL_WORKLET_SRC], { type: 'application/javascript' }));
+    try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    levelModuled.add(ctx);
+  }
+  const node = new AudioWorkletNode(ctx, LEVEL_WORKLET_PROCESSOR, {
+    numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+    channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers',
+  });
+  node.port.onmessage = (e: MessageEvent) => {
+    const [rms, peak, samples] = e.data as [number, number, number];
+    onLevel(rms, peak, samples);
+  };
+  return node;
+}
