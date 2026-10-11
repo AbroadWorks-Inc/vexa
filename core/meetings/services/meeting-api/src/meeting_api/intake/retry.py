@@ -7,10 +7,9 @@ auto-join sweep sends a new bot session to it once the failed workload is proven
 
 ``due_at(meeting, failure, now=, settings=)`` is the decision, pure. A failure is retried when:
 
-  * it is a bot failure: a ``failed`` session, whatever its reason except ``stopped`` (a user's
-    stop), ``evicted`` (the host removed the bot) and ``startup_alone`` (nobody joined); or a
-    ``completed`` session nobody reported (``lost``: the runtime or a reconcile sweep saw the
-    workload gone) with any other reason, which is a lost bot, not a normal end;
+  * it is a bot failure: a ``failed`` session, whatever its reason except the ``NOT_RETRIED``
+    ones; or a ``completed`` session nobody reported (``lost``: the runtime or a reconcile sweep
+    saw the workload gone) with any other reason, which is a lost bot, not a normal end;
   * entries manage the meeting (it has an active entry); meetings without entries are out of
     scope;
   * nobody ended it: no ``data.stop_requested``, no outcome (a calendar removal, R5/R8), and the
@@ -78,9 +77,21 @@ __all__ = [
 MARKER = "bot_retry"
 #: The typed code a failed bot session's send is recorded with (``last_error_code``).
 BOT_FAILED = "bot_failed"
-#: Completion reasons that end the meeting: a user's stop, the host removing the bot, nobody
-#: joining.
-NOT_RETRIED = frozenset({"stopped", "evicted", "startup_alone"})
+#: Completion reasons that end the meeting, because a new bot would meet the same answer: a
+#: user's stop, the host removing the bot, nobody joining, the host or the platform refusing the
+#: bot (``awaiting_admission_rejected``, e.g. Zoom's "automated bots aren't allowed"), a
+#: signed-out bot profile, a link that isn't a meeting, the bot's time cap reached.
+NOT_RETRIED = frozenset(
+    {
+        "stopped",
+        "evicted",
+        "startup_alone",
+        "awaiting_admission_rejected",
+        "auth_session_missing",
+        "validation_error",
+        "max_bot_time_exceeded",
+    }
+)
 #: The session's keys the marker carries instead of the row while the meeting is live.
 _KEPT_ON_MARKER = ("completion_reason", "failure_stage", "failure_reason", MARKER)
 
@@ -230,7 +241,7 @@ def unfinished_spawn(
 
 
 def is_bot_failure(failure: Failure) -> bool:
-    """A failed bot (not a stop, a host removal, nobody joining, or a normal end)."""
+    """A failed bot (not a ``NOT_RETRIED`` reason, and not a normal end)."""
     if failure.reason in NOT_RETRIED:
         return False
     if failure.status == "failed":

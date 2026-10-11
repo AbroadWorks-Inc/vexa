@@ -90,7 +90,6 @@ def _due(store: InMemoryIntakeStore, mid: int, failure: retry.Failure, **kw):
     [
         "join_failure",
         "awaiting_admission_timeout",
-        "awaiting_admission_rejected",
         "start_failed",
         "left_alone",
         None,
@@ -105,8 +104,19 @@ def test_a_failed_bot_on_an_entry_managed_live_meeting_is_retried(status, reason
     assert _due(store, mid, _failed(reason)) == NOW + timedelta(seconds=60)
 
 
-@pytest.mark.parametrize("reason", ["stopped", "evicted", "startup_alone"])
-def test_a_stop_a_host_removal_and_nobody_joining_are_not_retried(reason):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "stopped",
+        "evicted",
+        "startup_alone",
+        "awaiting_admission_rejected",
+        "auth_session_missing",
+        "validation_error",
+        "max_bot_time_exceeded",
+    ],
+)
+def test_a_failure_a_new_bot_would_repeat_is_not_retried(reason):
     store = _store()
     mid = _meeting(store)
     assert _due(store, mid, _failed(reason)) is None

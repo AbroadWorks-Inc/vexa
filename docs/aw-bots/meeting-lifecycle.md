@@ -56,16 +56,21 @@ budget above.
 A failure is retried when the meeting still has active entries, nobody has asked it to stop, and
 `is_bot_failure` is true:
 
-- status `failed` (a failed start, a join failure, a lobby rejection, a lobby timeout, a crash), or
+- status `failed` (a failed start, a join failure, a lobby timeout, a crash), or
 - status `completed` and the bot was lost.
 
-These completion reasons are not retried (`NOT_RETRIED`):
+These completion reasons are not retried (`NOT_RETRIED`), because a new bot would get the same
+answer. The meeting ends `failed` (or `completed`) with the reason, and `bot.failed` reports it:
 
 | Reason | Meaning |
 |---|---|
 | `stopped` | A user called `POST /v2/meetings/{id}/stop`. |
 | `evicted` | The host removed the bot after it was in the call. |
 | `startup_alone` | Nobody joined. |
+| `awaiting_admission_rejected` | The host denied the bot, or the platform refused it (Zoom: "automated bots aren't allowed", which needs Zoom RTMS). |
+| `auth_session_missing` | The bot's signed-in profile is signed out. |
+| `validation_error` | The link is not a meeting the bot can join. |
+| `max_bot_time_exceeded` | The bot reached its time cap. |
 
 `left_alone` is a normal completion. The bot was in the call and hung up after the room emptied
 or the silence window expired. It is status `completed`. It is not in `NOT_RETRIED` because a
@@ -87,8 +92,8 @@ Google Meet admission (`core/meetings/modules/join/src/googlemeet/admission.ts`)
 - Google Meet withdraws an unanswered "Ask to join" about 10 minutes after the knock. The waiting room disappears, with no denial and no in-call controls. The page logs `DisconnectedError`, `EndCause = 72`. A lobby that has been gone for `KNOCK_LOST_GRACE_MS` (20 seconds) with neither an admission nor a denial is `awaiting_admission_timeout`. The retry sends a new knock. The bot does not keep polling that page until the lobby budget ends.
 - A page with no meeting and no lobby at the end of the budget is `join_failure`.
 
-`awaiting_admission_rejected` and `awaiting_admission_timeout` are still bot failures, so an
-entry-managed meeting retries them until the send budget is used. The alerts treat both as the
+`awaiting_admission_timeout` is a bot failure, so an entry-managed meeting retries it until the
+send budget is used. `awaiting_admission_rejected` is not retried. The alerts treat both as the
 host's answer and store them at severity info.
 
 ## Stop and erase
