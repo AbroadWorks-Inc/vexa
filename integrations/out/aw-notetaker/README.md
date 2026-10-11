@@ -159,8 +159,8 @@ one transcript with speaker names:
   `offset_s`, where the file starts on the meeting clock. Nothing is decoded or padded: a
   2-hour, 19-speaker meeting's channels are ~270 MB as opus, ~3.5 GB as 16 kHz wav. Every parsed activity frame
   the channel transcript needs goes to `speaker_activity_frames.json` (`[]` when no session's
-  activity parsed), streamed to disk as it is read. On Jitsi, a session with `"src":"channel"`
-  lines writes only those. A meeting without channels, or whose channel step failed (logged as
+  activity parsed), streamed to disk as it is read, each with its channel (none for a
+  mixed-lane frame; the worker uses only frames whose channel has a file). A meeting without channels, or whose channel step failed (logged as
   `channel_export_failed`; the mixed folder and `/process` still go out), gets the index `[]`,
   and the worker stays on the mixed path. On a rerun the worker removes the channel files the
   index does not name; the exporter deletes nothing. The worker's use of these files is

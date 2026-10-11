@@ -38,9 +38,11 @@ Zoom is the only `pertrack` platform (`isPerTrackLanePlatform`). Teams stays on 
 Jitsi's lane for the mixed timeline stays `mixed`. Per-speaker lines on Jitsi are extra; they
 are described under [Per-speaker channels](#per-speaker-channels).
 
-The exporter (`exporter/activity.py`) keeps a named frame on every lane. A line with
-`"src":"channel"` stays out of that timeline. Hints become the timeline only when the file
-stored no named frame. That is the Teams path, and a Zoom file that never named a channel.
+The exporter (`exporter/activity.py`) keeps a named frame on every lane. On the mixed lane only
+the mix's own frames (no channel) are the timeline; a channel's frames stay out of it. Hints
+become the timeline only when the file stored no named frame. That is the Teams path, a Zoom
+file that never named a channel, and a Jitsi file from a bot before 2026-10-11 (its mixed-lane
+frames carry `ch: 0`).
 
 `build_speaker_timeline` in `exporter/attribution.py` then:
 

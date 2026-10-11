@@ -2274,12 +2274,13 @@ def test_a_rerun_over_a_wav_export_indexes_only_the_opus_files(
 
 
 @pytest.mark.parametrize("mix_named", [True, False])
-def test_channel_tap_frames_change_no_timeline_and_are_the_only_frames_written(
+def test_channel_frames_change_no_timeline_and_every_frame_is_written(
     storage: Storage, mix_named: bool
 ) -> None:
-    """A Jitsi session with tap frames: speaker_timeline.json and
+    """A Jitsi session with channel frames: speaker_timeline.json and
     participants.json match the same file without them, and
-    speaker_activity_frames.json holds only the tap frames."""
+    speaker_activity_frames.json holds every frame with its channel (none for
+    the mix's own frames)."""
     origin = _origin_ms()
     storage_path = _put_master(storage, 20, "uid-20")
 
@@ -2302,14 +2303,15 @@ def test_channel_tap_frames_change_no_timeline_and_are_the_only_frames_written(
     assert timeline == plain_timeline
     assert timeline["speaker_timeline"] or timeline["speaker_intervals"]
     assert participants == plain_participants
-    assert frames == [
-        {"t_rel": 0.1, "ch": 0, "name": "Tap Zero", "rms": 0.3, "dur_ms": 256},
-        {"t_rel": 0.356, "ch": 0, "name": None, "rms": 0.01, "dur_ms": 256},
-        {"t_rel": 1.6, "ch": 1, "name": "Tap One", "rms": 0.4, "dur_ms": 256},
-        {"t_rel": 5.0, "ch": 1, "name": "Tap One", "rms": 0.4, "dur_ms": 256},
+    assert [row for row in frames if row["ch"] is not None] == [
+        {"t_rel": 0.1, "ch": 1, "name": "Tap One", "rms": 0.3, "dur_ms": 256},
+        {"t_rel": 0.356, "ch": 1, "name": None, "rms": 0.01, "dur_ms": 256},
+        {"t_rel": 1.6, "ch": 2, "name": "Tap Two", "rms": 0.4, "dur_ms": 256},
+        {"t_rel": 5.0, "ch": 2, "name": "Tap Two", "rms": 0.4, "dur_ms": 256},
     ]
+    assert [row for row in frames if row["ch"] is None] == plain_frames
     assert len(plain_frames) == 3
-    assert all(row["ch"] == 0 for row in plain_frames)
+    assert all(row["ch"] is None for row in plain_frames)
 
 
 def test_exactly_ten_seconds_of_silent_coverage_still_hands_off(

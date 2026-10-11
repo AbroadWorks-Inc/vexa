@@ -26,18 +26,13 @@ class Frame:
 
 @dataclass(slots=True, frozen=True)
 class CapturedFrame:
-    """One parsed activity frame, named or not, with its channel when present.
-
-    `source` is the line's `src`: `"channel"` for a per-channel tap frame,
-    None for every other frame (the field is absent).
-    """
+    """One parsed activity frame, named or not, with its channel when present."""
 
     ts: int
     channel: int | None
     name: str | None
     rms: float
     duration_ms: int
-    source: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -64,9 +59,10 @@ class Activity:
     `frames` holds named frames on every lane; speech events are built from
     those only. Every frame that parsed, including unnamed ones and the
     channel number, goes to `parse_activity`'s `capture` as it is read (for the
-    per-channel transcript), and is not kept. Channel-tap frames
-    (`"src":"channel"`) are captured only, never in `frames`: on Jitsi they
-    share ch 0 with the mixed lane and must not change it.
+    per-channel transcript), and is not kept. On the mixed lane (Jitsi, Teams:
+    one combined stream) a frame that carries a channel belongs to that
+    channel's recording, not to the mix: it is captured only, never in
+    `frames`.
     """
 
     lane: str
@@ -144,8 +140,6 @@ def parse_activity(
                 channel = None if raw_channel is None else int(raw_channel)
             except (TypeError, ValueError):
                 channel = None
-            raw_source = row.get("src")
-            source = raw_source if isinstance(raw_source, str) else None
             if capture is not None:
                 capture(
                     CapturedFrame(
@@ -154,13 +148,12 @@ def parse_activity(
                         name=parsed.name,
                         rms=parsed.rms,
                         duration_ms=parsed.duration_ms,
-                        source=source,
                     )
                 )
-            # Named frames are the timeline on every lane, including mixed and
-            # pertrack. Unnamed frames and channel-tap frames stay out of
-            # `frames`.
-            if parsed.name and source != "channel":
+            # Named frames are the timeline on every lane. On the mixed lane
+            # only the mix's own frames (no channel) are; unnamed frames stay
+            # out of `frames` everywhere.
+            if parsed.name and not (activity.lane == "mixed" and channel is not None):
                 activity.frames.append(parsed)
     if activity is None:
         raise ValueError("speaker-activity file has no speaker_activity_header")

@@ -210,7 +210,7 @@ def test_named_frames_on_mixed_lane_win_over_hints() -> None:
     a = parse_activity(
         [
             header("mixed"),
-            frame(ORIGIN_MS, "A", 0.9),  # high RMS frame in mixed lane
+            frame(ORIGIN_MS, "A", 0.9, ch=None),  # high RMS frame in mixed lane
             hint(ORIGIN_MS + 100, "B"),  # but B is in hints
         ]
     )
@@ -316,9 +316,9 @@ def test_unnamed_frames_never_change_gmeet_events() -> None:
 
 @pytest.mark.parametrize("mix_named", [True, False])
 def test_channel_tap_frames_never_enter_the_mixed_timeline(mix_named: bool) -> None:
-    """Jitsi: tap frames share ch 0 with the mixed lane. They are captured
-    with their source, yet frames, names and events are exactly those of the
-    same file without them (with unnamed mix frames, hints stay the events)."""
+    """Jitsi: channel frames are captured with their channel, yet frames,
+    names and events are exactly those of the same file without them (with
+    unnamed mix frames, hints stay the events)."""
     captured_with: list[CapturedFrame] = []
     captured_without: list[CapturedFrame] = []
     with_taps = parse_activity(
@@ -333,15 +333,26 @@ def test_channel_tap_frames_never_enter_the_mixed_timeline(mix_named: bool) -> N
     assert speech_events(with_taps, ORIGIN_MS, 0.05, 700) == speech_events(
         without, ORIGIN_MS, 0.05, 700
     )
-    taps = [(c.channel, c.name) for c in captured_with if c.source == "channel"]
-    assert taps == [(0, "Tap Zero"), (0, None), (1, "Tap One"), (1, "Tap One")]
-    assert all(c.source is None for c in captured_without)
+    taps = [(c.channel, c.name) for c in captured_with if c.channel is not None]
+    assert taps == [(1, "Tap One"), (1, None), (2, "Tap Two"), (2, "Tap Two")]
+    assert all(c.channel is None for c in captured_without)
 
 
-def test_a_frame_without_src_has_no_source() -> None:
-    captured: list[CapturedFrame] = []
-    a = parse_activity([header(), frame(ORIGIN_MS, "A", 0.2)], captured.append)
-    assert captured[0].source is None
+def test_a_legacy_jitsi_file_falls_back_to_hints() -> None:
+    """A bot before 2026-10-11 wrote mixed-lane frames with `ch: 0`. On the
+    mixed lane a frame with a channel is not the mix's, so such a file has no
+    named frame and its level hints are the timeline."""
+    legacy = parse_activity(
+        jitsi_lines(ORIGIN_MS, mix_named=True, taps=True, legacy=True)
+    )
+    assert legacy.frames == []
+    events = speech_events(legacy, ORIGIN_MS, 0.05, 700)
+    assert events and all(ev.source == "hint" for ev in events)
+    assert {ev.name for ev in events} == {"Speaker Alpha", "Speaker Beta"}
+
+
+def test_a_gmeet_frame_with_a_channel_is_on_the_timeline() -> None:
+    a = parse_activity([header(), frame(ORIGIN_MS, "A", 0.2, ch=2)])
     assert [f.name for f in a.frames] == ["A"]
 
 
