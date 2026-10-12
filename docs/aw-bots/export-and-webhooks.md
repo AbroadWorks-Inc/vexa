@@ -85,13 +85,19 @@ One pass writes:
 | `signal/` | Only when `EXPORT_DEBUG` is true |
 | `_export.json` | The exporter's own state, including `handed_off`. An `audio_mismatch` holds counts and levels, never a speaker's name. A rerun refused because the meeting is being transcribed adds `rerun` here and leaves the state as it was |
 
+notetaker-worker writes into the same folder: its outputs (`notes.json`, `transcript.txt`,
+`summary.json`) and `_transcription.json`, the state of its current job for this folder:
+`{"state": "processing" | "completed" | "failed", "error", "at"}`. The exporter never writes
+`_transcription.json`. Its rerun check asks the worker's `GET /status/{id}` instead.
+
 Several bot sessions on one meeting are joined into that one folder, up to
-`EXPORT_MAX_RECORDINGS` (the Deployment sets 50). Past that, the export fails
-`too_many_recordings` and writes only `_export.json` and the empty
-`channels/index.json`, `speaker_activity_frames.json` and `live_transcript.json`, as a
-`no_audio` export does. Channel pieces from those sessions
-share one `channels/ch<N>.webm` per channel number. The index row keeps the earliest
-piece's identity.
+`EXPORT_MAX_RECORDINGS` (the Deployment sets 50). Channel pieces from those sessions share one
+`channels/ch<N>.webm` per channel number. The index row keeps the earliest piece's identity.
+
+Past `EXPORT_MAX_RECORDINGS` the export fails `too_many_recordings`. That run, and a run that
+fails `no_audio`, write `_export.json` and, empty, the files a full export owns beside it:
+`channels/index.json` `[]`, `speaker_activity_frames.json` `[]` and `live_transcript.json`
+`{"segments": []}` (`exporter/job.py` `_write_empty_owned_files`).
 
 Every channel's identity is checked and every master asked for before any channel
 file is written (`exporter/job.py` `_export_channels`). A failure while reading the
@@ -99,24 +105,34 @@ recording, fetching, copying, or joining logs `channel_export_failed`, writes th
 index `[]`, and does not stop the mixed export or `POST /process`; the worker then
 treats the meeting as mixed. Channel files and `channels/index.json` use the `audio`
 retention class (the index expires with the files it names);
-`speaker_activity_frames.json` uses `metadata`. Every run writes every file above,
-so a rerun leaves nothing stale; notetaker-worker removes the channel files the
-index does not name.
+`speaker_activity_frames.json` uses `metadata`. A run that exports writes every file in
+the table, and a run that stops at `no_audio` or `too_many_recordings` writes the empty ones
+above, so a rerun leaves no file of an earlier export behind; notetaker-worker removes the
+channel files the index does not name.
 
 Memory stays flat at any meeting length: activity frames are streamed to disk as
 they are read, the timeline's named frames wait on disk in sorted runs past 50,000,
 and a speaker's level is measured in wav blocks of at most 2 MiB.
 
-The queue (`aw-exporter/pending/`) changes each item with a conditional write
-(`IfMatch` / `IfNoneMatch`), so a webhook, a rerun request and the worker never
-undo each other. A pod kill charges a crash to every export it was running; a
-meeting with a crash then exports alone, and its second crash quarantines it.
-A job running past `EXPORT_JOB_TIMEOUT_SECONDS` fails `/healthz`, so the pod is
-restarted and that meeting is charged a crash; on SIGTERM running exports get
-`EXPORT_STOP_WAIT_SECONDS` to finish. `python -m exporter.rerun` refuses a meeting
-still in the queue or being transcribed, and the export job asks notetaker-worker
-again before a rerun writes anything; a refused rerun never turns a `handed_off`
-export into `failed`. Details: the [package README](../../integrations/out/aw-notetaker/README.md).
+The queue (`aw-exporter/pending/`, `exporter/queue.py`) is bounded in every direction:
+
+| Case | What happens |
+|---|---|
+| Two writers on one item | Every change is a conditional write (`IfMatch` on the ETag read, `IfNoneMatch` to create) carrying a `write_id`, redone from a fresh read when another writer got in first. A webhook, a rerun request and the worker never undo each other. |
+| A job that raises | Retried after `EXPORT_RETRY_BACKOFF_SECONDS` × 2^attempts, up to `EXPORT_MAX_ATTEMPTS` (default 5), then quarantined in `aw-exporter/failed/`. |
+| A pod killed mid-export | Each export holds a lease. An expired lease is a crash, charged to every export that pod was running. A meeting with a crash then runs alone, and at `EXPORT_MAX_CRASHES` (default 2) it is quarantined. |
+| A hung job | Every ffmpeg run has a timeout sized from its input (`exporter/audio.py`). A job running past `EXPORT_JOB_TIMEOUT_SECONDS` (default 14400) makes `/healthz` fail, the liveness probe restarts the pod, and that meeting is charged a crash. |
+| A deploy | On SIGTERM nothing new starts, and running exports get `EXPORT_STOP_WAIT_SECONDS` (default 100) to finish; the Deployment's grace period is 120 s. The rest release their leases, so a deploy is not a crash. |
+| Bookkeeping after a job keeps failing | The meeting is held in that process with a growing backoff, and after `EXPORT_MAX_ATTEMPTS` failures in a row it is not run again until the exporter restarts. |
+
+`python -m exporter.rerun <uuid>` exports a finished meeting again. It refuses while the meeting
+is still being exported, while a rerun is already queued, and while notetaker-worker is
+transcribing it (`GET /status/{id}` reads `processing`); when the worker cannot answer, nothing
+is queued either. The export job asks the worker again before the rerun writes anything. A rerun whose `/process` was already
+accepted finishes only the steps after it on a retry, without rewriting the folder. A refused
+rerun is recorded in `_export.json`'s `rerun` block and is reported `failed` only for a folder
+that was never handed off, so a `handed_off` export is never turned into `failed`. Details: the
+[package README](../../integrations/out/aw-notetaker/README.md).
 
 `POST /process` goes to `NOTETAKER_URL`. The exporter Deployment sets
 `http://notetaker-api.notetaker.svc.cluster.local:8080`. The runbook's prerequisite check is

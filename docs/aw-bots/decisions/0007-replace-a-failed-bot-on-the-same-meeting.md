@@ -20,4 +20,9 @@ The exporter joins every session of that meeting into one folder. A host denial 
 the send budget is used. The alert for that reason is severity info: it is stored, and it is not
 paged, because the bot did reach the lobby.
 
+Note, 2026-10-12: a host denial is no longer retried. `awaiting_admission_rejected` (the host
+declining the bot, the platform refusing it, or a join that ended blocked) is in `NOT_RETRIED`; a
+lobby timeout is still retried. `left_alone` reported by the bot is the normal end and is not
+replaced; `left_alone` that meeting-api writes for a bot lost in the call is replaced.
+
 Current rules: [meeting lifecycle](../meeting-lifecycle.md).

@@ -34,21 +34,25 @@ on the webhook. `export_state`, `export_s3_path`, `export_error`, and `export_at
 `completion_reason`, `failure_stage`, `failure_reason`, `join_evidence`, and `bot_retry` while a
 replacement is waiting (`intake/retry.py`). While it waits, the failed bot's reason, stage and
 `join_evidence` are on `bot_retry`, not the row; a new bot moves them into `completion_history`.
-The v2 meeting's `join_failure` is `join_evidence`'s `reason`, `attribution` and `detail`, on a `failed` meeting that did not end by a user stop.
+The v2 meeting's `join_failure` is `join_evidence`'s `reason`, `attribution` and `detail` (detail
+cut to 500 characters), on a `failed` meeting whose `completion_reason` is not `stopped`; otherwise
+`null` (`intake/projection.py`).
 
 ## Statuses that matter to operators
 
 | Status or reason | What it means |
 |---|---|
 | `scheduled` | The meeting exists and a bot has not been sent. |
-| `requested`, `starting`, `joining`, `awaiting_admission`, `running`, `stopping` | A bot is in flight or in the call. `stopping` is not replaced. |
-| `completed` + `left_alone` | The bot was in the call and hung up after the room emptied. A successful end. |
+| `requested`, `joining`, `awaiting_admission`, `needs_help`, `active`, `stopping` | A bot is in flight or in the call. `stopping` is not replaced. |
+| `needs_help` | The bot met a blocker before it got in (Zoom's automated-bot wall, the Meet consent prompt, or one in the lobby). Pre-active: it counts against the bot limit, and a stop deletes its workload. |
+| `completed` + `left_alone`, reported by the bot | The bot was in the call and hung up after the room emptied. A successful end, not replaced. |
+| `left_alone` written by reconcile | The bot was in the call and its workload vanished without an end of its own: a lost bot. Replaced (`bot.retry`). |
 | `completed` + `evicted` | The host removed the bot. The bot reports status `completed` with this reason. |
 | `stopping`, then `completed` or `failed`, reason `stopped` | A client called stop. The bot leaves and the callback ends the meeting. A meeting that was only waiting for a replacement ends `failed` with `stopped` immediately. |
-| `failed` + `awaiting_admission_rejected` | The host denied the bot. |
+| `failed` + `awaiting_admission_rejected` | The host denied the bot, the platform refused it, or the join ended blocked. Not replaced. |
 | `failed` + `awaiting_admission_timeout` | The knock was not answered. |
 | `failed` + `join_failure` | The join died without a host denial and without a lobby still on screen. |
-| `not_sent` | The send budget was used up, or the meeting became overdue before a bot was in the call. |
+| `failed` + outcome `not_sent` | The send budget was used up, or the meeting became overdue before a bot was in the call. |
 
 Replacement rules for these reasons are in [meeting lifecycle](meeting-lifecycle.md).
 
@@ -86,6 +90,5 @@ channels does not by itself replace the mixed transcript.
 **Image tags.** `global.imageTag` is empty, so each image uses the tag in the values file or,
 for the exporter, in its Deployment. There is no `:latest`.
 
-Pins and the values file are the intended release. This handbook does not claim a cluster
-snapshot. Confirming what is running requires a current kubectl context. The agent session that
-wrote this page did not query the cluster.
+Pins and the values file are the intended release. What is running in the cluster is read from
+the cluster, not from this page.
