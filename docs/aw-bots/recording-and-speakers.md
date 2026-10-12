@@ -84,7 +84,7 @@ environment variable of its own.
 | Platform | What is recorded | What the first chunk stores |
 |---|---|---|
 | Google Meet | Each remote audio element `gmeet-capture` is connected to. The channel number is the index that capture assigned (`gmeet-capture.ts` `channels()`). Meet keeps a small rotating pool of those elements. | `channel_kind: gmeet`, `stream_id`. Glow names stay on the ordinary activity frames, which already carry `ch`. |
-| Jitsi | A live remote stream whose id is `remote-audio-<n>` (`record-chunker/src/channel-targets.ts`). The digits are the channel number. `mixedmslabel` is not a channel. | `channel_kind: jitsi`, `stream_id`, and, when the page store has them, `participant_id` and `display_name` (`jitsiNameForStream`). |
+| Jitsi | A live remote stream whose id is `remote-audio-<n>` (`record-chunker/src/channel-targets.ts`). The first stream with an id gets its digits as the channel number. A later stream object under an id already used (a new bridge session numbers its streams from `remote-audio-1` again) gets the next number never used, so `stream_id` and the channel number can differ. `mixedmslabel` is not a channel. | `channel_kind: jitsi`, `stream_id`, and, when the page store has them, `participant_id` and `display_name` (`jitsiNameForStream`). |
 
 The recorder is the same `record-chunker` tap as the master, one continuous recorder per
 channel, same timeslice (`VEXA_RECORDING_TIMESLICE_MS`, default 15000 ms). The page looks for
@@ -108,11 +108,14 @@ meeting-api checks each channel upload (`recordings/router.py`, `recordings/json
   concatenated into another whose name starts the same way.
 
 A channel's recorder is released when its audio track ends, or when its stream has been missing
-from the page for `VEXA_CHANNEL_GONE_MS` (default 30000 ms). The release flushes the recorder's
-final chunk and frees its audio nodes. A released channel number is never reopened in that
-session. At stop the bot stops every channel recorder in parallel and waits for releases still
-flushing, so no channel chunk arrives after the stop returns. A channel that opens while a stop or
-a release takes it leaves no recorder running (`capture-bridge.ts` `startRecording`).
+from the page for `VEXA_CHANNEL_GONE_MS` (default 30000 ms). Missing means that stream object: a
+new stream under the same id does not keep the old channel open. The release flushes the recorder's
+final chunk and frees its audio nodes. A released channel number is never reopened in that session;
+a speaker who comes back on a new stream, or after a bridge session restart, records on a new
+channel, and the per-chunk identity names them. At stop the bot stops every channel recorder in
+parallel and waits for releases still flushing, so no channel chunk arrives after the stop returns.
+A channel that opens while a stop or a release takes it leaves no recorder running
+(`capture-bridge.ts` `startRecording`).
 
 Jitsi also appends activity for those channels to `speaker-activity.jsonl`, with
 `"src":"channel"` on the line. One shared `AudioContext` feeds every channel tap. A block

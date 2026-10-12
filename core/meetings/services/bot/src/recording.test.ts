@@ -21,6 +21,7 @@ import { createBotRecordingSink, type BotRecordingSink, type ChannelChunkIdentit
 import { startRecording } from './capture-bridge.js';
 import type { Invocation } from './config.js';
 import type { ChunkUploadExtra, RecordingMasterFormat } from '@vexa/recording';
+import { createJitsiChannelNumbers } from '@vexa/record-chunker';
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = '') => {
@@ -333,6 +334,7 @@ function channelPage(streamIds: string[]) {
   g.VexaBrowserUtils = {
     selectJitsiChannels: (present: { streamId: string }[]) =>
       present.map((p) => ({ streamId: p.streamId, channel: Number(p.streamId.split('-').pop()) })),
+    createJitsiChannelNumbers,
     createLevelNode: async (_ctx: unknown, _cb: unknown) => {
       const streamId = (sources[sources.length - 1] as unknown as { stream: string }).stream;
       await gates.level.get(streamId);

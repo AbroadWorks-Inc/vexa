@@ -1624,17 +1624,20 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       w.logBot?.('[channels] createRecordingTap missing — channel recorders skipped');
       return;
     }
-    if (platform === 'jitsi' && typeof w.VexaBrowserUtils.selectJitsiChannels !== 'function') {
-      w.logBot?.('[channels] selectJitsiChannels missing — channel recorders skipped');
+    if (platform === 'jitsi' && (typeof w.VexaBrowserUtils.selectJitsiChannels !== 'function'
+      || typeof w.VexaBrowserUtils.createJitsiChannelNumbers !== 'function')) {
+      w.logBot?.('[channels] selectJitsiChannels or createJitsiChannelNumbers missing — channel recorders skipped');
       return;
     }
     const MediaStreamRef = w.MediaStream;
-    // Every channel number ever opened in this session: a released one is never reopened (a
-    // Jitsi stream id, and so its channel number, is not reused).
+    // Every channel number ever opened in this session: a released one is never reopened. A Jitsi
+    // channel number names one stream object (createJitsiChannelNumbers): a new bridge session's
+    // streams reuse the ids remote-audio-<n> as new objects, and those get new numbers.
     const started = new Set<number>();
-    // The live ones: channel -> its recorder, its stream id, and its activity source and node.
+    const jitsiNumbers = platform === 'jitsi' ? w.VexaBrowserUtils.createJitsiChannelNumbers() : null;
+    // The live ones: channel -> its recorder, its stream and stream id, and its activity source and node.
     // Whoever takes an entry out of this map (a release, or the stop) stops its recorder.
-    w.__vexaChannels = new Map<number, { tap: any; streamId: string; src?: any; node?: any; missingSince?: number }>();
+    w.__vexaChannels = new Map<number, { tap: any; streamId: string; stream: any; src?: any; node?: any; missingSince?: number }>();
     // Set by the stop. An open that resumes after it adds nothing and leaves nothing running.
     w.__vexaChannelsStopped = false;
     // Releases still flushing: the stop waits for them, so no final chunk arrives after it.
@@ -1662,8 +1665,9 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
         const el = all[i];
         const stream = el?.srcObject;
         if (!(stream instanceof MediaStreamRef)) continue;
+        // Live tracks only: an element left holding a stream whose tracks ended is not a candidate.
         let tracks = 0;
-        try { tracks = stream.getAudioTracks().length; } catch { tracks = 0; }
+        try { tracks = stream.getAudioTracks().filter((t: any) => t.readyState !== 'ended').length; } catch { tracks = 0; }
         out.push({ streamId: String(stream.id), paused: !!el.paused, audioTracks: tracks, stream });
       }
       return out;
@@ -1694,7 +1698,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
           } catch { return false; }
         },
       });
-      const entry: { tap: any; streamId: string; src?: any; node?: any } = { tap, streamId };
+      const entry: { tap: any; streamId: string; stream: any; src?: any; node?: any } = { tap, streamId, stream };
       w.__vexaChannels.set(channel, entry);
       w.logBot?.('[channels] recording ch' + channel + ' ' + streamId);
       // After every await: the stop, or a release (its track ended), may have taken the entry. Its
@@ -1740,7 +1744,13 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       scanning = true;
       try {
         const present = mediaStreams();
-        const byId = new Map(present.map((item) => [item.streamId, item]));
+        // One stream per id, the first live one: an element left with an ended stream does not hide
+        // a live stream that has the same id.
+        const byId = new Map<string, (typeof present)[number]>();
+        for (const item of present) {
+          const held = byId.get(item.streamId);
+          if (!held || (held.audioTracks < 1 && item.audioTracks > 0)) byId.set(item.streamId, item);
+        }
         if (platform === 'google_meet') {
           const list = w.__vexaGmeetCapture?.channels?.() ?? [];
           for (const row of list) {
@@ -1761,14 +1771,17 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
                 displayName: typeof named?.displayName === 'string' && named.displayName ? named.displayName : undefined,
               };
             };
-            await openChannel(target.channel, found.stream, 'jitsi', target.streamId, nameOf);
+            const channel = jitsiNumbers.channelFor(found.stream, target.streamId);
+            if (channel === null) continue;
+            await openChannel(channel, found.stream, 'jitsi', target.streamId, nameOf);
           }
-          // A stream gone from the page for channelGoneMs is a speaker who left. Jitsi gives a
-          // returning participant a new stream id (a new channel), so a released channel is never
-          // needed again; the grace keeps a stream that is only briefly detached recording.
+          // A stream gone from the page for channelGoneMs is a speaker who left. Present means the
+          // same stream OBJECT: a new stream under the same id (a returning participant, or a new
+          // bridge session) has its own channel, so a released channel is never needed again; the
+          // grace keeps a stream that is only briefly detached recording.
           const now = Date.now();
-          for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { streamId: string; missingSince?: number }][]) {
-            if (byId.has(entry.streamId)) { entry.missingSince = undefined; continue; }
+          for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { streamId: string; stream: any; missingSince?: number }][]) {
+            if (byId.get(entry.streamId)?.stream === entry.stream) { entry.missingSince = undefined; continue; }
             entry.missingSince ??= now;
             if (now - entry.missingSince >= channelGoneMs) await release(channel);
           }

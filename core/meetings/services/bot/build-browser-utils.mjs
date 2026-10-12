@@ -80,6 +80,7 @@ import {
 import {
   createRecordingTap,
   selectJitsiChannels,
+  createJitsiChannelNumbers,
 } from ${JSON.stringify(RECORD)};
 import {
   createJitsiSpeakers,
@@ -114,6 +115,7 @@ const VexaBrowserUtils = {
   // ── recording (all platforms): MediaRecorder → recording.v1 chunks ──
   createRecordingTap,        // capture-bridge.ts: w.VexaBrowserUtils.createRecordingTap
   selectJitsiChannels,       // capture-bridge.ts: the Jitsi streams that are speaker channels
+  createJitsiChannelNumbers, // capture-bridge.ts: a channel number per Jitsi stream object
   // ── jitsi lane (dominant-speaker naming hints + chat over the app's own state) ──
   createJitsiSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createJitsiSpeakers
   jitsiNameForStream,        // capture-bridge.ts: name a remote-audio stream at recorder start
