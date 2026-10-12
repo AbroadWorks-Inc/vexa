@@ -195,7 +195,7 @@ Portal ──instant join / stop / read (always "for whom")───────
 **R8: Removed meetings are kept as history.** A meeting whose last entry is removed before its bot was sent ends `failed`, `completion_reason: "stopped"`, outcome `cancelled_by_calendar`, with `meeting.removed`. The row is kept.
 
 **Reasons: the sealed enum stays, and AW's cause is additive.**
-- `completion_reason` is the sealed `lifecycle.v1` set: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded`. `lifecycle/retry.py` classifies on it, so it is never extended. The one other value already in the code, upstream's `start_failed` on a `failed` row (a workload that never started; the auto-join retry rule reads it), stays as it is. Intake never writes it (V12).
+- `completion_reason` is the sealed `lifecycle.v1` set: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded`. The retry decision (`intake/retry.py` `NOT_RETRIED`) reads it, so it is never extended. The one other value already in the code, upstream's `start_failed` on a `failed` row (a workload that never started; the auto-join retry rule reads it), stays as it is. Intake never writes it (V12).
 - Every meeting object carries an additive **`outcome`**, `null` until set:
 
 ```json
@@ -653,6 +653,7 @@ No alert watches `aw_sweep_items_total{result="runtime_unreachable"}`: a pending
     "status": "scheduled",
     "completion_reason": null,
     "failure_stage": null,
+    "join_failure": null,
     "outcome": null,
     "platform": "google_meet",
     "room": "kxo-misr-avz",
@@ -673,9 +674,10 @@ No alert watches `aw_sweep_items_total{result="runtime_unreachable"}`: a pending
 }
 ```
 
-The meeting (sealed `intake.v1` `Meeting`, 19 keys) is the same object in every reply, read and webhook:
+The meeting (sealed `intake.v1` `Meeting`, 20 keys) is the same object in every reply, read and webhook:
 - `id` is the UUID; `upstream_id` is the integer row id, for the upstream reads that take it (`GET /recordings?meeting_id=`, `GET /transcripts/by-id/{id}`); no `/v2` path takes it.
 - `start` and `end` are the planned times (`end` is `null` for an open-ended `join_now` meeting). `started_at` is when the bot first went `active` and `ended_at` when the meeting finished, each `null` until then.
+- `join_failure`: why a bot that never got in failed, `{reason, attribution, detail}` from the failed bot's `data.join_evidence` on a `failed` meeting not ended by a user stop (`stopped`), else `null`. `attribution` tells the platform refusing the bot (`exogenous_platform`, e.g. Zoom's automated-bot wall) from the host declining it (`host_action`); `detail` is the platform's text, at most 500 characters. While the meeting waits for a new bot (§1.5) the evidence is on the retry marker, so it reads `null`.
 - `bot_joins_at`: while `scheduled`, `start` − `AUTO_JOIN_LEAD_S`; while waiting for a new bot after one failed (§1.5), the retry's `due_at`; once sent, when it was sent; otherwise `null`. The examples use AW's 300 s lead (08:55 for a 09:00 start); the default, 120 s, gives 08:58.
 - `entries`: a finished meeting lists its closed entries, any other meeting its active ones.
 - `sequence` rises by 1 with every event of the meeting.

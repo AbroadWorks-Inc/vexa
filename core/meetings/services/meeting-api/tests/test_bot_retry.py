@@ -243,6 +243,38 @@ async def test_the_writer_sends_the_meeting_back_to_requested_with_bot_retry():
     assert [e.state for e in view.entries] == ["active"]
 
 
+_EVIDENCE = {
+    "reason": "never_reached_lobby",
+    "attribution": "system_fault",
+    "source": "bot",
+    "stage": "joining",
+    "detail": "no meeting indicators found after polling",
+}
+
+
+async def test_a_retried_sessions_join_evidence_waits_on_the_marker_until_the_meeting_ends():
+    """The failed bot's evidence is the meeting's only while no other bot may follow: on the row
+    during the wait it would read as the meeting's own refusal (``join_failure``)."""
+    store = _store()
+    mid = _meeting(store, status="joining")
+    async with store.room_lock(USER, [ROOM]) as tx:
+        written = await retry.retry(
+            tx, mid, _failed(), now=NOW, settings=SETTINGS,
+            data_patch={"completion_reason": "join_failure", "join_evidence": _EVIDENCE},
+        )
+    assert written is not None
+    view = store.view(mid)
+    assert "join_evidence" not in view.data
+    assert view.data["bot_retry"]["join_evidence"] == _EVIDENCE
+    assert view.project(lead_s=300)["join_failure"] is None
+
+    async with store.room_lock(USER, [ROOM]) as tx:
+        assert await retry.end(tx, mid) is not None
+    view = store.view(mid)
+    assert view.status == "failed" and view.data["join_evidence"] == _EVIDENCE
+    assert view.project(lead_s=300)["join_failure"]["reason"] == "never_reached_lobby"
+
+
 async def test_the_writer_writes_nothing_for_a_failure_it_does_not_retry():
     store = _store()
     mid = _meeting(store)
@@ -646,6 +678,14 @@ async def test_the_claim_takes_a_waiting_meeting_whose_workload_is_proven_gone()
     assert archived["failure_reason"] == "no page"
     assert archived["after_session"] == "sess-old"
     assert "completion_reason" not in data
+
+
+async def test_the_claim_moves_the_failed_bots_join_evidence_into_the_history():
+    repo = _waiting_repo(proven=True)
+    repo._meetings[5]["data"]["bot_retry"]["join_evidence"] = _EVIDENCE
+    data = (await _claim(repo, max_concurrent=1))["data"]
+    assert "join_evidence" not in data
+    assert data["completion_history"][-1]["join_evidence"] == _EVIDENCE
 
 
 async def test_the_claim_refuses_a_waiting_meeting_not_proven_gone():

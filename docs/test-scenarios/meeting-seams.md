@@ -15,7 +15,7 @@ Add a row per known failure class; a row is "done" when every named probe is gre
     join_outcome: rejected
     failure_stage: awaiting_admission
     completion_reason: awaiting_admission_rejected
-    retry_class: permanent          # lifecycle/retry.py: NOT re-spawned (was: thrown -> join_failure -> retried)
+    retry_class: permanent          # intake/retry.py NOT_RETRIED: not re-spawned
   note: >
     The admission wait THROWS a typed AdmissionError(outcome); the join-driver now maps the outcome
     instead of letting it fall through to the orchestrator's blanket transient join_failure.

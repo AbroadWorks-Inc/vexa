@@ -64,10 +64,23 @@ in, and the folder goes to `notetaker-worker`'s `/process` with `"rerun": true`,
 previous outputs to `runs/<processed_at>/` and redoes the transcript. A meeting notetaker-worker
 is transcribing now (`GET /status/{id}` reads `processing`) is refused with `transcription in
 progress for this meeting`, as is every meeting when the worker cannot say; nothing is queued or
-written for it. A meeting that has not finished, had no bot sent, or never had its bot in the
-meeting is refused too (`refused <id>: <why>`, exit code 1). A webhook redelivered while a rerun is
-pending keeps it a rerun, and a rerun asked for while the meeting is exporting stays queued after
-that export. A rerun out of attempts is reported `failed`, never the earlier hand-off.
+written for it. A meeting still in the exporter's queue is refused with `export in progress for
+this meeting` while its export has not finished, or `rerun already queued` when a rerun is pending
+or running; the check and the queuing are one conditional S3 write (`IfNoneMatch`), so nothing is
+folded into a pending item. A meeting that has not finished, had no bot sent, or never had its bot
+in the meeting is refused too (`refused <id>: <why>`, exit code 1). An id that can't be read
+(aw-bots or notetaker-worker unreachable, or a `/status` body that is not a JSON object) prints
+`failed <id>: <why>` and the other ids go on; the exit code is 1. A webhook redelivered while a
+rerun is pending keeps it a rerun. Before it writes anything the export job asks notetaker-worker
+again: a meeting being transcribed by then writes no export file and the rerun ends
+`rerun_refused` with `rerun refused: transcription in progress for this meeting`, added to
+`_export.json` as `rerun` (`state`, `error`, `at`) beside the marker already there, whose state
+stays; it is reported `failed` only over a folder that was never handed off, so aw-bots'
+`handed_off` export is never turned into `failed`. A `/status` that can't answer is retried. Once
+the rerun's `/process` is accepted, its `_export.json` is kept on the pending item before the
+steps after it, so a retry (the report or the marker write failed) only finishes those steps and
+never refuses the rerun's own transcription. A rerun out of attempts before its `/process` is
+reported `failed`, never the earlier hand-off; after it, the hand-off stands.
 
 ## Through the gateway (design §1.9, §1.10)
 - **Reads.** `GET /recordings`, `GET /recordings/{id}/master`, `GET /transcripts/by-id/{id}` and,
@@ -89,8 +102,9 @@ that export. A rerun out of attempts is reported `failed`, never the earlier han
   nothing to the export bucket.
 - **Export result.** After `_export.json` records the outcome, the exporter reports it with
   `POST /v2/meetings/{uuid}/export` `{"state": "handed_off" | "failed", "s3_path": "s3://…/", "error": "…"}`
-  (`error` only on `failed`): `handed_off` after `/process`, `failed` when the meeting has no audio
-  or its export is quarantined. meeting-api stores it on the meeting and sends `export.handed_off`
+  (`error` only on `failed`): `handed_off` after `/process`, `failed` when the meeting has no audio,
+  a speaker's audio is missing (`audio_mismatch`: counts and levels only, no speaker's name, in
+  the error, the log and `_export.json`), a rerun is refused, or its export is quarantined. meeting-api stores it on the meeting and sends `export.handed_off`
   / `export.failed`; repeating a report changes nothing. A report that isn't accepted fails the job
   step, and the queue retries it with its normal backoff.
 
@@ -147,7 +161,10 @@ one transcript with speaker names:
   not ours to extend), and `recordings.json` lists every recording as meeting-api returned it.
   `live_transcript.json` is the meeting's transcript (`GET /transcripts/by-id/{id}`); only a bot
   that ran with live transcription leaves segments, otherwise it is `{"segments": []}`. Every run
-  writes every file listed here, empty when there is nothing, so a rerun leaves nothing stale. A recording with no audio file (the bot failed before it recorded) is skipped with
+  writes every file listed here, empty when there is nothing, so a rerun leaves nothing stale; a
+  run that ends `no_audio` or `too_many_recordings` writes `channels/index.json` `[]`,
+  `speaker_activity_frames.json` `[]` and `live_transcript.json` `{"segments": []}` beside
+  `_export.json`. A recording with no audio file (the bot failed before it recorded) is skipped with
   the log line `recording_skipped … reason=no_audio`. With `EXPORT_DEBUG`, each session's signal
   files go to `signal/<session_uid>/`.
 - **One session** is exported from its recording alone: `master.webm` is a server-side copy,
@@ -173,9 +190,19 @@ secret of its `/v2/webhooks` subscription),
 `EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `EXPORT_RETRY_BACKOFF_SECONDS`
 (default 30: a failed export waits this × 2^attempts seconds before its next try),
 `EXPORT_MAX_CRASHES` (default 2: runs that stopped mid-export, the pod killed or out of memory,
-before the meeting is quarantined; a crash raises nothing, so it has its own budget),
-`EXPORT_LEASE_SECONDS` (default 120: a running export's lease, renewed while it runs; one found
-expired is a crash; a stopped worker releases its leases, so a deploy is not one),
+before the meeting is quarantined; a crash raises nothing, so it has its own budget, checked
+whether or not a lease is there; one kill charges a crash to every export the pod was running, so
+a meeting with a crash runs alone, with no other export beside it, and a second crash is its
+own), `EXPORT_LEASE_SECONDS` (default 120: a running export's lease, renewed while it runs and
+only while it is still held; one found expired is a crash; a lease left by bookkeeping that
+failed after the job is released, or recognised by the worker that holds it; a stopped worker
+stops and awaits its renewals, then releases its leases, so a deploy is not one),
+`EXPORT_JOB_TIMEOUT_SECONDS` (default 14400: a job running longer has hung, `/healthz` answers
+503 and the liveness probe restarts the pod; that meeting's lease is left to expire, so it is
+charged a crash and runs alone; ffmpeg itself has a timeout sized from its input, so a hung
+ffmpeg normally fails just its export first), `EXPORT_STOP_WAIT_SECONDS` (default 100: on
+SIGTERM the running exports get this long to finish and record their outcome; the Deployment's
+`terminationGracePeriodSeconds` is 120),
 `RMS_SPEECH_THRESHOLD`,
 `SPEECH_HANGOVER_MS`, `MIN_DOMINANT_UTTERANCE_MS`, `RECORD_CHUNK_TIMESLICE_MS`,
 `ACTIVITY_WAIT_SECONDS`, `EXPORT_MAX_RECORDINGS` (default 50: the meeting's recordings are read

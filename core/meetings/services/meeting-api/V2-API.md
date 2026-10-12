@@ -481,7 +481,7 @@ until it is accepted.
 ### The meeting object
 
 Every reply, read and webhook carries the meeting in this one shape (sealed as `intake.v1`
-`Meeting`): exactly these 19 keys.
+`Meeting`): exactly these 20 keys.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -490,6 +490,7 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 | `status` | string | See the status table below. |
 | `completion_reason` | string or null | Set when the meeting finished: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded` (and upstream's `start_failed` on some `failed` rows). |
 | `failure_stage` | string or null | On a `failed` meeting, the stage it failed at: `requested`, `joining`, `awaiting_admission`, `active`. |
+| `join_failure` | object or null | Why a bot that never got in failed: `{reason, attribution, detail}`, from the evidence recorded on the failed bot. `reason` is the join taxonomy (`awaiting_admission_rejected`, `awaiting_admission_timeout`, `never_reached_lobby`, `navigation_failure`, `auth_session_missing`, `stopped_while_joining`, `unknown`); `attribution` who it belongs to (`host_action`, `exogenous_platform`, `system_fault`, `user_action`, `unknown`), so Zoom refusing the bot (`exogenous_platform`) reads differently from the host declining it (`host_action`); `detail` the platform's own text, at most 500 characters. `null` when no such evidence exists, and while a meeting waits for its next bot. |
 | `outcome` | object or null | aw-bots' own cause, below. `null` until set. |
 | `platform` | string | `google_meet`, `zoom`, `teams` or `jitsi`, from parsing `meeting_url`. |
 | `room` | string | The platform's room id: the Meet code, the Zoom numeric id, the Teams id, the lower-cased Jitsi room. |

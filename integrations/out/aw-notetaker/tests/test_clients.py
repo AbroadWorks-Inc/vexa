@@ -270,6 +270,15 @@ def test_meeting_api_reads_one_meeting_by_its_id() -> None:
     assert seen == ["/v2/meetings/m-1"]
 
 
+@pytest.mark.parametrize("content", [b"not json", b"[]", b"null"])
+def test_meeting_api_meeting_raises_on_a_body_that_is_not_a_json_object(
+    content: bytes,
+) -> None:
+    api = _api(lambda r: httpx.Response(200, content=content))
+    with pytest.raises(MeetingApiError):
+        api.meeting("m-1")
+
+
 @pytest.mark.parametrize(
     ("status", "body", "expected"),
     [
@@ -296,6 +305,18 @@ def test_notetaker_transcribing_reads_the_meetings_status(
 def test_notetaker_transcribing_raises_when_the_worker_cannot_say() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
+
+    nt = Notetaker("http://n", httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(NotetakerError):
+        nt.transcribing("m-1")
+
+
+@pytest.mark.parametrize("content", [b"<html>busy</html>", b"[]", b'"processing"'])
+def test_notetaker_transcribing_raises_on_a_body_that_is_not_a_json_object(
+    content: bytes,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content)
 
     nt = Notetaker("http://n", httpx.Client(transport=httpx.MockTransport(handler)))
     with pytest.raises(NotetakerError):
@@ -404,6 +425,7 @@ def test_webm_to_wav_command_includes_mandatory_aresample_filter(
         captured.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
+    (tmp_path / "in.webm").write_bytes(b"")
     webm_to_wav(tmp_path / "in.webm", tmp_path / "out.wav", run=fake_run)
     assert captured[0][0] == "ffmpeg"
     assert "aresample=async=1:first_pts=0" in captured[0]
@@ -419,11 +441,41 @@ def test_webm_to_wav_raises_runtimeerror_with_last_20_stderr_lines(
             cmd, 1, stdout="", stderr="\n".join(stderr_lines)
         )
 
+    (tmp_path / "in.webm").write_bytes(b"")
     with pytest.raises(RuntimeError) as exc_info:
         webm_to_wav(tmp_path / "in.webm", tmp_path / "out.wav", run=fake_run)
     message = str(exc_info.value)
     assert "line29" in message
     assert "line0" not in message
+
+
+def test_every_ffmpeg_run_has_a_timeout_sized_from_its_input(tmp_path: Path) -> None:
+    """A hung ffmpeg must fail its export, not hold a slot forever."""
+    timeouts: list[float] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        timeouts.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    (tmp_path / "a.webm").write_bytes(b"x" * 3_000_000)
+    (tmp_path / "b.webm").write_bytes(b"x" * 300_000)
+    webm_to_wav(tmp_path / "a.webm", tmp_path / "out.wav", run=fake_run)
+    join_webm(
+        [(tmp_path / "a.webm", 0.0), (tmp_path / "b.webm", 50.0)],
+        tmp_path / "out.webm",
+        run=fake_run,
+    )
+
+    assert timeouts == [pytest.approx(1300.0), pytest.approx(300 + 1100 + 10)]
+
+
+def test_an_ffmpeg_that_times_out_is_a_runtimeerror(tmp_path: Path) -> None:
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    (tmp_path / "in.webm").write_bytes(b"")
+    with pytest.raises(RuntimeError, match="ffmpeg timed out after 300 s"):
+        webm_to_wav(tmp_path / "in.webm", tmp_path / "out.wav", run=fake_run)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -473,6 +525,8 @@ def test_join_webm_decodes_every_part_with_the_dtx_filter_and_pads_the_gaps(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     parts = [(tmp_path / "a.webm", 0.0), (tmp_path / "b.webm", 2.5)]
+    for path, _ in parts:
+        path.write_bytes(b"")
     join_webm(parts, tmp_path / "out.webm", run=fake_run)
 
     cmd = captured[0]
@@ -491,6 +545,7 @@ def test_join_webm_raises_runtimeerror_with_the_stderr_tail(tmp_path: Path) -> N
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bad input")
 
+    (tmp_path / "a.webm").write_bytes(b"")
     with pytest.raises(RuntimeError, match="bad input"):
         join_webm([(tmp_path / "a.webm", 0.0)], tmp_path / "out.webm", run=fake_run)
 

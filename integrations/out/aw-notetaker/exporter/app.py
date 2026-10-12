@@ -7,6 +7,9 @@ rotation, under `EXPORTER_WEBHOOK_SECRET`), validates the webhook.v1
 `MeetingEvent` fields the export job needs before anything is durably
 enqueued, hands finished meetings to the worker in `queue.py`, and answers
 2xx to every other event (`webhook.test` included) without acting on it.
+`GET /healthz` (the liveness and readiness probe) answers 503 while any
+export has run longer than `EXPORT_JOB_TIMEOUT_SECONDS`, so a hung export
+gets the pod restarted.
 aw-bots retries a 5xx, so an enqueue failure is a 503; any other refusal is
 final.
 
@@ -39,7 +42,7 @@ from fastapi.responses import JSONResponse
 from exporter import signature
 from exporter.config import Settings
 from exporter.job import Deps, meeting_is_valid, not_sent
-from exporter.queue import PendingQueue, run_worker
+from exporter.queue import PendingQueue, WorkerState, run_worker
 
 logger = logging.getLogger("exporter")
 
@@ -55,15 +58,19 @@ def create_app(
     deps: Deps,
     clock: Callable[[], float] = time.time,
     start_worker: bool = True,
+    worker: WorkerState | None = None,
 ) -> FastAPI:
     stop = asyncio.Event()
     worker_task: asyncio.Task[None] | None = None
+    worker = worker or WorkerState(settings.concurrency)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         nonlocal worker_task
         if start_worker:
-            worker_task = asyncio.create_task(run_worker(queue, deps, stop))
+            worker_task = asyncio.create_task(
+                run_worker(queue, deps, stop, worker=worker)
+            )
         try:
             yield
         finally:
@@ -155,6 +162,17 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
+        overdue = worker.overdue(settings.job_timeout_seconds)
+        if overdue:
+            # The liveness probe restarts the pod; the hung meeting's lease is
+            # left to expire, so the next worker counts a crash and runs it
+            # alone.
+            logger.error(
+                "healthz failing: export running past EXPORT_JOB_TIMEOUT_SECONDS "
+                "meeting_ids=%s",
+                ",".join(overdue),
+            )
+            return JSONResponse({"status": "export_overdue"}, status_code=503)
         return JSONResponse({"status": "ok"})
 
     return app

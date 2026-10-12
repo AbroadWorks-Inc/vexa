@@ -387,6 +387,14 @@ async def _subscription_bot_failed(orm) -> str:
         data_patch={
             "completion_reason": "awaiting_admission_rejected",
             "failure_stage": "awaiting_admission",
+            "join_evidence": {
+                "reason": "awaiting_admission_rejected",
+                "attribution": "host_action",
+                "source": "bot",
+                "stage": "awaiting_admission",
+                "detail": "Bot admission was rejected by meeting admin",
+                "timings": {"time_to_lobby_ms": 7000, "time_in_lobby_ms": 31000, "total_ms": 38000},
+            },
         },
         change_reason="host denied admission",
     )

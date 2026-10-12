@@ -6,6 +6,9 @@ completion_reason; a terminal record cannot be re-opened.
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from meeting_api.lifecycle import (
@@ -15,6 +18,7 @@ from meeting_api.lifecycle import (
     IllegalTransition,
     LifecycleSink,
     MeetingStore,
+    LEGAL_TRANSITIONS,
     can_transition,
 )
 
@@ -29,6 +33,7 @@ def test_legal_edges():
     assert can_transition(BotStatus.AWAITING_ADMISSION, BotStatus.NEEDS_HELP)
     assert can_transition(BotStatus.JOINING, BotStatus.NEEDS_HELP)  # a pre-lobby blocker (#1251)
     assert can_transition(BotStatus.NEEDS_HELP, BotStatus.ACTIVE)
+    assert can_transition(BotStatus.NEEDS_HELP, BotStatus.AWAITING_ADMISSION)  # blocker cleared
     assert can_transition(BotStatus.ACTIVE, BotStatus.COMPLETED)
     assert can_transition(BotStatus.ACTIVE, BotStatus.FAILED)
 
@@ -109,6 +114,54 @@ def test_needs_help_after_the_lobby_still_fails_at_the_lobby_stage(goldens):
     sink.apply({"connection_id": "sess-uid", "status": "needs_help"})
     rec = sink.apply(goldens["failed-join"])
     assert rec.failure_stage is FailureStage.AWAITING_ADMISSION
+
+
+def test_a_consent_gate_that_clears_reaches_the_lobby(goldens):
+    """joining -> needs_help -> awaiting_admission: Google Meet's consent gate escalates, then the
+    bot reaches the waiting room. Refusing that edge dropped the lobby report, and every later
+    report from the bot was judged against a stale `needs_help`."""
+    sink = LifecycleSink(store=MeetingStore())
+    sink.apply(goldens["joining"])
+    sink.apply({"connection_id": "sess-uid", "status": "needs_help"})
+    lobby = sink.apply({"connection_id": "sess-uid", "status": "awaiting_admission"})
+    assert lobby.status is BotStatus.AWAITING_ADMISSION
+    rec = sink.apply(goldens["failed-join"])
+    assert rec.failure_stage is FailureStage.AWAITING_ADMISSION
+
+
+def _ts_transitions(source: str) -> dict[str, set[str]]:
+    m = re.search(r"export const LIFECYCLE_TRANSITIONS[^=]*= \{(.*?)\n\};", source, re.S)
+    assert m, "LIFECYCLE_TRANSITIONS not found in the bot contracts"
+    return {
+        state: set(re.findall(r"'([a-z_]+)'", targets))
+        for state, targets in re.findall(r"^\s*([a-z_]+): \[(.*?)\],", m.group(1), re.M)
+    }
+
+
+def _readme_transitions(source: str) -> dict[str, set[str]]:
+    m = re.search(r"## States & legal transitions.*?```(.*?)```", source, re.S)
+    assert m, "transition table not found in the lifecycle.v1 README"
+    table: dict[str, set[str]] = {}
+    for line in m.group(1).strip().splitlines():
+        state, _, targets = line.partition("→")
+        table[state.split()[0]] = set(re.findall(r"[a-z_]+", targets))
+    return table
+
+
+def test_the_bot_the_contract_and_the_control_plane_share_one_machine():
+    """Three copies of one table: the bot refuses to SEND what it thinks is illegal, meeting-api
+    refuses to ACCEPT it, and the contract documents it. Any drift drops a real report."""
+    root = Path(__file__).resolve()
+    meetings = next(p for p in root.parents if (p / "contracts" / "lifecycle.v1").is_dir())
+    ts = (meetings / "services" / "bot" / "src" / "contracts.ts").read_text()
+    readme = (meetings / "contracts" / "lifecycle.v1" / "README.md").read_text()
+    ours = {
+        frm.value: {to.value for to in tos}
+        for frm, tos in LEGAL_TRANSITIONS.items()
+        if frm is not None
+    }
+    assert _ts_transitions(ts) == ours
+    assert _readme_transitions(readme) == ours
 
 
 # --- rejecting illegal transitions -----------------------------------------------------

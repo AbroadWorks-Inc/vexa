@@ -59,8 +59,8 @@ def dominant_completion_reason(reason: Any, *, stop_requested: bool) -> Any:
     A stop that loses a race still ends the run, and the row must record WHY THE USER ENDED IT, not
     whichever fault the race happened to reach first. Witnessed on stage rev 193 (row 26313): a
     DELETE landed 0.4s after the POST, the bot was torn down before it could join, and the terminal
-    was written ``join_failure`` — a reason ``retry.py`` classes TRANSIENT, so the occurrence stayed
-    eligible for re-dispatch while ``data.stop_requested`` was true the whole time. The reason is the
+    was written ``join_failure`` — a reason that is retried (not in ``intake.retry.NOT_RETRIED``), so
+    the occurrence stayed eligible for re-dispatch while ``data.stop_requested`` was true the whole time. The reason is the
     user's intent; the race is an accident of scheduling and has no business overwriting it.
 
     Founder ruling 2026-08-17: *"explicit stop must be stop, evict."*
@@ -121,7 +121,11 @@ LEGAL_TRANSITIONS: Dict[Optional[BotStatus], frozenset[BotStatus]] = {
     BotStatus.AWAITING_ADMISSION: frozenset(
         {BotStatus.ACTIVE, BotStatus.NEEDS_HELP, BotStatus.FAILED}
     ),
-    BotStatus.NEEDS_HELP: frozenset({BotStatus.ACTIVE, BotStatus.FAILED}),
+    # `needs_help -> awaiting_admission`: the blocker cleared (a consent gate answered) and the bot
+    # reached the waiting room. The bot's `LIFECYCLE_TRANSITIONS` (contracts.ts) is the same table.
+    BotStatus.NEEDS_HELP: frozenset(
+        {BotStatus.AWAITING_ADMISSION, BotStatus.ACTIVE, BotStatus.FAILED}
+    ),
     BotStatus.ACTIVE: frozenset({BotStatus.COMPLETED, BotStatus.FAILED}),
     BotStatus.COMPLETED: frozenset(),  # terminal
     BotStatus.FAILED: frozenset(),  # terminal
@@ -460,6 +464,19 @@ class MeetingStore:
                     rec.status_transition = [
                         dict(entry) for entry in trail if isinstance(entry, dict)
                     ]
+                    # `history` answers "did the bot reach the lobby?" for the failure stage and
+                    # the join evidence. Another replica may have stored the lobby, so it is the
+                    # stored trail's statuses, not this process's own.
+                    rec.history = [
+                        status
+                        for status in (
+                            bot_status_from_persisted(entry.get("to"))
+                            for entry in rec.status_transition
+                        )
+                        if status is not None
+                    ]
+            if seeded is not None and (not rec.history or rec.history[-1] is not seeded):
+                rec.history.append(seeded)
         return rec
 
     def __len__(self) -> int:  # pragma: no cover - trivial

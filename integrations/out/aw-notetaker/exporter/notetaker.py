@@ -7,7 +7,8 @@ httpx.TransportError (connect errors and all timeouts — /process is idempotent
 via idempotency_key, so a retry after a timeout is safe) and 5xx (transient);
 4xx fails immediately. That includes a rerun's 409 (the meeting's job is still
 running), which the durable queue retries with its backoff; `exporter.rerun`
-asks `transcribing` first, so a rerun is refused before anything is written.
+asks `transcribing` before it queues a rerun, and the export job asks again
+before it writes anything, so a rerun is refused before anything is written.
 """
 
 from __future__ import annotations
@@ -69,7 +70,9 @@ class Notetaker:
     def transcribing(self, meeting_id: str) -> bool:
         """Whether notetaker-worker is transcribing the meeting now
         (`GET /status/{id}` reads `processing`). A worker that does not know
-        the meeting (404, e.g. after its restart) is not transcribing it."""
+        the meeting (404, e.g. after its restart) is not transcribing it. Any
+        answer that is not one of those, a body that is not a JSON object
+        included, raises `NotetakerError`."""
         try:
             resp = self._http.get(
                 f"{self._base_url}/status/{meeting_id}", timeout=_TIMEOUT_S
@@ -80,4 +83,10 @@ class Notetaker:
             return False
         if resp.status_code // 100 != 2:
             raise NotetakerError(f"notetaker {resp.status_code}")
-        return bool(resp.json().get("status") == "processing")
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise NotetakerError("notetaker /status body is not JSON") from exc
+        if not isinstance(body, dict):
+            raise NotetakerError("notetaker /status body is not a JSON object")
+        return bool(body.get("status") == "processing")

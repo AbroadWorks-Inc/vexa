@@ -1633,17 +1633,27 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     // Jitsi stream id, and so its channel number, is not reused).
     const started = new Set<number>();
     // The live ones: channel -> its recorder, its stream id, and its activity source and node.
+    // Whoever takes an entry out of this map (a release, or the stop) stops its recorder.
     w.__vexaChannels = new Map<number, { tap: any; streamId: string; src?: any; node?: any; missingSince?: number }>();
+    // Set by the stop. An open that resumes after it adds nothing and leaves nothing running.
+    w.__vexaChannelsStopped = false;
+    // Releases still flushing: the stop waits for them, so no final chunk arrives after it.
+    w.__vexaChannelReleases = new Set<Promise<void>>();
     // A speaker who left: flush the recorder's last chunk and free its source and node, so a long
     // meeting does not keep one recorder and one worklet per person who ever joined.
-    const release = async (channel: number): Promise<void> => {
+    const release = (channel: number): Promise<void> => {
       const entry = w.__vexaChannels.get(channel);
-      if (!entry) return;
+      if (!entry) return Promise.resolve();
       w.__vexaChannels.delete(channel);
-      try { entry.node?.disconnect?.(); } catch { /* best-effort */ }
-      try { entry.src?.disconnect?.(); } catch { /* best-effort */ }
-      try { await entry.tap?.stop?.(); } catch { /* best-effort */ }
-      w.logBot?.('[channels] released ch' + channel + ' ' + entry.streamId);
+      const done = (async () => {
+        try { entry.node?.disconnect?.(); } catch { /* best-effort */ }
+        try { entry.src?.disconnect?.(); } catch { /* best-effort */ }
+        try { await entry.tap?.stop?.(); } catch { /* best-effort */ }
+        w.logBot?.('[channels] released ch' + channel + ' ' + entry.streamId);
+      })();
+      w.__vexaChannelReleases.add(done);
+      void done.finally(() => w.__vexaChannelReleases.delete(done));
+      return done;
     };
     const mediaStreams = (): { streamId: string; paused: boolean; audioTracks: number; stream: any }[] => {
       const out: { streamId: string; paused: boolean; audioTracks: number; stream: any }[] = [];
@@ -1664,7 +1674,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       channel: number, stream: any, kind: string, streamId: string,
       nameOf?: () => { participantId?: string; displayName?: string },
     ): Promise<void> => {
-      if (started.has(channel)) return;
+      if (started.has(channel) || w.__vexaChannelsStopped) return;
       started.add(channel);
       let startedAt = 0;
       const tap = w.VexaBrowserUtils.createRecordingTap({
@@ -1687,7 +1697,11 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       const entry: { tap: any; streamId: string; src?: any; node?: any } = { tap, streamId };
       w.__vexaChannels.set(channel, entry);
       w.logBot?.('[channels] recording ch' + channel + ' ' + streamId);
+      // After every await: the stop, or a release (its track ended), may have taken the entry. Its
+      // recorder is then theirs to stop; this open only frees what it made after that.
+      const taken = (): boolean => w.__vexaChannelsStopped || w.__vexaChannels.get(channel) !== entry;
       await tap.start();
+      if (taken()) return;
       try {
         for (const track of stream.getAudioTracks()) track.addEventListener('ended', () => { void release(channel); });
       } catch { /* the scan's absence check releases it */ }
@@ -1699,6 +1713,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
         if (!w.__vexaChannelActivityCtx) w.__vexaChannelActivityCtx = new w.AudioContext({ sampleRate: 16000 });
         const ctx = w.__vexaChannelActivityCtx;
         try { await ctx.resume(); } catch { /* a suspended context emits nothing until the page resumes it */ }
+        if (taken()) return;
         const src = ctx.createMediaStreamSource(stream);
         // Loudness is measured in the worklet: one value per 4096-sample block crosses to Node,
         // never the samples. Silence writes nothing (the gmeet-capture SILENCE peak rule).
@@ -1706,6 +1721,11 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
           if (peak <= 0.005) return;
           try { w.__vexaChannelActivity?.(channel, rms, samples, Date.now()); } catch { /* activity must not stop the recorder */ }
         });
+        if (taken()) {
+          try { node?.disconnect?.(); } catch { /* best-effort */ }
+          try { src.disconnect?.(); } catch { /* best-effort */ }
+          return;
+        }
         src.connect(node);
         node.connect(ctx.destination);
         entry.src = src;
@@ -1778,13 +1798,18 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       try { await w.__vexaRecordingTap?.stop?.(); } catch { /* best-effort */ }
       w.__vexaRecordingTap = null;
       try {
+        // Every recorder flushes its final chunk before this returns, in parallel (each stop may
+        // wait up to 10 s), along with the releases still flushing; the sink closes after it.
+        w.__vexaChannelsStopped = true;
         const channels = Array.from((w.__vexaChannels ?? new Map()).values()) as { tap: any; src?: any; node?: any }[];
         w.__vexaChannels = new Map();
-        for (const entry of channels) {
+        const stopEntry = async (entry: { tap: any; src?: any; node?: any }): Promise<void> => {
           try { entry.node?.disconnect?.(); } catch { /* best-effort */ }
           try { entry.src?.disconnect?.(); } catch { /* best-effort */ }
           try { await entry.tap?.stop?.(); } catch { /* best-effort */ }
-        }
+        };
+        const releases = Array.from(w.__vexaChannelReleases ?? []) as Promise<void>[];
+        await Promise.allSettled([...channels.map(stopEntry), ...releases]);
       } catch { /* best-effort */ }
       try { w.__vexaChannelActivityCtx?.close?.(); } catch { /* best-effort */ }
       w.__vexaChannelActivityCtx = null;

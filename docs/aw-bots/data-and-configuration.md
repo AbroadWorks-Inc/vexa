@@ -31,8 +31,10 @@ on the webhook. `export_state`, `export_s3_path`, `export_error`, and `export_at
 `POST /v2/meetings/{id}/export` records.
 
 `meetings.data` still holds bot fields the upstream row already had, including
-`completion_reason`, `failure_stage`, `failure_reason`, and `bot_retry` while a replacement is
-waiting (`intake/retry.py`).
+`completion_reason`, `failure_stage`, `failure_reason`, `join_evidence`, and `bot_retry` while a
+replacement is waiting (`intake/retry.py`). While it waits, the failed bot's reason, stage and
+`join_evidence` are on `bot_retry`, not the row; a new bot moves them into `completion_history`.
+The v2 meeting's `join_failure` is `join_evidence`'s `reason`, `attribution` and `detail`, on a `failed` meeting that did not end by a user stop.
 
 ## Statuses that matter to operators
 

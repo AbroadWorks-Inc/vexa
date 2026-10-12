@@ -12,6 +12,7 @@
     "status": "active",
     "completion_reason": null,
     "failure_stage": null,
+    "join_failure": null,
     "outcome": null,
     "platform": "google_meet",
     "room": "kxo-misr-avz",

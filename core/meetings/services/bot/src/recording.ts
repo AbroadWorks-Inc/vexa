@@ -92,11 +92,14 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
  */
 const IDENTITY_TEXT_LIMIT = 200;
 
+/** A name field, trimmed and cut to 200 code points (meeting-api stores at most that many; a
+ *  dropped name would be asked for again on every chunk and never sent). Code points, not UTF-16
+ *  units, so a cut never splits a surrogate pair. */
 function textField(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
-  if (!trimmed || trimmed.length > IDENTITY_TEXT_LIMIT) return undefined;
-  return trimmed;
+  if (!trimmed) return undefined;
+  return Array.from(trimmed).slice(0, IDENTITY_TEXT_LIMIT).join('');
 }
 
 /** media_type chN and the channel's identity so far, on every channel chunk. */

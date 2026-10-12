@@ -312,7 +312,7 @@ def test_a_quarantined_export_reports_failed_with_its_error(storage: Storage) ->
     queue.enqueue(_envelope())
 
     def failing_job(
-        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False, progress: Any = None
     ) -> ExportResult:
         raise RuntimeError("notetaker 422")
 
@@ -338,7 +338,7 @@ def test_a_failed_report_that_is_not_accepted_still_quarantines(
     queue.enqueue(_envelope())
 
     def failing_job(
-        envelope: dict[str, Any], deps: Deps, rerun: bool = False
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False, progress: Any = None
     ) -> ExportResult:
         raise RuntimeError("boom")
 

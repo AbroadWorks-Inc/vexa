@@ -32,7 +32,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
 
-from ..bot_spawn.ports import MeetingRepo, WorkloadUnknown
+from ..bot_spawn.ports import PRE_ACTIVE_MEETING_STATUSES, MeetingRepo, WorkloadUnknown
 from .stop import leave_command_channel, leave_command_payload
 
 
@@ -66,11 +66,14 @@ def _resolve_user_id(x_user_id: Optional[str]) -> int:
         raise HTTPException(status_code=401, detail="Invalid user identity")
 
 
-# Statuses where the bot is still BOOTING — it has not yet subscribed to its command channel, so the
-# fire-and-forget leave below can be LOST (the POST→immediate-DELETE orphan). For these we ALSO tear the
-# workload down directly. An `active`/`needs_help` bot IS listening → trust the graceful leave (so it
-# finalizes its recording cleanly); the reconcile loop is the backstop if it never completes.
-BOOTING_STATUSES = frozenset({"requested", "joining", "awaiting_admission"})
+# Statuses where the bot has NOT reached the meeting (``bot_spawn.ports.PRE_ACTIVE_MEETING_STATUSES``):
+# it may not have subscribed to its command channel yet, so the fire-and-forget leave below can be
+# LOST (the POST→immediate-DELETE orphan), and it has no recording to finalize. For these we ALSO
+# tear the workload down directly, and the row keeps its stage (``stopping`` means a bot in the
+# meeting is leaving). `needs_help` is pre-active: a blocked bot never got in. An `active` bot IS
+# listening → trust the graceful leave (so it finalizes its recording cleanly); the reconcile loop
+# is the backstop if it never completes.
+BOOTING_STATUSES = PRE_ACTIVE_MEETING_STATUSES
 
 # The sealed api.v1 `Platform` enum — the DELETE path param is typed as this enum in the contract, so an
 # unsupported platform is a VALIDATION error (422), not a missing-resource (404). Mirrors the POST /bots

@@ -5,9 +5,9 @@
   1. the link lock;
   2. the meeting row, locked by the status writer;
   3. the outcome on ``meeting_aw_state``, when given;
-  4. the status: a bot that reached the meeting (``active``, ``needs_help``, …) goes ``stopping``
+  4. the status: a bot that reached the meeting (``active``) goes ``stopping``
      through ``write_status`` with ``data.stop_requested``; a bot still booting (``requested``,
-     ``joining``, ``awaiting_admission``) keeps the stage it reached and gets only
+     ``joining``, ``awaiting_admission``, ``needs_help``) keeps the stage it reached and gets only
      ``data.stop_requested`` (and the outcome), because ``stopping`` means "a bot in the meeting is
      leaving" to every terminal reader (``lifecycle.machine``, ``lifecycle.reconcile``);
   5. after the commit, the leave command on ``bot_commands:meeting:{id}``;

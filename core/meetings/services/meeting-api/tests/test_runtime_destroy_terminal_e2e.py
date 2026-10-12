@@ -280,16 +280,12 @@ def test_runtime_destroy_pre_active_before_admission_is_join_failure_e2e(callbac
 
 
 def test_pre_active_attribution_is_retry_neutral():
-    """RETRY PARITY (the "no behavior change" guard): both pre-active teardown reasons are TRANSIENT,
+    """RETRY PARITY (the "no behavior change" guard): both pre-active teardown reasons are retried,
     so status-accurate attribution never flips a destroy-path bot's retry class."""
-    from meeting_api.lifecycle.machine import CompletionReason
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    from meeting_api.intake.retry import NOT_RETRIED
 
-    assert (
-        classify_retry(CompletionReason.AWAITING_ADMISSION_TIMEOUT)
-        is classify_retry(CompletionReason.JOIN_FAILURE)
-        is RetryClass.TRANSIENT
-    )
+    assert "awaiting_admission_timeout" not in NOT_RETRIED
+    assert "join_failure" not in NOT_RETRIED
 
 
 def test_runtime_destroy_noop_on_already_terminal_e2e():

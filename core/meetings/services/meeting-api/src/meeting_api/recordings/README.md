@@ -28,7 +28,13 @@ in `service.py`).
 `meeting.data['recordings']` is a list of recording dicts (`id`, `session_uid`, `source="bot"`,
 `status`, `media_files[]`). Each `media_files[]` entry tracks per-type cumulative
 `file_size_bytes` / `chunk_count`, the chunk/master `storage_path`, and `is_final` / `finalized_by`
-(Pack U.7 master-preserve + sticky-COMPLETED status are ported verbatim).
+(Pack U.7 master-preserve + sticky-COMPLETED status are ported verbatim). A final chunk of a
+per-channel media type (`ch<N>`) marks that media file final only; the recording's `status` turns
+`completed` on a final chunk of a mixed lane (`audio`/`video`); a recording of only channels (no
+mixed lane) completes when its bot session's terminal status is written (`finish_session_recordings`,
+called by the meeting repo's `update_meeting_status`). Channel identity names longer than
+200 characters are stored cut to 200; a `channel_kind` other than `gmeet`/`jitsi` is dropped with a
+`recording_channel_kind_unknown` warning naming the kind.
 
 ## P3 seams (NOT built here)
 The raw byte-stream / Range download of a finalized master, and the lifecycle-driven server-side

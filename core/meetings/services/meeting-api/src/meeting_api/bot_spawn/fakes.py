@@ -36,7 +36,7 @@ from .ports import (
     reconcile_grace_for_status,
 )
 
-_ACTIVE_STATUSES = ("requested", "joining", "awaiting_admission", "active")
+_ACTIVE_STATUSES = ("requested", "joining", "awaiting_admission", "needs_help", "active")
 _TERMINAL_STATUSES = ("completed", "failed")
 
 
@@ -468,6 +468,8 @@ class InMemoryMeetingRepo:
             row["data"]["completion_reason"] = mark["reason"]
         if mark.get("stage") is not None:
             row["data"]["failure_stage"] = mark["stage"]
+        if mark.get("join_evidence") is not None:
+            row["data"]["join_evidence"] = mark["join_evidence"]
         if not mark.get("proven_gone") and mark.get("workload"):
             from .ports import unproven_teardown
 
@@ -550,6 +552,13 @@ class InMemoryMeetingRepo:
         pending = bool(row["data"].get("bot_retry"))  # §6.9 F-K2: waiting for its next bot
         if row["status"] != status and (pending or row["status"] not in predecessors):
             return None
+        if status in ("completed", "failed"):
+            # The adapter's session-end rule: a recording of only channels completes now.
+            from ..recordings.jsonb import finish_session_recordings
+
+            finished = finish_session_recordings(row["data"].get("recordings"), session_uid)
+            if finished is not None:
+                row["data"]["recordings"] = finished
         row["status"] = status
         if completion_reason is not None:
             row["data"]["completion_reason"] = completion_reason

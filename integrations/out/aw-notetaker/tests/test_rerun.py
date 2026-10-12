@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
 from exporter.notetaker import NotetakerError
@@ -13,10 +14,15 @@ from tests.builders import MEETING_UUID, meeting_v2
 
 
 class _Meetings:
-    def __init__(self, meetings: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self, meetings: dict[str, dict[str, Any]], unreachable: set[str] | None = None
+    ) -> None:
         self._meetings = meetings
+        self._unreachable = unreachable or set()
 
     def meeting(self, meeting_id: str) -> dict[str, Any]:
+        if meeting_id in self._unreachable:
+            raise httpx.ConnectError("connection refused")
         if meeting_id not in self._meetings:
             raise MeetingApiError(404, f"/v2/meetings/{meeting_id}")
         return self._meetings[meeting_id]
@@ -36,11 +42,17 @@ class _Notetaker:
 
 
 class _Queue:
-    def __init__(self) -> None:
+    def __init__(self, pending: dict[str, bool] | None = None) -> None:
         self.queued: list[tuple[dict[str, Any], bool]] = []
+        self._pending = pending or {}  # meeting id -> rerun
 
-    def enqueue(self, envelope: dict[str, Any], *, rerun: bool = False) -> None:
-        self.queued.append((envelope, rerun))
+    def request_rerun(self, envelope: dict[str, Any]) -> str:
+        meeting_id = envelope["data"]["meeting"]["id"]
+        if meeting_id in self._pending:
+            return "rerun_queued" if self._pending[meeting_id] else "export_in_progress"
+        self._pending[meeting_id] = True
+        self.queued.append((envelope, True))
+        return "queued"
 
 
 @pytest.mark.parametrize(
@@ -119,3 +131,98 @@ def test_a_worker_that_cannot_say_refuses_the_rerun() -> None:
 
     assert refused == [MEETING_UUID]
     assert queue.queued == []
+
+
+@pytest.mark.parametrize(
+    ("pending_rerun", "reason"),
+    [(False, "export in progress for this meeting"), (True, "rerun already queued")],
+)
+def test_a_meeting_still_in_the_queue_is_refused(
+    pending_rerun: bool, reason: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P9: a rerun would rewrite the folder its running export hands off, and a
+    second rerun would be folded into the first without a word."""
+    queue = _Queue({MEETING_UUID: pending_rerun})
+    meetings = _Meetings({MEETING_UUID: meeting_v2(status="completed")})
+
+    refused = request_reruns(
+        [MEETING_UUID], meetings, queue, _Notetaker()  # type: ignore[arg-type]
+    )
+
+    assert refused == [MEETING_UUID]
+    assert queue.queued == []
+    assert f"refused {MEETING_UUID}: {reason}" in capsys.readouterr().out
+
+
+def test_an_id_that_cannot_be_read_fails_alone_and_the_others_are_queued(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first, unreachable, broken = (
+        "00000000-0000-4000-8000-00000000000a",
+        "00000000-0000-4000-8000-00000000000b",
+        MEETING_UUID,
+    )
+    last = "00000000-0000-4000-8000-00000000000c"
+    queue = _Queue()
+    meetings = _Meetings(
+        {
+            first: meeting_v2(id=first, status="completed"),
+            broken: meeting_v2(id=broken, status="completed"),
+            last: meeting_v2(id=last, status="completed"),
+        },
+        unreachable={unreachable},
+    )
+
+    class _Status(_Notetaker):
+        def transcribing(self, meeting_id: str) -> bool:
+            if meeting_id == broken:
+                raise NotetakerError("notetaker /status body is not a JSON object")
+            return False
+
+    refused = request_reruns(
+        [first, unreachable, broken, last], meetings, queue, _Status()  # type: ignore[arg-type]
+    )
+
+    assert refused == [unreachable, broken]
+    assert [envelope["data"]["meeting"]["id"] for envelope, _ in queue.queued] == [
+        first,
+        last,
+    ]
+    out = capsys.readouterr().out
+    assert f"failed {unreachable}: ConnectError" in out
+    assert f"refused {broken}: notetaker /status body" in out
+
+
+def test_a_storage_fault_while_queuing_fails_that_id_alone(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review 3: an S3 fault on one id must not abort the others."""
+    from botocore.exceptions import ClientError, EndpointConnectionError
+
+    from exporter.storage import PreconditionFailed
+
+    ids = [f"00000000-0000-4000-8000-00000000001{n}" for n in range(4)]
+    faults: dict[str, Exception] = {
+        ids[0]: ClientError({"Error": {"Code": "AccessDenied"}}, "PutObject"),
+        ids[1]: EndpointConnectionError(endpoint_url="https://s3"),
+        ids[2]: PreconditionFailed("pending item kept changing"),
+    }
+
+    class _FaultyQueue(_Queue):
+        def request_rerun(self, envelope: dict[str, Any]) -> str:
+            meeting_id = envelope["data"]["meeting"]["id"]
+            if meeting_id in faults:
+                raise faults[meeting_id]
+            return super().request_rerun(envelope)
+
+    queue = _FaultyQueue()
+    meetings = _Meetings({i: meeting_v2(id=i, status="completed") for i in ids})
+
+    refused = request_reruns(ids, meetings, queue, _Notetaker())  # type: ignore[arg-type]
+
+    assert refused == ids[:3]
+    assert [envelope["data"]["meeting"]["id"] for envelope, _ in queue.queued] == [
+        ids[3]
+    ]
+    out = capsys.readouterr().out
+    assert all(f"failed {i}:" in out for i in ids[:3])

@@ -36,9 +36,9 @@ bytes-out build exists twice:
 
 | pure core (build the master) | TypeScript                                  | Python                                         |
 |------------------------------|---------------------------------------------|------------------------------------------------|
-| dispatch by format           | `buildRecordingMaster` (recording-codec.ts) | `_build_recording_master` (recording_codec.py) |
-| webm = byte-concat Clusters  | `buildWebmMaster`                           | `_build_webm_master`                           |
-| wav = RIFF header-merge      | `buildWavMaster`                            | `_build_wav_master`                            |
+| dispatch by format           | `buildRecordingMaster` (recording-codec.ts) | `build_recording_master` (recording_codec.py)  |
+| webm = byte-concat Clusters  | `buildWebmMaster`                           | `MasterWriter` (webm)                          |
+| wav = RIFF header-merge      | `buildWavMaster`                            | `MasterWriter` (wav)                           |
 
 Everything else (store, transport, DB/JSONB, lifecycle) is a thin adapter that
 differs per deployment. The two cores are kept honest by the **golden vectors**
@@ -56,7 +56,7 @@ is the map.
 | **contract** | `golden/generate.mjs` | `node modules/recording/src/contracts/golden/generate.mjs --check` | the committed vectors *are* the spec (tamper-evident) |
 | **module** · master | `modules/recording/src/golden.test.ts` | `npm test` (in `modules/recording`) | TS `buildRecordingMaster` ≡ vectors |
 | **module** · wire | `modules/shared/capture-codec/src/recording-chunk.test.ts` | `npm test` (in `modules/shared/capture-codec`) | `REC1` frame encode/decode round-trips; null on audio |
-| **service** · master | `services/meeting-api/tests/test_recording_golden.py` | `pytest services/meeting-api/tests/` | Python `_build_recording_master` ≡ **same** vectors |
+| **service** · master | `services/meeting-api/tests/test_recording_golden.py` | `pytest services/meeting-api/tests/` | Python `build_recording_master` ≡ **same** vectors |
 | **service** · record | `services/meeting-api/tests/test_recording_jsonb.py` | `pytest services/meeting-api/tests/` | `apply_chunk_to_recording`: cumulative bytes, U.7 master-preserve, R2 sticky |
 | **deployment** · desktop | `services/vexa-desktop/src/recording-e2e.test.ts` | `npm test` (in `services/vexa-desktop`) | full chain offline: wire → store → assemble → serve + build-on-read |
 

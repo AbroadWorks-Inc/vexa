@@ -97,7 +97,9 @@ class SqlAlchemyMeetingRepo:
                     Meeting.user_id == user_id,
                     Meeting.platform == platform,
                     Meeting.platform_specific_id == native_meeting_id,
-                    Meeting.status.in_(["requested", "joining", "awaiting_admission", "active"]),
+                    Meeting.status.in_(
+                        ["requested", "joining", "awaiting_admission", "needs_help", "active"]
+                    ),
                 )
                 .order_by(Meeting.created_at.desc())
             )
@@ -134,7 +136,9 @@ class SqlAlchemyMeetingRepo:
             stmt = (
                 select(Meeting)
                 .where(
-                    Meeting.status.in_(["requested", "joining", "awaiting_admission", "active", "stopping"]),
+                    Meeting.status.in_(
+                        ["requested", "joining", "awaiting_admission", "needs_help", "active", "stopping"]
+                    ),
                     Meeting.data["auth_userdata_path"].astext == userdata_s3_path,
                 )
                 .order_by(Meeting.created_at.desc())
@@ -598,6 +602,12 @@ class SqlAlchemyMeetingRepo:
                         select(_func.count()).select_from(Transcription).where(Transcription.meeting_id == m.id)
                     )
                 ).scalar() or 0
+                # The bot session ended: a recording of only channels (no mixed lane) completes now.
+                from ..recordings.jsonb import finish_session_recordings
+
+                finished = finish_session_recordings((m.data or {}).get("recordings"), session_uid)
+                if finished is not None:
+                    merged["recordings"] = finished
             if status in FINISHED_STATUSES and m.status != status:
                 # §6.9 F-K2: the session ended; a bot failure while the meeting is on sends the
                 # meeting back to `requested` for a new bot instead. A lost bot is a `completed`
@@ -665,7 +675,9 @@ class SqlAlchemyMeetingRepo:
                 .select_from(Meeting)
                 .where(
                     Meeting.user_id == user_id,
-                    Meeting.status.in_(["requested", "joining", "awaiting_admission", "active"]),
+                    Meeting.status.in_(
+                        ["requested", "joining", "awaiting_admission", "needs_help", "active"]
+                    ),
                     Meeting.platform != "browser_session",  # infra excluded (parent meetings.py:1091)
                 )
             )
@@ -701,13 +713,13 @@ class SqlAlchemyMeetingRepo:
         """Meetings stuck in ANY non-terminal status whose row has gone quiet past its grace window —
         a bot that exited (or vanished) without ever sending its terminal lifecycle callback leaves the
         row hung here forever. ``updated_at`` is bumped on every status change AND on segment/heartbeat
-        persistence. NOTE: for a LIVE status (`active`/`needs_help`) ``updated_at`` staleness is a
-        CANDIDATE signal only — the sweep additionally gates the active-reap on runtime workload
+        persistence. NOTE: for a LIVE status (`active`, and every pre-active one) ``updated_at``
+        staleness is a CANDIDATE signal only — the sweep additionally gates the active-reap on runtime workload
         liveness (see ``reconcile.py``), because a silent-but-live bot stops bumping ``updated_at``.
 
         Per-row window: ``stopping`` uses ``stop_grace`` (a stop was requested — clear it fast), a
-        PRE-ACTIVE row (`requested`/`joining`/`awaiting_admission` — the bot has not reached the
-        meeting yet, and holds the lobby budget the control plane handed it) uses ``preactive_grace``,
+        PRE-ACTIVE row (`requested`/`joining`/`awaiting_admission`/`needs_help` — the bot has not
+        reached the meeting yet, and holds the lobby budget the control plane handed it) uses ``preactive_grace``,
         everything else ``active_grace`` (a longer idle so a momentarily-quiet live bot is not
         reaped). A meeting waiting for its next bot (§6.9 F-K2, ``data.bot_retry``) is left out:
         the auto-join tick's retry driver owns it, and past its deadline the sweep ends it
@@ -840,7 +852,7 @@ class SqlAlchemyMeetingRepo:
         if max_concurrent is not None and max_concurrent <= 0:
             raise MaxBotsExceeded(user_id, max_concurrent)
 
-        active = ["requested", "joining", "awaiting_admission", "active"]
+        active = ["requested", "joining", "awaiting_admission", "needs_help", "active"]
         async with self._session_factory() as db:
             await take_link_lock(db, user_id, Room(platform, native_meeting_id))
             # Per-user serialization: hold the advisory lock for the whole transaction. asyncpg needs a

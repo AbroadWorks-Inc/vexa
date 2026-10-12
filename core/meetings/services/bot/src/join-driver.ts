@@ -22,7 +22,7 @@ import type { JoinDriver, JoinOutcome, JoinResult, JoinSignals } from './ports.j
  *
  * The admission wait THROWS an `AdmissionError` carrying a precise `outcome`; without this the
  * orchestrator's catch blanket-maps every throw to a transient `join_failure` → the retry classifier
- * (`lifecycle/retry.py`) RE-SPAWNS a bot that was actually DENIED, burning quota. Mapping the outcome
+ * (meeting-api `intake/retry.py`) RE-SPAWNS a bot that was actually DENIED, burning quota. Mapping the outcome
  * keeps the truth: a `denial` → `rejected` → `awaiting_admission_rejected` (PERMANENT, no retry); a
  * `lobby_timeout` → `timeout` → `awaiting_admission_timeout` (transient, a legit retry); a `join_failure`
  * stays `error` → `join_failure` (transient); an `auth_session_missing` (signed-out profile in

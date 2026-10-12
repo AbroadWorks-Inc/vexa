@@ -34,6 +34,7 @@ EXPECTED_KEYS = [
     "status",
     "completion_reason",
     "failure_stage",
+    "join_failure",
     "outcome",
     "platform",
     "room",
@@ -409,3 +410,74 @@ def test_start_falls_back_to_start_time():
     meeting = _meeting(data={"title": "Instant"}, start_time="2026-09-29T09:05:00Z")
     result = _project(meeting=meeting, aw=None)
     assert result["start"] == "2026-09-29T09:05:00Z"
+
+
+# ── join_failure: why a bot that never got in failed ────────────────────────────────────────────
+
+
+def _failed_with(evidence):
+    return _meeting(
+        status="failed",
+        data={
+            "completion_reason": "awaiting_admission_rejected",
+            "failure_stage": "joining",
+            "join_evidence": evidence,
+        },
+    )
+
+
+def test_join_failure_is_reason_attribution_and_detail_only():
+    evidence = {
+        "reason": "awaiting_admission_rejected",
+        "attribution": "exogenous_platform",
+        "source": "bot",
+        "stage": "joining",
+        "detail": "[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins",
+        "timings": {"total_ms": 12100},
+        "lobby_budget_ms": 900000,
+    }
+    result = _project(meeting=_failed_with(evidence), aw=_aw())
+    assert result["join_failure"] == {
+        "reason": "awaiting_admission_rejected",
+        "attribution": "exogenous_platform",
+        "detail": "[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins",
+    }
+    assert list(result["join_failure"]) == ["reason", "attribution", "detail"]
+
+
+def test_join_failure_detail_is_capped_at_500():
+    evidence = {"reason": "unknown", "attribution": "unknown", "detail": "x" * 900}
+    result = _project(meeting=_failed_with(evidence), aw=_aw())
+    assert result["join_failure"]["detail"] == "x" * 500
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [None, "awaiting_admission_rejected", [], {}, {"reason": None}, {"reason": 7}],
+)
+def test_join_failure_null_without_evidence_carrying_a_string_reason(evidence):
+    data = {} if evidence is None else {"join_evidence": evidence}
+    result = _project(meeting=_meeting(status="failed", data=data), aw=_aw())
+    assert result["join_failure"] is None
+
+
+@pytest.mark.parametrize(
+    ("status", "completion_reason"),
+    [("failed", "stopped"), ("completed", "stopped"), ("completed", "left_alone")],
+)
+def test_join_failure_null_unless_the_meeting_ended_on_the_failed_join(status, completion_reason):
+    # A stop while the meeting waited for its next bot keeps the earlier bot's evidence on the row.
+    evidence = {"reason": "navigation_failure", "attribution": "system_fault", "detail": "x"}
+    data = {"completion_reason": completion_reason, "join_evidence": evidence}
+    result = _project(meeting=_meeting(status=status, data=data), aw=_aw())
+    assert result["join_failure"] is None
+
+
+def test_join_failure_non_string_attribution_and_detail_render_null():
+    evidence = {"reason": "never_reached_lobby", "attribution": 3, "detail": {"x": 1}}
+    result = _project(meeting=_failed_with(evidence), aw=_aw())
+    assert result["join_failure"] == {
+        "reason": "never_reached_lobby",
+        "attribution": None,
+        "detail": None,
+    }

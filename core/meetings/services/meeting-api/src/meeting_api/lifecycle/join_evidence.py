@@ -15,8 +15,8 @@ Two production defects motivate this module, and they are the same defect seen f
     different fix, and any SLO built on it measures two unrelated things.
 
 The fix for both is TWO axes this module owns, carried alongside — never instead of — the sealed
-lifecycle.v1 ``CompletionReason`` (which stays untouched: it is the retry classifier's input, see
-``retry.py``):
+lifecycle.v1 ``CompletionReason`` (which stays untouched: it is the retry decision's input, see
+``intake.retry.NOT_RETRIED``):
 
   * :class:`JoinFailureReason` — WHAT happened, derived from the signals we actually hold. This is
     the diagnostic axis #1058 calls missing.

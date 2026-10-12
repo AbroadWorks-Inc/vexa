@@ -16,7 +16,7 @@
   "core/meetings/contracts/acts.v1": "1eaa34d27c52b0eb987a278115a1966c058f615ca16e3391b00107a6779dec4f",
   "core/meetings/contracts/captured-signal.v1": "495922d99e195524fee7bb5892119eefff8f47ef72338a0e484ff81f8650768c",
   "core/meetings/contracts/flagged-issue.v1": "4b868f57298131f8eec8246d86d57251f259927d8bfd7df5a0f6016a10f16211",
-  "core/meetings/contracts/intake.v1": "0e7794b4b0bbe898cb20da5908e347d1e722977a486423beec7365ea14303179",
+  "core/meetings/contracts/intake.v1": "9134dcd20b4f68c1e8c48e063198bb766d190d31f0bb089ce4094d0693e55e2f",
   "core/meetings/contracts/invocation.v1": "81e96ed3efb5011f742d8ecc070a751a0fe77ceaab48ba704de28edad8aadecf",
   "core/meetings/contracts/lifecycle.v1": "95392746da49c7c61ec81863e6b836af5acb879f979918753fc8fcf92583b820",
   "core/meetings/contracts/service-authority.v1": "cbcb1662424e180faebc9170896cc270985d8510b50f51ae1e9b32bc2e6050e6",

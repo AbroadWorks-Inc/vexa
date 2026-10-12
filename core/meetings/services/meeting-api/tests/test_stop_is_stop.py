@@ -13,7 +13,7 @@ in-memory fakes standing in for Postgres and the runtime kernel:
   AFTERWARDS and ran. The stop's direct teardown targeted a workload that did not exist yet, and the
   leave command was published before any bot could subscribe.
 
-  **F3** — a stop that lost either race terminalized as ``join_failure`` (TRANSIENT in ``retry.py``)
+  **F3** — a stop that lost either race terminalized as ``join_failure`` (retried: not in ``intake.retry.NOT_RETRIED``)
   while ``stop_requested`` was true on the row, leaving the occurrence eligible for re-dispatch.
 
   **F4** — ``POST /bots {"continue_meeting": true}`` reopened ANY terminal row in place, erasing its
@@ -292,7 +292,7 @@ async def test_f3_a_lost_race_records_stopped_not_the_fault_it_hit():
     """The bot, killed mid-join, reports what IT saw (``join_failure``). The row must record what
     the USER did.
 
-    ``join_failure`` is TRANSIENT in ``retry.py``, so the mis-attributed row stayed eligible for
+    ``join_failure`` is retried (not in ``intake.retry.NOT_RETRIED``), so the mis-attributed row stayed eligible for
     re-dispatch — a stop that produced a retry. Driven through the real callback endpoint, so the
     dominance is asserted where the value is actually persisted."""
     repo = InMemoryMeetingRepo()

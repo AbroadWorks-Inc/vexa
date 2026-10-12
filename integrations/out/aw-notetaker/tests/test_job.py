@@ -27,6 +27,7 @@ from exporter.job import (
     Deps,
     ExportResult,
     NotAV2Meeting,
+    RerunProgress,
     export_meeting,
     recording_origin_ms,
 )
@@ -144,9 +145,17 @@ class FakeExportResult:
 
 
 class FakeNotetaker:
-    def __init__(self) -> None:
+    def __init__(self, transcribing: bool | Exception = False) -> None:
         self.calls: list[tuple[str, str, str]] = []
         self.reruns: list[bool] = []
+        self._transcribing = transcribing
+        self.status_calls: list[str] = []
+
+    def transcribing(self, meeting_id: str) -> bool:
+        self.status_calls.append(meeting_id)
+        if isinstance(self._transcribing, Exception):
+            raise self._transcribing
+        return self._transcribing
 
     def process(
         self, meeting_id: str, s3_path: str, platform: str, *, rerun: bool = False
@@ -542,9 +551,46 @@ def test_no_audio_recording_marks_no_audio_and_does_not_process(
 
     assert result == ExportResult("no_audio", FOLDER)
     assert notetaker.calls == []
-    assert storage.list_keys(EXPORT_BUCKET, BASE) == [BASE + "_export.json"]
+    _assert_only_empty_owned_files_and_marker(storage)
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["state"] == "no_audio"
+
+
+def _assert_only_empty_owned_files_and_marker(storage: Storage) -> None:
+    """A run that ends before the audio writes every file it owns, empty, so
+    nothing an earlier export wrote there stays (P8)."""
+    assert sorted(storage.list_keys(EXPORT_BUCKET, BASE)) == [
+        BASE + "_export.json",
+        BASE + "channels/index.json",
+        BASE + "live_transcript.json",
+        BASE + "speaker_activity_frames.json",
+    ]
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
+    assert storage.get_json(EXPORT_BUCKET, BASE + "speaker_activity_frames.json") == []
+    assert storage.get_json(EXPORT_BUCKET, BASE + "live_transcript.json") == {
+        "segments": []
+    }
+
+
+def test_a_no_audio_rerun_leaves_no_file_of_the_earlier_export(
+    storage: Storage,
+) -> None:
+    for key, body in (
+        ("channels/index.json", [{"channel": 0, "file": "ch0.webm"}]),
+        ("speaker_activity_frames.json", [{"t_rel": 1.0}]),
+        ("live_transcript.json", {"segments": [{"text": "x"}]}),
+    ):
+        storage.put_json(EXPORT_BUCKET, BASE + key, body)
+    video_only = {
+        "id": 1,
+        "created_at": RECORDING_CREATED_AT,
+        "media_files": [{"type": "video", "format": "mp4"}],
+    }
+    deps = _deps(storage, FakeMeetingApi(recordings=[video_only]), FakeNotetaker())
+
+    assert export_meeting(_envelope(), deps, True).state == "no_audio"
+
+    _assert_only_empty_owned_files_and_marker(storage)
 
 
 def test_debug_copies_signal_files(storage: Storage) -> None:
@@ -1048,9 +1094,12 @@ class _SpyStorage(Storage):
         data: bytes,
         content_type: str,
         retention: str | None = None,
+        **conditions: Any,
     ) -> None:
         self.put_bytes_keys.append(key)
-        super().put_bytes(bucket, key, data, content_type, retention=retention)
+        super().put_bytes(
+            bucket, key, data, content_type, retention=retention, **conditions
+        )
 
     def download_file(self, bucket: str, key: str, path: Path) -> None:
         self.downloads.append(key)
@@ -1661,7 +1710,7 @@ def test_a_meeting_over_the_recordings_cap_is_a_failed_export(
     assert export_result.calls == [(MEETING_UUID, "failed", S3_PATH, error)]
     assert notetaker.calls == []
     assert meeting_api.master_calls == []
-    assert storage.list_keys(EXPORT_BUCKET, BASE) == [BASE + "_export.json"]
+    _assert_only_empty_owned_files_and_marker(storage)
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker == {
         "state": "too_many_recordings",
@@ -1835,10 +1884,11 @@ def _split_wav(dst: Path, loud_s: float, silent_s: float, value: int = 3000) -> 
 
 
 def test_a_quiet_long_turn_is_audio_mismatch_and_is_not_handed_off(
-    storage: Storage,
+    storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Ann is loud for her 15 s; Bo's 15 s is silence. Both intervals are
-    written. /process is not called. The report is failed."""
+    written. /process is not called. The report is failed. No speaker's name
+    is in the log, the report or `_export.json` (C4): counts and levels only."""
     storage_path = _put_master(storage, 91, "uid-91")
     origin = _origin_ms()
     _put_activity(
@@ -1864,21 +1914,28 @@ def test_a_quiet_long_turn_is_audio_mismatch_and_is_not_handed_off(
         export_result=export_result,
     )
 
-    result = export_meeting(_envelope(), deps)
+    with caplog.at_level(logging.DEBUG, logger="exporter"):
+        result = export_meeting(_envelope(), deps)
 
     assert result.state == "audio_mismatch"
     assert notetaker.calls == []
-    assert export_result.calls[0][0] == MEETING_UUID
-    assert export_result.calls[0][1] == "failed"
-    assert export_result.calls[0][2] == S3_PATH
-    assert export_result.calls[0][3] is not None
-    assert "Bo" in export_result.calls[0][3]
+    error = (
+        "audio_mismatch: 1 of 2 speakers with more than 10 s of timeline "
+        "coverage are below rms 0.026 in the audio (lowest rms=0.0000)"
+    )
+    assert export_result.calls == [(MEETING_UUID, "failed", S3_PATH, error)]
     marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
     assert marker["state"] == "audio_mismatch"
     assert marker["speaker_activity"] == "audio_mismatch"
-    assert set(marker["speaker_levels"]) == {"Ann Lee", "Bo"}
-    assert marker["speaker_levels"]["Bo"]["rms"] < 0.026
-    assert marker["speaker_levels"]["Ann Lee"]["rms"] >= 0.026
+    assert (marker["speakers_checked"], marker["speakers_quiet"]) == (2, 1)
+    assert [row["rms"] < 0.026 for row in marker["speaker_levels"]] == [True, False]
+    assert all(set(row) == {"coverage_s", "rms"} for row in marker["speaker_levels"])
+    for text in (
+        json.dumps(marker),
+        error,
+        *(record.getMessage() for record in caplog.records),
+    ):
+        assert "Ann" not in text and "Bo" not in text
     timeline = storage.get_json(EXPORT_BUCKET, BASE + "speaker_timeline.json")
     assert {i["speaker_name"] for i in timeline["speaker_intervals"]} == {
         "Ann Lee",
@@ -2369,3 +2426,205 @@ def test_a_channel_that_started_before_the_session_origin_is_logged(
     assert any(
         r.getMessage().startswith("channel_offset_negative ") for r in caplog.records
     )
+
+
+def _export_objects(storage: Storage) -> dict[str, bytes]:
+    return {
+        key: storage.get_bytes(EXPORT_BUCKET, key)
+        for key in storage.list_keys(EXPORT_BUCKET, BASE)
+    }
+
+
+def test_a_rerun_while_the_meeting_is_transcribed_writes_no_file_and_ends_failed(
+    storage: Storage,
+) -> None:
+    """P9: the rerun asks notetaker-worker again before it writes anything.
+    Transcribing: no export file changes, the hand-off marker keeps its state
+    and gets the refusal as `rerun`, and nothing is reported: aw-bots'
+    handed-off export (its transcript exists) is never turned into failed."""
+    storage_path = _put_master(storage, 61, "uid-61")
+    export_meeting(
+        _envelope(), _deps(storage, _api_for(61, storage_path), FakeNotetaker())
+    )
+    before = _export_objects(storage)
+    handed_off = json.loads(before.pop(BASE + "_export.json"))
+
+    meeting_api = _api_for(61, storage_path)
+    notetaker = FakeNotetaker(transcribing=True)
+    export_result = FakeExportResult()
+    deps = _deps(storage, meeting_api, notetaker, export_result=export_result)
+
+    result = export_meeting(_envelope(), deps, True)
+
+    error = "rerun refused: transcription in progress for this meeting"
+    assert result == ExportResult("rerun_refused", FOLDER)
+    assert notetaker.status_calls == [MEETING_UUID]
+    assert meeting_api.list_recordings_calls == [] and notetaker.calls == []
+    after = _export_objects(storage)
+    marker = json.loads(after.pop(BASE + "_export.json"))
+    assert after == before, "no export file is written"
+    assert marker == {
+        **handed_off,
+        "rerun": {"state": "failed", "error": error, "at": "2026-06-18T11:00:00+00:00"},
+    }
+    assert export_result.calls == []
+
+
+def test_a_rerun_whose_transcription_check_fails_writes_nothing_and_retries(
+    storage: Storage,
+) -> None:
+    """Fail closed: a `/status` that can't answer raises before any write, so
+    the queue retries the rerun."""
+    from exporter.notetaker import NotetakerError
+
+    storage_path = _put_master(storage, 62, "uid-62")
+    export_meeting(
+        _envelope(), _deps(storage, _api_for(62, storage_path), FakeNotetaker())
+    )
+    before = _export_objects(storage)
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage,
+        _api_for(62, storage_path),
+        FakeNotetaker(transcribing=NotetakerError("notetaker 503")),
+        export_result=export_result,
+    )
+
+    with pytest.raises(NotetakerError):
+        export_meeting(_envelope(), deps, True)
+
+    assert _export_objects(storage) == before
+    assert export_result.calls == []
+
+
+def test_a_first_export_does_not_ask_whether_the_meeting_is_transcribed(
+    storage: Storage,
+) -> None:
+    storage_path = _put_master(storage, 63, "uid-63")
+    notetaker = FakeNotetaker(transcribing=True)
+
+    assert (
+        export_meeting(
+            _envelope(), _deps(storage, _api_for(63, storage_path), notetaker)
+        ).state
+        == "handed_off"
+    )
+    assert notetaker.status_calls == []
+
+
+def test_a_long_window_is_measured_in_bounded_blocks_with_the_same_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P10: a speaker's window is read at most `_LEVEL_BLOCK_FRAMES` at a time,
+    and its level is the one `audioop.rms` gives over the whole window."""
+    import audioop
+    import random
+
+    rnd = random.Random(5)
+    samples = b"".join(
+        rnd.randint(-9000, 9000).to_bytes(2, "little", signed=True) for _ in range(1500)
+    )
+    wav_path = tmp_path / "audio.wav"
+    with wave.open(str(wav_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(100)
+        wav.writeframes(samples)
+    start = datetime(2026, 6, 18, 10, 0, 0, tzinfo=timezone.utc)
+    events = [
+        job_module.ActivityEvent("Speaker One", 0, "SPEAKER_START", "audio"),
+        job_module.ActivityEvent("Speaker One", 15_000, "SPEAKER_END", "audio"),
+    ]
+    timeline = build_speaker_timeline(
+        events,
+        platform="google_meet",
+        meeting_id=MEETING_UUID,
+        room_name="room",
+        recording_started_at=start,
+        recording_ended_at=start + timedelta(seconds=15),
+        min_dominant_utterance_ms=1500,
+        hangover_ms=700,
+    )
+    reads: list[int] = []
+    real_readframes = wave.Wave_read.readframes
+
+    def readframes(self: wave.Wave_read, n: int) -> bytes:
+        reads.append(n)
+        return real_readframes(self, n)
+
+    monkeypatch.setattr(job_module, "_LEVEL_BLOCK_FRAMES", 7)
+    monkeypatch.setattr(wave.Wave_read, "readframes", readframes)
+
+    levels = job_module._speaker_levels(wav_path, timeline, 700)
+
+    assert max(reads) <= 7
+    assert levels == {
+        "Speaker One": {
+            "coverage_s": 15.0,
+            "rms": round(audioop.rms(samples, 2) / 32768.0, 6),
+        }
+    }
+
+
+def test_a_rerun_whose_process_was_accepted_only_finishes_on_a_retry(
+    storage: Storage,
+) -> None:
+    """Review 1a: the report after the rerun's /process fails. The retry must
+    not ask about the transcription (it is the rerun's own) and refuse
+    itself: it writes the hand-off marker kept on the pending item and
+    reports handed_off, with nothing else written again."""
+    storage_path = _put_master(storage, 64, "uid-64")
+    export_meeting(
+        _envelope(), _deps(storage, _api_for(64, storage_path), FakeNotetaker())
+    )
+    kept: list[dict[str, Any]] = []
+    notetaker = FakeNotetaker()
+    first = _deps(
+        storage,
+        _api_for(64, storage_path),
+        notetaker,
+        export_result=FakeExportResult(failures=1),
+    )
+
+    with pytest.raises(ExportReportError):
+        export_meeting(_envelope(), first, True, RerunProgress(None, kept.append))
+
+    assert notetaker.reruns == [True] and len(kept) == 1
+    before = _export_objects(storage)
+    before.pop(BASE + "_export.json")
+    meeting_api = _api_for(64, storage_path)
+    transcribing = FakeNotetaker(transcribing=True)
+    export_result = FakeExportResult()
+    retry = _deps(storage, meeting_api, transcribing, export_result=export_result)
+
+    result = export_meeting(
+        _envelope(), retry, True, RerunProgress(kept[0], kept.append)
+    )
+
+    assert result == ExportResult("handed_off", FOLDER)
+    assert transcribing.status_calls == [] and transcribing.calls == []
+    assert meeting_api.list_recordings_calls == []
+    after = _export_objects(storage)
+    assert json.loads(after.pop(BASE + "_export.json")) == kept[0]
+    assert kept[0]["state"] == "handed_off"
+    assert after == before
+    assert export_result.calls == [(MEETING_UUID, "handed_off", S3_PATH, None)]
+
+
+def test_a_rerun_refused_over_a_folder_never_handed_off_is_reported_failed(
+    storage: Storage,
+) -> None:
+    export_result = FakeExportResult()
+    deps = _deps(
+        storage,
+        FakeMeetingApi(),
+        FakeNotetaker(transcribing=True),
+        export_result=export_result,
+    )
+
+    assert export_meeting(_envelope(), deps, True).state == "rerun_refused"
+
+    error = "rerun refused: transcription in progress for this meeting"
+    assert export_result.calls == [(MEETING_UUID, "failed", S3_PATH, error)]
+    marker = storage.get_json(EXPORT_BUCKET, BASE + "_export.json")
+    assert marker["state"] == "failed" and marker["rerun"]["error"] == error

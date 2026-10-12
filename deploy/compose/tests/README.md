@@ -19,7 +19,7 @@ Everything polls with bounded timeouts — never sleep-and-hope. Absent docker �
 | 5  | upload a chunk via the bot's `/internal/recordings/upload` → the object lands in minio; finalize → a master is assembled in minio | yes |
 | 6c | `continue_meeting` reuses the meeting row + accumulates a session; the prior transcript survives | yes |
 | 6d | a user at `max_concurrent_bots` gets `429` on the N+1; a freed slot admits the next | yes |
-| 6b | the join-retry re-spawn wiring is present in the live image; the **backoff proof leans on the offline P3 `test_join_retry.py`** (forcing a real transient join-failure on a live bot is slow/flaky) | yes (wiring) |
+| 6b | the retry decision (`intake.retry`) is present in the live image; the **retry proof leans on the offline `test_bot_retry.py`** (forcing a real transient join-failure on a live bot is slow/flaky) | yes (wiring) |
 | 3  | `POST /bots` → meeting-api spawns via runtime → a real `vexa-mtg-…` container appears in `docker ps` AND the meeting advances to `joining`; then the bot is stopped + cleaned | **`COMPOSE_BOT=1`** |
 | 6a | start-then-stop a real bot → terminal; the leave-command channel wiring is asserted | **`COMPOSE_BOT=1`** |
 

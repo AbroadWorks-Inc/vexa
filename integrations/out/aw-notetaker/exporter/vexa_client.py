@@ -108,8 +108,19 @@ class MeetingApi:
 
     def meeting(self, meeting_id: str) -> dict[str, Any]:
         """The meeting as aw-bots holds it now: the same §2.4 meeting a webhook's
-        `data.meeting` carries."""
-        return dict(self._get(f"/v2/meetings/{meeting_id}").json())
+        `data.meeting` carries. A body that is not a JSON object raises
+        `MeetingApiError`."""
+        path = f"/v2/meetings/{meeting_id}"
+        resp = self._get(path)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise MeetingApiError(
+                resp.status_code, f"{path} (body is not a JSON object)"
+            )
+        return body
 
     def recording(self, recording_id: int) -> dict[str, Any]:
         """One recording in full, every media file with its `metadata`."""
