@@ -1,8 +1,8 @@
 # AW Bots `/v2` API reference
 
-- **Date:** 2026-09-29. Served by meeting-api (`src/meeting_api/intake/`, `src/meeting_api/webhooks/`) through the gateway; webhook subscriptions are stored by admin-api.
+- **Served by:** meeting-api (`src/meeting_api/intake/`, `src/meeting_api/webhooks/`) through the gateway; webhook subscriptions are stored by admin-api.
 - **For:** anyone who writes a client of aw-bots: the calendar module, the portal, or any other app.
-- **Where the rules come from:** the [handbook](../../../../docs/aw-bots/README.md) ([lifecycle](../../../../docs/aw-bots/meeting-lifecycle.md), [webhooks](../../../../docs/aw-bots/export-and-webhooks.md)) and the sealed contracts [`intake.v1`](../../../../core/meetings/contracts/intake.v1/) and [`webhook.v1`](../../../../core/meetings/contracts/webhook.v1/). When this page and a sealed contract disagree, the contract wins. The 25 Sep design is in the [archive](../../../../docs/aw-bots/archive/2026-09-25-meeting-intake-and-webhooks-design.md).
+- **Where the rules come from:** the [handbook](../../../../docs/aw-bots/README.md) ([lifecycle](../../../../docs/aw-bots/meeting-lifecycle.md), [webhooks](../../../../docs/aw-bots/export-and-webhooks.md)) and the sealed contracts [`intake.v1`](../../../../core/meetings/contracts/intake.v1/) and [`webhook.v1`](../../../../core/meetings/contracts/webhook.v1/). When this page and a sealed contract disagree, the contract wins.
 
 Contents: [Part 1 — Meeting intake API](#part-1--meeting-intake-api) · [Part 2 — Webhooks API](#part-2--webhooks-api)
 
@@ -81,6 +81,19 @@ passes ends `failed` with outcome `not_sent` and the reason. A meeting never sta
 forever. A bot that fails while the meeting is on is replaced on the same meeting
 ([`bot.retry`](#events)), up to the meeting's `BOT_SEND_MAX_ATTEMPTS` (3) sends.
 
+Which endings get a new bot, while the meeting still has active entries and nobody has stopped
+it:
+
+| The bot's session ended | New bot? |
+|---|---|
+| With `completion_reason` `stopped`, `evicted`, `startup_alone`, `awaiting_admission_rejected`, `auth_session_missing`, `validation_error` or `max_bot_time_exceeded` | No. A new bot would get the same answer; the meeting ends with that reason. |
+| `failed` with any other reason (`awaiting_admission_timeout`, `join_failure`, a crash in the call, …) | Yes, while sends are left and the next send is before the planned end. |
+| `completed` reported by the bot itself, `left_alone` included (it was in the call and hung up after everyone left) | No. That is the normal end (`meeting.completed`). |
+| `left_alone` written by aw-bots for a lost bot: the bot was in the call and its workload disappeared without the bot reporting an end | Yes. `bot.retry` carries `change.reason: "left_alone"`. |
+
+`awaiting_admission_rejected` covers the host declining the bot, the platform refusing it (Zoom's
+"automated bots aren't allowed" wall) and a join that ended blocked without admission.
+
 ### Conventions
 
 - Request and reply bodies are JSON. Send `Content-Type: application/json`.
@@ -146,6 +159,7 @@ Always **200** with the reply envelope, for every result:
     "status": "scheduled",
     "completion_reason": null,
     "failure_stage": null,
+    "join_failure": null,
     "outcome": null,
     "platform": "google_meet",
     "room": "kxo-misr-avz",
@@ -416,8 +430,9 @@ Scope `bot`, no body. The live bot leaves now; the reply is the meeting (**200**
 
 - A bot **in the call** goes `stopping`, then `completed` with `completion_reason: "stopped"`.
   What was recorded is processed as usual.
-- A bot **still joining** (`requested`, `joining`, `awaiting_admission`) keeps its status until it
-  ends; it is told to stop and its workload is removed.
+- A bot **still joining** (`requested`, `joining`, `awaiting_admission`, `needs_help`) keeps its
+  status until it ends; it is told to stop and its workload is removed. The meeting then ends
+  `failed` with `completion_reason: "stopped"` and the stage it reached in `failure_stage`.
 - A meeting **waiting for a new bot** after one failed (`requested`, `bot_joins_at` in the future)
   has no bot to tell: it ends `failed` with `completion_reason: "stopped"` at once.
 - A user's stop sets no `outcome`: it is the user's own `stopped`.
@@ -489,8 +504,8 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 | `upstream_id` | integer | The meeting's integer row id, for the upstream reads that take it (`GET /recordings?meeting_id=`, `GET /transcripts/by-id/{id}`). No `/v2` path takes it. |
 | `status` | string | See the status table below. |
 | `completion_reason` | string or null | Set when the meeting finished: `stopped`, `left_alone`, `startup_alone`, `evicted`, `awaiting_admission_timeout`, `awaiting_admission_rejected`, `join_failure`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded` (and upstream's `start_failed` on some `failed` rows). |
-| `failure_stage` | string or null | On a `failed` meeting, the stage it failed at: `requested`, `joining`, `awaiting_admission`, `active`. |
-| `join_failure` | object or null | Why a bot that never got in failed: `{reason, attribution, detail}`, from the evidence recorded on the failed bot. `reason` is the join taxonomy (`awaiting_admission_rejected`, `awaiting_admission_timeout`, `never_reached_lobby`, `navigation_failure`, `auth_session_missing`, `stopped_while_joining`, `unknown`); `attribution` who it belongs to (`host_action`, `exogenous_platform`, `system_fault`, `user_action`, `unknown`), so Zoom refusing the bot (`exogenous_platform`) reads differently from the host declining it (`host_action`); `detail` the platform's own text, at most 500 characters. `null` when no such evidence exists, and while a meeting waits for its next bot. |
+| `failure_stage` | string or null | On a `failed` meeting, the stage it failed at: `requested`, `joining`, `awaiting_admission`, `active`. `awaiting_admission` only when the bot reached the lobby; a bot that met a blocker before any lobby (`needs_help` from `joining`) and never reached one reads `joining`. |
+| `join_failure` | object or null | Why a bot that never got in failed: `{reason, attribution, detail}`, from the evidence recorded on the failed bot (see below). |
 | `outcome` | object or null | aw-bots' own cause, below. `null` until set. |
 | `platform` | string | `google_meet`, `zoom`, `teams` or `jitsi`, from parsing `meeting_url`. |
 | `room` | string | The platform's room id: the Meet code, the Zoom numeric id, the Teams id, the lower-cased Jitsi room. |
@@ -512,7 +527,8 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 | `joining` | The bot is opening the meeting. |
 | `awaiting_admission` | The bot is in the lobby, waiting to be let in. |
 | `active` | The bot is in the call and recording. |
-| `needs_help`, `needs_human_help` | The bot is stuck and needs a person. |
+| `needs_help` | The bot met a blocker before it got in: before any lobby (Zoom's automated-bot wall, Google Meet's note-taking consent prompt) or in the lobby. It goes on to `awaiting_admission` or `active` if the blocker clears, else `failed`. Like `requested` … `awaiting_admission`, it has not reached the call: stop removes its workload, and it counts against the account's bot limit. |
+| `needs_human_help` | Upstream's status for the same case. AW Bots' bot reports `needs_help`. |
 | `stopping` | The bot is leaving. |
 | `completed` | Finished normally. |
 | `failed` | Finished without a normal recording: see `completion_reason`, `failure_stage` and `outcome`. |
@@ -520,6 +536,23 @@ Every reply, read and webhook carries the meeting in this one shape (sealed as `
 
 `requested` through `stopping` are **live**: the meeting has a bot and stop works.
 `completed` and `failed` are **finished**.
+
+```json "join_failure"
+{ "reason": "awaiting_admission_rejected", "attribution": "host_action", "detail": "Bot admission was rejected by meeting admin" }
+```
+
+`join_failure` is `null` unless all three hold: `status` is `failed`, `completion_reason` is not
+`stopped`, and the failed bot recorded join evidence with a `reason`. Join evidence is recorded only
+for a bot that failed before it reached `active`, so a bot that failed in the call has none. A
+meeting a user stopped renders `null`. A meeting waiting for its next bot (`requested` after
+`bot.retry`) renders `null` too; aw-bots keeps the failed bot's evidence, and it shows if the
+meeting then ends `failed` without a new bot getting in.
+
+| Field | Values |
+|---|---|
+| `reason` | `awaiting_admission_rejected`, `awaiting_admission_timeout`, `never_reached_lobby`, `navigation_failure`, `auth_session_missing`, `stopped_while_joining`, `unknown`. |
+| `attribution` | Who the failure belongs to: `host_action`, `exogenous_platform`, `system_fault`, `user_action`, `unknown`, or `null`. Zoom refusing the bot is `exogenous_platform`; the host declining it is `host_action`. |
+| `detail` | The platform's own text or the bot's reason, at most 500 characters, or `null`. |
 
 ```json "outcome"
 { "kind": "not_sent", "detail": "account_limit", "message": "bot limit reached (45 of 45)", "at": "2026-09-29T04:20:00Z" }
@@ -797,7 +830,7 @@ deployment's secret key ring not configured, or the test couldn't be queued; ret
 | `meeting.started` | The bot reached `active`. |
 | `meeting.completed` | The meeting reached `completed`. |
 | `bot.failed` | The meeting reached `failed` (except `not_sent`, which is `meeting.not_sent`). |
-| `bot.retry` | A bot failed while the meeting is on; a new bot will be sent to the same meeting. The meeting is back to `requested`, `change.reason` is the failure reason and `bot_joins_at` is when the new bot goes. |
+| `bot.retry` | A bot failed while the meeting is on; a new bot will be sent to the same meeting. The meeting is back to `requested`, `change.reason` is the failure reason and `bot_joins_at` is when the new bot goes. Which endings are retried is in [Entries and meetings](#entries-and-meetings). |
 | `export.handed_off` / `export.failed` | The exporter's result (`meeting.export`). |
 | `webhook.test` | A test send. |
 
@@ -829,6 +862,7 @@ Every delivery is one JSON object:
       "export": null,
       "failure_stage": null,
       "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+      "join_failure": null,
       "meeting_url": "https://meet.google.com/abc-defg-hij",
       "outcome": null,
       "platform": "google_meet",
@@ -937,7 +971,7 @@ export function verify(rawBody, headers, secret, toleranceS = 300) {
 Both snippets check out against the sealed `webhook.v1` goldens: the body is
 `MeetingEvent.meeting-completed.json` written compactly with sorted keys (exactly how aw-bots posts
 it), the secret `whsec_demo_secret`, the timestamp `1790658761`, giving
-`sha256=28cdd8ad6a643ec2695ceeeb85b19d02ed8606d98b8715f39fef7fac29e9594c`
+`sha256=4a69a350165c68ede085dbb567e5c2e3b5fca923dfb00d86e17d1552b5d882e3`
 (`SignatureHeaders.subscription.json`). With `whsec_demo_previous_secret`, the match is on
 `X-Webhook-Signature-Previous` (`SignatureHeaders.rotated.json`). Test with the golden's own
 timestamp as "now", or the 300 s check refuses it.

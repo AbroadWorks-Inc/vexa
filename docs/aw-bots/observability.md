@@ -2,8 +2,7 @@
 
 What meeting-api counts, and what each alert in the rule file means. The rules themselves are
 aw-notetaker `deployment/base/aw-bots/alerts.yml`. That file's header is the contract for how
-severity is routed. Whether a given Prometheus release has loaded the file is a cluster fact and
-is not recorded here.
+severity is routed.
 
 ## Where metrics are scraped
 

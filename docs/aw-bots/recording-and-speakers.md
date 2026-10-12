@@ -93,11 +93,26 @@ new elements every 2 seconds. Each channel uploads as media type `ch<N>`
 `recordings/{user}/{recording}/{session}/ch<N>/` (`recordings/jsonb.py` `chunk_storage_key`)
 and finalizes it with the same `finalize_master` as `audio`. A channel's final chunk (sent when
 its speaker leaves, or at stop) marks only that media file final; the recording turns `completed`
-on the `audio` lane's final, or, when the mix was not recorded, when the bot session ends. A `ch<N>` chunk without a `chunk_seq` (absent or `null`) is refused
-with 422 after the upload is authenticated. Names over 200 characters are sent and stored cut to
-200. The list prefix includes a
-trailing slash (`recordings/service.py`), so one media type is not concatenated into another
-whose name starts the same way.
+on the mixed lane's final chunk, or, when the mix was not recorded, when the bot session's
+terminal status is written (`recordings/jsonb.py` `finish_session_recordings`).
+
+meeting-api checks each channel upload (`recordings/router.py`, `recordings/jsonb.py`):
+
+- A `ch<N>` chunk without a `chunk_seq` (absent or `null`) is refused with 422, after the upload
+  is authenticated.
+- `stream_id`, `participant_id` and `display_name` over 200 characters are stored cut to 200. The
+  bot cuts them to 200 before it sends them.
+- A `channel_kind` other than `gmeet` or `jitsi` is not stored, and the upload still succeeds.
+  meeting-api logs `recording_channel_kind_unknown` once per media file, naming the kind.
+- The list prefix includes a trailing slash (`recordings/service.py`), so one media type is not
+  concatenated into another whose name starts the same way.
+
+A channel's recorder is released when its audio track ends, or when its stream has been missing
+from the page for `VEXA_CHANNEL_GONE_MS` (default 30000 ms). The release flushes the recorder's
+final chunk and frees its audio nodes. A released channel number is never reopened in that
+session. At stop the bot stops every channel recorder in parallel and waits for releases still
+flushing, so no channel chunk arrives after the stop returns. A channel that opens while a stop or
+a release takes it leaves no recorder running (`capture-bridge.ts` `startRecording`).
 
 Jitsi also appends activity for those channels to `speaker-activity.jsonl`, with
 `"src":"channel"` on the line. One shared `AudioContext` feeds every channel tap. A block
@@ -137,11 +152,4 @@ pool scale down. A non-zero exit copies `kubectl logs --tail=200` into the runti
 Docker and process backends have no reaper.
 
 A failed `kubectl get` is not exit code 0. Only a NotFound answer means the pod is gone. A failed
-delete raises, so meeting-api does not treat a still-running pod as removed
-(`k8s_backend.py`, commit `f819b40a` and the reaper on `a6c69ad7`, both in `development`).
-
-## Earlier notes
-
-The 1 Oct investigation is in the [archive](archive/2026-10-01-zoom-teams-recording-and-speaker-intervals.md).
-Its opening line says the fixes had not started. The lane, the named-frame rule, the point
-intervals, and the Meet notice on `development` are the sections above.
+delete raises, so meeting-api does not treat a still-running pod as removed (`k8s_backend.py`).

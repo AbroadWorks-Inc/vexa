@@ -34,7 +34,7 @@ the link parses. `ENTRY_BLOCKED_HOSTS` is empty, so intake does not refuse it.
    │  builds  s3://aw-chatworks-transcribe/recordings/<platform>_<meetingId>_<startUTC>/
    │          master.webm · audio.wav · speaker_timeline.json · participants.json · meeting.json …
    │          and, when the bot recorded per-speaker channels:
-   │          channels/ch<N>.wav · channels/index.json · speaker_activity_frames.json
+   │          channels/ch<N>.webm · channels/index.json · speaker_activity_frames.json
    │  then calls  POST /process  (meeting UUID)  and reports the result to AW Bots
    ▼
  notetaker-worker ──► transcriber (Whisper large-v3, GPU) ──► notes.json · transcript.txt · summary
@@ -47,7 +47,7 @@ doesn't know who is speaking. The bot's `speaker-activity.jsonl` says who was ta
 with Prosody's speaker timeline.
 
 On Google Meet and Jitsi the bot also records each remote channel beside that mix. The exporter
-adds `channels/ch<N>.wav`, `channels/index.json`, and `speaker_activity_frames.json`. The worker
+adds `channels/ch<N>.webm`, `channels/index.json`, and `speaker_activity_frames.json`. The worker
 setting `CHANNEL_TRANSCRIPT_MODE` is `compare`: users still receive the mixed transcript, and the
 channel transcript is saved beside it as `transcript_channels.txt`. `deliver` makes the channel
 transcript the one users receive. Teams, Zoom, and any meeting without `channels/index.json` stay
@@ -107,19 +107,20 @@ Everything else is upstream Vexa, unchanged.
 |---|---|---|
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
 | **Per-speaker channel files.** On Google Meet and Jitsi, when the deployment lists the platform, the bot records each remote channel beside the mixed master (`media_type` `ch<N>`). Jitsi also writes activity lines marked `"src":"channel"`. Those lines do not enter the mixed timeline. The exporter copies each channel into the notetaker folder. | `capture-bridge.ts`, `core/meetings/modules/record-chunker/src/channel-targets.ts`, `meeting_api/bot_spawn/service.py`, `exporter/job.py` | One mixed recording loses words when people talk at once, and a Meet glow name can land on the wrong channel. The mixed folder is still always written. |
-| **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the §2.4 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
+| **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the v2 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. Its queue is bounded: conditional writes, a retry and a crash budget, a job timeout, a stop wait on SIGTERM, and memory that stays flat at any meeting length. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
-| **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. The meeting (§2.4) carries `upstream_id`, `started_at` and `ended_at` too. | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |
+| **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. The v2 meeting object carries `upstream_id`, `started_at`, `ended_at`, and `join_failure` (why a bot that never got in failed, and whether the host, the platform or our system caused it). | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |
 | **One status writer and the webhook outbox.** Every status change goes through one function, which records the event in the same transaction. Leased senders deliver it, with their state in Postgres. | `meeting_api/intake/status.py`, `meeting_api/webhooks/`; new `webhook.v1` events | No change is lost or sent twice from our side, whichever meeting-api replica handles it. |
 | **One finish.** Every way a meeting ends, whether the bot reports it or aw-bots ends the meeting itself, runs the same finish steps: the transcript finalized, the service provenance, the typed event and its edges (flows, the per-user `webhook_url`, the system hook when one is set), the copilot reap. | `meeting_api/app.py` (`_finish`) | A meeting's end is reported the same way whoever ended it. |
 | **Bounded bot sends.** A meeting entries manage gets at most `BOT_SEND_MAX_ATTEMPTS` sends, `BOT_SEND_RETRY_BACKOFF_S` apart; the last failure ends it `not_sent` with the typed code. | `meeting_api/intake/service.py`, `bot_spawn/auto_join.py`; `meeting_aw_state.send_attempts` | A bot that can't be sent is tried again a few times, never forever, and the reason reaches the webhook and the metrics. |
-| **A new bot on the same meeting.** A bot that fails while its meeting is on (a failed start, joining, a lobby rejection or timeout, a crash in the call, a lost bot) is replaced on the same meeting, from the same send count, once the failed pod is proven gone; a deadline, a pending-teardown list, a spawn that names its workload before it creates it, and a reconcile backstop bound every case. Not replaced: a user's stop, the host removing the bot, nobody joining, a normal end. | `meeting_api/intake/retry.py`, `bot_spawn/`, `lifecycle/reconcile.py`; webhook `bot.retry` | Never two bots in one call, and a meeting whose bot failed early still gets recorded. The exporter joins every session's audio and speakers into one folder. |
+| **A new bot on the same meeting.** A bot that fails while its meeting is on (a failed start, a join failure, a lobby timeout, a crash in the call, a lost bot) is replaced on the same meeting, from the same send count, once the failed pod is proven gone; a deadline, a pending-teardown list, a spawn that names its workload before it creates it, and a reconcile backstop bound every case. Not replaced (`intake/retry.py` `NOT_RETRIED`): a user's stop, the host removing the bot, nobody joining, the host or the platform refusing the bot, a signed-out profile, a link that isn't a meeting, the time cap, and the bot's own normal end. | `meeting_api/intake/retry.py`, `bot_spawn/`, `lifecycle/reconcile.py`; webhook `bot.retry` | Never two bots in one call, and a meeting whose bot failed early still gets recorded. The exporter joins every session's audio and speakers into one folder. |
 | **Bounded sweeps.** Every intake sweep, and upstream's reconcile loops (`stale-stopping`, `stale-nonterminal`), reads in pages of `SWEEP_BATCH_SIZE` and gives an item up after `SWEEP_MAX_ITEM_FAILURES`, logged and counted. A runtime that doesn't answer is never an item's failure: a teardown waits for it, counted `runtime_unreachable`, until `UNPROVEN_TEARDOWN_MAX_AGE_S`. Give-up records are kept while their item is listed and pruned after `SWEEP_ITEM_FAILURES_RETENTION_S`; admin-api's webhook retention deletes in bounded batches. An entry write that loses a database race is run again `INTAKE_CONFLICT_RETRIES` times, then answered 500. | `meeting_api/sweeps/item_failures.py` (`run_pages`, `run_item`), `lifecycle/reconcile.py` (`runtime_bound`), table `sweep_item_failures`; `intake/service.py`; `admin_api/app/retention.py` | Nothing retries forever, and one bad item never stops the rest. |
 | **Webhook subscriptions, scopes and keys.** `/v2/webhooks`, encrypted receiver secrets, new scopes `webhooks`, `erase`, `export`. | `core/identity/services/admin-api`; `core/identity/contracts/identity.v1/` | Each app subscribes on its own; each consumer's key can do only its own job. |
 | **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can't act as any user by setting a header. |
 | **Metrics.** `/metrics` on meeting-api and admin-api (not routed through the gateway). | `meeting_api/metrics.py`, `admin_api/app/metrics.py`; Helm `meetingApi.podAnnotations`, `adminApi.podAnnotations` | Prometheus scrapes them; the alerts live in aw-notetaker. |
 | **Image workflow.** Builds and pushes our six images (meeting-api, bot, exporter, gateway, admin-api, runtime) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
+| **Join outcomes.** A blocker met before any lobby (Zoom's automated-bot wall, the Meet consent prompt) reports `needs_help` from `joining`; `needs_help` can lead back to `awaiting_admission`. A join that ends blocked is `awaiting_admission_rejected` and is not retried. `failure_stage` names the lobby only when the bot reached it. `needs_help` counts as pre-active for reconcile, the bot limit and stop. | bot `src/contracts.ts`, `src/orchestrator.ts`; meeting-api `lifecycle/machine.py`, `lifecycle/reconcile.py`, `intake/stop.py`; contract `core/meetings/contracts/lifecycle.v1/` | A wall or a consent prompt is reported as what it is, and a refusal is not retried into the same answer. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
 The handbook is [`docs/aw-bots/`](docs/aw-bots/README.md). Decisions are
@@ -154,7 +155,7 @@ We leave those folders in place so upstream changes keep merging cleanly.
 |---|---|
 | `main` | Mirror of upstream Vexa. We never commit to it. |
 | `development` | Our working line. Feature branches merge here. |
-| `feat/<topic>`, `fix/<topic>` | Work in progress, cut from `development` (current: `feat/meeting-intake`). |
+| `feat/<topic>`, `fix/<topic>` | Work in progress, cut from `development`. |
 | `aw/main` and `aw/*` | The old cloud bot (Vexa v0.10.4). Kept for reference only. |
 
 **Taking upstream changes:** update `main` from upstream, then merge `main` into `development` on a
@@ -173,7 +174,7 @@ One Helm install runs all of these. Each service is its own Docker image.
 | **admin-api** (users, API keys, settings) | built from this repo | **ours** (webhook subscriptions, new scopes, checks the signed identity) |
 | **meeting-api** | built from this repo | **ours** (accepts `speaker-activity`; the `/v2` intake and webhooks) |
 | **runtime** (starts bot pods) | built from this repo | **ours** (deletes a bot pod once it has exited, so the meeting node can scale to zero) |
-| **bot** | built from this repo | **ours** (writes `speaker-activity.jsonl`) |
+| **bot** | built from this repo | **ours** (writes `speaker-activity.jsonl`, records per-speaker channels, reports join blockers) |
 | terminal (web console) | `vexaai/v012-terminal` | upstream |
 | agent-api, dashboard, flows | `vexaai/*` | upstream; all three **off** for us (we don't use Vexa's AI agents) |
 | postgres, redis (Valkey) | chart defaults, inside the same install | upstream; Vexa's own database and message bus, separate from the notetaker's |
@@ -237,8 +238,7 @@ docker build --platform linux/amd64 -t $REG/aw-bots-runtime:$TAG core/runtime
 docker push $REG/aw-bots-runtime:$TAG
 ```
 
-Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our change adds one small source file and
-no dependencies. The exporter image is about 640 MB, mostly ffmpeg.
+Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our changes add no dependencies. The exporter image is about 640 MB, mostly ffmpeg.
 
 ---
 
@@ -279,16 +279,15 @@ Every setting lives in configuration, not code:
 | Bounded work | `SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`, `INTAKE_CONFLICT_RETRIES`, `INTAKE_CONFLICT_DELAY_MIN_S`/`_MAX_S` (the pause before each rerun, times the try's number), `INTAKE_STOP_LINK_RETRIES` (reruns of a stop whose meeting moved link) (meeting-api) | 200, 5, 3, 0.01–0.05 s, 1 |
 | Teardowns the runtime doesn't answer | `UNPROVEN_TEARDOWN_MAX_AGE_S` (meeting-api): how long a pending teardown or a stale reconcile row is chased while the runtime doesn't answer, before it is given up | 21600 s (6 h) |
 | Give-up records | `SWEEP_ITEM_FAILURES_RETENTION_S` (meeting-api): an untouched `sweep_item_failures` record is pruned after this | 604800 s (7 days) |
-| Per-user rate limit | `GATEWAY_RATE_LIMIT_BURST`, `GATEWAY_RATE_LIMIT_RPS` (gateway, WS-6): the per-user token bucket at the single REST funnel | 120, 40/s |
+| Per-user rate limit | `GATEWAY_RATE_LIMIT_BURST`, `GATEWAY_RATE_LIMIT_RPS` (gateway): the per-user token bucket at the single REST funnel | 120, 40/s |
 
 Every meeting-api, admin-api and gateway setting is declared in its service's `config.v1.json`;
 the chart's `meetingApi.*`, `adminApi.*` and `gateway.*` values set every one above. The full list
 of exporter settings (among them `EXPORTER_WEBHOOK_SECRET` and `EXPORT_MAX_RECORDINGS`) is in
 [`integrations/out/aw-notetaker/README.md`](integrations/out/aw-notetaker/README.md). Secret values
-live only in Kubernetes Secrets, never in this repo. On EKS the four new keys (the two key rings
-and their active ids) go into `aw-bots-secrets` **before** the `helm upgrade` that brings the new
-services, and `VEXA_SYSTEM_WEBHOOK_SECRET` leaves it right before the upgrade that turns the system
-webhook off. Docker Compose, Lite and
+live only in Kubernetes Secrets, never in this repo. On EKS the two key rings and their active ids
+are in `aw-bots-secrets`, and must be there before the gateway, meeting-api and admin-api start.
+`VEXA_SYSTEM_WEBHOOK_SECRET` is not set, because the system webhook is off. Docker Compose, Lite and
 a chart-managed Secret (`secrets.gatewayIdentityKeys`, `secrets.gatewayIdentityActiveKey`) supply
 `GATEWAY_IDENTITY_KEYS` and `GATEWAY_IDENTITY_ACTIVE_KEY` too; they don't need the webhook key ring.
 

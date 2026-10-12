@@ -4,14 +4,17 @@ One module per job; the flow is `app` → `queue` → `job`.
 
 | Module | What it does |
 |---|---|
-| `app.py` | `POST /hooks/vexa`, the aw-bots `/v2/webhooks` subscription (verifies the signature, current or previous, validates, queues `meeting.completed` and `bot.failed` once per `event_id`, never a `not_sent` meeting, answers 200 to every other event) and `GET /healthz` |
+| `app.py` | `POST /hooks/vexa`, the aw-bots `/v2/webhooks` subscription (verifies the signature, current or previous, validates, queues `meeting.completed` and `bot.failed` once per `event_id`, never a `not_sent` meeting, answers 200 to every other event) and `GET /healthz` (503 while a job has run past `EXPORT_JOB_TIMEOUT_SECONDS`) |
 | `queue.py` | Durable queue in S3 (`aw-exporter/pending/`, `failed/`, and `events/` for the events already queued; every change a conditional write), retry with backoff, crash budget (a meeting with a crash runs alone), the worker loop |
 | `job.py` | Exports one meeting: every bot session's master audio → one `audio.wav`/`master.webm` on one clock, speaker timeline, per-speaker `channels/` when the bot recorded them, JSON files, `/process` call |
 | `activity.py` | Reads the bot's `speaker-activity.jsonl` (who-spoke-when, no audio) into speaker start/end events; the named frames wait on disk in sorted runs past a bound, so memory is flat. On the mixed lane only the mix's own frames (no channel) are that timeline. No fallback to the debug capture tape |
-| `attribution.py` | Turns those events into `speaker_timeline.json` / `participants.json` (rules ported from the old cloud bot) |
+| `attribution.py` | Turns those events into `speaker_timeline.json` / `participants.json`: intervals from paired frames, else from point runs, and the Zoom/Teams start anchor |
 | `schemas.py` | The JSON shapes `notetaker-worker` reads |
 | `export_result.py` | Reports the export result through the gateway (`POST /v2/meetings/{uuid}/export`); the queue retries it |
 | `audio.py` | ffmpeg webm → wav transcode, and the join of several sessions (wav in Python, webm with ffmpeg) with silence in the gaps |
 | `storage.py`, `vexa_client.py`, `notetaker.py` | S3, meeting-api (through the gateway) and notetaker-worker adapters |
 | `config.py`, `naming.py`, `signature.py` | Env settings, export folder name, subscription signature check |
-| `__main__.py` | Entry point: `python -m exporter` |
+| `rerun.py` | `python -m exporter.rerun <uuid> [...]`: queues a meeting to be exported again, refused while it is being exported, a rerun is queued, or notetaker-worker is transcribing it |
+| `retention.py` | The `retention-class` tag values (`audio`, `metadata`, `recording-mp4`) the export bucket's lifecycle rules expire by |
+| `__main__.py` | Entry point: `python -m exporter` builds the dependencies from the environment and serves the app and the worker |
+| `__init__.py` | The package version |
