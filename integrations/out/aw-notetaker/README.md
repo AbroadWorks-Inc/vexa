@@ -129,9 +129,14 @@ The Deployment, Service, ServiceAccount and Secret templates are in aw-notetaker
 any time: on SIGTERM the running exports get `EXPORT_STOP_WAIT_SECONDS` to finish, and the rest
 release their leases and resume in the new pod from the durable queue.
 
-**Rotating the webhook secret.** `POST /v2/webhooks/{id}/rotate-secret` with the new secret, then
-put it in `aw-exporter-secrets` and roll the exporter within 24 h. For those 24 h every delivery
-is signed under both secrets, and the exporter accepts a match on either header.
+**Rotating the webhook secret.** The commands, how to find `{id}`, and the repair when the Secret
+was already applied are in aw-notetaker `deployment/base/aw-bots/README.md`, heading "Rotating the
+exporter webhook secret". Order: `POST /v2/webhooks/{id}/rotate-secret` with the new secret first,
+then put the same value in `aw-exporter-secrets` and restart the exporter within 24 h. For those
+24 h every delivery is signed under both secrets, and the exporter accepts a match on either
+header. `{id}` is the subscription whose description is `aw-exporter` (`GET /v2/webhooks` lists
+it). Applying the Secret without `rotate-secret` makes this process answer 401, and aw-bots does
+not retry that.
 
 ## Several bot sessions
 A meeting can have more than one bot session: a bot fails and a new one joins the same meeting.

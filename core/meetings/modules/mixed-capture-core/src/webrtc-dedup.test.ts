@@ -69,15 +69,15 @@ check('ONE track event yields ONE mirrored stream (not two)',
 check('ONE track event yields ONE injected <audio> element',
   win.__vexaInjectedAudioElements.length === 1, `n=${win.__vexaInjectedAudioElements.length}`);
 
-// A REPEAT of the same track id (a renegotiation re-firing the same track) must not mirror again.
+// A REPEAT of the same track object (a renegotiation re-firing the same track) must not mirror again.
 pc.emit({ track, streams: [stream] });
-check('a re-fired event for the same track id does not mirror again',
+check('a re-fired event for the same track object does not mirror again',
   win.__vexaCapturedRemoteAudioStreams.length === 1, `n=${win.__vexaCapturedRemoteAudioStreams.length}`);
 
 // A genuinely DIFFERENT track still gets mirrored — the dedup keys on identity, not on count.
 const track2 = { id: 'dominantSpeaker-9', kind: 'audio' };
 pc.emit({ track: track2, streams: [new win.MediaStream([track2])] });
-check('a different track is still mirrored (dedup is by id, not a cap)',
+check('a different track is still mirrored (dedup is by identity, not a cap)',
   win.__vexaCapturedRemoteAudioStreams.length === 2, `n=${win.__vexaCapturedRemoteAudioStreams.length}`);
 
 // Video is not our business.
@@ -101,6 +101,30 @@ check('each captured stream carries only its own track',
   captured[2].getAudioTracks().length === 1 && captured[2].getAudioTracks()[0].id === 'track-a'
   && captured[3].getAudioTracks().length === 1 && captured[3].getAudioTracks()[0].id === 'track-b',
   JSON.stringify(captured.slice(2).map((s: any) => s.getAudioTracks().map((t: any) => t.id))));
+
+// A NEW PEER CONNECTION reuses track ids. After a Jitsi bridge session restart the new connection's
+// tracks are new objects whose ids are the old strings (`remote-audio-1`). The old track ended with
+// its connection; the new one carries the meeting from now on, so it must be mirrored.
+const pcOld: any = new (globalThis as any).RTCPeerConnection();
+pcOld.ontrack = () => { /* the meeting app's own handler */ };
+const oldTrack = { id: 'remote-audio-1', kind: 'audio' };
+pcOld.emit({ track: oldTrack, streams: [new win.MediaStream([oldTrack])] });
+const beforeRestart = win.__vexaCapturedRemoteAudioStreams.length;
+const pcNew: any = new (globalThis as any).RTCPeerConnection();
+pcNew.ontrack = () => { /* the meeting app's own handler */ };
+const newTrack = { id: 'remote-audio-1', kind: 'audio' };
+pcNew.emit({ track: newTrack, streams: [new win.MediaStream([newTrack])] });
+const afterRestart = win.__vexaCapturedRemoteAudioStreams;
+check('a new track object with an already-mirrored id is mirrored once (both paths fired)',
+  afterRestart.length === beforeRestart + 1, `n=${afterRestart.length - beforeRestart}`);
+check('the new track gets its own stream, not the old one',
+  afterRestart[afterRestart.length - 1].getAudioTracks()[0] === newTrack
+  && afterRestart[afterRestart.length - 1] !== afterRestart[beforeRestart - 1]);
+pcNew.emit({ track: newTrack, streams: [] });
+pcOld.emit({ track: oldTrack, streams: [] });
+check('the same track objects re-fired on either connection are not mirrored again',
+  win.__vexaCapturedRemoteAudioStreams.length === beforeRestart + 1,
+  `n=${win.__vexaCapturedRemoteAudioStreams.length - beforeRestart}`);
 
 if (failed) { console.error(`\n❌ webrtc-dedup: ${failed} check(s) FAILED.`); process.exit(1); }
 console.log('\n✅ webrtc-dedup: each remote audio track is mirrored exactly once, so the mixer cannot sum a track with itself.');

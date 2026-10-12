@@ -14,7 +14,7 @@ the only operations that account's callers can perform:
 | `bot` | `PUT /v2/entries`, `POST /v2/entries/remove`, `GET /v2/entries`, `POST /v2/meetings/{id}/stop` |
 | `tx` | `GET /v2/meetings` and `GET /v2/meetings/{id}` |
 | `export` | `POST /v2/meetings/{id}/export` |
-| `webhooks` | Subscription CRUD, rotate, test, and the delivery list |
+| `webhooks` | Subscription CRUD, rotate, test, and the delivery list (the operator key: aw-notetaker `deployment/base/aw-bots/README.md`, "The operator key") |
 | `erase` | `DELETE /v2/meetings/{id}` |
 
 `/user/*` accepts the user scopes `bot`, `tx`, and `browser`. Minting a token is
@@ -22,7 +22,9 @@ the only operations that account's callers can perform:
 once, on `TokenResponse.token`. The list endpoint returns metadata only.
 
 Rotation of a consumer key: mint a new token with the same name, update that consumer's Secret,
-roll its Deployment, then revoke the old token by id. admin-api metrics expose time left on each
+roll its Deployment, then revoke the old token by id. There is no rotate or reset endpoint for a
+token. The gateway answers only callers inside the cluster (`192.168.0.0/16`), so a key is used
+from a pod, not through a laptop port-forward. admin-api metrics expose time left on each
 named key (`aw_api_token_expires_seconds`).
 
 ## Signed identity

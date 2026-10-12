@@ -36,7 +36,9 @@ Signing (`meeting_api/webhooks/signing.py`):
   under the old secret
 
 The exporter accepts either signature header and rejects a timestamp more than 300 seconds off
-(`exporter/signature.py`).
+(`exporter/signature.py`). Changing the exporter's copy of that secret is an operator step in
+aw-notetaker `deployment/base/aw-bots/README.md`, heading "Rotating the exporter webhook secret".
+Applying Secret `aw-exporter-secrets` does not change the subscription meeting-api signs with.
 
 Retries follow `WEBHOOK_RETRY_SCHEDULE_S`, default `60,300,1800,7200` (1 min, 5 min, 30 min,
 2 h). A 5xx, 429, timeout, or connection error waits and is then `dead`. Any other non-2xx,

@@ -656,8 +656,11 @@ scope; the events carry the same [meeting object](#the-meeting-object) every
 export AW_BOTS_WEBHOOKS_KEY=vxa_webhooks_…   # placeholder; a key with the webhooks scope
 ```
 
-In AW's deployment the portal and the exporter are the subscribers; the exporter subscribes to
-`meeting.completed` and `bot.failed`. These subscriptions are separate from the per-account webhook
+In AW's deployment this key is the **operator key**, held by the people who administer webhooks
+and used by no service. How to create, keep, replace and use it, including that the gateway
+answers only callers inside the cluster (a laptop port-forward gets `403`), is in aw-notetaker
+`deployment/base/aw-bots/README.md`, section "The operator key". The portal and the exporter are
+the subscribers; the exporter subscribes to `meeting.completed` and `bot.failed`. These subscriptions are separate from the per-account webhook
 in [Settings](../../../../docs/docs/webhooks.mdx) (`PUT /user/webhook`), which keeps upstream's
 envelope and meeting block.
 
