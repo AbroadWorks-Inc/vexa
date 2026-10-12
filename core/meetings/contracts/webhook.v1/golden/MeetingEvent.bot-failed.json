@@ -30,6 +30,11 @@
       "export": null,
       "failure_stage": "awaiting_admission",
       "id": "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90",
+      "join_failure": {
+        "attribution": "host_action",
+        "detail": "Bot admission was rejected by meeting admin",
+        "reason": "awaiting_admission_rejected"
+      },
       "meeting_url": "https://meet.google.com/abc-defg-hij",
       "outcome": null,
       "platform": "google_meet",

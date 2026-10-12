@@ -136,7 +136,7 @@ async def test_active_bot_is_asked_to_leave_and_goes_stopping():
     assert s.h.published()[-1] == event.event_id
 
 
-@pytest.mark.parametrize("status", ["needs_help", "needs_human_help"])
+@pytest.mark.parametrize("status", ["needs_human_help"])
 async def test_a_bot_that_reached_the_meeting_goes_stopping(status):
     s = _stack()
     mid = await s.live(status)
@@ -145,7 +145,8 @@ async def test_a_bot_that_reached_the_meeting_goes_stopping(status):
     assert s.runtime.deleted == []
 
 
-@pytest.mark.parametrize("status", ["requested", "joining", "awaiting_admission"])
+# `needs_help` is pre-active: a blocked bot never got in (`active -> needs_help` is not an edge).
+@pytest.mark.parametrize("status", ["requested", "joining", "awaiting_admission", "needs_help"])
 async def test_booting_bot_is_torn_down_and_keeps_its_stage(status):
     s = _stack()
     mid = await s.live(status, container="wl-boot")

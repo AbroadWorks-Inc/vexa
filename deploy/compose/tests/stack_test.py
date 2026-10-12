@@ -383,18 +383,18 @@ def test_06d_max_bots(stack):
 # ── 6b. join-retry wiring (backoff proof leans on the offline P3 eval) ────────────────────────────
 
 def test_06b_join_retry_wiring_present(stack):
-    """The join-retry re-spawn path is WIRED in the live meeting-api image; the deterministic backoff
-    proof is the offline P3 test_join_retry.py (forcing a real transient join-failure on a live bot is
+    """The join-retry re-spawn path is WIRED in the live meeting-api image; the deterministic retry
+    proof is the offline test_bot_retry.py (forcing a real transient join-failure on a live bot is
     slow/flaky — documented split). Here we assert the shipped control-plane carries the re-spawn
-    machinery (JoinRetryController + Scheduler) inside the running meeting-api container."""
+    machinery (intake.retry NOT_RETRIED + Scheduler) inside the running meeting-api container."""
     out = stack.exec(
         "meeting-api", "python", "-c",
-        "import meeting_api.lifecycle as l, meeting_api.scheduling as s; "
-        "assert hasattr(l, 'JoinRetryController') and hasattr(l, 'classify_retry'); "
+        "import meeting_api.intake.retry as r, meeting_api.scheduling as s; "
+        "assert hasattr(r, 'NOT_RETRIED') and hasattr(r, 'unfinished_spawn'); "
         "assert hasattr(s, 'Scheduler') and hasattr(s, 'FakeClock'); print('ok')",
     )
     assert out.endswith("ok"), f"join-retry wiring not present in meeting-api: {out!r}"
-    print(f"\n[6b/join-retry] re-spawn wiring present (JoinRetryController+Scheduler); backoff proven offline (P3 test_join_retry.py)")
+    print(f"\n[6b/join-retry] re-spawn wiring present (intake.retry+Scheduler); retry proven offline (test_bot_retry.py)")
 
 
 # ── 3. real bot spawn → joining (COMPOSE_BOT=1) ──────────────────────────────────────────────────

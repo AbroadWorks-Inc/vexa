@@ -66,6 +66,7 @@ async def test_2_6_1_one_off_created():
             "status": "scheduled",
             "completion_reason": None,
             "failure_stage": None,
+            "join_failure": None,
             "outcome": None,
             "platform": "google_meet",
             "room": "kxo-misr-avz",

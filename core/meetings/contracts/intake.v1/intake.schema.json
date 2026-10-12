@@ -99,6 +99,17 @@
         "at": { "type": ["string", "null"] }
       }
     },
+    "JoinFailure": {
+      "description": "Meeting.join_failure (§2.4) — null unless the meeting is failed, did not end by a user stop (completion_reason stopped), and its data.join_evidence (the typed join-failure evidence recorded on a failed pre-active bot) carries a string reason. Only reason, attribution and detail are rendered. reason/attribution are the meeting-api join taxonomy (lifecycle.join_evidence JoinFailureReason / JoinFailureAttribution), left as open strings here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "attribution", "detail"],
+      "properties": {
+        "reason": { "type": "string" },
+        "attribution": { "type": ["string", "null"] },
+        "detail": { "type": ["string", "null"], "maxLength": 500 }
+      }
+    },
     "Export": {
       "description": "Meeting.export (§2.4) — null until the exporter reports a result.",
       "type": "object",
@@ -125,13 +136,13 @@
       }
     },
     "Meeting": {
-      "description": "The §2.4 meeting object — exactly the 19 keys meeting_api.intake.projection.project_meeting renders, in this order. Every reply, read and webhook ships a meeting through this one shape.",
+      "description": "The §2.4 meeting object — exactly the 20 keys meeting_api.intake.projection.project_meeting renders, in this order. Every reply, read and webhook ships a meeting through this one shape.",
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id", "upstream_id", "status", "completion_reason", "failure_stage", "outcome", "platform",
-        "room", "meeting_url", "title", "start", "end", "time_zone", "bot_joins_at", "started_at",
-        "ended_at", "entries", "export", "sequence"
+        "id", "upstream_id", "status", "completion_reason", "failure_stage", "join_failure",
+        "outcome", "platform", "room", "meeting_url", "title", "start", "end", "time_zone",
+        "bot_joins_at", "started_at", "ended_at", "entries", "export", "sequence"
       ],
       "properties": {
         "id": { "type": "string", "description": "str(meetings.uuid) — never the integer row id." },
@@ -139,6 +150,7 @@
         "status": { "type": ["string", "null"] },
         "completion_reason": { "type": ["string", "null"] },
         "failure_stage": { "type": ["string", "null"] },
+        "join_failure": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/JoinFailure" }] },
         "outcome": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Outcome" }] },
         "platform": { "type": ["string", "null"] },
         "room": { "type": ["string", "null"] },

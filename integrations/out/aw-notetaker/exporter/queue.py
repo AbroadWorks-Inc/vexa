@@ -4,10 +4,20 @@
 Pending objects live in the VEXA bucket under `aw-exporter/pending/<id>.json`
 (`<id>` is the meeting's UUID) as `{"envelope": {...}, "attempts": int,
 "next_attempt_at": epoch seconds float, "last_error": str | None,
-"rerun": bool, "crashes": int, "lease": {"owner", "expires_at"} | absent}`; a
-restart re-lists that prefix, so an in-flight job always resumes. `rerun` (queued by `exporter.rerun`) makes the job export the
-meeting again and hand it to notetaker-worker as a rerun; a webhook
-redelivered for the same meeting keeps it. Failed ones
+"rerun": bool, "rerun_handed_off": {...} | absent, "crashes": int,
+"lease": {"owner", "expires_at"} | absent, "write_id": str}`; a restart
+re-lists that prefix, so an in-flight job always resumes. Every change to a
+pending item is a read-modify-write conditional on the version read
+(`IfMatch` its ETag, `IfNoneMatch` to create), done again from a fresh read
+when another writer (a webhook, `exporter.rerun` in another process, a lease
+renewal) got in between, so no change is lost; each write's `write_id` lets a
+write that botocore resent after its answer was lost be recognised as its
+own. `rerun_handed_off` is the `_export.json` a rerun wrote once its
+`/process` was accepted: a retry only finishes the steps after it, and its
+quarantine keeps the hand-off. `rerun` (queued by
+`exporter.rerun`, only when nothing is pending for the meeting) makes the job
+export the meeting again and hand it to notetaker-worker as a rerun; a
+webhook redelivered for the same meeting keeps it. Failed ones
 (>= max_attempts) move to `aw-exporter/failed/<id>.json`. Each queued event
 is recorded under `aw-exporter/events/<event_id>.json` (`meeting_id`,
 `event_type`, `sequence`), so a redelivery of it is recognised
@@ -29,18 +39,32 @@ left as it is. An item whose meeting is not the §2.4 meeting
 the export bucket.
 
 Crashes: a job is leased before it starts (`lease`, renewed every third of
-`EXPORT_LEASE_SECONDS` while it runs) and the lease is cleared when the job
-ends either way. A lease found expired means the run that held it stopped
-without finishing (the pod was killed or ran out of memory, which raises
-nothing): that counts one crash, and at `EXPORT_MAX_CRASHES` the meeting is
-quarantined like one out of attempts and never runs again on its own. A
-worker that is stopped releases the leases of the jobs it is running, so a
-deploy is not a crash.
+`EXPORT_LEASE_SECONDS` while it runs, only while it is still held) and the
+lease is cleared when the job ends either way; the renewal stops before
+anything is recorded, and a lease left by bookkeeping that failed is released,
+or else recognised by the worker that holds it, never counted. Another
+owner's lease found expired means the run that held it stopped without
+finishing (the pod was killed or ran out of memory, which raises nothing):
+that counts one crash against every meeting that pod was exporting. A
+meeting with a crash runs alone: it waits until no other export is running,
+and none starts until it has finished, so a second crash is proven its own.
+At `EXPORT_MAX_CRASHES`, checked whether or not a lease is there, the meeting
+is quarantined like one out of attempts and never runs again on its own.
+Bookkeeping that keeps failing after a job (S3 refusing `done`, say) holds the
+meeting back in this process with a growing backoff, and after
+`EXPORT_MAX_ATTEMPTS` failures in a row until the exporter restarts. A job
+running past `EXPORT_JOB_TIMEOUT_SECONDS` has hung: `/healthz` fails and the
+liveness probe restarts the pod. A worker that is stopped starts nothing
+more and gives the running jobs `EXPORT_STOP_WAIT_SECONDS` to finish and
+record their outcome; for the rest it stops and awaits their renewals and
+releases their leases, so a deploy is not a crash, except a hung job's,
+which is left to expire and counted as a crash.
 
 The worker is a continuous pool: every `EXPORT_SWEEP_SECONDS` it starts each
 pending meeting that is not already running and is due, up to
 `EXPORT_CONCURRENCY` jobs at once; one long export never holds back the
-others.
+others. Every S3 call runs in a thread, so the webhook intake and `/healthz`
+stay responsive.
 
 The worker must never die: a bad envelope, a broken S3 call for one id, or
 an unexpected exception anywhere is logged and contained to that id so every
@@ -51,22 +75,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
-from collections.abc import Callable
-from typing import Any
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from typing import Any, Literal
 
 from exporter.export_result import ExportReportError, ReportState
-from exporter.job import Deps, ExportResult, NotAV2Meeting, export_meeting
+from exporter.job import (
+    Deps,
+    ExportResult,
+    NotAV2Meeting,
+    RerunProgress,
+    export_meeting,
+)
+from exporter.config import Settings
 from exporter.naming import folder_name
 from exporter.retention import METADATA
-from exporter.storage import Storage
+from exporter.storage import PreconditionFailed, Storage
 
 logger = logging.getLogger("exporter")
 
 _PENDING_PREFIX = "aw-exporter/pending/"
 _FAILED_PREFIX = "aw-exporter/failed/"
 _EVENTS_PREFIX = "aw-exporter/events/"
+# Conditional writes of one pending item that may lose to another writer in a
+# row before the change gives up (raises PreconditionFailed).
+_CONFLICT_TRIES = 10
+
+RerunRequest = Literal["queued", "export_in_progress", "rerun_queued"]
 
 
 class PendingQueue:
@@ -80,37 +118,98 @@ class PendingQueue:
     def _failed_key(self, meeting_id: str) -> str:
         return f"{_FAILED_PREFIX}{meeting_id}.json"
 
-    def enqueue(self, envelope: dict[str, Any], *, rerun: bool = False) -> None:
+    def _change(
+        self,
+        meeting_id: str,
+        change: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Read-modify-write the pending item, the write conditional on the
+        version read (`IfMatch` its ETag, or `IfNoneMatch` when there was
+        none). `change` gets the item (None when there is none) and returns
+        what to write, or None to write nothing. When another writer got in
+        between, the item is read again and `change` runs again on it. Each
+        write carries a fresh `write_id`: a write that landed but whose answer
+        was lost is resent by botocore and refused (412), and is then
+        recognised as this write's own instead of applied twice. Returns what
+        was written, or None."""
+        key = self._pending_key(meeting_id)
+        for _ in range(_CONFLICT_TRIES):
+            read = self._storage.get_json_versioned(self._bucket, key)
+            item, etag = read if read is not None else (None, None)
+            new = change(item)
+            if new is None:
+                return None
+            new["write_id"] = write_id = uuid.uuid4().hex
+            try:
+                self._storage.put_json(
+                    self._bucket,
+                    key,
+                    new,
+                    if_match=etag,
+                    if_none_match=etag is None,
+                )
+            except PreconditionFailed:
+                current = self.load(meeting_id)
+                if current is not None and current.get("write_id") == write_id:
+                    return current
+                continue
+            return new
+        raise PreconditionFailed(f"pending item {meeting_id} kept changing")
+
+    def enqueue(self, envelope: dict[str, Any]) -> None:
         """Durably enqueue `envelope`. A redelivery of an id already pending
         refreshes the stored envelope only — attempts/next_attempt_at/
         last_error are left alone, so a redelivered webhook never resets an
         in-progress backoff, and a pending rerun stays a rerun."""
         meeting_id = str(envelope["data"]["meeting"]["id"])
-        existing = self.load(meeting_id)
-        if existing is not None:
-            existing["envelope"] = envelope
-            existing["rerun"] = bool(existing.get("rerun")) or rerun
-            self._storage.put_json(
-                self._bucket, self._pending_key(meeting_id), existing
-            )
+        created = False
+
+        def refresh(item: dict[str, Any] | None) -> dict[str, Any]:
+            nonlocal created
+            created = item is None
+            if item is None:
+                return _new_item(envelope, rerun=False)
+            item["envelope"] = envelope
+            return item
+
+        written = self._change(meeting_id, refresh)
+        assert written is not None
+        if created:
+            logger.info("enqueue: new pending meeting_id=%s rerun=False", meeting_id)
+        else:
             logger.info(
                 "enqueue: refreshed pending envelope meeting_id=%s attempts=%s",
                 meeting_id,
-                existing["attempts"],
+                written["attempts"],
             )
-            return
-        self._storage.put_json(
-            self._bucket,
-            self._pending_key(meeting_id),
-            {
-                "envelope": envelope,
-                "attempts": 0,
-                "next_attempt_at": 0.0,
-                "last_error": None,
-                "rerun": rerun,
-            },
-        )
-        logger.info("enqueue: new pending meeting_id=%s rerun=%s", meeting_id, rerun)
+
+    def request_rerun(self, envelope: dict[str, Any]) -> RerunRequest:
+        """Queue `envelope` as a rerun only when nothing is pending for its
+        meeting (`IfNoneMatch`): `queued`; otherwise nothing changes and the
+        answer says what is pending, `rerun_queued` or `export_in_progress`
+        (the meeting's export has not finished)."""
+        meeting_id = str(envelope["data"]["meeting"]["id"])
+        for _ in range(_CONFLICT_TRIES):
+            item = _new_item(envelope, rerun=True)
+            item["write_id"] = write_id = uuid.uuid4().hex
+            try:
+                self._storage.put_json(
+                    self._bucket,
+                    self._pending_key(meeting_id),
+                    item,
+                    if_none_match=True,
+                )
+            except PreconditionFailed:
+                pending = self.load(meeting_id)
+                if pending is None:
+                    continue  # finished in between: ask again
+                if pending.get("write_id") != write_id:
+                    return (
+                        "rerun_queued" if pending.get("rerun") else "export_in_progress"
+                    )
+            logger.info("enqueue: new pending meeting_id=%s rerun=True", meeting_id)
+            return "queued"
+        raise PreconditionFailed(f"pending item {meeting_id} kept changing")
 
     def seen(self, event_id: str) -> bool:
         """True when the event `event_id` was queued before."""
@@ -155,16 +254,20 @@ class PendingQueue:
     ) -> int:
         """Count one failed attempt; the next waits `backoff_seconds` ×
         2**attempts."""
-        item = self.load(meeting_id)
-        if item is None:
-            raise KeyError(meeting_id)
-        attempts = int(item["attempts"]) + 1
-        item["attempts"] = attempts
-        item["last_error"] = error
-        item.pop("lease", None)
-        item["next_attempt_at"] = now() + backoff_seconds * 2**attempts
-        self._storage.put_json(self._bucket, self._pending_key(meeting_id), item)
-        return attempts
+
+        def fail(item: dict[str, Any] | None) -> dict[str, Any]:
+            if item is None:
+                raise KeyError(meeting_id)
+            attempts = int(item["attempts"]) + 1
+            item["attempts"] = attempts
+            item["last_error"] = error
+            item.pop("lease", None)
+            item["next_attempt_at"] = now() + backoff_seconds * 2**attempts
+            return item
+
+        written = self._change(meeting_id, fail)
+        assert written is not None
+        return int(written["attempts"])
 
     def done(self, meeting_id: str) -> None:
         self._storage.delete(self._bucket, self._pending_key(meeting_id))
@@ -178,40 +281,88 @@ class PendingQueue:
 
     def lease(
         self, meeting_id: str, owner: str, *, now: float, lease_seconds: float
+    ) -> dict[str, Any] | None:
+        """Take `owner`'s lease until `now` + `lease_seconds`; the item as
+        leased. None when the item is gone or another owner's lease has not
+        expired."""
+
+        def take(item: dict[str, Any] | None) -> dict[str, Any] | None:
+            if item is None:
+                return None
+            held = item.get("lease")
+            if (
+                held is not None
+                and held.get("owner") != owner
+                and float(held.get("expires_at") or 0.0) > now
+            ):
+                return None
+            item["lease"] = {"owner": owner, "expires_at": now + lease_seconds}
+            return item
+
+        return self._change(meeting_id, take)
+
+    def renew(
+        self, meeting_id: str, owner: str, *, now: float, lease_seconds: float
     ) -> bool:
-        """Take or renew `owner`'s lease until `now` + `lease_seconds`. False
-        when the item is gone or another owner's lease has not expired."""
-        item = self.load(meeting_id)
-        if item is None:
-            return False
-        held = item.get("lease")
-        if (
-            held is not None
-            and held.get("owner") != owner
-            and float(held.get("expires_at") or 0.0) > now
-        ):
-            return False
-        item["lease"] = {"owner": owner, "expires_at": now + lease_seconds}
-        self._storage.put_json(self._bucket, self._pending_key(meeting_id), item)
-        return True
+        """Extend `owner`'s lease to `now` + `lease_seconds`, only while
+        `owner` holds it: a released, taken or finished lease is never taken
+        back. False when it is not held."""
+
+        def extend(item: dict[str, Any] | None) -> dict[str, Any] | None:
+            if item is None or (item.get("lease") or {}).get("owner") != owner:
+                return None
+            item["lease"] = {"owner": owner, "expires_at": now + lease_seconds}
+            return item
+
+        return self._change(meeting_id, extend) is not None
 
     def release(self, meeting_id: str, owner: str) -> None:
         """Drop `owner`'s lease without counting anything (a stopped worker)."""
-        item = self.load(meeting_id)
-        if item is not None and (item.get("lease") or {}).get("owner") == owner:
+
+        def drop(item: dict[str, Any] | None) -> dict[str, Any] | None:
+            if item is None or (item.get("lease") or {}).get("owner") != owner:
+                return None
             item.pop("lease")
-            self._storage.put_json(self._bucket, self._pending_key(meeting_id), item)
+            return item
+
+        self._change(meeting_id, drop)
+
+    def record_rerun_handed_off(self, meeting_id: str, marker: dict[str, Any]) -> None:
+        """Keep the `_export.json` a rerun wrote once its `/process` was
+        accepted (`rerun_handed_off`), so a retry only finishes the steps
+        after it."""
+
+        def keep(item: dict[str, Any] | None) -> dict[str, Any]:
+            if item is None:
+                raise KeyError(meeting_id)
+            item["rerun_handed_off"] = marker
+            return item
+
+        self._change(meeting_id, keep)
 
     def record_crash(self, meeting_id: str) -> int:
         """Count a run that stopped without finishing; clears its lease."""
-        item = self.load(meeting_id)
-        if item is None:
-            raise KeyError(meeting_id)
-        crashes = int(item.get("crashes") or 0) + 1
-        item["crashes"] = crashes
-        item.pop("lease", None)
-        self._storage.put_json(self._bucket, self._pending_key(meeting_id), item)
-        return crashes
+
+        def crash(item: dict[str, Any] | None) -> dict[str, Any]:
+            if item is None:
+                raise KeyError(meeting_id)
+            item["crashes"] = int(item.get("crashes") or 0) + 1
+            item.pop("lease", None)
+            return item
+
+        written = self._change(meeting_id, crash)
+        assert written is not None
+        return int(written["crashes"])
+
+
+def _new_item(envelope: dict[str, Any], *, rerun: bool) -> dict[str, Any]:
+    return {
+        "envelope": envelope,
+        "attempts": 0,
+        "next_attempt_at": 0.0,
+        "last_error": None,
+        "rerun": rerun,
+    }
 
 
 def _quarantine_marker(
@@ -236,7 +387,154 @@ def _quarantine_marker(
     }
 
 
-Job = Callable[[dict[str, Any], Deps, bool], ExportResult]
+Job = Callable[[dict[str, Any], Deps, bool, RerunProgress | None], ExportResult]
+
+
+class _Slots:
+    """The worker's export slots: up to `concurrency` exports share them, and
+    a suspect (an export whose earlier run crashed) runs alone. A suspect
+    waits until no other export is running, and from the moment it waits no
+    export starts until it has finished, so a crash during its run is its
+    own. `closed` is set when the worker stops: an export that gets its slot
+    after that does not start."""
+
+    def __init__(self, concurrency: int) -> None:
+        self._limit = concurrency
+        self._busy = 0
+        self._alone = False
+        self._alone_waiting = 0
+        self._cond = asyncio.Condition()
+        self.closed = False
+
+    @asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        async with self._cond:
+            await self._cond.wait_for(
+                lambda: not self._alone
+                and not self._alone_waiting
+                and self._busy < self._limit
+            )
+            self._busy += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._busy -= 1
+                self._cond.notify_all()
+
+    @asynccontextmanager
+    async def alone(self) -> AsyncIterator[None]:
+        async with self._cond:
+            self._alone_waiting += 1
+            try:
+                await self._cond.wait_for(lambda: not self._alone and not self._busy)
+            finally:
+                self._alone_waiting -= 1
+                self._cond.notify_all()
+            self._alone = True
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._alone = False
+                self._cond.notify_all()
+
+
+class _Renewal:
+    """Renews a running export's lease every third of `lease_seconds` while
+    this worker holds it. `stop` returns once no renewal is in flight, so
+    nothing touches the lease after it."""
+
+    def __init__(
+        self,
+        queue: PendingQueue,
+        meeting_id: str,
+        owner: str,
+        lease_seconds: float,
+        now: Callable[[], float],
+    ) -> None:
+        self._stopped = asyncio.Event()
+        self._task = asyncio.create_task(
+            self._run(queue, meeting_id, owner, lease_seconds, now)
+        )
+
+    async def _run(
+        self,
+        queue: PendingQueue,
+        meeting_id: str,
+        owner: str,
+        lease_seconds: float,
+        now: Callable[[], float],
+    ) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=lease_seconds / 3)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                held = await asyncio.to_thread(
+                    queue.renew,
+                    meeting_id,
+                    owner,
+                    now=now(),
+                    lease_seconds=lease_seconds,
+                )
+            except Exception:  # noqa: BLE001 - the next renewal tries again
+                logger.exception("lease renewal failed meeting_id=%s", meeting_id)
+                continue
+            if not held:
+                logger.warning("lease no longer held meeting_id=%s", meeting_id)
+                return
+
+    async def stop(self) -> None:
+        self._stopped.set()
+        await self._task
+
+
+class WorkerState:
+    """One worker's in-process state, shared by its runs and `/healthz`: its
+    lease owner id, export slots, lease renewals, when each running job
+    started (monotonic clock), and the meetings whose bookkeeping after the
+    job keeps failing (failures so far, not run again before `now()` passes
+    the second value)."""
+
+    def __init__(self, concurrency: int) -> None:
+        self.owner = uuid.uuid4().hex
+        self.slots = _Slots(concurrency)
+        self.renewals: dict[str, _Renewal] = {}
+        self.started: dict[str, float] = {}
+        self.held: dict[str, tuple[int, float]] = {}
+
+    def overdue(self, timeout_s: float) -> list[str]:
+        """The meetings whose job has run longer than `timeout_s`."""
+        now = time.monotonic()
+        return sorted(m for m, at in self.started.items() if now - at > timeout_s)
+
+
+def _hold(worker: WorkerState, meeting_id: str, settings: Settings, now: float) -> None:
+    """The bookkeeping after this meeting's job failed: the job would run
+    again on every sweep with nothing counted, so it waits a growing backoff,
+    and after `max_attempts` failures in a row it is not run again until the
+    exporter restarts."""
+    failures = worker.held.get(meeting_id, (0, 0.0))[0] + 1
+    if failures >= settings.max_attempts:
+        worker.held[meeting_id] = (failures, math.inf)
+        logger.error(
+            "bookkeeping failed %d times in a row meeting_id=%s; not run again "
+            "until the exporter restarts",
+            failures,
+            meeting_id,
+        )
+        return
+    wait = settings.retry_backoff_seconds * 2**failures
+    worker.held[meeting_id] = (failures, now + wait)
+    logger.warning(
+        "bookkeeping failed meeting_id=%s failures=%d; next try in %.0f s",
+        meeting_id,
+        failures,
+        wait,
+    )
 
 
 async def _run_item(
@@ -245,129 +543,191 @@ async def _run_item(
     meeting_id: str,
     job: Job,
     now: Callable[[], float],
-    semaphore: asyncio.Semaphore,
-    owner: str,
+    worker: WorkerState,
 ) -> None:
-    """One pending meeting: count a crash its last run left behind, then run
-    it when due, under a lease, and record the outcome."""
+    """One pending meeting: count a crash its last run left behind, quarantine
+    it when out of crashes, else run it when due, under a lease (alone when
+    it has crashed before), and record the outcome."""
     settings = deps.settings
+    slots, owner = worker.slots, worker.owner
     try:
-        item = queue.load(meeting_id)
+        held = worker.held.get(meeting_id)
+        if held is not None and held[1] > now():
+            return
+        item = await asyncio.to_thread(queue.load, meeting_id)
         if item is None:
             return
         lease = item.get("lease")
-        if lease is not None:
+        # A lease of this worker's own is left by a run that finished here
+        # (its bookkeeping failed): not a crash, and not running.
+        if lease is not None and lease.get("owner") != owner:
             if float(lease.get("expires_at") or 0.0) > now():
                 return  # running
-            crashes = queue.record_crash(meeting_id)
+            item["crashes"] = await asyncio.to_thread(queue.record_crash, meeting_id)
             logger.error(
                 "export run stopped without finishing meeting_id=%s crashes=%s",
                 meeting_id,
-                crashes,
+                item["crashes"],
             )
-            if crashes >= settings.max_crashes:
-                error = (
-                    f"the exporter stopped {crashes} times while exporting this "
-                    "meeting (pod killed or out of memory)"
-                )
-                await _give_up(
-                    queue,
-                    deps,
-                    meeting_id,
-                    item["envelope"],
-                    int(item.get("attempts") or 0),
-                    error,
-                    rerun=bool(item.get("rerun")),
-                )
-                return
+        crashes = int(item.get("crashes") or 0)
+        if crashes >= settings.max_crashes:
+            error = (
+                f"the exporter stopped {crashes} times while exporting this "
+                "meeting (pod killed or out of memory)"
+            )
+            await _give_up(
+                queue,
+                deps,
+                meeting_id,
+                item["envelope"],
+                int(item.get("attempts") or 0),
+                error,
+                rerun=_rerun_not_handed_off(item),
+            )
+            return
         if float(item.get("next_attempt_at") or 0.0) > now():
             return
-        envelope: dict[str, Any] = item["envelope"]
-        async with semaphore:
-            if not queue.lease(
-                meeting_id, owner, now=now(), lease_seconds=settings.lease_seconds
-            ):
-                return
-            renewing = asyncio.create_task(
-                _renew(queue, meeting_id, owner, settings.lease_seconds, now)
+        if crashes:
+            logger.warning(
+                "export runs alone after a crash meeting_id=%s crashes=%s",
+                meeting_id,
+                crashes,
             )
+        async with slots.alone() if crashes else slots.shared():
+            if slots.closed:
+                return
+            # The item as leased, not as read before the wait for a slot: a
+            # refreshed envelope or a rerun's progress is in this one.
+            leased = await asyncio.to_thread(
+                queue.lease,
+                meeting_id,
+                owner,
+                now=now(),
+                lease_seconds=settings.lease_seconds,
+            )
+            if leased is None:
+                return
+            renewal = _Renewal(queue, meeting_id, owner, settings.lease_seconds, now)
+            worker.renewals[meeting_id] = renewal
             try:
-                await asyncio.to_thread(job, envelope, deps, bool(item.get("rerun")))
-            except NotAV2Meeting as exc:
-                attempts = queue.record_failure(
-                    meeting_id,
-                    str(exc),
-                    backoff_seconds=settings.retry_backoff_seconds,
-                    now=now,
+                if slots.closed:  # the worker stopped while the lease was taken
+                    await renewal.stop()
+                    await asyncio.to_thread(queue.release, meeting_id, owner)
+                    return
+                await _run_leased(
+                    queue, deps, meeting_id, job, now, leased, renewal, worker
                 )
-                logger.error(
-                    "export job failed: not a v2 meeting meeting_id=%s "
-                    "attempts=%s; moved to failed/, nothing exported",
-                    meeting_id,
-                    attempts,
-                )
-                queue.fail(meeting_id)
-                return
-            except Exception as exc:  # noqa: BLE001 - contained per id, logged
-                attempts = queue.record_failure(
-                    meeting_id,
-                    str(exc),
-                    backoff_seconds=settings.retry_backoff_seconds,
-                    now=now,
-                )
-                logger.warning(
-                    "export job failed meeting_id=%s attempts=%s error_class=%s",
-                    meeting_id,
-                    attempts,
-                    type(exc).__name__,
-                )
-                if attempts >= settings.max_attempts:
-                    if isinstance(exc, ExportReportError):
-                        logger.error(
-                            "quarantine: meeting_id=%s attempts=%s export result not "
-                            "accepted; the outcome in _export.json stands, moved to "
-                            "failed/",
-                            meeting_id,
-                            attempts,
-                        )
-                        queue.fail(meeting_id)
-                    else:
-                        await _give_up(
-                            queue,
-                            deps,
-                            meeting_id,
-                            envelope,
-                            attempts,
-                            str(exc),
-                            rerun=bool(item.get("rerun")),
-                        )
-                return
+            except Exception:
+                # Bookkeeping after the job failed: the lease must not stay
+                # behind to be counted as a crash, and the job must not run
+                # again on every sweep.
+                _hold(worker, meeting_id, settings, now())
+                try:
+                    await asyncio.to_thread(queue.release, meeting_id, owner)
+                except Exception:  # noqa: BLE001 - this worker skips its own lease
+                    logger.exception(
+                        "could not release the lease meeting_id=%s", meeting_id
+                    )
+                raise
+            else:
+                worker.held.pop(meeting_id, None)
             finally:
-                renewing.cancel()
-            if not item.get("rerun") and (queue.load(meeting_id) or {}).get("rerun"):
-                # A rerun was asked for while this export ran: it stays queued.
-                queue.release(meeting_id, owner)
-                return
-            queue.done(meeting_id)
+                await renewal.stop()
+                worker.renewals.pop(meeting_id, None)
     except Exception:  # noqa: BLE001 - one id's bug must not sink the worker
         logger.exception("unhandled error processing meeting_id=%s", meeting_id)
 
 
-async def _renew(
+def _rerun_not_handed_off(item: dict[str, Any]) -> bool:
+    """A rerun whose `/process` was accepted is handed off: its quarantine
+    keeps the `handed_off` marker like any hand-off."""
+    return bool(item.get("rerun")) and item.get("rerun_handed_off") is None
+
+
+async def _run_leased(
     queue: PendingQueue,
+    deps: Deps,
     meeting_id: str,
-    owner: str,
-    lease_seconds: float,
+    job: Job,
     now: Callable[[], float],
+    item: dict[str, Any],
+    renewal: _Renewal,
+    worker: WorkerState,
 ) -> None:
-    while True:
-        await asyncio.sleep(lease_seconds / 3)
-        try:
-            await asyncio.to_thread(
-                queue.lease, meeting_id, owner, now=now(), lease_seconds=lease_seconds
-            )
-        except Exception:  # noqa: BLE001 - the next renewal tries again
-            logger.exception("lease renewal failed meeting_id=%s", meeting_id)
+    """Run the job of a leased meeting and record its outcome. The lease's
+    renewal stops before anything is recorded."""
+    settings = deps.settings
+    envelope: dict[str, Any] = item["envelope"]
+    rerun = bool(item.get("rerun"))
+    progress = (
+        RerunProgress(
+            item.get("rerun_handed_off"),
+            lambda marker: queue.record_rerun_handed_off(meeting_id, marker),
+        )
+        if rerun
+        else None
+    )
+    worker.started[meeting_id] = time.monotonic()
+    try:
+        await asyncio.to_thread(job, envelope, deps, rerun, progress)
+    except NotAV2Meeting as exc:
+        await renewal.stop()
+        attempts = await asyncio.to_thread(
+            queue.record_failure,
+            meeting_id,
+            str(exc),
+            backoff_seconds=settings.retry_backoff_seconds,
+            now=now,
+        )
+        logger.error(
+            "export job failed: not a v2 meeting meeting_id=%s "
+            "attempts=%s; moved to failed/, nothing exported",
+            meeting_id,
+            attempts,
+        )
+        await asyncio.to_thread(queue.fail, meeting_id)
+        return
+    except Exception as exc:  # noqa: BLE001 - contained per id, logged
+        await renewal.stop()
+        attempts = await asyncio.to_thread(
+            queue.record_failure,
+            meeting_id,
+            str(exc),
+            backoff_seconds=settings.retry_backoff_seconds,
+            now=now,
+        )
+        logger.warning(
+            "export job failed meeting_id=%s attempts=%s error_class=%s",
+            meeting_id,
+            attempts,
+            type(exc).__name__,
+        )
+        if attempts >= settings.max_attempts:
+            if isinstance(exc, ExportReportError):
+                logger.error(
+                    "quarantine: meeting_id=%s attempts=%s export result not "
+                    "accepted; the outcome in _export.json stands, moved to "
+                    "failed/",
+                    meeting_id,
+                    attempts,
+                )
+                await asyncio.to_thread(queue.fail, meeting_id)
+            else:
+                handed_off = await asyncio.to_thread(queue.load, meeting_id)
+                await _give_up(
+                    queue,
+                    deps,
+                    meeting_id,
+                    envelope,
+                    attempts,
+                    str(exc),
+                    rerun=_rerun_not_handed_off(handed_off or item),
+                )
+        return
+    finally:
+        worker.started.pop(meeting_id, None)
+    await renewal.stop()
+    await asyncio.to_thread(queue.done, meeting_id)
 
 
 async def _give_up(
@@ -385,9 +745,9 @@ async def _give_up(
         envelope, attempts, error, meeting_id, deps, rerun=rerun
     )
     if finished:
-        queue.done(meeting_id)
+        await asyncio.to_thread(queue.done, meeting_id)
     else:
-        queue.fail(meeting_id)
+        await asyncio.to_thread(queue.fail, meeting_id)
 
 
 async def sweep_once(
@@ -397,12 +757,11 @@ async def sweep_once(
     now: Callable[[], float] = time.time,
 ) -> None:
     """Run every pending meeting that is due, and wait for all of them."""
-    semaphore = asyncio.Semaphore(deps.settings.concurrency)
-    owner = uuid.uuid4().hex
+    worker = WorkerState(deps.settings.concurrency)
     await asyncio.gather(
         *(
-            _run_item(queue, deps, meeting_id, job, now, semaphore, owner)
-            for meeting_id in queue.pending_ids()
+            _run_item(queue, deps, meeting_id, job, now, worker)
+            for meeting_id in await asyncio.to_thread(queue.pending_ids)
         ),
         return_exceptions=True,
     )
@@ -441,7 +800,9 @@ async def _quarantine(
     base = settings.export_prefix + folder + "/"
     marker_key = base + "_export.json"
     try:
-        existing = deps.storage.get_json(settings.export_bucket, marker_key)
+        existing = await asyncio.to_thread(
+            deps.storage.get_json, settings.export_bucket, marker_key
+        )
     except Exception as exc:  # noqa: BLE001 - logged; the marker is left alone
         logger.error(
             "quarantine: meeting_id=%s attempts=%s could not read _export.json "
@@ -468,8 +829,12 @@ async def _quarantine(
         )
     else:
         state, report_error = "failed", error
-        deps.storage.put_json(
-            settings.export_bucket, marker_key, body, retention=METADATA
+        await asyncio.to_thread(
+            deps.storage.put_json,
+            settings.export_bucket,
+            marker_key,
+            body,
+            retention=METADATA,
         )
         logger.error(
             "quarantine: meeting_id=%s attempts=%s moved to failed/",
@@ -504,13 +869,21 @@ async def run_worker(
     stop: asyncio.Event,
     job: Job = export_meeting,
     now: Callable[[], float] = time.time,
+    worker: WorkerState | None = None,
 ) -> None:
     """Continuous pool: every `sweep_seconds` start each pending meeting that
-    is not already running here; at most `concurrency` export at once. On
-    stop, release the leases of the jobs still running, so the next worker
-    runs them again without counting a crash."""
-    semaphore = asyncio.Semaphore(deps.settings.concurrency)
-    owner = uuid.uuid4().hex
+    is not already running here; at most `concurrency` export at once, and a
+    meeting whose earlier run crashed exports alone.
+
+    On stop, no export starts any more, and the running ones get up to
+    `EXPORT_STOP_WAIT_SECONDS` to finish and record their outcome. For each
+    still running after that, its lease renewal is stopped and awaited and
+    its lease released, so the next worker runs it again without counting a
+    crash; except a job past `EXPORT_JOB_TIMEOUT_SECONDS` (it hung, and
+    `/healthz` failed for it), whose lease is left to expire so the next
+    worker counts the crash and runs it alone."""
+    settings = deps.settings
+    worker = worker or WorkerState(settings.concurrency)
     running: dict[str, asyncio.Task[None]] = {}
     while not stop.is_set():
         running = {m: t for m, t in running.items() if not t.done()}
@@ -518,18 +891,33 @@ async def run_worker(
             for meeting_id in await asyncio.to_thread(queue.pending_ids):
                 if meeting_id not in running:
                     running[meeting_id] = asyncio.create_task(
-                        _run_item(queue, deps, meeting_id, job, now, semaphore, owner)
+                        _run_item(queue, deps, meeting_id, job, now, worker)
                     )
         except Exception:  # noqa: BLE001 - the worker loop must never die
             logger.exception("run_worker: listing pending meetings failed; continuing")
         try:
-            await asyncio.wait_for(stop.wait(), timeout=deps.settings.sweep_seconds)
+            await asyncio.wait_for(stop.wait(), timeout=settings.sweep_seconds)
         except asyncio.TimeoutError:
             pass
+    worker.slots.closed = True
+    unfinished = [t for t in running.values() if not t.done()]
+    if unfinished:
+        await asyncio.wait(unfinished, timeout=settings.stop_wait_seconds)
+    hung = set(worker.overdue(settings.job_timeout_seconds))
     for meeting_id, task in running.items():
         if task.done():
             continue
+        renewal = worker.renewals.get(meeting_id)
         try:
-            await asyncio.to_thread(queue.release, meeting_id, owner)
+            if renewal is not None:
+                await renewal.stop()
+            if meeting_id in hung:
+                logger.error(
+                    "run_worker: meeting_id=%s ran past EXPORT_JOB_TIMEOUT_SECONDS; "
+                    "lease left to expire, the next worker counts a crash",
+                    meeting_id,
+                )
+                continue
+            await asyncio.to_thread(queue.release, meeting_id, worker.owner)
         except Exception:  # noqa: BLE001 - its lease expires on its own
             logger.exception("run_worker: could not release meeting_id=%s", meeting_id)

@@ -5,13 +5,19 @@ control-plane callback. The kernel never interprets it (ADR-0001: separate chann
 
 ## States & legal transitions (the machine)
 ```
-joining            → awaiting_admission · active · failed
+joining            → awaiting_admission · needs_help · active · failed
 awaiting_admission → active · needs_help · failed
-needs_help   → active · failed
+needs_help         → awaiting_admission · active · failed
 active             → completed · failed
 completed          ∅   (terminal)
 failed             ∅   (terminal)
 ```
+`needs_help` is entered from `joining` when a blocker stands before any waiting room (Zoom's
+automated-bot wall, a consent gate) and from `awaiting_admission` when one appears in the lobby; it
+leaves for `awaiting_admission` when the blocker clears and the bot reaches the lobby. A `failed`
+from `needs_help` names `failure_stage: awaiting_admission` only if the bot reported
+`awaiting_admission` earlier in the run, otherwise `joining`.
+
 `completed` carries a `completion_reason`; `failed` carries a `failure_stage`. Pre-active teardown
 attribution (the control plane's reconcile path, when the workload dies before the bot reports
 `active`): `awaiting_admission` → `awaiting_admission_timeout` (reaped while waiting in the lobby —
@@ -41,7 +47,8 @@ for operations, but retry latency makes it invalid for rating.
 An **additive** field on a terminal `failed` event, riding this contract's liberal ingestion
 (`additionalProperties: true`) exactly as `infra_fault` and `stt_fault` do — **no schema change, no
 seal bump**. The sealed `CompletionReason` enum is deliberately untouched: it is the retry
-classifier's input (`lifecycle/retry.py`), and this is a diagnostic axis, not a retry input.
+decision's input (meeting-api `intake/retry.py` `NOT_RETRIED`), and this is a diagnostic axis, not a
+retry input.
 
 It exists because `completion_reason` alone could not answer either question an operator asks of a
 failed join. In hosted production, every one of 83 consecutive `join_failure` meetings carried

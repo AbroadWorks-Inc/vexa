@@ -51,7 +51,8 @@ budget above.
 
 ## A failed bot on a live meeting
 
-`intake/retry.py` is the replacement decision. `lifecycle/retry.py` is not that path.
+`intake/retry.py` is the replacement decision, and its `NOT_RETRIED` is the one list of reasons
+that are not retried (the calendar occurrence rule, `lifecycle/occurrence.py`, reads it too).
 
 A failure is retried when the meeting still has active entries, nobody has asked it to stop, and
 `is_bot_failure` is true:
@@ -67,7 +68,7 @@ answer. The meeting ends `failed` (or `completed`) with the reason, and `bot.fai
 | `stopped` | A user called `POST /v2/meetings/{id}/stop`. |
 | `evicted` | The host removed the bot after it was in the call. |
 | `startup_alone` | Nobody joined. |
-| `awaiting_admission_rejected` | The host denied the bot, or the platform refused it (Zoom: "automated bots aren't allowed", which needs Zoom RTMS). |
+| `awaiting_admission_rejected` | The host denied the bot, or the platform refused it (Zoom: "automated bots aren't allowed", which needs Zoom RTMS), or the join ended blocked (`needs_help`) without admission. |
 | `auth_session_missing` | The bot's signed-in profile is signed out. |
 | `validation_error` | The link is not a meeting the bot can join. |
 | `max_bot_time_exceeded` | The bot reached its time cap. |

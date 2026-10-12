@@ -24,11 +24,11 @@ responses against the same shapes.
   `previous_meeting_id`, `entry` (`ReplyEntry`), `meeting` (`Meeting`, always present —
   `project_meeting` never returns `null`, so every result carries the full projected meeting, even
   `removed`/`already_removed`).
-- **`Meeting`** — the §2.4 meeting object, exactly the 19 keys
+- **`Meeting`** — the §2.4 meeting object, exactly the 20 keys
   `meeting_api.intake.projection.project_meeting` renders, in this order:
-  `id, upstream_id, status, completion_reason, failure_stage, outcome, platform, room,
-  meeting_url, title, start, end, time_zone, bot_joins_at, started_at, ended_at, entries, export,
-  sequence`. `id` is the meeting's UUID; `upstream_id` is its integer row id, the id the upstream
+  `id, upstream_id, status, completion_reason, failure_stage, join_failure, outcome, platform,
+  room, meeting_url, title, start, end, time_zone, bot_joins_at, started_at, ended_at, entries,
+  export, sequence`. `id` is the meeting's UUID; `upstream_id` is its integer row id, the id the upstream
   reads take (`GET /recordings?meeting_id=`, `GET /transcripts/by-id/{id}`) and the bot's
   `signal/<user>/<meeting>/<session>/` files are keyed by, so a subscriber such as the exporter
   can read the meeting's recordings from the webhook alone. `start`/`end` are the planned times;
@@ -42,6 +42,14 @@ responses against the same shapes.
   (`golden/Meeting.retry-pending.json`).
 - **`MeetingEntryRef`** — one item of `Meeting.entries`: a finished meeting lists its closed
   entries, any other meeting its active entries; removed entries are never listed.
+- **`JoinFailure`** — `Meeting.join_failure`: why a bot that never got in failed, from the
+  meeting's `data.join_evidence` (the typed evidence meeting-api records on a `failed` pre-active
+  bot). Exactly `{reason, attribution, detail}`; `null` unless the meeting is `failed`, did not
+  end by a user stop (`completion_reason` `stopped`), and has evidence with a string `reason`. `reason` tells a platform refusal (Zoom's automated-bot wall, `attribution:
+  exogenous_platform`) from a host declining the bot (`host_action`); `detail` is the platform's
+  own text, at most 500 characters. While a meeting waits for its next bot (`bot.retry`) the failed
+  bot's evidence is held on the retry marker, and a new bot moves it into the meeting's history, so
+  `join_failure` stays `null` until a bot's failure ends the meeting.
 - **`Outcome`** / **`Export`** — `Meeting.outcome` / `Meeting.export`, each `null` until set.
 - **`EntryState`** — `GET /v2/entries` row (§2.1): the entry's own §2.2 fields, plus
   `content_hash` and `state`, so a sender can diff its view against aw-bots'.

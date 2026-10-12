@@ -76,7 +76,8 @@ The runtime kernel's own `owner_quota` → `QuotaExceeded` (→ 429) is the defe
 Join-retry re-spawns and `continue_meeting` sessions count against the same cap.
 
 Tests: `../../../tests/test_bot_spawn.py` · `test_continue_meeting.py` · `test_max_bots.py`.
-Join-retry (P3d) lives in the `lifecycle` brick: `lifecycle/retry.py` + `test_join_retry.py`.
+A failed bot on a live meeting gets a new bot through `intake/retry.py` (§6.9 F-K2,
+`test_bot_retry.py`); `NOT_RETRIED` there is the one list of reasons that are not retried.
 
 ### Optional external service authority
 

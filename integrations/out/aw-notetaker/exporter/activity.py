@@ -6,14 +6,19 @@ fallback to the debug capture tape (spec: 2026-09-23-speaker-activity-design.md)
 
 from __future__ import annotations
 
+import heapq
 import json
-from collections.abc import Callable, Iterable
+import tempfile
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 EventType = Literal["SPEAKER_START", "SPEAKER_END"]
 Source = Literal["audio", "hint"]
 HintKind = Literal["levels", "dominant"]
+
+# Timeline frames held in memory at once; past it they go to disk in sorted runs.
+_RUN_FRAMES = 50_000
 
 
 @dataclass(slots=True, frozen=True)
@@ -52,13 +57,79 @@ class ActivityEvent:
     kind: HintKind | None = None
 
 
+def _ts(frame: Frame) -> int:
+    return frame.ts
+
+
+class TimelineFrames:
+    """The named frames the timeline is built from, iterated in time order
+    without holding them all in memory.
+
+    Up to `_RUN_FRAMES` frames are kept in memory; each full run is sorted by
+    `ts` and written to an anonymous temporary file, and iteration merges the
+    runs. Both the sort and the merge are stable, so frames with the same `ts`
+    keep their file order: iteration yields exactly `sorted(frames, key=ts)`.
+    The file's own order is no guide, because `t` comes from several page-side
+    clocks (each stream's accumulated audio time, or the page's `Date.now()`)
+    and the lanes append their lines as they arrive. Memory is one run, plus
+    one frame per run on disk while iterating. One iteration at a time.
+    """
+
+    __slots__ = ("_run", "_spilled", "_count", "_names")
+
+    def __init__(self) -> None:
+        self._run: list[Frame] = []
+        self._spilled: list[IO[str]] = []
+        self._count = 0
+        self._names: dict[str, None] = {}
+
+    def append(self, frame: Frame) -> None:
+        self._count += 1
+        if frame.name:
+            self._names.setdefault(frame.name)
+        self._run.append(frame)
+        if len(self._run) >= _RUN_FRAMES:
+            run = tempfile.TemporaryFile("w+", encoding="utf-8")
+            for f in sorted(self._run, key=_ts):
+                run.write(json.dumps([f.ts, f.name, f.rms, f.duration_ms]) + "\n")
+            self._spilled.append(run)
+            self._run = []
+
+    def __len__(self) -> int:
+        return self._count
+
+    def names(self) -> list[str]:
+        """Distinct names in first-seen (file) order."""
+        return list(self._names)
+
+    def __iter__(self) -> Iterator[Frame]:
+        runs: list[Iterable[Frame]] = [_read_run(run) for run in self._spilled]
+        runs.append(sorted(self._run, key=_ts))
+        return heapq.merge(*runs, key=_ts)
+
+    def close(self) -> None:
+        """Drop the frames and the files they were written to."""
+        for run in self._spilled:
+            run.close()
+        self._spilled = []
+        self._run = []
+
+
+def _read_run(run: IO[str]) -> Iterator[Frame]:
+    run.seek(0)
+    for line in run:
+        ts, name, rms, duration_ms = json.loads(line)
+        yield Frame(ts=ts, name=name, rms=rms, duration_ms=duration_ms)
+
+
 @dataclass(slots=True)
 class Activity:
     """One parsed file.
 
-    `frames` holds named frames on every lane; speech events are built from
-    those only. Every frame that parsed, including unnamed ones and the
-    channel number, goes to `parse_activity`'s `capture` as it is read (for the
+    `frames` holds named frames on every lane, in time order, on disk past
+    `_RUN_FRAMES` (`close` drops them); speech events are built from those
+    only. Every frame that parsed, including unnamed ones and the channel
+    number, goes to `parse_activity`'s `capture` as it is read (for the
     per-channel transcript), and is not kept. On the mixed lane (Jitsi, Teams:
     one combined stream) a frame that carries a channel belongs to that
     channel's recording, not to the mix: it is captured only, never in
@@ -67,10 +138,13 @@ class Activity:
 
     lane: str
     started_at: str | None
-    frames: list[Frame] = field(default_factory=list)
+    frames: TimelineFrames = field(default_factory=TimelineFrames)
     hints: list[Hint] = field(default_factory=list)
     frame_count: int = 0
     capped: bool = False
+
+    def close(self) -> None:
+        self.frames.close()
 
 
 def parse_activity(
@@ -162,10 +236,7 @@ def parse_activity(
 
 def names(activity: Activity) -> list[str]:
     """Return distinct named speakers in first-seen order."""
-    seen: dict[str, None] = {}
-    for f in activity.frames:
-        if f.name:
-            seen.setdefault(f.name)
+    seen = dict.fromkeys(activity.frames.names())
     for h in activity.hints:
         seen.setdefault(h.name)
     return list(seen)
@@ -203,7 +274,7 @@ def speech_events(
         )
         del started[name]
 
-    for f in sorted(activity.frames, key=lambda fr: fr.ts):
+    for f in activity.frames:
         for name in [n for n in started if f.ts - last_voiced[n] >= hangover_ms]:
             close(name)
         if not f.name or f.rms < rms_threshold:

@@ -5,6 +5,7 @@
     "status": "completed",
     "completion_reason": "stopped",
     "failure_stage": null,
+    "join_failure": null,
     "outcome": null,
     "platform": "google_meet",
     "room": "kxo-misr-avz",

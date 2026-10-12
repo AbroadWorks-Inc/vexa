@@ -28,10 +28,12 @@ caller's transaction under the meeting's link lock: one of the meeting's sends
 status writer's ``requested`` with ``bot.retry``, the change reason the session's completion
 reason (else the code), and ``data.bot_retry``::
 
-    {reason, stage, message, after_session, workload, at, due_at, proven_gone}
+    {reason, stage, message, after_session, workload, at, due_at, proven_gone[, join_evidence]}
 
 ``reason`` / ``stage`` are the failed session's completion reason and failure stage, kept on the
 marker while the meeting is live (the row's own ``completion_reason`` stays empty until it ends);
+``join_evidence``, when the session recorded one, is kept there too, so the meeting does not read
+as refused while it waits or after a new bot gets in;
 ``workload`` is the failed bot's workload and ``proven_gone`` whether it is already proven gone.
 It returns ``None``, having written nothing, when the failure isn't retried.
 
@@ -43,8 +45,9 @@ sweep both apply that one rule.
 A waiting meeting leaves ``requested`` one of two ways. A new bot claims it once ``proven``: the
 claim writes ``claimed(data)`` (the marker's failure moved into ``completion_history``, the marker
 removed) and no status change. Or ``end(tx, meeting_id, …)`` ends it ``failed`` (``bot.failed``,
-``aw_meetings_failed_total``) with the marker's reason and stage, or the reason given (a stop's
-``stopped``): its planned end passed, it was stopped, or its last send failed before the claim.
+``aw_meetings_failed_total``) with the marker's reason, stage and join evidence, or the reason
+given (a stop's ``stopped``): its planned end passed, it was stopped, or its last send failed
+before the claim.
 """
 
 from __future__ import annotations
@@ -80,7 +83,11 @@ BOT_FAILED = "bot_failed"
 #: Completion reasons that end the meeting, because a new bot would meet the same answer: a
 #: user's stop, the host removing the bot, nobody joining, the host or the platform refusing the
 #: bot (``awaiting_admission_rejected``, e.g. Zoom's "automated bots aren't allowed"), a
-#: signed-out bot profile, a link that isn't a meeting, the bot's time cap reached.
+#: signed-out bot profile, a link that isn't a meeting, the bot's time cap reached. The one list
+#: of what is not retried: the calendar occurrence rule (``lifecycle.occurrence``) reads it too.
+#: ``left_alone`` is not here. A bot that hung up after the room emptied reports ``completed``
+#: itself, which is not a bot failure; the ``left_alone`` that reaches a retry is the one the
+#: runtime or the reconcile sweep writes for a bot lost in the call, and a lost bot is retried.
 NOT_RETRIED = frozenset(
     {
         "stopped",
@@ -93,7 +100,7 @@ NOT_RETRIED = frozenset(
     }
 )
 #: The session's keys the marker carries instead of the row while the meeting is live.
-_KEPT_ON_MARKER = ("completion_reason", "failure_stage", "failure_reason", MARKER)
+_KEPT_ON_MARKER = ("completion_reason", "failure_stage", "failure_reason", "join_evidence", MARKER)
 
 
 def pending_from() -> frozenset[str]:
@@ -147,6 +154,8 @@ def claimed(data: Any) -> dict[str, Any]:
     out["completion_reason"] = mark.get("reason")
     out["failure_stage"] = mark.get("stage")
     out["failure_reason"] = mark.get("message") or "the bot failed"
+    if mark.get("join_evidence") is not None:
+        out["join_evidence"] = mark["join_evidence"]
     out = _archive_completion(out)
     if mark.get("after_session"):
         history = out["completion_history"]
@@ -229,7 +238,7 @@ def unfinished_spawn(
     if newest_session and newest_session in retired_sessions(data):
         code, message = over
         last = data["completion_history"][-1]
-        for key in ("completion_reason", "failure_stage"):
+        for key in ("completion_reason", "failure_stage", "join_evidence"):
             if last.get(key) is not None:
                 patch[key] = last[key]
     else:
@@ -314,6 +323,9 @@ async def retry(
         "due_at": iso_utc(due),
         "proven_gone": failure.proven_gone,
     }
+    evidence = (data_patch or {}).get("join_evidence")
+    if evidence is not None:
+        patch[MARKER]["join_evidence"] = evidence
     return await tx.status(
         meeting_id,
         "requested",
@@ -357,6 +369,8 @@ async def end(
         patch["completion_reason"] = reason
     if mark.get("stage") is not None:
         patch["failure_stage"] = mark["stage"]
+    if mark.get("join_evidence") is not None:
+        patch["join_evidence"] = mark["join_evidence"]
     return await tx.status(
         meeting_id,
         "failed",

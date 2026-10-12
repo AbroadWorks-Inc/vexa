@@ -614,7 +614,7 @@ def test_channel_identity_sticks_to_the_first_chunk():
         },
     )
     rejected_mf = next(m for m in rejected["media_files"] if m["type"] == "ch0")
-    assert rejected_mf["metadata"] == {"sample_rate": 16000}
+    assert rejected_mf["metadata"] == {"sample_rate": 16000, "participant_id": "x" * 200}
 
     renamed, _ = _fold_audio(
         rec, chunk_seq=1, file_size=50, sample_rate=None,
@@ -1003,4 +1003,122 @@ def test_a_channel_chunk_without_its_number_is_refused_but_a_whole_upload_is_not
         ).status_code
 
     assert post({"media_type": "ch3", "media_format": "webm", "is_final": False}) == 422
+    assert post({"media_type": "ch3", "media_format": "webm", "chunk_seq": None}) == 422
     assert post({"media_type": "audio", "media_format": "webm"}) == 200
+
+
+def test_a_channel_chunk_without_its_number_is_refused_only_after_auth():
+    """An unauthenticated caller learns nothing about the body: 401 before any 422."""
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    status = client.post(
+        "/internal/recordings/upload", headers={"Authorization": "Bearer not-a-token"},
+        data={"metadata": json.dumps({"session_uid": SESSION_UID, "media_type": "ch3"})},
+        files={"file": ("c.webm", b"chunk", "video/webm")},
+    ).status_code
+    assert status == 401
+
+
+def _fold(prior, media_type, *, chunk_seq, is_final, file_size=100):
+    return apply_chunk_to_recording(
+        prior, recording_id=123, meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID,
+        media_type=media_type, media_format="webm", storage_path=f"k/{media_type}/{chunk_seq}",
+        file_size=file_size, chunk_seq=chunk_seq, is_final=is_final, duration_seconds=None,
+        sample_rate=None,
+    )
+
+
+def test_a_channel_final_finalises_that_channel_and_not_the_recording():
+    """A Jitsi speaker who leaves sends their channel's final mid-meeting. The recording is still
+    being made: only the mixed lane's final completes it."""
+    rec, _ = _fold(None, "audio", chunk_seq=0, is_final=False)
+    rec, _ = _fold(rec, "ch0", chunk_seq=0, is_final=False)
+    rec, transitioned = _fold(rec, "ch0", chunk_seq=1, is_final=True, file_size=0)
+    assert (rec["status"], rec["completed_at"], transitioned) == ("in_progress", None, False)
+    assert next(m for m in rec["media_files"] if m["type"] == "ch0")["is_final"] is True
+    assert next(m for m in rec["media_files"] if m["type"] == "audio")["is_final"] is False
+
+    rec, transitioned = _fold(rec, "audio", chunk_seq=1, is_final=True, file_size=0)
+    assert (rec["status"], transitioned) == ("completed", True)
+    assert rec["completed_at"] is not None
+
+
+def test_a_recording_started_by_a_channel_final_is_in_progress():
+    rec, transitioned = _fold(None, "ch2", chunk_seq=0, is_final=True)
+    assert (rec["status"], rec["completed_at"], transitioned) == ("in_progress", None, False)
+
+
+async def test_a_channel_final_logs_no_recording_completed(capsys):
+    repo, storage = _seeded()
+    for seq, final in ((0, False), (1, True)):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=b"chunk", media_type="ch1", media_format="webm", chunk_seq=seq, is_final=final,
+        )
+    assert receipt["status"] == "in_progress"
+    assert "recording_completed" not in capsys.readouterr().out
+
+
+def test_an_unknown_channel_kind_is_dropped_with_a_warning_naming_it(capsys):
+    """Warned once per media file, on its first chunk: every chunk carries the kind."""
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=None,
+        chunk_metadata={"channel_kind": "zoom", "display_name": "Ada"},
+    )
+    rec, _ = _fold_audio(
+        rec, chunk_seq=1, file_size=100, sample_rate=None,
+        chunk_metadata={"channel_kind": "zoom", "display_name": "Ada"},
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"display_name": "Ada"}
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    warned = [e for e in lines if e.get("event") == "recording_channel_kind_unknown"]
+    assert len(warned) == 1 and warned[0]["level"] == "warning"
+    assert warned[0]["fields"] == {"channel_kind": "zoom"}
+    assert "Ada" not in json.dumps(warned[0])
+
+
+def test_a_long_name_is_kept_cut_to_200_characters():
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=None,
+        chunk_metadata={"display_name": "a" * 250, "stream_id": "s" * 201},
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"display_name": "a" * 200, "stream_id": "s" * 200}
+
+
+def _channels_only(session_uid=SESSION_UID):
+    rec, _ = _fold(None, "ch1", chunk_seq=0, is_final=False)
+    rec, _ = _fold(rec, "ch1", chunk_seq=1, is_final=True, file_size=0)
+    return {**rec, "session_uid": session_uid}
+
+
+def test_a_recording_of_only_channels_completes_when_its_session_ends():
+    """The mix was not recorded (no mixed lane), so no final chunk can complete the recording:
+    the end of its bot session does."""
+    from meeting_api.recordings.jsonb import finish_session_recordings
+
+    mixed, _ = _fold(None, "audio", chunk_seq=0, is_final=False)
+    other = _channels_only("another-session")
+    out = finish_session_recordings([_channels_only(), mixed, other], SESSION_UID)
+    assert out is not None
+    assert (out[0]["status"], out[0]["completed_at"] is not None) == ("completed", True)
+    assert out[1]["status"] == "in_progress"  # a mixed lane completes on its own final
+    assert out[2]["status"] == "in_progress"  # another session's recording is not this one's
+    assert finish_session_recordings([mixed], SESSION_UID) is None
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_the_session_terminal_write_completes_a_channel_only_recording(terminal):
+    import asyncio
+
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    repo = InMemoryMeetingRepo()
+    m = asyncio.run(repo.create_meeting(
+        user_id=USER, platform="jitsi", native_meeting_id="room", data={"recordings": [_channels_only()]},
+    ))
+    asyncio.run(repo.create_session(meeting_id=m["id"], session_uid=SESSION_UID))
+    repo.set_status(m["id"], "active")
+    asyncio.run(repo.update_meeting_status(session_uid=SESSION_UID, status=terminal))
+    assert repo._meetings[m["id"]]["data"]["recordings"][0]["status"] == "completed"

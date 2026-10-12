@@ -481,7 +481,7 @@ def _stopped_reopen_detail(meeting_id) -> str:
 # row, so the first run's ending is history, not noise: erasing it left no record that the row had
 # ever completed, which is how a resurrected row (rev 193, 26313) read as if it had never ended.
 _COMPLETION_HISTORY_KEY = "completion_history"
-_ARCHIVED_KEYS = ("completion_reason", "failure_stage", "failure_reason")
+_ARCHIVED_KEYS = ("completion_reason", "failure_stage", "failure_reason", "join_evidence")
 _COMPLETION_HISTORY_CAP = 20
 
 
@@ -601,7 +601,9 @@ class DuplicateMeeting(Exception):
 # Statuses in which the bot has NOT yet reached the meeting. Their row goes quiet by DESIGN — a bot
 # parked in a waiting room reports `awaiting_admission` once and then polls silently for the whole
 # lobby budget the control plane handed it — so they carry their OWN (longer) reconcile window.
-PRE_ACTIVE_MEETING_STATUSES = frozenset({"requested", "joining", "awaiting_admission"})
+# `needs_help` is one of them: it is entered from `joining` or `awaiting_admission` only, and
+# `active -> needs_help` is not an edge (lifecycle.machine.LEGAL_TRANSITIONS).
+PRE_ACTIVE_MEETING_STATUSES = frozenset({"requested", "joining", "awaiting_admission", "needs_help"})
 
 
 def reconcile_grace_for_status(

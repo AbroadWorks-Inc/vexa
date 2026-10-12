@@ -106,7 +106,7 @@ def test_intake_golden_count_covers_every_reply_result_and_error_code():
 
 
 def test_every_reply_golden_meeting_is_the_full_projection_shape():
-    """Reply.meeting is never null and always carries the 19 §2.4 keys, for every result —
+    """Reply.meeting is never null and always carries the 20 §2.4 keys, for every result —
     including the removal-shaped results (removed/entry_removed/bot_stopping/already_removed).
     """
     expected_keys = {
@@ -115,6 +115,7 @@ def test_every_reply_golden_meeting_is_the_full_projection_shape():
         "status",
         "completion_reason",
         "failure_stage",
+        "join_failure",
         "outcome",
         "platform",
         "room",

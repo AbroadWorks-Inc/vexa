@@ -12,6 +12,7 @@
     "status": "scheduled",
     "completion_reason": null,
     "failure_stage": null,
+    "join_failure": null,
     "outcome": {
       "kind": "cancelled_by_calendar",
       "detail": "entry_removed",

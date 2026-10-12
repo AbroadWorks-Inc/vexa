@@ -89,7 +89,7 @@ MATRIX: list[Cell] = [
          why="died before it even reported — nothing about the meeting refused us"),
     Cell("failed/awaiting_admission_timeout", status="failed",
          reason="awaiting_admission_timeout", stage="awaiting_admission", expect=RETRY,
-         why="nobody let it out of the lobby in time; TRANSIENT in retry.py — the host may be late"),
+         why="nobody let it out of the lobby in time; retried (not in NOT_RETRIED) — the host may be late"),
     Cell("failed/start_failed", status="failed", reason="start_failed", stage="requested",
          expect=RETRY,
          why="fail_meeting's out-of-enum reason: the WORKLOAD never started, the most retryable "
@@ -113,7 +113,7 @@ MATRIX: list[Cell] = [
              "in the room whether or not anything recorded why it left"),
     Cell("failed/awaiting_admission_rejected", status="failed",
          reason="awaiting_admission_rejected", stage="awaiting_admission", expect=SERVED,
-         why="the host said NO; PERMANENT in retry.py — a retry re-knocks on a slammed door"),
+         why="the host said NO; in NOT_RETRIED — a retry re-knocks on a slammed door"),
     Cell("failed/auth_session_missing", status="failed", reason="auth_session_missing",
          stage="joining", expect=SERVED,
          why="signed-out profile; a re-spawn hits the same dead cookie jar"),
@@ -234,7 +234,7 @@ async def test_cell_dispatch_through_the_live_seam(cell: Cell):
 # applied to every row rather than three more rows chosen by whoever wrote them.
 #
 # The storm (2026-08-18, stage rev 193): a DELETE that lost a race left the row terminal as
-# `join_failure` — a reason `retry.py` classes TRANSIENT — with `stop_requested` true the whole
+# `join_failure` — a reason that is retried (not in `intake.retry.NOT_RETRIED`) — with `stop_requested` true the whole
 # time. Classification alone was not enough: the reason must be dominated at the WRITE, because
 # every reader that keys on `completion_reason` and not on the flag would otherwise re-dispatch.
 # So the column is asserted in both places, the classifier and the writer.
@@ -264,7 +264,7 @@ def test_stop_dominance_at_the_writers(cell: Cell):
 
     The classifier reads `data`; these produce it. A reason written as `join_failure` on a stopped
     row is re-dispatchable to every consumer that never looks at the flag — including
-    ``retry.py``'s TRANSIENT/PERMANENT taxonomy, which is what actually let 26313 back in."""
+    the retry taxonomy (now ``intake.retry.NOT_RETRIED``), which is what actually let 26313 back in."""
     assert dominant_completion_reason(cell.reason, stop_requested=True) == "stopped"
     # ...while a run nobody stopped keeps its own reason, unchanged.
     assert dominant_completion_reason(cell.reason, stop_requested=False) == cell.reason

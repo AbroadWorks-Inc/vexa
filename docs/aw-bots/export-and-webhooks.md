@@ -83,11 +83,13 @@ One pass writes:
 | `recordings.json` | Recording list |
 | `live_transcript.json` | The meeting's live transcript; `{"segments": []}` when the bot had none |
 | `signal/` | Only when `EXPORT_DEBUG` is true |
-| `_export.json` | The exporter's own state, including `handed_off` |
+| `_export.json` | The exporter's own state, including `handed_off`. An `audio_mismatch` holds counts and levels, never a speaker's name. A rerun refused because the meeting is being transcribed adds `rerun` here and leaves the state as it was |
 
 Several bot sessions on one meeting are joined into that one folder, up to
 `EXPORT_MAX_RECORDINGS` (the Deployment sets 50). Past that, the export fails
-`too_many_recordings` and writes nothing else. Channel pieces from those sessions
+`too_many_recordings` and writes only `_export.json` and the empty
+`channels/index.json`, `speaker_activity_frames.json` and `live_transcript.json`, as a
+`no_audio` export does. Channel pieces from those sessions
 share one `channels/ch<N>.webm` per channel number. The index row keeps the earliest
 piece's identity.
 
@@ -100,6 +102,21 @@ retention class (the index expires with the files it names);
 `speaker_activity_frames.json` uses `metadata`. Every run writes every file above,
 so a rerun leaves nothing stale; notetaker-worker removes the channel files the
 index does not name.
+
+Memory stays flat at any meeting length: activity frames are streamed to disk as
+they are read, the timeline's named frames wait on disk in sorted runs past 50,000,
+and a speaker's level is measured in wav blocks of at most 2 MiB.
+
+The queue (`aw-exporter/pending/`) changes each item with a conditional write
+(`IfMatch` / `IfNoneMatch`), so a webhook, a rerun request and the worker never
+undo each other. A pod kill charges a crash to every export it was running; a
+meeting with a crash then exports alone, and its second crash quarantines it.
+A job running past `EXPORT_JOB_TIMEOUT_SECONDS` fails `/healthz`, so the pod is
+restarted and that meeting is charged a crash; on SIGTERM running exports get
+`EXPORT_STOP_WAIT_SECONDS` to finish. `python -m exporter.rerun` refuses a meeting
+still in the queue or being transcribed, and the export job asks notetaker-worker
+again before a rerun writes anything; a refused rerun never turns a `handed_off`
+export into `failed`. Details: the [package README](../../integrations/out/aw-notetaker/README.md).
 
 `POST /process` goes to `NOTETAKER_URL`. The exporter Deployment sets
 `http://notetaker-api.notetaker.svc.cluster.local:8080`. The runbook's prerequisite check is

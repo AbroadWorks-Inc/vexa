@@ -91,7 +91,11 @@ channel, same timeslice (`VEXA_RECORDING_TIMESLICE_MS`, default 15000 ms). The p
 new elements every 2 seconds. Each channel uploads as media type `ch<N>`
 (`bot/src/recording.ts`). meeting-api stores that as its own media file under
 `recordings/{user}/{recording}/{session}/ch<N>/` (`recordings/jsonb.py` `chunk_storage_key`)
-and finalizes it with the same `finalize_master` as `audio`. The list prefix includes a
+and finalizes it with the same `finalize_master` as `audio`. A channel's final chunk (sent when
+its speaker leaves, or at stop) marks only that media file final; the recording turns `completed`
+on the `audio` lane's final, or, when the mix was not recorded, when the bot session ends. A `ch<N>` chunk without a `chunk_seq` (absent or `null`) is refused
+with 422 after the upload is authenticated. Names over 200 characters are sent and stored cut to
+200. The list prefix includes a
 trailing slash (`recordings/service.py`), so one media type is not concatenated into another
 whose name starts the same way.
 

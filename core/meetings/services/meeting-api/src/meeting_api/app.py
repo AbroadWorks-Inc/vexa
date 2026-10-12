@@ -1106,9 +1106,9 @@ def _mount_lifecycle(
         ALSO consumes a runtime-confirmed TERMINAL workload state as evidence the run is over, driving a
         synthetic terminal through the SAME in-process lifecycle logic (no HTTP self-POST):
 
-          * PRE-ACTIVE meeting → ``failed`` (CC5): the bot never started/reported and never will, so the
-            meeting would otherwise hang ``requested``/``joining`` forever.
-          * WAS-ACTIVE meeting (``stopping``/``active``/``needs_help``) → ``completed``: the bot reached
+          * PRE-ACTIVE meeting (``needs_help`` included) → ``failed`` (CC5): the bot never got in and
+            never will, so the meeting would otherwise hang ``requested``/``joining`` forever.
+          * WAS-ACTIVE meeting (``stopping``/``active``) → ``completed``: the bot reached
             the meeting but its workload is now runtime-confirmed gone WITHOUT its own terminal callback
             (e.g. SIGKILLed at teardown before it could POST ``completed``, or killed in the waiting room
             on a stop). Without this the meeting stays ``stopping`` and the stop-reconcile sweep re-DELETEs

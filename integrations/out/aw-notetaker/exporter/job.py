@@ -17,7 +17,8 @@ The outcome is reported through the gateway (`export_result.py`) after it is
 recorded in `_export.json`: `handed_off` after `/process`, `failed` when a
 completed meeting has no audio, a meeting has more recordings than
 `EXPORT_MAX_RECORDINGS`, or a speaker with more than 10 s of timeline
-coverage is missing from the wav (`audio_mismatch`). A re-run of a
+coverage is missing from the wav (`audio_mismatch`, which names no speaker:
+counts and levels only). A re-run of a
 handed-off folder only reports again. `audio_mismatch` is not `handed_off`,
 so a later re-enqueue runs the check again.
 
@@ -26,7 +27,15 @@ folder: every file is written again from what aw-bots holds now, so a file
 an earlier export could not write (a channel whose master timed out) is
 filled in, and the folder goes to notetaker-worker's `/process` with
 `"rerun": true`, which redoes the transcript where a plain `/process` would be
-an idempotent no-op.
+an idempotent no-op. Before it writes anything, a rerun asks notetaker-worker
+whether it is transcribing the meeting (`GET /status/{id}`); if so the rerun
+writes no export file and ends `rerun_refused`, the reason added to
+`_export.json` as `rerun` beside the marker already there; it is reported
+`failed` only when that marker is not `handed_off`. A `/status` that can't
+answer raises, so the queue retries. Once the rerun's `/process` is accepted,
+its `_export.json` is kept on the pending item (`RerunProgress`) before the
+steps after it; a retry then only writes that marker and reports, without
+asking about the transcription (its own) or writing anything else.
 
 A meeting can have several bot sessions (a bot failed and a new one joined,
 §6.9 F-K2); each session with audio has its own recording. They make ONE
@@ -35,24 +44,29 @@ session sits at its own origin's offset from it, and the gaps are silence.
 One session is exported from its recording as it stands.
 
 A recording may also carry per-channel media (`ch0`, `ch1`, ...). Each
-channel is written as its recorder made it, opus `channels/ch<N>.webm`, with
-one `channels/index.json` row naming the `file` and its `offset_s` on the
-meeting clock; nothing is decoded or padded (a 2-hour, 19-speaker meeting's
-channels are ~270 MB as opus and would be ~3.5 GB as 16 kHz wav). One bot
-session's channel is an S3 copy of its master; a channel several sessions
-recorded is joined into one opus file, one channel at a time. Every frame
+channel is written as opus `channels/ch<N>.webm`, with one
+`channels/index.json` row naming the `file` and its `offset_s` on the meeting
+clock; it is never written as 16 kHz wav (a 2-hour, 19-speaker meeting's
+channels are ~270 MB as opus and would be ~3.5 GB as wav). One bot session's
+channel is an S3 copy of its recorder's master, as recorded; a channel several
+sessions recorded is decoded once per piece to measure it, and the pieces are
+joined with ffmpeg into one re-encoded opus file with silence between them,
+one channel at a time. Every frame
 that parsed, named or not, is written to `speaker_activity_frames.json` with
 its channel (none for a mixed-lane frame); frames are written to disk as they
-are read, so memory stays flat however long the meeting. On the mixed lane the
-timeline reads only the mix's own frames (no channel).
+are read, the timeline's named frames go to disk in sorted runs past a bound,
+and the wav is measured in bounded blocks, so memory stays flat however long
+the meeting. On the mixed lane the timeline reads only the mix's own frames
+(no channel).
 
 Every run writes every file the exporter owns, so a rerun leaves nothing
 stale: `channels/index.json` is `[]` for a meeting with no channel media or
 whose channel step failed (fetch, copy, join: logged, and the mixed export and
 `/process` go on as without channels); `speaker_activity_frames.json` is `[]`
 when no session's activity parsed; `live_transcript.json` has no segments
-when the bot had no live transcription. The index goes last, so it never
-names a file this run did not write. The exporter deletes nothing here
+when the bot had no live transcription. A run that ends `no_audio` or
+`too_many_recordings` writes those three empty. The index goes last, so it
+never names a file this run did not write. The exporter deletes nothing here
 (§1.9): notetaker-worker removes, on a rerun, the channel files the index no
 longer names.
 
@@ -67,8 +81,11 @@ import audioop
 import json
 import logging
 import math
+import operator
+import sys
 import tempfile
 import wave
+from array import array
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -114,10 +131,14 @@ State = Literal[
     "skipped",
     "already_done",
     "audio_mismatch",
+    "rerun_refused",
 ]
 # A speaker must have strictly more than this much timeline coverage before
 # their wav RMS can fail the export. Shorter turns stay a hand-off.
 _MISMATCH_MIN_COVERAGE_S = 10.0
+# The most wav frames read at once when measuring a speaker's level (2 MiB of
+# mono s16; ~65 s at 16 kHz).
+_LEVEL_BLOCK_FRAMES = 1 << 20
 ActivityState = Literal["ok", "missing", "invalid", "capped"]
 # A meeting's `speaker_activity` is its worst session's, in this order.
 _ACTIVITY_SEVERITY: tuple[ActivityState, ...] = ("ok", "capped", "invalid", "missing")
@@ -176,6 +197,17 @@ class Deps:
 class ExportResult:
     state: State
     folder: str
+
+
+@dataclass
+class RerunProgress:
+    """How far a rerun got, kept on its pending item. `handed_off` is the
+    `_export.json` the rerun wrote once its `/process` was accepted (None
+    before that); `record` keeps that marker on the item, raising when it
+    can't, before anything after `/process` runs."""
+
+    handed_off: dict[str, Any] | None
+    record: Callable[[dict[str, Any]], None]
 
 
 def recording_origin_ms(recording: Mapping[str, Any], timeslice_ms: int) -> int:
@@ -607,13 +639,16 @@ def _session_activity(
                 deps.storage.iter_lines(settings.vexa_bucket, session.activity_key),
                 capture,
             )
-        events = speech_events(
-            activity,
-            session.origin_ms - start_ms,
-            settings.rms_speech_threshold,
-            settings.speech_hangover_ms,
-        )
-        speaker_names = activity_names(activity)
+        try:
+            events = speech_events(
+                activity,
+                session.origin_ms - start_ms,
+                settings.rms_speech_threshold,
+                settings.speech_hangover_ms,
+            )
+            speaker_names = activity_names(activity)
+        finally:
+            activity.close()
     except (KeyError, TypeError, ValueError) as exc:
         frames_path.unlink(missing_ok=True)
         logger.warning(
@@ -674,8 +709,8 @@ def _speaker_levels(
     Intervals are the windows. When the timeline has none, point runs use the
     same closure as the interval fallback (last point plus hangover, clipped
     to the next speaker). A speaker is included only when that coverage is
-    strictly longer than 10 s. The wav is read span by span; the whole file
-    is not held as a Python list.
+    strictly longer than 10 s. The wav is read in blocks of at most
+    `_LEVEL_BLOCK_FRAMES`, however long a window is.
     """
     if timeline.speaker_intervals:
         spans = [
@@ -714,11 +749,9 @@ def _speaker_levels(
                 if end <= start:
                     continue
                 wav.setpos(start)
-                raw = wav.readframes(end - start)
-                samples = len(raw) // 2
+                rms, samples = _window_rms(wav, end - start)
                 if samples == 0:
                     continue
-                rms = audioop.rms(raw, 2)
                 sum_sq += float(rms) * float(rms) * samples
                 count += samples
             coverage_s = count / rate if rate else 0.0
@@ -731,8 +764,96 @@ def _speaker_levels(
     return levels
 
 
+def _window_rms(wav: wave.Wave_read, frames: int) -> tuple[int, int]:
+    """`audioop.rms` of the next `frames` frames of a mono s16 wav, and how
+    many samples were read, holding at most `_LEVEL_BLOCK_FRAMES` at once.
+
+    A window of one block is `audioop.rms` itself. A longer one sums its exact
+    squares block by block and truncates the root as `audioop.rms` does, so
+    the result is the same whenever the window's sum of squares is below
+    2**53 (`audioop` sums in a double): any real speech."""
+    if frames <= _LEVEL_BLOCK_FRAMES:
+        raw = wav.readframes(frames)
+        samples = len(raw) // 2
+        return (audioop.rms(raw, 2) if samples else 0), samples
+    sum_sq = 0
+    samples = 0
+    while samples < frames:
+        raw = wav.readframes(min(_LEVEL_BLOCK_FRAMES, frames - samples))
+        if not raw:
+            break
+        block = array("h")
+        block.frombytes(raw)
+        if sys.byteorder == "big":
+            block.byteswap()
+        sum_sq += sum(map(operator.mul, block, block))
+        samples += len(block)
+    return (int(math.sqrt(sum_sq / samples)) if samples else 0), samples
+
+
+def _write_empty_owned_files(base: str, deps: Deps) -> None:
+    """The files a full export writes beside `_export.json`, empty, for a run
+    that ends before it has them: no file of an earlier export survives it."""
+    settings = deps.settings
+    deps.storage.put_json(
+        settings.export_bucket, base + "channels/index.json", [], retention=AUDIO
+    )
+    deps.storage.put_json(
+        settings.export_bucket, base + FRAMES_FILE, [], retention=METADATA
+    )
+    deps.storage.put_json(
+        settings.export_bucket,
+        base + "live_transcript.json",
+        {"segments": []},
+        retention=METADATA,
+    )
+
+
+def _refuse_rerun(
+    existing: Any, meeting_uuid: str, vexa_meeting_id: int, folder: str, deps: Deps
+) -> ExportResult:
+    """notetaker-worker is transcribing this folder now: the rerun writes none
+    of the files it reads and ends failed. The reason goes on `_export.json`
+    (the exporter's own state, which the worker does not read) as `rerun`,
+    beside the marker that is there, whose state stays; a folder without one
+    gets a `failed` marker. The refusal is reported `failed` only over a
+    folder that is not handed off: aw-bots' `handed_off` export, whose
+    transcript exists, is never turned into `failed` by a refused rerun."""
+    settings = deps.settings
+    base = settings.export_prefix + folder + "/"
+    error = "rerun refused: transcription in progress for this meeting"
+    logger.error(
+        "rerun_refused meeting_id=%s vexa_meeting_id=%s reason=transcribing; "
+        "no export file written",
+        meeting_uuid,
+        vexa_meeting_id,
+    )
+    refusal = {"state": "failed", "error": error, "at": deps.now().isoformat()}
+    if isinstance(existing, dict) and existing.get("state"):
+        marker = {**existing, "rerun": refusal}
+    else:
+        marker = {
+            "state": "failed",
+            "meeting_id": meeting_uuid,
+            "vexa_meeting_id": vexa_meeting_id,
+            "error": error,
+            "rerun": refusal,
+        }
+    deps.storage.put_json(
+        settings.export_bucket, base + "_export.json", marker, retention=METADATA
+    )
+    if marker["state"] != "handed_off":
+        deps.export_result.report(
+            meeting_uuid, "failed", f"s3://{settings.export_bucket}/{base}", error
+        )
+    return ExportResult("rerun_refused", folder)
+
+
 def export_meeting(
-    envelope: dict[str, Any], deps: Deps, rerun: bool = False
+    envelope: dict[str, Any],
+    deps: Deps,
+    rerun: bool = False,
+    progress: RerunProgress | None = None,
 ) -> ExportResult:
     settings = deps.settings
     storage = deps.storage
@@ -754,10 +875,26 @@ def export_meeting(
     base = settings.export_prefix + folder + "/"
     s3_path = f"s3://{settings.export_bucket}/{base}"
 
+    if rerun and progress is not None and progress.handed_off is not None:
+        # An earlier attempt of this rerun had its /process accepted: the
+        # worker may be transcribing it now, so nothing is written again and
+        # the transcription check would refuse the rerun's own job. Only the
+        # steps after /process are left.
+        storage.put_json(
+            settings.export_bucket,
+            base + "_export.json",
+            progress.handed_off,
+            retention=METADATA,
+        )
+        deps.export_result.report(meeting_uuid, "handed_off", s3_path)
+        return ExportResult("handed_off", folder)
+
     existing = storage.get_json(settings.export_bucket, base + "_export.json")
     if existing and existing.get("state") == "handed_off" and not rerun:
         deps.export_result.report(meeting_uuid, "handed_off", s3_path)
         return ExportResult("already_done", folder)
+    if rerun and deps.notetaker.transcribing(meeting_uuid):
+        return _refuse_rerun(existing, meeting_uuid, vexa_meeting_id, folder, deps)
 
     platform = m["platform"]
 
@@ -775,6 +912,7 @@ def export_meeting(
             vexa_meeting_id,
             settings.max_recordings,
         )
+        _write_empty_owned_files(base, deps)
         storage.put_json(
             settings.export_bucket,
             base + "_export.json",
@@ -800,6 +938,7 @@ def export_meeting(
         )
         return ExportResult("skipped", folder)
     if not audio_recs:
+        _write_empty_owned_files(base, deps)
         storage.put_json(
             settings.export_bucket,
             base + "_export.json",
@@ -1013,15 +1152,18 @@ def export_meeting(
         }
         if quiet:
             finished = deps.now()
-            detail = ", ".join(
-                f"{name} rms={row['rms']:.4f} coverage_s={row['coverage_s']}"
-                for name, row in sorted(levels.items())
+            error = (
+                f"audio_mismatch: {len(quiet)} of {len(levels)} speakers with more "
+                f"than {_MISMATCH_MIN_COVERAGE_S:g} s of timeline coverage are below "
+                f"rms {settings.rms_speech_threshold} in the audio (lowest rms="
+                f"{min(row['rms'] for row in quiet.values()):.4f})"
             )
-            error = f"audio_mismatch: {detail}"
             logger.error(
-                "audio_mismatch vexa_meeting_id=%s %s",
+                "audio_mismatch vexa_meeting_id=%s speakers_checked=%d "
+                "speakers_quiet=%d",
                 vexa_meeting_id,
-                detail,
+                len(levels),
+                len(quiet),
             )
             storage.put_json(
                 settings.export_bucket,
@@ -1036,7 +1178,11 @@ def export_meeting(
                     "speaker_activity": "audio_mismatch",
                     "speaker_activity_events": len(events),
                     "audio_recordings": len(audio_recs),
-                    "speaker_levels": levels,
+                    "speakers_checked": len(levels),
+                    "speakers_quiet": len(quiet),
+                    "speaker_levels": sorted(
+                        levels.values(), key=lambda row: (row["rms"], row["coverage_s"])
+                    ),
                 },
                 retention=METADATA,
             )
@@ -1046,20 +1192,23 @@ def export_meeting(
         deps.notetaker.process(meeting_uuid, base, platform, rerun=rerun)
 
         finished = deps.now()
+        handed_off = {
+            "state": "handed_off",
+            "meeting_id": meeting_uuid,
+            "vexa_meeting_id": vexa_meeting_id,
+            "exported_at": finished.isoformat(),
+            "elapsed_s": (finished - started).total_seconds(),
+            "exporter_version": __version__,
+            "speaker_activity": activity_state,
+            "speaker_activity_events": len(events),
+            "audio_recordings": len(audio_recs),
+        }
+        if rerun and progress is not None:
+            progress.record(handed_off)
         storage.put_json(
             settings.export_bucket,
             base + "_export.json",
-            {
-                "state": "handed_off",
-                "meeting_id": meeting_uuid,
-                "vexa_meeting_id": vexa_meeting_id,
-                "exported_at": finished.isoformat(),
-                "elapsed_s": (finished - started).total_seconds(),
-                "exporter_version": __version__,
-                "speaker_activity": activity_state,
-                "speaker_activity_events": len(events),
-                "audio_recordings": len(audio_recs),
-            },
+            handed_off,
             retention=METADATA,
         )
         deps.export_result.report(meeting_uuid, "handed_off", s3_path)

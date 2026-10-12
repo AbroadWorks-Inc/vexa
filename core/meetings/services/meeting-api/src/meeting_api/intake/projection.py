@@ -10,6 +10,10 @@ Field-source decisions (grounded in the existing code, not invented):
   * ``completion_reason`` / ``failure_stage`` — ``data.completion_reason`` / ``data.failure_stage``,
     the keys the lifecycle machine already writes there (mirrors ``app.py``'s own
     ``_meeting_projection_from_row`` hoist).
+  * ``join_failure`` — ``data.join_evidence``, the typed join-failure evidence the lifecycle machine
+    (or the reconcile sweep) records on a ``failed`` pre-active terminal: only its ``reason``,
+    ``attribution`` and ``detail``, so a reader can tell the platform refusing the bot from the
+    host declining it. ``None`` without evidence carrying a string ``reason``.
   * ``title`` / ``meeting_url`` — ``data.title`` / ``data.constructed_meeting_url``, the keys
     ``collector/adapters.py`` and ``bot_spawn/service.py`` already write; there is no plain
     ``data.meeting_url``.
@@ -99,6 +103,32 @@ def _export(aw: Optional[Mapping[str, Any]]) -> Optional[dict]:
     }
 
 
+#: The longest ``join_failure.detail`` rendered. The producer already caps it at this length
+#: (``lifecycle.join_evidence.DETAIL_MAX_CHARS``); the projection does not trust that.
+_JOIN_FAILURE_DETAIL_MAX = 500
+
+
+def _text(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) else None
+
+
+def _join_failure(status: Any, data: Mapping[str, Any]) -> Optional[dict]:
+    """Why the bot never got in, for a meeting that ended on it: ``failed``, and not ended by a user
+    stop (a stop while the meeting waited for its next bot keeps the earlier bot's evidence, which
+    is not why the meeting ended)."""
+    if status != "failed" or data.get("completion_reason") == "stopped":
+        return None
+    evidence = data.get("join_evidence")
+    if not isinstance(evidence, Mapping) or not isinstance(evidence.get("reason"), str):
+        return None
+    detail = _text(evidence.get("detail"))
+    return {
+        "reason": evidence["reason"],
+        "attribution": _text(evidence.get("attribution")),
+        "detail": detail[:_JOIN_FAILURE_DETAIL_MAX] if detail is not None else None,
+    }
+
+
 def _data_of(meeting: Mapping[str, Any]) -> dict[str, Any]:
     """The meeting row's ``data`` blob, or ``{}`` when absent/malformed."""
     value = meeting.get("data")
@@ -151,6 +181,7 @@ def project_meeting(
         "status": meeting.get("status"),
         "completion_reason": data.get("completion_reason"),
         "failure_stage": data.get("failure_stage"),
+        "join_failure": _join_failure(meeting.get("status"), data),
         "outcome": _outcome(aw),
         "platform": meeting.get("platform"),
         "room": meeting.get("platform_specific_id"),

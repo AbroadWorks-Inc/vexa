@@ -14,6 +14,13 @@ if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
 
 _NOT_FOUND_CODES = {"404", "NoSuchKey"}
+# A conditional write lost: the object changed, appeared or went since it was
+# read (412), or another conditional write on it was in flight (409).
+_CONFLICT_CODES = {"412", "PreconditionFailed", "409", "ConditionalRequestConflict"}
+
+
+class PreconditionFailed(Exception):
+    """A conditional write found the object no longer as it was read."""
 
 
 def _tagging(retention: str) -> str:
@@ -70,7 +77,13 @@ class Storage:
         data: bytes,
         content_type: str,
         retention: str | None = None,
+        *,
+        if_match: str | None = None,
+        if_none_match: bool = False,
     ) -> None:
+        """Write the object. With `if_match` (an ETag) only over that version,
+        with `if_none_match` only where there is none; otherwise
+        `PreconditionFailed`."""
         kwargs: dict[str, Any] = {
             "Bucket": bucket,
             "Key": key,
@@ -79,10 +92,29 @@ class Storage:
         }
         if retention is not None:
             kwargs["Tagging"] = _tagging(retention)
-        self._client.put_object(**kwargs)
+        if if_match is not None:
+            kwargs["IfMatch"] = if_match
+        if if_none_match:
+            kwargs["IfNoneMatch"] = "*"
+        try:
+            self._client.put_object(**kwargs)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in _CONFLICT_CODES or (
+                if_match is not None and code in _NOT_FOUND_CODES
+            ):
+                raise PreconditionFailed(f"{bucket}/{key}: {code}") from exc
+            raise
 
     def put_json(
-        self, bucket: str, key: str, obj: object, retention: str | None = None
+        self,
+        bucket: str,
+        key: str,
+        obj: object,
+        retention: str | None = None,
+        *,
+        if_match: str | None = None,
+        if_none_match: bool = False,
     ) -> None:
         self.put_bytes(
             bucket,
@@ -90,6 +122,8 @@ class Storage:
             json.dumps(obj).encode("utf-8"),
             "application/json",
             retention=retention,
+            if_match=if_match,
+            if_none_match=if_none_match,
         )
 
     def get_json(self, bucket: str, key: str) -> Any | None:
@@ -100,6 +134,17 @@ class Storage:
                 return None
             raise
         return json.loads(data)
+
+    def get_json_versioned(self, bucket: str, key: str) -> tuple[Any, str] | None:
+        """The object's JSON and the ETag of that version, or None if it does
+        not exist."""
+        try:
+            resp = self._client.get_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
+                return None
+            raise
+        return json.loads(resp["Body"].read()), resp["ETag"]
 
     def copy(
         self,

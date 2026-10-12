@@ -1,6 +1,6 @@
 {
   "Content-Type": "application/json",
   "X-Webhook-Timestamp": "1790658761",
-  "X-Webhook-Signature": "sha256=28cdd8ad6a643ec2695ceeeb85b19d02ed8606d98b8715f39fef7fac29e9594c",
-  "X-Webhook-Signature-Previous": "sha256=da86d62c8223a86013eb1cc67cb4050ac662a1dc4e6165347e124057ff813731"
+  "X-Webhook-Signature": "sha256=4a69a350165c68ede085dbb567e5c2e3b5fca923dfb00d86e17d1552b5d882e3",
+  "X-Webhook-Signature-Previous": "sha256=40331609d47f84a289d1a586be4f310d6502a4f314bd84b61b19df14d971110d"
 }

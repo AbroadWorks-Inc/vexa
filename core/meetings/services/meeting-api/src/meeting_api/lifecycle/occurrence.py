@@ -23,22 +23,22 @@ The rule, in priority order:
 3. **RETRY** — failure class, and the bot never reached the room. Only these stay eligible, and only
    behind the sweep's backoff (#1200's storm ceiling: one dispatch per backoff per occurrence).
 
-The retry set is DERIVED from the sealed taxonomy already in ``retry.py`` (TRANSIENT =
-``join_failure`` / ``awaiting_admission_timeout``) plus two values that taxonomy does not carry:
+What is not retried is one list for the whole service: ``intake.retry.NOT_RETRIED``, the reasons a
+new bot would meet again (the host or the platform refused it, ``awaiting_admission_rejected``; the
+profile is signed out, ``auth_session_missing``; the request is malformed, ``validation_error``; or
+an active-phase ending, ``evicted``, ``startup_alone``, ``max_bot_time_exceeded``). Every other
+reason this codebase writes (``KNOWN_REASONS``) is retryable, including ``start_failed`` — written
+straight to ``data.completion_reason`` by ``fail_meeting`` and NOT a member of the sealed
+``CompletionReason`` enum; the workload never started, the most retryable failure there is. A value
+outside ``KNOWN_REASONS`` is SERVED: nothing positively classes it as retryable.
 
-* ``start_failed`` — written straight to ``data.completion_reason`` by ``fail_meeting`` and NOT a
-  member of the sealed ``CompletionReason`` enum. The workload never started, so the bot never got
-  near the meeting; that is the most retryable failure there is.
-* absent/unknown reason — no producer emits one today (the bot stamps a reason on every terminal
-  edge, and ``reconcile`` derives one), so this is legacy and synthetic rows. Retryable ONLY because
-  rule 2 already caught the shape that matters: a reason-less row whose ``failure_stage`` is
-  ``active`` is SERVED. Without positive evidence the bot was admitted, the pre-#1200 behaviour
-  stands and the backoff bounds it.
-
-Every other reason is SERVED: the host rejected us (``awaiting_admission_rejected``), the profile is
-signed out (``auth_session_missing``), the request was malformed (``validation_error``), or the
-reason belongs to the active phase at all (``evicted``, ``left_alone``, ``startup_alone``,
-``max_bot_time_exceeded``) — in which case the bot was in the room whatever the stage says.
+An absent reason is retryable too — no producer emits one today (the bot stamps a reason on every
+terminal edge, and ``reconcile`` derives one), so this is legacy and synthetic rows. Retryable ONLY
+because rule 2 already caught the shape that matters: a reason-less row whose ``failure_stage`` is
+``active`` is SERVED. Without positive evidence the bot was admitted, the pre-#1200 behaviour
+stands and the backoff bounds it. Rule 2 also claims every ``left_alone`` this codebase writes: the
+bot reports it as ``completed``, and the reconcile sweep writes it only for a row that reached the
+meeting (``active``/``stopping``; ``needs_help`` is pre-active), so at the ``active`` stage.
 """
 from __future__ import annotations
 
@@ -46,7 +46,6 @@ from enum import Enum
 from typing import Any, Optional
 
 from .machine import CompletionReason
-from .retry import _TRANSIENT
 
 # The user-stop reason, the one value that is final regardless of status or stage.
 USER_STOP_REASON = CompletionReason.STOPPED.value
@@ -55,11 +54,6 @@ USER_STOP_REASON = CompletionReason.STOPPED.value
 # because the sealed enum is not the whole truth: ``fail_meeting`` writes ``start_failed`` without
 # ever going through ``CompletionReason``.
 START_FAILED = "start_failed"
-
-# The complete set of terminal reasons an UNSERVED occurrence may be dispatched for again.
-RETRYABLE_REASONS: frozenset[str] = frozenset(
-    {reason.value for reason in _TRANSIENT} | {START_FAILED}
-)
 
 # Every reason value this codebase can put on a terminal row. The matrix test asserts this is
 # exhaustive over the sealed enum, so a new CompletionReason cannot be added without deciding — and
@@ -113,9 +107,11 @@ def disposition(row: Any) -> Optional[Disposition]:
     if status == "completed" or data.get("failure_stage") == ACTIVE_STAGE:
         return Disposition.SERVED
 
-    # 3. Pre-active failure: retry only what is positively retryable (unknown reasons included, see
+    # 3. Pre-active failure: retry only what is positively retryable (absent reasons included, see
     #    the module docstring — rule 2 already claimed the admitted shape).
-    if reason is None or reason in RETRYABLE_REASONS:
+    from ..intake.retry import NOT_RETRIED
+
+    if reason is None or (reason in KNOWN_REASONS and reason not in NOT_RETRIED):
         return Disposition.RETRY
     return Disposition.SERVED
 

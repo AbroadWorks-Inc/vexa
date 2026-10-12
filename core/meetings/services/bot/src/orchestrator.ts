@@ -127,11 +127,13 @@ function driverSignals(join: JoinDriver): JoinSignals | undefined {
   }
 }
 
-/** Map a non-admitted join verdict to the terminal completion_reason. */
+/** Map a non-admitted join verdict to the terminal completion_reason. A join that ends `blocked`
+ *  (the platform walled the bot, or it was left needing a human) is a refusal like a denial: the
+ *  join-evidence classifier files both `awaiting_admission_rejected`, and neither is sent again. */
 const OUTCOME_FAIL: Record<Exclude<JoinOutcome, 'admitted'>, CompletionReason> = {
   rejected: 'awaiting_admission_rejected',
   timeout: 'awaiting_admission_timeout',
-  blocked: 'join_failure',
+  blocked: 'awaiting_admission_rejected',
   auth_missing: 'auth_session_missing',
   error: 'join_failure',
 };
@@ -166,6 +168,13 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   const recordingKey = `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`;
 
   let cur: BotStatus = 'joining';
+  // Whether the bot ever reported `awaiting_admission`. `needs_help` alone does not say: it is also
+  // entered from `joining`, by a blocker met before any waiting room (Zoom's automated-bot wall).
+  let reachedLobby = false;
+  /** The pre-active stage a failed terminal names: the lobby only if the bot actually stood in it.
+   *  meeting-api derives the same thing from its own history (machine.py, FM-003). */
+  const preActiveStage = (): 'joining' | 'awaiting_admission' =>
+    reachedLobby && (cur === 'awaiting_admission' || cur === 'needs_help') ? 'awaiting_admission' : 'joining';
   const eventTime = (): string => deps.now?.() ?? new Date().toISOString();
 
   const emit = async (status: BotStatus, extra: Partial<LifecycleEvent> = {}): Promise<void> => {
@@ -173,6 +182,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       throw new Error(`lifecycle.v1: illegal transition ${cur} → ${status}`);
     }
     cur = status;
+    if (status === 'awaiting_admission') reachedLobby = true;
     // A terminal event is the LAST thing anyone hears from this bot — if the meeting was degraded,
     // it says so here or the reason dies with the container. A reporter fault must never change the
     // exit path (P18: report, but never at the cost of the report itself).
@@ -307,7 +317,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
           deps.join.withdraw('stopped').catch(() => { /* best-effort */ }),
           new Promise<void>((resolve) => setTimeout(resolve, 8000)),
         ]);
-        const stage = cur === 'awaiting_admission' ? 'awaiting_admission' : 'joining';
+        const stage = preActiveStage();
         const abortDetail = 'stopped while awaiting admission (withdrew the join request)';
         await emit('failed', {
           failure_stage: stage, completion_reason: 'stopped',
@@ -330,9 +340,10 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       // The driver parked its measurements before re-raising, so even this path is evidenced —
       // typically as `navigation_failure` (system_fault) off the transport marker in the message.
       const crashDetail = String(e);
+      const stage = preActiveStage();
       await emit('failed', {
-        failure_stage: 'joining', completion_reason: 'join_failure', reason: crashDetail, exit_code: 1,
-        ...joinEvidenceFor('error', 'joining', driverSignals(deps.join), crashDetail),
+        failure_stage: stage, completion_reason: 'join_failure', reason: crashDetail, exit_code: 1,
+        ...joinEvidenceFor('error', stage, driverSignals(deps.join), crashDetail),
       });
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
     }
@@ -350,7 +361,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       // control plane re-derives it server-side anyway (FM-003), so a truthful payload simply stops
       // the two from disagreeing — and it is the field the taxonomy reads to tell a lobby expiry
       // from a bot that never got there, the exact conflation #1058 measured.
-      const stage = cur === 'awaiting_admission' || cur === 'needs_help' ? 'awaiting_admission' : 'joining';
+      const stage = preActiveStage();
       await emit('failed', {
         failure_stage: stage, completion_reason: reason, reason: reasonText, exit_code: 1,
         ...joinEvidenceFor(outcome, stage, joinSignals, reasonText),

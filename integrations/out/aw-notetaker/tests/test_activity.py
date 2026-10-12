@@ -1,12 +1,15 @@
 """Tests for speaker-activity parsing and speech event detection."""
 
 import json
+import random
 
 import pytest
 
+import exporter.activity as activity_module
 from exporter.activity import (
     ActivityEvent,
     CapturedFrame,
+    Frame,
     names,
     parse_activity,
     speech_events,
@@ -136,7 +139,7 @@ def test_header_only_is_valid_empty_activity() -> None:
     """A bot that left before anyone spoke uploads a header-only file; this
     is a valid, empty session — not invalid."""
     a = parse_activity([header()])
-    assert a.frames == []
+    assert list(a.frames) == []
     assert a.hints == []
     assert a.capped is False
     assert names(a) == []
@@ -245,7 +248,7 @@ def test_mixed_lane_frames_are_counted_not_stored() -> None:
             hint(ORIGIN_MS + 10, "A"),
         ]
     )
-    assert a.frames == []
+    assert list(a.frames) == []
     assert a.frame_count == 2
     assert [h.name for h in a.hints] == ["A"]
 
@@ -328,7 +331,7 @@ def test_channel_tap_frames_never_enter_the_mixed_timeline(mix_named: bool) -> N
         jitsi_lines(ORIGIN_MS, mix_named=mix_named, taps=False), captured_without.append
     )
 
-    assert with_taps.frames == without.frames
+    assert list(with_taps.frames) == list(without.frames)
     assert names(with_taps) == names(without)
     assert speech_events(with_taps, ORIGIN_MS, 0.05, 700) == speech_events(
         without, ORIGIN_MS, 0.05, 700
@@ -345,7 +348,7 @@ def test_a_legacy_jitsi_file_falls_back_to_hints() -> None:
     legacy = parse_activity(
         jitsi_lines(ORIGIN_MS, mix_named=True, taps=True, legacy=True)
     )
-    assert legacy.frames == []
+    assert list(legacy.frames) == []
     events = speech_events(legacy, ORIGIN_MS, 0.05, 700)
     assert events and all(ev.source == "hint" for ev in events)
     assert {ev.name for ev in events} == {"Speaker Alpha", "Speaker Beta"}
@@ -364,9 +367,52 @@ def test_activity_dataclasses_use_slots() -> None:
     )
     for obj in (
         a,
-        a.frames[0],
+        next(iter(a.frames)),
         a.hints[0],
         captured[0],
         speech_events(a, ORIGIN_MS, 0.05, 700)[0],
     ):
         assert not hasattr(obj, "__dict__"), type(obj).__name__
+
+
+def test_timeline_frames_past_the_bound_go_to_disk_and_read_back_in_time_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P10: the timeline's named frames are held up to `_RUN_FRAMES` at once;
+    the rest wait on disk in sorted runs. Read back, they are exactly the
+    stable sort by time of every named frame (ties keep file order), so the
+    events and names are those of holding them all."""
+    rnd = random.Random(3)
+    rows = [
+        (
+            ORIGIN_MS + rnd.randrange(0, 4000, 128),  # out of order, with ties
+            rnd.choice(["A", "B", "C"]),
+            rnd.choice([0.01, 0.1234567891, 0.3]),
+            rnd.choice([128, 256, 300]),
+        )
+        for _ in range(23)
+    ]
+    lines = [header("pertrack")] + [
+        frame(ts, name, rms, ch=0, dur_ms=dur) for ts, name, rms, dur in rows
+    ]
+    monkeypatch.setattr(activity_module, "_RUN_FRAMES", 4)
+    spilled = parse_activity(lines)
+    monkeypatch.setattr(activity_module, "_RUN_FRAMES", 1_000_000)
+    held = parse_activity(lines)
+
+    assert len(spilled.frames._spilled) == 5 and len(spilled.frames._run) == 3
+    expected = sorted(
+        (
+            Frame(ts=ts, name=name, rms=rms, duration_ms=dur)
+            for ts, name, rms, dur in rows
+        ),
+        key=lambda f: f.ts,
+    )
+    assert list(spilled.frames) == expected == list(held.frames)
+    assert len(spilled.frames) == 23
+    assert names(spilled) == names(held)
+    assert speech_events(spilled, ORIGIN_MS, 0.05, 700) == speech_events(
+        held, ORIGIN_MS, 0.05, 700
+    )
+    spilled.close()
+    assert list(spilled.frames) == []
