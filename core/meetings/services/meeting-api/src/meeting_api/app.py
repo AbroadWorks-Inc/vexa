@@ -475,9 +475,11 @@ def _mount_lifecycle(
     import jsonschema
 
     from .lifecycle.machine import (
+        LIVE_BOT_STATUSES,
         IllegalTransition,
         StatusChange,
         TransitionSource,
+        bot_status_from_persisted,
         durable_status_repairs_edge,
         persisted_statuses_for,
     )
@@ -942,6 +944,28 @@ def _mount_lifecycle(
                                     level="warning", span="lifecycle.callback",
                                     fields={"error": str(e)},
                                 )
+        # The row is the meeting's status. A report the row did not take, while the row holds
+        # another status the bot moves, is answered as not stored: this copy of the record is
+        # dropped, and the bot's retry is applied from the row.
+        if meeting_row is None and rec.status is not None and not change.no_op and connection_id:
+            try:
+                stored_state = await meeting_repo.get_lifecycle_state_by_session(
+                    session_uid=connection_id
+                )
+            except Exception as read_error:  # noqa: BLE001 — answered 503, the bot retries
+                sink.store.forget(connection_id)
+                log_event("lifecycle_status_unknown", audience="system", level="warning",
+                          span="lifecycle.callback",
+                          fields={"to": rec.status.value, "error": str(read_error)})
+                return 503, {"status": "error", "detail": "meeting status could not be read"}
+            stored = stored_state.get("status") if isinstance(stored_state, dict) else None
+            if stored in LIVE_BOT_STATUSES and bot_status_from_persisted(stored) is not rec.status:
+                sink.store.forget(connection_id)
+                log_event("lifecycle_status_not_stored", audience="system", level="warning",
+                          span="lifecycle.callback",
+                          fields={"stored": stored, "to": rec.status.value})
+                return 409, {"status": "error", "detail": "status not stored",
+                             "stored": stored, "to": rec.status.value}
         # The envelope is the edge that survived the write. A refused `joining` →
         # `active` must not be recorded when the stored row was `awaiting_admission`
         # and the event was applied again from there. An idempotent replay

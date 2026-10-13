@@ -162,21 +162,34 @@ A teardown in that state is chased until `UNPROVEN_TEARDOWN_MAX_AGE_S` (default 
 An entry write that loses a database race is run again `INTAKE_CONFLICT_RETRIES` times (default
 3), then answered 500.
 
-## Known issue: the two-replica status race
+## Two replicas and the meeting's status
 
-meeting-api keeps each meeting's last status in memory per replica, and re-reads the database
-only when an update looks illegal to it. With two replicas, a bot's updates can alternate between
-them: `joining` lands on replica A, `awaiting_admission` on replica B, then `active` on replica A,
-which still holds `joining`. The guard (`expected_from=persisted_statuses_for(change.old_status)`
-in `app.py`, our commit `c86a62e6`, not upstream) then refuses the write and logs
-`lifecycle_status_refused`, while the bot is still answered `200 accepted`, so it does not retry.
-Later updates are refused the same way. When the runtime removes the pod, the meeting ends
-`failed` with no start time, and the exporter skips it (`bot_failed_skipped … no_start_time`). The
-recording itself is complete in bucket `aw-bots`.
+The meeting row is the meeting's status. Each meeting-api replica also keeps its own copy of each
+meeting's status in memory, and a bot's reports can alternate between the replicas: `joining` on
+replica A, `awaiting_admission` on replica B, then `active` on replica A, which still holds
+`joining`. The write names the status the replica expects the row to hold
+(`expected_from=persisted_statuses_for(change.old_status)` in `app.py`, our commit `c86a62e6`), so
+the row refuses it and meeting-api logs `lifecycle_status_refused`. Then, in `_apply_lifecycle_event`:
 
-Meetings 40, 221, 265, 319, 338, 369, 370 and 372 (2026-10-01 to 2026-10-08) were lost this way.
-Each holds one recording, but its record is `failed`, `awaiting_admission_timeout`, with no start
-time (checked 2026-10-13), so the exporter's rerun refuses it (`exporter/rerun.py` requires
-`started_at`). They are not yet reprocessed. The intended fix makes the database row the state machine (read,
-check the edge, conditional write, repeat on conflict) and answers a lasting refusal with 409 or
-503 instead of 200; it is deferred by the owner.
+1. **Repair.** The replica re-reads the row. When the row is ahead of its copy and the report is
+   legal from the row's status, it applies the report again from there and writes it
+   (`lifecycle_status_reconciled`; `lifecycle_status_reconcile_rejected` when it is not legal).
+2. **Not stored.** When the write still did not land and the row holds a different status the bot
+   moves (`joining`, `awaiting_admission`, `needs_help`, `active`; `LIVE_BOT_STATUSES` in
+   `lifecycle/machine.py`), the replica drops its copy of the meeting and answers
+   `409 {"detail": "status not stored", "stored": …, "to": …}` (`lifecycle_status_not_stored`).
+   When it cannot read the row, it drops its copy and answers `503`
+   (`lifecycle_status_unknown`). The bot sends any report that gets a non-2xx answer again, up to
+   5 attempts over about 7.5 s (`bot/src/adapters/lifecycle-http.ts`). The retry, on either
+   replica, is applied from the row.
+3. **Not the bot's to move.** A refused report against a row that is `requested` (waiting for its
+   next bot), `stopping`, finished, or unknown is answered `200` as before; the server moves those
+   rows (retry driver, stop reconcile), so the bot does not retry.
+
+A report from a session the meeting has replaced is refused by the row; it may get a 409 and be
+retried, and it never changes the row.
+
+A meeting whose status was lost this way has its recording in bucket `aw-bots` but its record ends
+`failed` with no start time, so the exporter skips it (`bot_failed_skipped … no_start_time`) and
+`exporter.rerun` refuses it (it requires `started_at`). The recordings in `aw-bots` expire after
+14 days.

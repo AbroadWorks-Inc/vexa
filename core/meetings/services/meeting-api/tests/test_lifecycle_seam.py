@@ -295,20 +295,19 @@ def test_rehydration_requested_then_skip_joining_is_409():
     assert r.json()["from"] is None and r.json()["to"] == "active"
 
 
-def test_rehydration_in_memory_record_wins_over_stale_db():
-    """A live in-process record (already advanced) must NOT be overwritten by a staler DB read:
-    drive joining→active in-process, then flip the DB BACK to `joining`; the next `completed` must
-    still succeed (the in-memory ACTIVE is the source of truth, not the stale DB `joining`)."""
+def test_a_row_behind_the_record_is_not_walked_forward_from_memory():
+    """The in-process record says `active` but the row says `joining`. `completed` is not
+    applied from the record's memory: the row keeps `joining` and the bot is told it was not
+    stored."""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
     assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
     assert _post(client, connection_id="sess-uid", status="active").status_code == 200
-    # Simulate a stale DB read regressing to joining (it shouldn't reseed the live record).
     repo.set_status(m["id"], "joining")
     r = _post(client, connection_id="sess-uid", status="completed", exit_code=0, completion_reason="stopped")
-    assert r.status_code == 200, r.text
-    assert r.json()["meeting_status"] == "completed"
+    assert r.status_code == 409, r.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "joining"
 
 
 def test_illegal_local_edge_refreshes_newer_db_state_from_another_replica():
@@ -436,6 +435,115 @@ def test_durable_status_repairs_only_an_ahead_row():
     assert durable_status_repairs_edge(
         BotStatus.JOINING, "stopping", BotStatus.ACTIVE
     )
+
+
+class _FlakyRepo(InMemoryMeetingRepo):
+    """Fails the next N status writes / state reads, as a database blip would."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_writes = 0
+        self.fail_reads = 0
+
+    async def update_meeting_status(self, **kw):
+        if self.fail_writes:
+            self.fail_writes -= 1
+            raise RuntimeError("db blip")
+        return await super().update_meeting_status(**kw)
+
+    async def get_lifecycle_state_by_session(self, *, session_uid):
+        if self.fail_reads:
+            self.fail_reads -= 1
+            raise RuntimeError("db blip")
+        return await super().get_lifecycle_state_by_session(session_uid=session_uid)
+
+
+def test_a_status_the_row_did_not_take_is_answered_409_and_lands_on_retry():
+    """The `active` write fails and the row still says `joining`. The bot is told (409),
+    sends `active` again, and the row becomes `active`."""
+    repo = _FlakyRepo()
+    _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+
+    repo.fail_writes = 1
+    first = _post(client, connection_id="sess-uid", status="active")
+    assert first.status_code == 409, first.text
+    assert first.json()["stored"] == "joining" and first.json()["to"] == "active"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "joining"
+
+    retry = _post(client, connection_id="sess-uid", status="active")
+    assert retry.status_code == 200, retry.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+
+
+def test_completed_on_a_row_that_never_stored_active_is_409():
+    """`active` was not stored, so the row is still in the lobby when `completed` comes.
+    `completed` is not stored either, and the bot is told."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    assert _post(client, connection_id="sess-uid", status="active").status_code == 200
+    repo.set_status(meeting["id"], "awaiting_admission")
+
+    done = _post(
+        client, connection_id="sess-uid", status="completed",
+        exit_code=0, completion_reason="left_alone",
+    )
+    assert done.status_code == 409, done.text
+    assert done.json()["stored"] == "awaiting_admission"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "awaiting_admission"
+
+
+def test_an_unreadable_row_answers_503_and_the_retry_lands():
+    repo = _FlakyRepo()
+    _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+
+    repo.fail_writes, repo.fail_reads = 1, 2  # the write, the repair read, the stored check
+    r = _post(client, connection_id="sess-uid", status="active")
+    assert r.status_code == 503, r.text
+
+    retry = _post(client, connection_id="sess-uid", status="active")
+    assert retry.status_code == 200, retry.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+
+
+@pytest.mark.parametrize("stored", ["completed", "failed", "requested"])
+def test_a_finished_or_waiting_row_keeps_200(stored):
+    """A row that is finished, or waiting for its next bot, is not the bot's to move:
+    the refusal is answered 200, so the bot does not retry for nothing."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], stored)
+
+    r = _post(client, connection_id="sess-uid", status="active")
+    assert r.status_code == 200, r.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == stored
+
+
+def test_an_unknown_session_keeps_200():
+    client = TestClient(create_app(meeting_repo=InMemoryMeetingRepo()))
+    r = _post(client, connection_id="no-such-session", status="joining")
+    assert r.status_code == 200, r.text
+
+
+def test_a_replaced_session_changes_nothing():
+    """A late report from a session the meeting has replaced is refused by the row,
+    whatever the answer."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested", session_uid="old")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="old", status="joining").status_code == 200
+    asyncio.run(repo.create_session(meeting_id=meeting["id"], session_uid="new"))
+
+    r = _post(client, connection_id="old", status="active")
+    assert r.status_code in (200, 409), r.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="new")) == "joining"
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
