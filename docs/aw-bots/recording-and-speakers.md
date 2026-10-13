@@ -40,6 +40,13 @@ the hints are each participant's audio level in the mix (`kind: "levels"`; bot l
 Jitsi's lane for the mixed timeline stays `mixed`. Per-speaker lines on Jitsi are extra; they
 are described under [Per-speaker channels](#per-speaker-channels).
 
+How a Jitsi level becomes a turn (`modules/jitsi-capture/src/jitsi-speakers.ts`), polled every
+400 ms: the loudest participant strictly above `JITSI_SPEECH_LEVEL` (0.1) is the speaker; a level
+sample older than 1 s is ignored; a new speaker, or silence, must hold for `CONFIRM_POLLS` (2)
+polls before a hint is sent, so a turn starts about 0.8 s late. The bot's own id, ids missing
+from the participant map, and an exact tie name nobody. The dominant-speaker flag is read only
+on a poll with no fresh level sample (hint `source` `dominant`).
+
 The exporter (`exporter/activity.py`) keeps a named frame on every lane. On the mixed lane only
 the mix's own frames (no channel) are the timeline; a channel's frames stay out of it. Hints
 become the timeline only when the file stored no named frame. That is the Teams path, a Zoom
@@ -60,7 +67,9 @@ frames carry `ch: 0`).
 A frame counts as speech at or above `RMS_SPEECH_THRESHOLD` (default 0.026).
 
 `notetaker-worker` reads `speaker_timeline.json` from the export bucket, including
-`speaker_intervals`. When the export folder also has `channels/index.json`, the worker can
+`speaker_intervals`. It splits a transcribed segment between words at a speaker change only when
+`speaker_intervals_source` is `audio` or `levels`, never for `points` (Teams' 2-second indicator
+cut segments into pieces). When the export folder also has `channels/index.json`, the worker can
 transcribe each channel. That choice is `CHANNEL_TRANSCRIPT_MODE` in the deployment repo.
 This repo does not change that worker. The handoff of the files is
 [export and webhooks](export-and-webhooks.md).
@@ -102,7 +111,13 @@ The recorder (`record-chunker`, started after admission) records one audio mix p
   admission. Bot log: `[pertrack] recording the live mix (N track(s) connected)` (Zoom) or
   `[mixed] recording the live mix (N stream(s) connected)` (Teams, Jitsi). If the mixed lane has no
   graph, the master is not recorded and the log says `recording not started: the live mix graph is
-  absent`; channel recorders still run.
+  absent`; channel recorders still run. The mix graphs run at 16 kHz, so these masters carry no
+  audio above 8 kHz. Whichever of capture and recording stops last closes the graph: stopping
+  capture while the recording tap is live leaves it open, because closing it would end the
+  recorder's stream and drop the open timeslice. On Jitsi the audio hook tells tracks apart by
+  object, not id, because each bridge session numbers `remote-audio-N` from 1 again; after a
+  reconnect the new tracks join the same mix and the same recording (bot log `[Audio Hook]
+  mirrored … re-used id: a new peer connection`), and audio during the cut itself is lost.
 - **Google Meet**: the page's remote audio elements.
 
 Each chunk uploads as it is made (`VEXA_RECORDING_TIMESLICE_MS`, default 15000). A bot session has
@@ -231,5 +246,8 @@ delete raises, so meeting-api does not treat a still-running pod as removed (`k8
 | A channel's empty final chunk can reach meeting-api before its last data chunk | Seen in tests and live (0.1 s apart). Whether assembly handles that order is not checked | A channel master shorter than its recorder ran |
 | Google Meet reconnect | A second recorder can open for the same stream under a new channel number | Two channels with the same `stream_id` |
 | Channels uploaded when the mixed master was skipped | The exporter's handling of that case is not checked | `[mixed] recording not started` in the bot log |
+| A quiet Jitsi speaker | A participant whose level never goes above 0.1 gets no turn on the mixed timeline (their channel still records them) | Speech in the per-person transcript with no matching turn in the mixed one |
+| Teams joins only as an anonymous guest | A tenant that sends the anonymous join to Microsoft sign-in cannot be joined; the bot ends with `join_failure` (a transient reason, so a new bot is tried) and the reason text `teams_auth_redirect` (`join/src/msteams/auth-redirect.ts`) | `teams_auth_redirect` in the meeting's `last_error` |
+| Zoom through the web client only | The native Zoom SDK is proprietary and excluded by the licence gate (`join/src/zoom/README.md`), so the bot meets Zoom's web-client protection (row above) | — |
 | Large Jitsi calls | At 30 participants the bot (1 CPU) averages 0.88 core and is throttled 47 % of the time, audio only; video receive is not measured | CPU throttling on the bot pod |
 
