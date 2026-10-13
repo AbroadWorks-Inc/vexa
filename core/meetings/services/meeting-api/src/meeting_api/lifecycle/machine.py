@@ -172,6 +172,12 @@ def persisted_statuses_for(status: Optional[BotStatus]) -> frozenset:
     return frozenset(s for s, b in _PERSISTED_STATUS_TO_BOTSTATUS.items() if b == status)
 
 
+# The persisted statuses only the bot's own reports move: its non-terminal `BotStatus` values.
+# The server moves a row in any other status (`requested`, `stopping`, `completed`, `failed`), so a
+# bot report it refuses is not retried.
+LIVE_BOT_STATUSES = frozenset(s.value for s in BotStatus if s not in _TERMINAL)
+
+
 def _reachable(src: Optional[BotStatus], dst: BotStatus) -> bool:
     """True when `dst` is a later state on some legal path out of `src`."""
     seen: set[Optional[BotStatus]] = set()
@@ -425,6 +431,10 @@ class MeetingStore:
             rec = MeetingRecord(connection_id=connection_id)
             self._records[connection_id] = rec
         return rec
+
+    def forget(self, connection_id: str) -> None:
+        """Drop the record, so the next event for it is applied from the stored row."""
+        self._records.pop(connection_id, None)
 
     def rehydrate(
         self,

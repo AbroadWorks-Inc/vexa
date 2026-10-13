@@ -437,7 +437,9 @@ async def _drive(mode: str, events: list[tuple[dict, bool]], monkeypatch) -> tup
             ),
             force_terminal_on_destroy=destroyed,
         )
-        assert status == 200, content
+        # A refused (stale) write is answered "not stored" while the row is at a status the
+        # bot moves; every other event is accepted.
+        assert status == 200 or (mode == "stale" and status == 409), content
     return app, sinks, repo._meetings[meeting["id"]]
 
 
