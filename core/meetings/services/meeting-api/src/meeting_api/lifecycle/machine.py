@@ -172,9 +172,10 @@ def persisted_statuses_for(status: Optional[BotStatus]) -> frozenset:
     return frozenset(s for s, b in _PERSISTED_STATUS_TO_BOTSTATUS.items() if b == status)
 
 
-# The persisted statuses only the bot's own reports move. The server moves a row in any other
-# status (`requested`, `stopping`, `completed`, `failed`), so a bot report it refuses is not retried.
-LIVE_BOT_STATUSES = frozenset({"joining", "awaiting_admission", "needs_help", "active"})
+# The persisted statuses only the bot's own reports move: its non-terminal `BotStatus` values.
+# The server moves a row in any other status (`requested`, `stopping`, `completed`, `failed`), so a
+# bot report it refuses is not retried.
+LIVE_BOT_STATUSES = frozenset(s.value for s in BotStatus if s not in _TERMINAL)
 
 
 def _reachable(src: Optional[BotStatus], dst: BotStatus) -> bool:
