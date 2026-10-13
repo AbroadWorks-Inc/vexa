@@ -1018,6 +1018,7 @@ export async function startCaptureBridge(
               let maxVal = 0;
               for (let i = 0; i < input.length; i++) { const a = Math.abs(input[i]); if (a > maxVal) maxVal = a; }
               if (maxVal <= SILENCE) return;                   // gate silence (as the mix path did)
+              w.__vexaTrackLastAudibleMs = Date.now();         // remote audio is arriving (the Zoom hint gate)
               w.__vexaTrackNamer?.markHot(ch, ts, maxVal);     // peak energy → the dominant-slot ranking
               const name = w.__vexaTrackNamer?.resolve(ch, ts);
               const arr = Array.from(input);                   // copy — the input buffer is reused
@@ -1100,15 +1101,29 @@ export async function startCaptureBridge(
       }, 30_000);
       // Zoom's active-speaker DOM watcher — the WHO signal the resolver correlates with per-track energy
       // (also teed to __vexaSpeakerHint for telemetry; the pipeline's recordHint is a no-op on this lane).
+      // Zoom keeps the last person in its active-speaker panel while nobody talks, and the watcher
+      // re-asserts that name every ~2 s. A hint is a claim of speech (it becomes the exporter's
+      // timeline), so it crosses only while remote audio arrives: an audible frame on any track
+      // within the last 2.5 s (one heartbeat plus a ScriptProcessor block). The resolver still sees
+      // every change, and a turn's end crosses only for a turn whose start did.
       if (isZoom && w.VexaBrowserUtils?.createZoomSpeakers && !w.__vexaZoomSpeakers) {
+        const HINT_AUDIBLE_MS = 2500;
         let lastActive: string | null = null;
+        let lastHinted: string | null = null;
         w.__vexaZoomSpeakers = w.VexaBrowserUtils.createZoomSpeakers({
           selfName: botName,
           log: (m: string) => w.logBot?.('[ZoomSpeakers] ' + m),
           onSpeakerChange: (name: string | null) => {
             const tMs = Date.now();
-            if (name) { w.__vexaTrackNamer?.onSpeak(name, tMs, false); w.__vexaSpeakerHint?.(name, tMs, false); }
-            else if (lastActive) { w.__vexaTrackNamer?.onSpeak(lastActive, tMs, true); w.__vexaSpeakerHint?.(lastActive, tMs, true); }
+            const audible = tMs - (w.__vexaTrackLastAudibleMs ?? -Infinity) <= HINT_AUDIBLE_MS;
+            if (name) {
+              w.__vexaTrackNamer?.onSpeak(name, tMs, false);
+              if (audible) { w.__vexaSpeakerHint?.(name, tMs, false); lastHinted = name; }
+            } else if (lastActive) {
+              w.__vexaTrackNamer?.onSpeak(lastActive, tMs, true);
+              if (lastHinted === lastActive) w.__vexaSpeakerHint?.(lastActive, tMs, true);
+              lastHinted = null;
+            }
             lastActive = name;
           },
         });
