@@ -48,10 +48,9 @@ with Prosody's speaker timeline.
 
 On Google Meet and Jitsi the bot also records each remote channel beside that mix. The exporter
 adds `channels/ch<N>.webm`, `channels/index.json`, and `speaker_activity_frames.json`. The worker
-setting `CHANNEL_TRANSCRIPT_MODE` is `compare`: users still receive the mixed transcript, and the
-channel transcript is saved beside it as `transcript_channels.txt`. `deliver` makes the channel
-transcript the one users receive. Teams, Zoom, and any meeting without `channels/index.json` stay
-on the mixed path. Detail is in
+setting `CHANNEL_TRANSCRIPT_MODE` is `deliver`: the per-person transcript is the one users receive
+(`transcript.txt`), and the mixed recording is transcribed only when that path fails or returns
+nothing. Teams, Zoom, and any meeting without `channels/index.json` stay on the mixed path. Detail is in
 [recording and speakers](docs/aw-bots/recording-and-speakers.md) and
 [export and webhooks](docs/aw-bots/export-and-webhooks.md). The worker's own page is
 `deployment/base/notetaker/worker/README.md` in the deployment repo.
@@ -119,7 +118,7 @@ Everything else is upstream Vexa, unchanged.
 | **Webhook subscriptions, scopes and keys.** `/v2/webhooks`, encrypted receiver secrets, new scopes `webhooks`, `erase`, `export`. | `core/identity/services/admin-api`; `core/identity/contracts/identity.v1/` | Each app subscribes on its own; each consumer's key can do only its own job. |
 | **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can't act as any user by setting a header. |
 | **Metrics.** `/metrics` on meeting-api and admin-api (not routed through the gateway). | `meeting_api/metrics.py`, `admin_api/app/metrics.py`; Helm `meetingApi.podAnnotations`, `adminApi.podAnnotations` | Prometheus scrapes them; the alerts live in aw-notetaker. |
-| **Image workflow.** Builds and pushes our six images (meeting-api, bot, exporter, gateway, admin-api, runtime) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`, or on a manual run with a release tag. |
+| **Image workflow.** Builds and pushes our six images (meeting-api, bot, exporter, gateway, admin-api, runtime) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`. |
 | **Join outcomes.** A blocker met before any lobby (Zoom's automated-bot wall, the Meet consent prompt) reports `needs_help` from `joining`; `needs_help` can lead back to `awaiting_admission`. A join that ends blocked is `awaiting_admission_rejected` and is not retried. `failure_stage` names the lobby only when the bot reached it. `needs_help` counts as pre-active for reconcile, the bot limit and stop. | bot `src/contracts.ts`, `src/orchestrator.ts`; meeting-api `lifecycle/machine.py`, `lifecycle/reconcile.py`, `intake/stop.py`; contract `core/meetings/contracts/lifecycle.v1/` | A wall or a consent prompt is reported as what it is, and a refusal is not retried into the same answer. |
 | **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
@@ -192,13 +191,10 @@ values must point `gateway.image` and `adminApi.image` at them.
 
 **Normally CI builds them**: `.github/workflows/aw-images.yml` ("AW images — build & push").
 
-| Trigger | Tags pushed |
-|---|---|
-| Push to `development` | `:<commit sha>` for all six images |
-| Manual run (Actions → Run workflow: branch, tag e.g. `v0.1.1`, `all` or one image) | `:<commit sha>` and `:<tag>` |
-
-To build one image with a version tag, for example the gateway or admin-api, use the manual run
-and pick that image.
+Every push or merge to `development` builds all six images, tagged `:<commit sha>`; the run's
+summary lists the tag. The workflow also declares a manual run, but GitHub offers the "Run
+workflow" button only for workflows on the default branch, which here is `main` (upstream's
+mirror, without this file), so there is no manual run. To get images, merge to `development`.
 
 There is no `:latest`: the deployment pins exact tags, so a new image reaches the cluster only when
 the tag is changed in aw-notetaker and applied (its runbook, "Upgrading our images"). The workflow
@@ -255,6 +251,10 @@ Every setting lives in configuration, not code:
 | meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
 | "Meeting finished" webhook | the exporter's `/v2/webhooks` subscription (`events: ["meeting.completed", "bot.failed"]`), secret = exporter env `EXPORTER_WEBHOOK_SECRET`; upstream's `VEXA_SYSTEM_WEBHOOK_URL` | subscription URL `http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa`; `VEXA_SYSTEM_WEBHOOK_URL` unset |
 | How early the bot joins | Helm `meetingApi.autoJoinLeadSeconds` → env `AUTO_JOIN_LEAD_S` (the chart's default is 120) | `300` |
+| How long a bot waits in a lobby | meeting-api env `VEXA_LOBBY_BUDGET_S` (Helm `meetingApi.extraEnv`; code default 900). The reconcile sweep's pre-active grace is this plus 60 s | `600`, every platform |
+| Jitsi hosts | Helm `meetingApi.jitsiHosts` → meeting-api env `VEXA_JITSI_HOSTS`; `meet.jit.si` is always recognised | `meet.abroadworks.com` |
+| When a bot leaves an empty call | bot env `BOT_ALONE_SILENCE_WINDOW_MS`: no remote audio above the capture floor for this long | default 10 minutes |
+| When a channel recorder is released | bot env `VEXA_CHANNEL_GONE_MS`: how long a channel's stream may be missing from the page | default 30 000 ms |
 | Services on Karpenter | Helm `global.nodeSelector` / `global.tolerations` | the `aw-bots-services` NodePool |
 | Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the `aw-bots-meetings` NodePool |
 | Postgres / Redis disks | Helm `postgres.persistence.storageClassName`, `redis.persistence.storageClassName` | `ebs-sc-gp3` (any zone, expandable) |
@@ -307,7 +307,9 @@ this fork. The step-by-step runbook is `deployment/base/aw-bots/README.md` there
 | `deployment/aws/iam/abroadworks-aw-bots-meeting-api-role/`, `…/abroadworks-aw-exporter-role/` | IAM roles (IRSA) |
 | `deployment/aws/s3-lifecycle/aw-bots-lifecycle.json` | 14-day expiry for the `aw-bots` bucket |
 
-Install order, secrets, and upgrades are the runbook. When the images are rolled separately, roll
+Install order, secrets, and upgrades are the runbook. The order across the whole pipeline
+(transcriber, notetaker-worker, Prometheus rules, this Helm release, the exporter, then the
+calendar module and portal) is its section "Deploying a change". When the images are rolled separately, roll
 the gateway and admin-api first, then meeting-api, then the runtime (its own image and
 `runtime.browserImage`, which is the bot), then the exporter. The new meeting-api refuses the
 unsigned requests an old gateway forwards. A new bot image is the one the runtime starts, and it
@@ -337,8 +339,8 @@ needs a meeting-api that accepts its speaker file. The exporter needs the export
 
 | What | Command |
 |---|---|
-| Bot | `cd core/meetings/services/bot && npm test` (and `npx tsc --noEmit -p .`) |
-| meeting-api | `cd core/meetings/services/meeting-api && uv run pytest` |
+| Bot | `cd core/meetings/services/bot && npm test` (and `npx tsc --noEmit -p .`). The Chromium boundary tests (`*.boundary.test.ts`: capture-bridge, channel-recording, csrc-capture, jitsi-session-restart, recording-source, teams-speaker-animation) SKIP unless Playwright's Chromium is installed: from the repo root, `node node_modules/.pnpm/playwright@1.56.0/node_modules/playwright/cli.js install chromium` |
+| meeting-api | `cd core/meetings/services/meeting-api && uv run pytest`. The `*_pg` tests (for example `test_bot_retry_pg.py`) run only with `MEETING_API_TEST_DATABASE_URL` set to a throwaway Postgres; otherwise they skip |
 | admin-api, gateway | the same, in `core/identity/services/admin-api` and `core/gateway/services/gateway` |
 | Exporter | `cd integrations/out/aw-notetaker && uv run pytest -q && uv run black --check . && uv run ruff check . && uv run mypy exporter` |
 | Exporter end-to-end (Docker, MinIO) | `uv run pytest -m integration -q tests/integration` (from `integrations/out/aw-notetaker`) |
@@ -349,8 +351,9 @@ checks: READMEs, architecture, contracts and so on. It needs Node 22, `pnpm inst
 [`uv`](https://docs.astral.sh/uv/) (`brew install uv`). Every folder needs a non-empty `README.md`. A
 local, gitignored folder can opt out with an empty `.gateignore` file.
 
-The full suite additionally starts the whole stack in Docker, which needs the minted
-`deploy/compose/.env`. Docker Hub refuses anonymous pulls of `minio/*`, so if that happens pull
+The full suite additionally starts the whole stack in Docker (`gate:compose`), which needs the
+minted `deploy/compose/.env`. AW does not deploy with Docker Compose, so a `gate:compose` skipped
+for lack of Docker does not block an AW change; the other gates must pass. Docker Hub refuses anonymous pulls of `minio/*`, so if that happens pull
 `quay.io/minio/minio` and `quay.io/minio/mc` and tag them as `minio/minio:latest` and `minio/mc:latest`.
 
 ---

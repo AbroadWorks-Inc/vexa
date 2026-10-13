@@ -122,8 +122,10 @@ The Deployment, Service, ServiceAccount and Secret templates are in aw-notetaker
   `POST /v2/webhooks/{id}/test`: its delivery shows `delivered` with 200 (`ignored`). While the
   subscription is missing or paused, nothing reaches the exporter and those events are not
   delivered later; export such meetings with the rerun command.
-- **Optional:** an S3 lifecycle rule expiring `aw-exporter/events/` (for example 30 days; it must
-  be over 48 h, the longest a redelivery can come late).
+- **Event-marker expiry.** The bucket's lifecycle file (aw-notetaker
+  `deployment/aws/s3-lifecycle/aw-bots-lifecycle.json`) holds rule `exporter-event-markers-7d`,
+  which expires `aw-exporter/events/` after 7 days, well over the 48 h a redelivery can come late.
+  It takes effect once the operator applies the file (runbook install step 14e).
 
 **Upgrading.** Roll the exporter after the gateway and meeting-api it calls. A rollout is safe at
 any time: on SIGTERM the running exports get `EXPORT_STOP_WAIT_SECONDS` to finish, and the rest

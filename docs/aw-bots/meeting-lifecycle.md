@@ -103,6 +103,9 @@ Google Meet admission (`core/meetings/modules/join/src/googlemeet/admission.ts`)
 - The host's "denied your request" is `awaiting_admission_rejected`. The bot exits and does not post a chat into the meeting.
 - Google Meet withdraws an unanswered "Ask to join" about 10 minutes after the knock. The waiting room disappears, with no denial and no in-call controls. The page logs `DisconnectedError`, `EndCause = 72`. A lobby that has been gone for `KNOCK_LOST_GRACE_MS` (20 seconds) with neither an admission nor a denial is `awaiting_admission_timeout`. The retry sends a new knock. The bot does not keep polling that page until the lobby budget ends.
 - A page with no meeting and no lobby at the end of the budget is `join_failure`.
+- The lobby budget is `VEXA_LOBBY_BUDGET_S`, 600 seconds in our values on every platform (code
+  default 900), so a bot gives up at about the time Meet withdraws an unanswered knock. The
+  reconcile sweep reaps a not-yet-active bot only after the budget plus 60 seconds.
 - Google Meet's "take notes for me" consent prompt is a blocker: the bot reports `needs_help`, does
   not click it, and keeps polling. Admission continues once someone answers it.
 
@@ -158,3 +161,22 @@ A teardown in that state is chased until `UNPROVEN_TEARDOWN_MAX_AGE_S` (default 
 
 An entry write that loses a database race is run again `INTAKE_CONFLICT_RETRIES` times (default
 3), then answered 500.
+
+## Known issue: the two-replica status race
+
+meeting-api keeps each meeting's last status in memory per replica, and re-reads the database
+only when an update looks illegal to it. With two replicas, a bot's updates can alternate between
+them: `joining` lands on replica A, `awaiting_admission` on replica B, then `active` on replica A,
+which still holds `joining`. The guard (`expected_from=persisted_statuses_for(change.old_status)`
+in `app.py`, our commit `c86a62e6`, not upstream) then refuses the write and logs
+`lifecycle_status_refused`, while the bot is still answered `200 accepted`, so it does not retry.
+Later updates are refused the same way. When the runtime removes the pod, the meeting ends
+`failed` with no start time, and the exporter skips it (`bot_failed_skipped … no_start_time`). The
+recording itself is complete in bucket `aw-bots`.
+
+Meetings 40, 221, 265, 319, 338, 369, 370 and 372 (2026-10-01 to 2026-10-08) were lost this way.
+Each holds one recording, but its record is `failed`, `awaiting_admission_timeout`, with no start
+time (checked 2026-10-13), so the exporter's rerun refuses it (`exporter/rerun.py` requires
+`started_at`). They are not yet reprocessed. The intended fix makes the database row the state machine (read,
+check the edge, conditional write, repeat on conflict) and answers a lasting refusal with 409 or
+503 instead of 200; it is deferred by the owner.

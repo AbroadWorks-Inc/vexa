@@ -17,6 +17,10 @@ name: AW images — build & push
 #   push to development   -> :<commit sha>            all six images
 #   manual run            -> :<commit sha> + :<tag>   the images you pick, e.g. tag v0.1.1
 #
+# GitHub offers the manual run only for workflows on the default branch. This
+# repo's default branch is main (upstream's mirror), which does not carry this
+# file, so in practice images come only from pushes to development.
+#
 # There is no :latest or other moving tag. The deployment (aw-notetaker
 # deployment/base/aw-bots/values.yaml and ../aw-exporter/deployment.yaml) pins an
 # exact tag, so nothing changes in the cluster until someone edits those files and

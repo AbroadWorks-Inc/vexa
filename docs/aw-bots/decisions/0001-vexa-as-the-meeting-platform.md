@@ -1,5 +1,7 @@
 # 0001 — Vexa is the meeting platform
 
+Jitsi is no longer on its own recorder: see [0009](0009-jitsi-records-through-aw-bots.md).
+
 ## Context
 
 AW already had a notetaker worker that turns a folder in `aw-chatworks-transcribe` into a named
