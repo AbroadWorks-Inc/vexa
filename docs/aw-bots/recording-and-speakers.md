@@ -34,7 +34,9 @@ capture bridge, and the pipeline share.
 | Zoom | `pertrack` | Named frames, one track per participant |
 | Teams, Jitsi | `mixed` | The server mix. Frames are unnamed. Hints carry the active speaker. |
 
-Zoom is the only `pertrack` platform (`isPerTrackLanePlatform`). Teams stays on the mix.
+Zoom is the only `pertrack` platform (`isPerTrackLanePlatform`). Teams stays on the mix. On Jitsi
+the hints are each participant's audio level in the mix (`kind: "levels"`; bot log
+`[JitsiSpeakers] level speaker → …`), so a Jitsi timeline's `speaker_intervals_source` is `levels`.
 Jitsi's lane for the mixed timeline stays `mixed`. Per-speaker lines on Jitsi are extra; they
 are described under [Per-speaker channels](#per-speaker-channels).
 
@@ -62,6 +64,63 @@ A frame counts as speech at or above `RMS_SPEECH_THRESHOLD` (default 0.026).
 transcribe each channel. That choice is `CHANNEL_TRANSCRIPT_MODE` in the deployment repo.
 This repo does not change that worker. The handoff of the files is
 [export and webhooks](export-and-webhooks.md).
+
+## Zoom hints in a silent room
+
+Zoom keeps the last person in its active-speaker panel while nobody talks, and
+`zoom-speakers.ts` (upstream) re-sends the lit name every ~2 s. Upstream uses that only to name
+tracks. Our `speaker-activity.jsonl` records every hint, and the exporter builds the timeline from
+hints when a file has no named audio frame. A silent room has no frames at all, because the bot
+writes no block whose peak is at or below 0.005. Without a gate, a host alone in a no-show call
+would get minutes of "speech" over a silent recording, and the export would fail its audio check
+([export and webhooks](export-and-webhooks.md#the-audio-check-audio_mismatch)).
+
+So the Zoom wiring in `capture-bridge.ts` sends a hint only while remote audio arrives: a block
+above that same 0.005 floor on any track within the last 2.5 s (one heartbeat plus one
+ScriptProcessor block). An end hint is sent only for a turn whose start was sent. The track namer
+still gets every change, so naming is unchanged. Teams needs no gate: it re-sends a name only
+while the speaking ring is on (`msteams-speakers.ts`). This wiring differs from upstream's
+`capture-bridge.ts`; keep ours when syncing upstream.
+
+Two thresholds answer two questions, and they cannot disagree:
+
+| Value | Where | Question |
+|---|---|---|
+| peak 0.005 | the bot, upstream's capture gate (`aloneness.ts` calls it the single silence oracle) | Is any sound arriving? Below it the bot writes no frame, counts the room as silent and, on Zoom, sends no hint. |
+| RMS 0.026 (`RMS_SPEECH_THRESHOLD`) | the exporter | Is this sound speech? |
+
+A block below the floor is also below the speech threshold.
+
+## What the recorder records
+
+The recorder (`record-chunker`, started after admission) records one audio mix per bot session
+(`recordingSource` in `capture-bridge.ts`):
+
+- **Zoom, Teams, Jitsi**: the live Web Audio graph the capture lane already reads. A track that
+  joins later is connected to the same destination, so it is in the recording. A constant-zero
+  source keeps the mix rendering from the moment it is created, so the recording's clock starts at
+  admission. Bot log: `[pertrack] recording the live mix (N track(s) connected)` (Zoom) or
+  `[mixed] recording the live mix (N stream(s) connected)` (Teams, Jitsi). If the mixed lane has no
+  graph, the master is not recorded and the log says `recording not started: the live mix graph is
+  absent`; channel recorders still run.
+- **Google Meet**: the page's remote audio elements.
+
+Each chunk uploads as it is made (`VEXA_RECORDING_TIMESLICE_MS`, default 15000). A bot session has
+one recording id, derived from its session id (`recordings/jsonb.py`
+`session_recording_numeric_id`), so the first chunks of several media types arriving at the same
+moment land under one recording. The master is assembled on read
+(`GET /recordings/{id}/master`): chunks are read 8 at a time and uploaded as one object, in 8 MiB
+multipart parts above 8 MiB (`recordings/README.md`). A 2-hour channel builds in about 3 s, well
+inside the gateway's 30 s timeout for buffered requests.
+
+## When the bot leaves
+
+The bot leaves when no remote audio above the capture floor (peak 0.005) has reached it for
+`BOT_ALONE_SILENCE_WINDOW_MS` (default 10 minutes, `aloneness.ts`), and ends `completed` with
+reason `left_alone`; that ending is not retried. A bot whose streams are connected but deliver no
+frames is treated as deaf, not alone, and does not leave on that rule.
+meeting-api's own `left_alone`, for a bot whose pod vanished mid-meeting (`reconcile.py`), is a
+lost bot and is retried.
 
 ## Per-speaker channels
 
@@ -125,6 +184,11 @@ already name the channel.
 
 The bot log line when a recorder starts is `[channels] recording ch<N>`.
 
+A Jitsi channel exists only once Jitsi forwards that participant's audio. A client sending
+digital silence never gets one; a real microphone does, through its noise floor. Meet moves
+speakers between its few remote audio elements, so a Meet channel is not one person; the
+activity frames' glow names say who was on it when.
+
 ## Google Meet recording notice
 
 After Meet admits the bot, join posts a chat message
@@ -156,3 +220,16 @@ Docker and process backends have no reaper.
 
 A failed `kubectl get` is not exit code 0. Only a NotFound answer means the pod is gone. A failed
 delete raises, so meeting-api does not treat a still-running pod as removed (`k8s_backend.py`).
+
+## Known limitations
+
+| Limit | Effect | How to spot it |
+|---|---|---|
+| Zoom's web-client bot protection | Zoom refused the bot on 8 of 12 Zoom meetings between 2026-10-01 and 2026-10-12. It cannot be turned off from our side; the sanctioned path is Zoom RTMS (aw-notetaker `docs/superpowers/plans/2026-10-12-zoom-authorised-join.md`). | The meeting ends `failed`, `awaiting_admission_rejected`; the portal says Zoom blocked the notetaker |
+| A Zoom host alone who says two short things minutes apart | If the track namer never binds the host's track, both remarks pass the hint gate, the exporter joins them into one long run (point runs have no gap limit), and the audio check fails. Not observed. Fixing it means changing how point runs join, which changes Teams and Jitsi turns too. | Zoom `_export.json`: `audio_mismatch` with `speakers_checked` 1 |
+| A Jitsi bridge session restart while the bot reports `ended` | A speaker who comes back may not get a channel | Fewer channels than speakers after a reconnect |
+| A channel's empty final chunk can reach meeting-api before its last data chunk | Seen in tests and live (0.1 s apart). Whether assembly handles that order is not checked | A channel master shorter than its recorder ran |
+| Google Meet reconnect | A second recorder can open for the same stream under a new channel number | Two channels with the same `stream_id` |
+| Channels uploaded when the mixed master was skipped | The exporter's handling of that case is not checked | `[mixed] recording not started` in the bot log |
+| Large Jitsi calls | At 30 participants the bot (1 CPU) averages 0.88 core and is throttled 47 % of the time, audio only; video receive is not measured | CPU throttling on the bot pod |
+

@@ -45,7 +45,8 @@ Retries follow `WEBHOOK_RETRY_SCHEDULE_S`, default `60,300,1800,7200` (1 min, 5 
 including a redirect, is `failed` and is not retried. HTTP 404 is `failed`.
 
 Secrets are stored encrypted with `WEBHOOK_SECRET_ENC_KEYS`. The active kid is
-`WEBHOOK_SECRET_ENC_ACTIVE_KEY`. A subscription secret is 16 to 512 characters and is not shown
+`WEBHOOK_SECRET_ENC_ACTIVE_KEY`, which the chart fills from the Secret key
+`WEBHOOK_SECRET_ENC_KEY_LABEL`. A subscription secret is 16 to 512 characters and is not shown
 again. Private webhook hosts must be listed in `WEBHOOK_PRIVATE_HOST_ALLOWLIST`. The hosts we
 set are in the README configuration table.
 
@@ -66,7 +67,8 @@ The exporter reads recordings through the gateway with its own key (scopes `tx` 
 It reports the result with `POST /v2/meetings/{uuid}/export`.
 
 The folder name is `exporter/naming.py` `folder_name`:
-`{platform}_{native_meeting_id}_{start UTC as YYYYMMDDTHHMMSSmmmZ}`.
+`{platform}_{native_meeting_id}_{start UTC as YYYYMMDDTHHMMSSmmmZ}`. The native id (a Meet code, a
+Zoom number, a Jitsi room) is in the name on purpose, so a folder can be found by meeting in S3.
 Unsafe characters in the native id become `-`. The prefix is `recordings/` in bucket
 `aw-chatworks-transcribe` (`EXPORT_BUCKET`, `EXPORT_PREFIX`).
 
@@ -87,9 +89,13 @@ One pass writes:
 | `signal/` | Only when `EXPORT_DEBUG` is true |
 | `_export.json` | The exporter's own state, including `handed_off`. An `audio_mismatch` holds counts and levels, never a speaker's name. A rerun refused because the meeting is being transcribed adds `rerun` here and leaves the state as it was |
 
-notetaker-worker writes into the same folder: its outputs (`notes.json`, `transcript.txt`,
-`summary.json`) and `_transcription.json`, the state of its current job for this folder:
-`{"state": "processing" | "completed" | "failed", "error", "at"}`. The exporter never writes
+notetaker-worker writes into the same folder: `notes.json`, `transcript.txt` (the per-person
+transcript when `channels/index.json` names channels, otherwise the mixed one), `transcript_en.txt`
+(the English translation of non-English turns), `summary.json`, `cost.json`, and
+`_transcription.json`, the state of its current job for this folder:
+`{"state": "processing" | "completed" | "failed", "error", "at"}`. When nothing was transcribed
+(a silent call), the worker calls no model: `notes.json` has `segment_count` 0 and `summary` `{}`,
+and there is no `summary.json`. The exporter never writes
 `_transcription.json`. Its rerun check asks the worker's `GET /status/{id}` instead.
 
 Several bot sessions on one meeting are joined into that one folder, up to
@@ -111,6 +117,10 @@ retention class (the index expires with the files it names);
 the table, and a run that stops at `no_audio` or `too_many_recordings` writes the empty ones
 above, so a rerun leaves no file of an earlier export behind; notetaker-worker removes the
 channel files the index does not name.
+
+The exporter deletes nothing in the export bucket, and its IAM role has no delete permission
+there. Removing files from a folder is notetaker-worker's job on a rerun: it moves the previous
+outputs to `runs/<processed_at>/` and removes the channel files the index does not name.
 
 Memory stays flat at any meeting length: activity frames are streamed to disk as
 they are read, the timeline's named frames wait on disk in sorted runs past 50,000,
@@ -134,7 +144,8 @@ is queued either. The export job asks the worker again before the rerun writes a
 accepted finishes only the steps after it on a retry, without rewriting the folder. A refused
 rerun is recorded in `_export.json`'s `rerun` block and is reported `failed` only for a folder
 that was never handed off, so a `handed_off` export is never turned into `failed`. Details: the
-[package README](../../integrations/out/aw-notetaker/README.md).
+[package README](../../integrations/out/aw-notetaker/README.md). When to run it: aw-notetaker
+`deployment/base/aw-bots/README.md`, heading "Re-exporting a meeting".
 
 `POST /process` goes to `NOTETAKER_URL`. The exporter Deployment sets
 `http://notetaker-api.notetaker.svc.cluster.local:8080`. The runbook's prerequisite check is
@@ -146,3 +157,27 @@ deployment repo. This fork stops at the handoff.
 
 A meeting already marked `handed_off` is not submitted again. Transport errors and HTTP 5xx are
 retried. HTTP 4xx fails the export.
+
+## The audio check (`audio_mismatch`)
+
+Before `POST /process`, the exporter checks that the recording holds the speech the speaker
+timeline says happened (`exporter/job.py` `_speaker_levels`). For each speaker it measures the RMS
+of `audio.wav` inside that speaker's timeline coverage: the timeline's intervals, or, when it has
+none, runs of points closed at the last point plus `SPEECH_HANGOVER_MS` and clipped to the next
+speaker. Only speakers with more than 10 s of coverage are checked. If any of them is below
+`RMS_SPEECH_THRESHOLD` (0.026), the export fails `audio_mismatch`: `_export.json` records counts
+and levels (never a name), the result is reported `failed`, and `/process` is not called. A later
+re-enqueue runs the check again.
+
+The check compares our recording with the platform's own speaker signal. Jitsi's audio levels and
+Teams' speaking ring come from the platform, not from our recording, so a speaker the platform
+heard and our recording missed shows up as silence. That is how a silent recording is caught. An
+exporter that accepted only hints our own audio backs up would be comparing the recording with
+itself, and the check would catch nothing.
+
+Zoom is the exception. Zoom keeps the last speaker lit in its active-speaker panel while nobody
+talks, and the bot re-sends that name every ~2 s, so the bot sends a Zoom hint only while remote
+audio reaches it ([recording and speakers](recording-and-speakers.md#zoom-hints-in-a-silent-room)).
+A silent one-person Zoom call therefore exports with no speech instead of failing this check. On
+Zoom the check still catches a recording that loses audio the bot received (a broken mix or
+recorder: the per-track taps that gate the hints are separate from the recorder).

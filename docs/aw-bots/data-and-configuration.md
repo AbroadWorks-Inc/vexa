@@ -84,8 +84,13 @@ and Teams and Zoom, do not get channel files. The bot learns the decision from
 `perChannelRecordingEnabled` on its invocation, and only when the value is true.
 Changing the list and running `helm upgrade` changes the next bot. A bot already in a
 call keeps the invocation it started with. The worker's `CHANNEL_TRANSCRIPT_MODE` is a
-different setting, on the notetaker Deployment in the deployment repo. Recording
-channels does not by itself replace the mixed transcript.
+different setting, on the notetaker Deployment in the deployment repo, set to `deliver`: when a
+meeting has channel files, the per-person transcript is the one delivered, and the mixed
+recording is transcribed only when that path fails or returns nothing.
+
+**Lobby budget.** `VEXA_LOBBY_BUDGET_S` is set to 600 in `meetingApi.extraEnv`; the code default
+in `bot_spawn/service.py` is 900. The reconcile sweep's pre-active grace is derived from it
+(budget plus 60 s), so raising one raises the other.
 
 **Image tags.** `global.imageTag` is empty, so each image uses the tag in the values file or,
 for the exporter, in its Deployment. There is no `:latest`.

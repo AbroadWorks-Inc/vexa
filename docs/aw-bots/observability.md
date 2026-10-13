@@ -75,6 +75,29 @@ increment. The `webhook_deliveries` row can still say `failed` or `dead`.
 | `AwBotsRetentionSweepStale` | warning | Webhook retention has not run |
 | `AwBotsSweepRunCapped` | warning | A sweep stopped because it hit its batch cap |
 
+No rule watches `aw_calendar_entries_sent_total{result="auth_failed"}`. If the calendar module's
+key is revoked or expires, every sync is refused and no alert fires; `AwBotsApiKeyExpiring` is the
+only warning ahead of time.
+
 For an exporter subscription, `AwBotsWebhookDeliveryFailed` with HTTP 401 means
 `EXPORTER_WEBHOOK_SECRET` and the subscription secret differ. That meeting is not exported.
 HTTP 404 from a subscriber is the same alert: the event is not retried.
+
+## Pipeline alerts outside this fork
+
+The rest of the recording pipeline is alerted from the deployment repo (talke),
+`deployment/monitoring-stack/prometheus-alerting-values.yaml`, in the same Prometheus:
+
+| Alert | Severity | Fires when |
+|---|---|---|
+| `NotetakerTranscriptionFailed` | warning | A notetaker-worker job ended `failed` in the last 30 minutes (`notetaker_jobs_finished_total{outcome="failed"}`): a meeting has no notes. The meeting id is in the worker log line `Error processing meeting <id>`. |
+| `NotetakerRecordingsPendingMetricAbsent` | critical | `notetaker_recordings_pending` has been missing for 15 minutes, so the transcriber's autoscaling has nothing to read |
+| `TranscriberNoReplicaAvailable` | critical | The transcriber wants a replica and has none for 25 minutes |
+| `TranscriberPodPending` | critical | A transcriber pod has been Pending for 30 minutes |
+| `TranscriberNodeAdvertisesNoGPU` | critical | A transcriber node advertises no GPU for 5 minutes |
+| `TranscriberGPUNodeIdle` | warning | A GPU node has run with no transcriber pod for 45 minutes |
+| `GPUSaturated` | warning | A GPU averaged over 90 % for 30 minutes, held 45 minutes. One long recording can do this on its own. |
+| `GPUMemoryNearFull`, `GPUTemperatureHigh`, `GPUMetricsMissing` | warning | GPU memory, temperature or its metrics exporter |
+
+`NotetakerBotPodStuck` and `NotetakerBotJobFailed` in the same file watch the old cloud bot's
+namespace `notetaker-bots`, not AW Bots.

@@ -1,5 +1,7 @@
 # 0008 — Per-speaker channels beside the mix
 
+The worker now runs `deliver`, not `compare`: see [0010](0010-per-person-transcript-is-delivered.md).
+
 ## Context
 
 After the call, one mixed recording is transcribed and names are applied from
