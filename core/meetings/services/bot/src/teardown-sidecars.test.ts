@@ -118,7 +118,7 @@ const dir = mkdtempSync(join(tmpdir(), 'vexa-teardown-'));
     existsSync(rec.botlogPath) === false || summary.skipped.includes('botlog') || summary.uploaded.includes('botlog'),
     JSON.stringify(summary));
   check('every part the walk attempted is one the server knows',
-    attempted.every((p) => ['captured-signal', 'stt', 'captions', 'csrc', 'observations', 'botlog', 'transcript'].includes(p)),
+    attempted.every((p) => ['captured-signal', 'stt', 'captions', 'csrc', 'observations', 'botlog', 'transcript', 'speaker-activity'].includes(p)),
     JSON.stringify(attempted));
 }
 

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "webhook_not_found",
+    "message": "no such webhook subscription"
+  }
+}

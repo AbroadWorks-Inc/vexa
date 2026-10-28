@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "meeting_not_finished",
+    "message": "the meeting hasn't finished; remove its entries or stop it first"
+  }
+}

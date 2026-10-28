@@ -1,491 +1,370 @@
-<div align="center">
+# AW Bots
 
-<img src="assets/logodark.svg" alt="Vexa logo" width="72"/>
+AbroadWorks's meeting bots. A bot joins a **Google Meet, Microsoft Teams, Zoom, or Jitsi** call before it
+starts, records the audio and notes **who was speaking when**. After the call, the meeting goes to the
+AW notetaker pipeline, which produces a **named transcript and a summary**.
 
-# Vexa
+AW Bots is a fork of the open-source project [Vexa](https://github.com/Vexa-ai/vexa) (v0.12,
+Apache-2.0). We run Vexa as-is wherever we can and keep our own changes small and clearly separated
+(see [What we changed](#what-we-changed)). Upstream's original README is kept in
+[`README.upstream.md`](README.upstream.md).
 
-**Open-source meeting bots and real-time transcription — cloud or fully self-hosted.**
-
-A bot joins your Google Meet, Microsoft Teams, and Zoom calls and streams speaker-attributed
-transcripts in real time — through our API or one *you* host — then feeds sandboxed agents that build
-a Markdown knowledge base your team owns. Apache-2.0, air-gap-ready. (Jitsi: join + capture
-offline-proven, live validation pending — [#883](https://github.com/Vexa-ai/vexa/issues/883).)
-
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12-informational.svg)](#️-status--roadmap)
-[![Deploy](https://img.shields.io/badge/deploy-cloud%20or%20self--hosted-success.svg)](#-quickstart)
-[![Discord](https://img.shields.io/badge/chat-Discord-5865F2.svg)](https://discord.gg/Ga9duGkVz9)
-
-**[vexa.ai](https://vexa.ai)** runs Vexa 0.12 for meeting bots and transcription.
-Sandboxed knowledge agents are self-hosted only — [self-host Vexa](#-quickstart) to run the full stack.
-
-</div>
+Jitsi, including `meet.abroadworks.com`, uses the same bot. `VEXA_JITSI_HOSTS` lists that host so
+the link parses. `ENTRY_BLOCKED_HOSTS` is empty, so intake does not refuse it.
 
 ---
 
-**[Connect your agent](https://vexa.ai/connect?utm_source=github&utm_medium=readme)**
-· **[Get an API key](https://vexa.ai/start?utm_source=github&utm_medium=readme)**
-· **[Talk to the founder](https://cal.com/dmitrygrankin/web)**
+## How it fits together
 
-## Why Vexa
-
-Every meeting-AI tool you can buy sends your conversations to *their* cloud and rents you
-access back. Vexa inverts that: run the stack yourself, point it at your own models, own what
-your meetings become.
-
-No one else has all three:
-
-1. **Vexa is *in* the meeting.** A real bot joins Meet, Teams and Zoom — Jitsi offline-proven, live
-   validation pending — and streams speaker-attributed transcripts live. That bot fleet is the
-   genuinely hard part — every "chat with your docs" tool starts *after* a transcript exists. Vexa
-   produces it.
-
-2. **Your knowledge is files you own.** Meetings compile into Markdown in a git repo —
-   portable, diffable, greppable. Knowledge as code.
-
-3. **Agents work it, safely.** Sandboxed coding agents read and write that repo like
-   developers — isolated ephemeral containers, no egress, thousands in parallel, on Docker
-   or your Kubernetes.
-
-> **Only here for the transcription API?** It's a complete standalone product — send a bot,
-> read the stream, ignore the agent lane entirely.
-
----
-
-## ⚡ Quickstart
-
-**Just want a bot in a meeting?** Use the hosted service — no install. Sign in at
-[vexa.ai/signin](https://vexa.ai/signin), copy your key from [your account page](https://vexa.ai/account),
-and send a bot:
-
-```bash
-curl -X POST "https://api.cloud.vexa.ai/bots" \
-  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"platform":"google_meet","native_meeting_id":"abc-defg-hij","bot_name":"Vexa"}'
+```
+ Calendar module (calendar-dispatcher)   Portal (users sign in with Google)
+   │  PUT /v2/entries, POST /v2/entries/remove, reads, instant join, stop  (own key each)
+   ▼
+ AW Bots (this repo, deployed with Helm on EKS)
+   ├─ gateway ─ admin-api ─ meeting-api ─ runtime ──► one bot pod per meeting (Karpenter nodes)
+   │                                                   joins before start, records audio,
+   │                                                   writes speaker-activity.jsonl
+   │  stores recordings + speaker activity in  s3://aw-bots/
+   │  a bot that fails mid-meeting is replaced on the same meeting ("bot.retry")
+   │  every status change: signed webhook to each /v2/webhooks subscriber (the portal, the exporter)
+   │  the exporter acts on  "meeting.completed", or "bot.failed" when a recording exists
+   ▼
+ exporter (our addition, integrations/out/aw-notetaker/)
+   │  reads the meeting's recordings through the gateway (its own key)
+   │  builds  s3://aw-chatworks-transcribe/recordings/<platform>_<meetingId>_<startUTC>/
+   │          master.webm · audio.wav · speaker_timeline.json · participants.json · meeting.json …
+   │          and, when the bot recorded per-speaker channels:
+   │          channels/ch<N>.webm · channels/index.json · speaker_activity_frames.json
+   │  then calls  POST /process  (meeting UUID)  and reports the result to AW Bots
+   ▼
+ notetaker-worker ──► transcriber (Whisper large-v3, GPU) ──► notes.json · transcript.txt · summary
+   (existing AW pipeline, shared with Jitsi; lives in the deployment repo, not here)
 ```
 
-New accounts get **$2 of free bot credit, no card required** — about 6 hours of bot time at
-$0.30/hr ([pricing](https://vexa.ai/pricing)). More calls: [Send a bot](https://docs.vexa.ai/how-to/send-a-bot).
+**How names get onto the transcript.** Whisper turns `audio.wav` into text with timestamps but
+doesn't know who is speaking. The bot's `speaker-activity.jsonl` says who was talking at each moment.
+`notetaker-worker` matches the two by time and writes the names. This is the same method Jitsi uses
+with Prosody's speaker timeline.
 
-### Or self-host the whole stack
+On Google Meet and Jitsi the bot also records each remote channel beside that mix. The exporter
+adds `channels/ch<N>.webm`, `channels/index.json`, and `speaker_activity_frames.json`. The worker
+setting `CHANNEL_TRANSCRIPT_MODE` is `deliver`: the per-person transcript is the one users receive
+(`transcript.txt`), and the mixed recording is transcribed only when that path fails or returns
+nothing. Teams, Zoom, and any meeting without `channels/index.json` stay on the mixed path. Detail is in
+[recording and speakers](docs/aw-bots/recording-and-speakers.md) and
+[export and webhooks](docs/aw-bots/export-and-webhooks.md). The worker's own page is
+`deployment/base/notetaker/worker/README.md` in the deployment repo.
 
-That is also how you get the agent plane, which is not part of the hosted service.
-Self-host on one host, then explore it in the Terminal or drive it over the API.
-Linux (Ubuntu 24.04) is the production target; a Mac with Docker Desktop works fine for a local
-evaluation — everything runs in containers either way.
+**Live transcription is off.** Vexa can transcribe live during the call, but we use the recording and
+the shared Whisper large-v3 transcriber instead. Live transcription is a setting
+(`TRANSCRIBE_ENABLED`), default off for us.
 
-**Prerequisites** — `make`, **Docker engine ≥ v26** (`make all` checks), and transcription: a free token at
-[vexa.ai/account](https://vexa.ai/account), or self-host the (GPU) transcription unit for a fully
-air-gapped setup. By default `POST /bots` **requires** STT and answers **503** when it is missing
-(`make all` warns when the credentials block in `.env` is empty). Capture-only is an explicit opt-out:
-`{"transcribe_enabled": false}` on the spawn (or set `TRANSCRIBE_ENABLED=false` for the deployment).
+Which service does what, and who may call it, is [docs/aw-bots/architecture.md](docs/aw-bots/architecture.md).
 
-> **Build machine:** `make all` **pulls** the published, release-validated images — no build, so a
-> modest box is fine. `make lite` (the single-container all-in-one image) is lighter still. Building
-> from this checkout instead (`make dev`, for contributors) wants **8 vCPUs and 16 GB RAM**.
+### The `/v2` API
 
-```bash
-git clone https://github.com/Vexa-ai/vexa.git && cd vexa
-make all      # full Docker Compose stack — seeds .env, pulls the images (bot included),
-              # prints your API key + URLs. Contributors: `make dev` builds from this checkout.
-```
+Apps send meetings to AW Bots through the gateway. **Client developers start with the
+[`/v2` API reference](core/meetings/services/meeting-api/V2-API.md)**: every
+route, field, reply, error and webhook, with `curl` examples and signature-check code.
+How an entry becomes a bot is [docs/aw-bots/meeting-lifecycle.md](docs/aw-bots/meeting-lifecycle.md).
+The sealed contracts are `core/meetings/contracts/intake.v1/` and `webhook.v1/`.
 
-When `make all` finishes it prints your key and URLs:
-
-```text
-  Terminal UI : http://localhost:13000     # the web workbench
-  API gateway : http://localhost:18056     # the API
-  API key     : vxa_…
-```
-
-### Explore in the Terminal (the fast path)
-
-**The Terminal is the way to see what Vexa can do.** Open **`http://localhost:13000`** — you're
-already signed in to a self-host account. From the
-workbench you can, with no curl:
-
-- **Send a bot** — paste a Meet / Zoom / Teams / Jitsi URL; a bot joins as a participant.
-- **Watch the transcript** stream in live, speaker-attributed, draft-then-confirmed.
-- **Chat with your workspace** — ask an agent that has every captured meeting as context, and watch it
-  commit what you decide.
-
-### Or drive it over the API
-
-```bash
-export API_KEY=vxa_...
-export API_BASE=http://localhost:18056
-
-# WIN 1 — send a bot into a live call, then read the transcript as it streams
-curl -X POST "$API_BASE/bots" \
-  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"platform":"google_meet","native_meeting_id":"abc-defg-hij","bot_name":"Vexa"}'
-
-curl -H "X-API-Key: $API_KEY" "$API_BASE/transcripts/google_meet/abc-defg-hij"
-
-# WIN 2 — ask an agent that has your whole workspace as context (answer streams back as SSE)
-curl -N -X POST "$API_BASE/agent/chat" \
-  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"prompt":"What did we decide in my last meeting?"}'
-```
-
-`platform` is `google_meet` · `teams` · `zoom` · `jitsi`; `native_meeting_id` is the code from the join URL. The
-agent reply streams as Server-Sent Events — `message-delta` frames carry the text, `commit` frames mark
-anything it recorded into your workspace.
-
----
-
-## 🧩 How it works
-
-One gateway, two domains — **Meetings** (capture) and **Agents** (work the knowledge) — both running on
-the same **runtime**: the engine that spawns every bot and every agent in its own sandboxed container.
-
-<div align="center">
-  <img src="assets/architecture.svg" width="840"
-       alt="One API gateway routes to two domains — Meetings and Agents — both running on one runtime that spawns each bot and agent in its own sandboxed container on Docker, Kubernetes, or Process.">
-</div>
-
-A bot and an agent are the **same `runtime.v1` workload** — isolated, ephemeral, reaped on idle — so the
-machinery already proven by thousands of meeting bots is exactly what runs your agents. Every arrow stays
-inside your network.
-
----
-
-## ⚙️ The agentic runtime
-
-A CLI coding agent is just a process on Linux. The **runtime** makes that a multi-tenant,
-sandboxed execution layer safe to point at real business data — the same engine that already
-spawns Vexa's meeting bots in production.
-
-- **Isolated.** Every dispatch gets its own container: no egress except brokered tools, and
-  only its granted workspaces exist in its filesystem — enforced by the substrate, not by the
-  agent. Agents never run in the control plane.
-- **Ephemeral.** A container lives while it works and is reaped on idle; continuity is a
-  session file in the workspace. Sub-second starts, thousands in parallel.
-- **Orchestration-agnostic.** One `runtime.v1` lifecycle, pluggable substrate — the same
-  dispatch runs identically across:
-
-| Backend (`RUNTIME_BACKEND`) | A workload is… | State |
+| Call | Scope | Does |
 |---|---|---|
-| **`docker`** (default) | its own container via the Docker socket — brought up with `make all` | ✅ Shipped (open core) |
-| **`process`** | a child process, no Docker socket required | ✅ Available |
-| **`k8s`** | a bare **Pod** (`kubectl run --restart=Never`), scheduled across a cluster | ✅ Lifecycle + per-mount workspace isolation; Helm chart in `deploy/helm` |
+| `PUT /v2/entries` | `bot` | Create or update one **entry**: one person's invite, or one click (`join_now: true` sends a bot now) |
+| `POST /v2/entries/remove` | `bot` | Remove one entry, with an optional reason |
+| `GET /v2/entries?user=` | `bot` | The sender's active entries for one user, with a hash of each, so a sender can send only the differences |
+| `GET /v2/meetings?user=`, `GET /v2/meetings/{id}?user=` | `tx` | The meetings a user owns or is invited to |
+| `POST /v2/meetings/{id}/stop` | `bot` | The live bot, in the call or still joining, leaves now (no live bot at all → `no_live_bot`) |
+| `DELETE /v2/meetings/{id}` | `erase` | Erase a finished meeting's AW Bots data (recording copies in `aw-bots`, transcript rows, entries, webhook rows). Nothing in `aw-chatworks-transcribe` is deleted |
+| `POST /v2/meetings/{id}/export` | `export` | The exporter reports its result |
 
-Same control plane, same worker — only how the container is created changes. One laptop to a
-Kubernetes/OpenShift cluster, inside your walls.
+Events, signing, and delivery are [docs/aw-bots/export-and-webhooks.md](docs/aw-bots/export-and-webhooks.md).
 
----
+### Keys and signed identity
 
-## 🧠 Agents & your workspace
+How the gateway signs `x-user-id`, and how the rings rotate, is
+[docs/aw-bots/security.md](docs/aw-bots/security.md). One key per consumer, all under the service
+user, with only the scopes it needs:
 
-Capture is the front door; **agents** make the knowledge compound. Every meeting compiles into
-your **workspace** — a git repo of Markdown (an [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf)
-`kg/` bundle) that agents (Claude Code, Codex, …) read and write like developers work a codebase.
+  | Key name | Scopes | Where it lives |
+  |---|---|---|
+  | `calendar-dispatcher` | `bot` | Secret `aw-bots-key-calendar-dispatcher` (namespace `notetaker`) |
+  | `portal` | `bot`, `tx` | Secret `aw-bots-key-portal` (namespace `notetaker`) |
+  | `exporter` | `tx`, `export` | Secret `aw-bots-key-exporter` (namespace `aw-bots`) |
+  | `operator` | `webhooks`, `erase` | the operator vault only |
 
-> This is [Andrej Karpathy's **LLM Wiki**](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
-> pattern, run as a team service. The idea: don't RAG over raw documents — where the model
-> rediscovers everything from scratch on every question — have agents **compile** sources into
-> structured, interlinked markdown entity pages (people, companies, projects, decisions) so
-> knowledge **compounds**. Vexa builds that wiki for you from the richest source there is: your
-> meetings. Each call is ingested into entity pages; agents keep them current between calls; every
-> answer starts from what your team already knows — on your own servers.
-
-Agents work *any* workspace; a meeting is just one trigger of four — **chat**, **schedule**
-(cron), **event** (e.g. incoming email), **finished meeting**. Meetings themselves are scheduled
-work: connect your calendar (ICS) and planned meetings appear with attendees — bots
-**auto-join**, agents prepare before the call and process after it.
-
-- **Multiplayer.** Team-shared, attributed workspaces — not one person's private notes.
-- **Automated.** The bot captures the call; the transcript compiles itself in.
-- **Safe by design.** Agents are untrusted and enforce nothing themselves. You, in chat, write
-  directly (git is the undo); untrusted input — an email, a web page — runs **propose-only**:
-  the agent suggests, a human approves, trusted code applies. Irreversible effects are always gated.
-
-> **Status (honest):** capture, transcription, and speaker attribution are **production**; the
-> agent dispatch core is **built and proven live** end-to-end. What's still landing is tracked in
-> [Status](#️-status--roadmap).
+  The `/user/*` routes accept only the user scopes `bot`, `tx` and `browser`.
 
 ---
 
-## 🖥️ The Terminal: AI-augmented meetings
+## What we changed
 
-0.12 ships a **new Terminal UI** built to put the backend's scale — thousands of bots and
-agents — to work on your actual week. It opens on your meetings: coming up, live now, to review.
+Everything else is upstream Vexa, unchanged.
 
-- **An agent in your meeting, with your knowledge.** Open a live call: the transcript streams
-  speaker-attributed, and the agent has the live conversation *and* your workspace in context.
-  Ask mid-call "what did we promise them last time?" — or research a person, company, or
-  contract the moment it comes up, grounded in your wiki.
+| Change | Where | Why |
+|---|---|---|
+| **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
+| **Per-speaker channel files.** On Google Meet and Jitsi, when the deployment lists the platform, the bot records each remote channel beside the mixed master (`media_type` `ch<N>`). Jitsi also writes activity lines marked `"src":"channel"`. Those lines do not enter the mixed timeline. The exporter copies each channel into the notetaker folder. | `capture-bridge.ts`, `core/meetings/modules/record-chunker/src/channel-targets.ts`, `meeting_api/bot_spawn/service.py`, `exporter/job.py` | One mixed recording loses words when people talk at once, and a Meet glow name can land on the wrong channel. The mixed folder is still always written. |
+| **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the v2 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. Its queue is bounded: conditional writes, a retry and a crash budget, a job timeout, a stop wait on SIGTERM, and memory that stays flat at any meeting length. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
+| **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
+| **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |
+| **Meeting intake (`/v2`).** Entries, meetings, stop, erase and the export report; one meeting per link and time, one live bot per link; the scheduler sends the bot for the exact meeting that is due. The v2 meeting object carries `upstream_id`, `started_at`, `ended_at`, and `join_failure` (why a bot that never got in failed, and whether the host, the platform or our system caused it). | `core/meetings/services/meeting-api/src/meeting_api/intake/` (+ changes in `bot_spawn/`, `lifecycle/`, `collector/`); contract `core/meetings/contracts/intake.v1/` | Any app (the calendar module, the portal) can hand AW Bots its meetings and get a definite answer, without two bots in one call. |
+| **One status writer and the webhook outbox.** Every status change goes through one function, which records the event in the same transaction. Leased senders deliver it, with their state in Postgres. | `meeting_api/intake/status.py`, `meeting_api/webhooks/`; new `webhook.v1` events | No change is lost or sent twice from our side, whichever meeting-api replica handles it. |
+| **One finish.** Every way a meeting ends, whether the bot reports it or aw-bots ends the meeting itself, runs the same finish steps: the transcript finalized, the service provenance, the typed event and its edges (flows, the per-user `webhook_url`, the system hook when one is set), the copilot reap. | `meeting_api/app.py` (`_finish`) | A meeting's end is reported the same way whoever ended it. |
+| **Bounded bot sends.** A meeting entries manage gets at most `BOT_SEND_MAX_ATTEMPTS` sends, `BOT_SEND_RETRY_BACKOFF_S` apart; the last failure ends it `not_sent` with the typed code. | `meeting_api/intake/service.py`, `bot_spawn/auto_join.py`; `meeting_aw_state.send_attempts` | A bot that can't be sent is tried again a few times, never forever, and the reason reaches the webhook and the metrics. |
+| **A new bot on the same meeting.** A bot that fails while its meeting is on (a failed start, a join failure, a lobby timeout, a crash in the call, a lost bot) is replaced on the same meeting, from the same send count, once the failed pod is proven gone; a deadline, a pending-teardown list, a spawn that names its workload before it creates it, and a reconcile backstop bound every case. Not replaced (`intake/retry.py` `NOT_RETRIED`): a user's stop, the host removing the bot, nobody joining, the host or the platform refusing the bot, a signed-out profile, a link that isn't a meeting, the time cap, and the bot's own normal end. | `meeting_api/intake/retry.py`, `bot_spawn/`, `lifecycle/reconcile.py`; webhook `bot.retry` | Never two bots in one call, and a meeting whose bot failed early still gets recorded. The exporter joins every session's audio and speakers into one folder. |
+| **Bounded sweeps.** Every intake sweep, and upstream's reconcile loops (`stale-stopping`, `stale-nonterminal`), reads in pages of `SWEEP_BATCH_SIZE` and gives an item up after `SWEEP_MAX_ITEM_FAILURES`, logged and counted. A runtime that doesn't answer is never an item's failure: a teardown waits for it, counted `runtime_unreachable`, until `UNPROVEN_TEARDOWN_MAX_AGE_S`. Give-up records are kept while their item is listed and pruned after `SWEEP_ITEM_FAILURES_RETENTION_S`; admin-api's webhook retention deletes in bounded batches. An entry write that loses a database race is run again `INTAKE_CONFLICT_RETRIES` times, then answered 500. | `meeting_api/sweeps/item_failures.py` (`run_pages`, `run_item`), `lifecycle/reconcile.py` (`runtime_bound`), table `sweep_item_failures`; `intake/service.py`; `admin_api/app/retention.py` | Nothing retries forever, and one bad item never stops the rest. |
+| **Webhook subscriptions, scopes and keys.** `/v2/webhooks`, encrypted receiver secrets, new scopes `webhooks`, `erase`, `export`. | `core/identity/services/admin-api`; `core/identity/contracts/identity.v1/` | Each app subscribes on its own; each consumer's key can do only its own job. |
+| **Signed gateway identity; callback checks.** The gateway signs the user it forwards; meeting-api and admin-api check it. Bot callbacks must carry the internal secret; runtime callbacks carry a per-bot token. The gateway limits entry writes per account and answers `/v2` errors in the `/v2` shape. | `core/gateway/services/gateway`, meeting-api, admin-api | A pod inside the cluster can't act as any user by setting a header. |
+| **Metrics.** `/metrics` on meeting-api and admin-api (not routed through the gateway). | `meeting_api/metrics.py`, `admin_api/app/metrics.py`; Helm `meetingApi.podAnnotations`, `adminApi.podAnnotations` | Prometheus scrapes them; the alerts live in aw-notetaker. |
+| **Image workflow.** Builds and pushes our six images (meeting-api, bot, exporter, gateway, admin-api, runtime) to GHCR. | `.github/workflows/aw-images.yml` | Images come from CI on every push to `development`. |
+| **Join outcomes.** A blocker met before any lobby (Zoom's automated-bot wall, the Meet consent prompt) reports `needs_help` from `joining`; `needs_help` can lead back to `awaiting_admission`. A join that ends blocked is `awaiting_admission_rejected` and is not retried. `failure_stage` names the lobby only when the bot reached it. `needs_help` counts as pre-active for reconcile, the bot limit and stop. | bot `src/contracts.ts`, `src/orchestrator.ts`; meeting-api `lifecycle/machine.py`, `lifecycle/reconcile.py`, `intake/stop.py`; contract `core/meetings/contracts/lifecycle.v1/` | A wall or a consent prompt is reported as what it is, and a refusal is not retried into the same answer. |
+| **Lite helper for local tests.** | `deploy/lite/Makefile`, `deploy/lite/aw-recording.sh` | Run one bot on a laptop against a real meeting and get the files out. |
 
-- **Knowledge built on meetings — and between them.** Every planned meeting gets an agent that
-  **prepares the brief before** (who's coming, history, open threads — it interviews *you* for
-  what it can't know) and **processes the transcript after**. Arrive prepared, leave with the
-  wiki updated.
-
-- **Sharing.** Invite colleagues into a workspace — same wiki, attributed. Share a meeting with
-  its attendees — they get the **real-time feed**, not a recording link after the fact.
-
-- **Collaborative, AI-augmented meetings.** Prep a shared workspace together; during the call,
-  humans edit the brief while agents stream the transcript in and work the knowledge — one room,
-  human and AI participants on the same files.
-
----
-
-## 📖 How-to recipes
-
-Each is a complete path to one outcome over the [Agent API](#-api-reference). Full guides at
-[docs.vexa.ai](https://docs.vexa.ai).
-
-**💬 Chat with your workspace** — ask an agent that has every meeting, email, and note as context; trusted
-chat can also record a decision (a git commit).
-
-```bash
-curl -N -X POST "$API_BASE/agent/chat" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"prompt":"Brief me on the Acme account: every meeting, the open decisions, and the next step."}'
-```
-
-**🌅 Brief me every morning** — an unattended agent on a cron schedule that commits to your workspace.
-
-```bash
-curl -X POST "$API_BASE/agent/routines" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"name":"Morning brief","cron":"0 8 * * 1-5",
-       "prompt":"Brief me from overnight activity — new meetings, decisions, follow-ups due. Write brief/today.md.",
-       "run_now":true}'
-```
-
-**📝 Report after every meeting** — dispatch a one-shot agent when a call ends (or a routine that sweeps
-recent meetings).
-
-```bash
-curl -X POST "$API_BASE/agent/invocations" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"runner":"claude-code","workspaces":[{"id":"u_jane","mode":"rw"}],"trigger":"scheduled",
-       "start":{"entrypoint":{"inline":"Write a report for the meeting that just ended: summary, decisions, action items with owners."}}}'
-```
-
-**📧 Triage incoming email (safely)** — an event-triggered agent that gets the mailbox **read-only** and can
-only *propose* actions as cards; a human approves before anything is written or sent.
-
-```bash
-curl -X POST "$API_BASE/agent/events" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"name":"email.received","source":{"uri":"mailbox://u_jane/INBOX/AB12CD"},
-       "plan":{"prompt":"Triage this email into tasks; propose a record for each action item and a draft reply."}}'
-```
-
-> **During the call** — stream the live transcript with `GET /agent/meeting/stream` and ask your
-> agent about it in the chat. Vexa runs no model of its own during a meeting: there is one
-> intelligence and it is your agent. See [Status](#️-status--roadmap).
+The handbook is [`docs/aw-bots/`](docs/aw-bots/README.md). Decisions are
+[`docs/aw-bots/decisions/`](docs/aw-bots/decisions/README.md).
 
 ---
 
-## 🚀 Deployment options
+## Repository map
 
-Two ways to run Vexa, one codebase:
+Folders we work in:
 
-**1. Personal / dev — Docker on your Mac, Linux, or Windows machine.**
-Single container (`make lite` — the all-in-one Vexa Lite image) or the full Compose stack
-(`make all`). **Reuse your Claude subscription**: workers run the official `claude` CLI against
-your own Pro/Max credential, which is a covered, credit-metered use under Anthropic's terms for a
-personal deployment — your subscription, your turns, your machine. See
-[Model credentials & licensing](https://docs.vexa.ai/model-credentials-licensing) for the exact
-terms mapping ([Anthropic's Agent SDK plan-usage article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
-is the primary source). You get the full service — bots, transcripts, agents, Terminal — on the
-subscription you already pay for.
-
-**2. Cloud — Helm on Kubernetes / OpenShift, scalable to thousands of users.**
-The chart in [`deploy/helm`](https://github.com/Vexa-ai/vexa/tree/main/deploy/helm) deploys the same control plane with
-`RUNTIME_BACKEND=k8s`: **every bot and every agent is its own Kubernetes workload** (a bare Pod
-per dispatch), so capacity is your cluster's scheduler, not a bigger box — built multi-tenant and
-multiuser from the start. One compliance rule when you go multiuser: other users' turns must run
-on an **API key** (Commercial Terms), never a personal subscription credential — the
-[licensing page](https://docs.vexa.ai/model-credentials-licensing) spells out the boundary, and
-Settings → Models enforces per-user/global credential resolution. K8s backend status is tracked
-honestly in [Status](#️-status--roadmap).
-
----
-
-## 🏠 Deploy & configure
-
-`make all` brings up the full stack via Docker Compose on one Linux host — each service in its own
-container, bound to loopback:
-
-| Service | Role |
+| Folder | What it is |
 |---|---|
-| **gateway** `:18056` | the one front door — auth, scopes, routing |
-| **terminal** `:13000` | the web workbench (proxies `/ws` → gateway) |
-| **meeting-api** | bots, transcripts, recordings |
-| **agent-api** | the agent control plane — dispatch, chat, routines, events |
-| **runtime** | spawns bot + agent containers on demand |
-| **admin-api** · redis · postgres · **minio** | keys · bus + scheduler · metadata · object storage (recordings + workspaces) |
+| `core/meetings/services/bot` | The meeting bot (TypeScript, Playwright + Chromium). One container per meeting. |
+| `core/meetings/services/meeting-api` | Meetings, recordings and signal files; the `/v2` intake; auto-join; webhooks (Python). |
+| `core/identity/services/admin-api` | Users, API keys and scopes; webhook subscriptions; the database schema (Python). |
+| `core/gateway/services/gateway` | The API front door: keys, scopes, the signed identity, the per-account write limit (Python). |
+| `integrations/out/aw-notetaker` | **Our** exporter service (Python), with its docs and tests. |
+| `deploy/helm/charts/vexa` | Upstream's Helm chart. We deploy it with our own values file (see [Deploy](#deploy-on-eks)). |
+| `deploy/lite`, `deploy/compose` | Local ways to run the stack (single container / full Docker Compose). |
 
-- **Runtime backend** — `RUNTIME_BACKEND=docker` (default) or `k8s` (a Pod per dispatch).
-- **Transcription is a separate GPU unit** — `make all` runs **GPU-free**; stand up the STT service
-  (faster-whisper, OpenAI-compatible) from `deploy/transcription` on any GPU box and point `.env` at it.
-  Or use a free hosted token at [vexa.ai/account](https://vexa.ai/account) while testing.
-- **Bring your own inference** — point the agent at your own LLM endpoint; no inference leaves the network.
-- **Air-gapped** — everything in-VPC, **zero egress** — the posture the regulated verticals require.
-- **Targets** — `make all` (pulls) · `make dev` (builds from this checkout) · `make lite` ·
-  `make probe` (full-journey smoke) · `make down` · `make help`. Expose the Terminal via a TLS reverse proxy for
-  production; full guide in the [docs](https://docs.vexa.ai).
+The rest is upstream Vexa. Build-relevant: `core/*` (all other services), `clients/terminal` (the web
+console), `packages`, `licenses`, `behavior`, `scripts` (repo checks). Upstream governance and
+publishing only: `docs`, `calm`, `carve`, `release`, `releases`, `security`, `assets`, `sdks`, `tools`.
+We leave those folders in place so upstream changes keep merging cleanly.
 
 ---
 
-## 🆚 How Vexa is different
+## Branches
 
-The crowded "AI second brain / self-hosted knowledge base" space is full of excellent tools for
-reasoning over documents you *already have*. None of them join a live meeting — they consume
-transcripts other tools produced. That's the whole point: **capture is the moat, and it sits
-upstream of where a document-RAG tool's architecture even starts.**
-
-Against the tools developers actually weigh for meeting capture:
-
-| Capability | **Vexa** | Hosted APIs (e.g. Recall.ai) | DIY (Whisper + your own bot) |
-|---|:---:|:---:|:---:|
-| Self-hosted / own your data | ✅ | ❌ their cloud | ✅ |
-| Real-time transcript API | ✅ | ✅ | 🟡 build it |
-| Joins **Meet + Teams + Zoom + Jitsi** | ✅ 3 production · 🟡 Jitsi | 🟡 varies | ❌ enormous effort |
-| Speaker attribution | ✅ | ✅ | 🟡 build it |
-| Knowledge as files you own | ✅ | ❌ | 🟡 build it |
-| Agents over your workspace | ✅ | ❌ | ❌ |
-| Open source | ✅ Apache-2.0 | ❌ | ✅ |
-
-Vexa is the one combination the others don't offer: a **permissively-licensed (Apache-2.0)
-meeting-bot-API server** that is **self-hosted × real-time × multi-platform × knowledge-you-own.**
-And it's *complementary* to the document-RAG and "second brain" tools — feed them Vexa's clean,
-attributed transcripts and let them do what they're good at.
-
-The full field — including [Attendee](https://github.com/attendee-labs/attendee) (the other
-meeting-bot API, source-available under the **Elastic License 2.0**, which does not permit providing
-it to third parties as a hosted or managed service) and the local-notetaker tools — is mapped
-honestly, trade-offs and all, in [How Vexa compares](https://docs.vexa.ai/comparison).
-
----
-
-## 🏦 For regulated enterprises
-
-For banks, healthcare, government, and anyone in a regulated industry, the meeting-AI question
-isn't "which cloud" — it's "how do we get this **without** a cloud." Vexa is **air-gapped meeting
-intelligence** — the sovereign alternative to Microsoft Copilot — built for exactly that buyer.
-
-You don't compete with a notes app here — you replace **Microsoft 365 Copilot** and **Zoom AI
-Companion** on the axes they structurally can't move:
-
-| | **Microsoft 365 Copilot / Zoom AI Companion** | **Vexa** |
-|---|---|---|
-| Deployment | Vendor cloud only | Your cloud, your VPC, or **fully air-gapped** |
-| Models | Vendor-hosted, fixed | **Bring your own** — local or hosted LLMs |
-| Commercial model | Rented, per-seat subscription | **Owned** — Apache-2.0, no per-seat tax |
-| Adaptable | Generic; no custom vocabulary; vendor roadmap queue | **Your engineers extend it directly** — domain vocabulary, underserved languages, custom workflows |
-| Meeting platforms | Teams-only / Zoom-only | **Meet + Teams + Zoom** (+ Jitsi, live validation pending) |
-| Data control | Transits the vendor's cloud | **Never leaves your perimeter** |
-| Extensibility | Closed black box | Open source, API-first |
-
-What that means in practice:
-
-- **Air-gapped** — fully offline, your infrastructure, your models. Nothing phones home.
-- **Adaptive** — your engineers implement requirements directly: domain vocabulary, underserved
-  languages, custom workflows. No vendor feature queue.
-- **Owned, not rented** — deploy once, extend without asking permission. No per-seat tax.
-- **Scales inside your walls** — thousands of isolated agents in parallel on Docker or your
-  Kubernetes/OpenShift cluster.
-
-**Evaluate it for your org** — the artifacts a security review asks for, in this repo:
-
-| Artifact | What it answers |
+| Branch | Role |
 |---|---|
-| [`architecture.calm.json`](architecture.calm.json) | machine-readable architecture (FINOS **CALM**) — every service and data flow, drift-gated in CI |
-| [`SECURITY.md`](SECURITY.md) | how to report a vulnerability |
-| [`security-insights.yml`](security-insights.yml) | OpenSSF Security Insights manifest |
-| [`license-exceptions.json`](license-exceptions.json) | license gating: Category-A permissive deps, exceptions explicit |
-| [`LICENSE`](LICENSE) | Apache-2.0 |
+| `main` | Mirror of upstream Vexa. We never commit to it. |
+| `development` | Our working line. Feature branches merge here. |
+| `feat/<topic>`, `fix/<topic>` | Work in progress, cut from `development`. |
+| `aw/main` and `aw/*` | The old cloud bot (Vexa v0.10.4). Kept for reference only. |
 
-Full review page: [Security & compliance](https://docs.vexa.ai/security-compliance) in the docs.
-
-> Regulated banks and Fortune-500s run Vexa fully air-gapped on their own OpenShift and local LLMs today.
-
----
-
-## 📡 API reference
-
-Two APIs behind the gateway, authenticated with `X-API-Key`. Base URL: `http://localhost:18056`
-(self-host) or `https://api.cloud.vexa.ai` (hosted).
-
-**Meetings API** — capture; usable standalone:
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/bots` | Send a bot into a meeting (`platform`, `native_meeting_id`, `bot_name`, `language`, `task`, optional `transcribe_enabled` / `recording_enabled`) |
-| `GET` | `/transcripts/{platform}/{native_meeting_id}` | Fetch the real-time transcript (poll while live) |
-| `GET` | `/bots/status` | List running bots |
-| `DELETE` | `/bots/{platform}/{native_meeting_id}` | Stop / remove the bot |
-| `GET` | `/meetings` · `/recordings` | List meetings; list recordings (audio in your own storage) |
-
-**Agent API** — the control plane, under the `/agent/*` prefix (identity is derived from your key, server-side):
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/agent/chat` | Chat over your workspace — streams SSE (`message-delta`, `tool-call`, `commit`, `done`, `error`) |
-| `POST` | `/agent/invocations` | Dispatch a one-shot agent (e.g. a post-meeting report) |
-| `POST` | `/agent/routines` | Create a scheduled (cron) agent routine |
-| `POST` | `/agent/events` | Fire an integration event that dispatches an agent (e.g. email triage) |
-| `GET` | `/agent/workspace/tree` · `/agent/workspace/file` | Browse and read your Markdown workspace |
-
-`platform` ∈ `google_meet` · `teams` · `zoom` · `jitsi`. The gateway also serves an **MCP endpoint**
-at `/mcp` for agent clients ([docs](https://docs.vexa.ai/vexa-mcp)). Full reference:
-**[docs.vexa.ai](https://docs.vexa.ai)**.
-
-> **v0.12 note:** live bot-control — `PUT /bots/{…}/config` (change language/task mid-call) and
-> `POST /bots/{…}/speak` (TTS into the call) — plus WebSocket streaming are not yet wired in the
-> open-core stack and return `404` today. So do `POST /agent/meeting/{start,process}`, the removed
-> in-product meeting copilot. Send-a-bot, stop, status, transcripts, recordings, the live transcript
-> feed, agent chat, routines, and events are live.
+**Taking upstream changes:** update `main` from upstream, then merge `main` into `development` on a
+branch and run the checks. Renovate currently opens dependency-bump branches against `aw/main`, the
+old line, so those branches don't bring upstream changes into `development`.
 
 ---
 
-## 🗺️ Status & roadmap
+## Services and images
 
-Honest state of the **0.12** line (mirrors the [status page](https://docs.vexa.ai/roadmap/status) — never aspirational):
+One Helm install runs all of these. Each service is its own Docker image.
 
-| Capability | State |
+| Service | Image | Ours or upstream |
+|---|---|---|
+| **gateway** (API front door) | built from this repo | **ours** (the `/v2` routes, new scopes, signed identity, write limit) |
+| **admin-api** (users, API keys, settings) | built from this repo | **ours** (webhook subscriptions, new scopes, checks the signed identity) |
+| **meeting-api** | built from this repo | **ours** (accepts `speaker-activity`; the `/v2` intake and webhooks) |
+| **runtime** (starts bot pods) | built from this repo | **ours** (deletes a bot pod once it has exited, so the meeting node can scale to zero) |
+| **bot** | built from this repo | **ours** (writes `speaker-activity.jsonl`, records per-speaker channels, reports join blockers) |
+| terminal (web console) | `vexaai/v012-terminal` | upstream |
+| agent-api, dashboard, flows | `vexaai/*` | upstream; all three **off** for us (we don't use Vexa's AI agents) |
+| postgres, redis (Valkey) | chart defaults, inside the same install | upstream; Vexa's own database and message bus, separate from the notetaker's |
+| **exporter** | built from `integrations/out/aw-notetaker` | **ours**, deployed next to the chart |
+
+Our images go to GHCR, under the names `ghcr.io/voyantt-consultancy-services-llp/aw-bots-meeting-api`,
+`…/aw-bots-bot`, `…/aw-bots-exporter`, `…/aw-bots-gateway`, `…/aw-bots-admin-api` and
+`…/aw-bots-runtime`.
+**The gateway and admin-api need our images, like meeting-api:** upstream's `vexaai/v012-gateway` and
+`vexaai/v012-admin-api` don't have the `/v2` routes, the new scopes or the signed identity, and the
+new meeting-api refuses every client request that upstream's gateway forwards unsigned. Our Helm
+values must point `gateway.image` and `adminApi.image` at them.
+
+### Build our images
+
+**Normally CI builds them**: `.github/workflows/aw-images.yml` ("AW images — build & push").
+
+Every push or merge to `development` builds all six images, tagged `:<commit sha>`; the run's
+summary lists the tag. The workflow also declares a manual run, but GitHub offers the "Run
+workflow" button only for workflows on the default branch, which here is `main` (upstream's
+mirror, without this file), so there is no manual run. To get images, merge to `development`.
+
+There is no `:latest`: the deployment pins exact tags, so a new image reaches the cluster only when
+the tag is changed in aw-notetaker and applied (its runbook, "Upgrading our images"). The workflow
+needs the secret `GHCR_PAT` in this repo (`AbroadWorks-Inc/vexa`): a classic personal access token with `write:packages`, owned by a member of `voyantt-consultancy-services-llp`. The talke repo's secret of the same name lives in the Voyantt org and is not visible here.
+The exporter's tests and checks run before its image is built.
+
+**By hand**, from the repo root. **Every image is built for `linux/amd64`**: both AW Bots machine pools are
+amd64 (Intel/AMD), because upstream publishes and tests the bot on amd64 only. An Apple Silicon Mac
+is arm64, so a build without `--platform linux/amd64` produces an image the cluster can't run
+(`exec format error`).
+
+```bash
+TAG=v0.1.0
+REG=ghcr.io/voyantt-consultancy-services-llp
+
+# bot — two steps: the join environment base, then the bot.
+docker build --platform linux/amd64 -f core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev core/meetings/modules/join
+docker build --platform linux/amd64 -f core/meetings/services/bot/Dockerfile \
+  --build-arg VEXA_IMAGE_VERSION=$TAG -t $REG/aw-bots-bot:$TAG .
+docker push $REG/aw-bots-bot:$TAG
+
+# meeting-api (context: the repo root) and the exporter.
+docker build --platform linux/amd64 -f core/meetings/services/meeting-api/Dockerfile \
+  -t $REG/aw-bots-meeting-api:$TAG .
+docker build --platform linux/amd64 -t $REG/aw-bots-exporter:$TAG integrations/out/aw-notetaker
+docker push $REG/aw-bots-meeting-api:$TAG
+docker push $REG/aw-bots-exporter:$TAG
+
+# gateway (context: the repo root) and admin-api (context: its own folder): build as CI does.
+docker build --platform linux/amd64 -f core/gateway/services/gateway/Dockerfile -t $REG/aw-bots-gateway:$TAG .
+docker build --platform linux/amd64 -t $REG/aw-bots-admin-api:$TAG core/identity/services/admin-api
+docker push $REG/aw-bots-gateway:$TAG
+docker push $REG/aw-bots-admin-api:$TAG
+
+# runtime (context: core/runtime) — starts the bot pods and deletes them after they exit.
+docker build --platform linux/amd64 -t $REG/aw-bots-runtime:$TAG core/runtime
+docker push $REG/aw-bots-runtime:$TAG
+```
+
+Upstream's bot image is about 3.6–4.6 GB, mostly Chromium. Our changes add no dependencies. The exporter image is about 640 MB, mostly ffmpeg.
+
+---
+
+## Configuration
+
+Every setting lives in configuration, not code:
+
+| Setting | Where | Value for us |
+|---|---|---|
+| Live transcription | Helm values → meeting-api env `TRANSCRIBE_ENABLED` | `false` |
+| Recording | `RECORDING_ENABLED` | `true` |
+| Per-speaker channels | Helm `meetingApi.perChannelRecordingPlatforms` → meeting-api env `PER_CHANNEL_RECORDING_PLATFORMS`. Passed to the bot as `perChannelRecordingEnabled` only when that platform is listed | `google_meet,jitsi` (empty turns it off for every platform) |
+| Storage | `MINIO_BUCKET` + `S3_ENDPOINT` (IAM role on EKS, no static keys) | bucket `aw-bots` |
+| meeting-api's IAM role (IRSA) | Helm `meetingApi.serviceAccount` (`create`, `name`, `annotations` with `eks.amazonaws.com/role-arn`) | its own service account, e.g. `aw-bots-meeting-api` |
+| "Meeting finished" webhook | the exporter's `/v2/webhooks` subscription (`events: ["meeting.completed", "bot.failed"]`), secret = exporter env `EXPORTER_WEBHOOK_SECRET`; upstream's `VEXA_SYSTEM_WEBHOOK_URL` | subscription URL `http://aw-exporter.aw-bots.svc.cluster.local:8080/hooks/vexa`; `VEXA_SYSTEM_WEBHOOK_URL` unset |
+| How early the bot joins | Helm `meetingApi.autoJoinLeadSeconds` → env `AUTO_JOIN_LEAD_S` (the chart's default is 120) | `300` |
+| How long a bot waits in a lobby | meeting-api env `VEXA_LOBBY_BUDGET_S` (Helm `meetingApi.extraEnv`; code default 900). The reconcile sweep's pre-active grace is this plus 60 s | `600`, every platform |
+| Jitsi hosts | Helm `meetingApi.jitsiHosts` → meeting-api env `VEXA_JITSI_HOSTS`; `meet.jit.si` is always recognised | `meet.abroadworks.com` |
+| When a bot leaves an empty call | bot env `BOT_ALONE_SILENCE_WINDOW_MS`: no remote audio above the capture floor for this long | default 10 minutes |
+| When a channel recorder is released | bot env `VEXA_CHANNEL_GONE_MS`: how long a channel's stream may be missing from the page | default 30 000 ms |
+| Services on Karpenter | Helm `global.nodeSelector` / `global.tolerations` | the `aw-bots-services` NodePool |
+| Bot pods on Karpenter | Helm `runtime.nodeSelector` / `runtime.tolerations` | the `aw-bots-meetings` NodePool |
+| Postgres / Redis disks | Helm `postgres.persistence.storageClassName`, `redis.persistence.storageClassName` | `ebs-sc-gp3` (any zone, expandable) |
+| Vexa's AI agents | Helm `agentApi.enabled` | `false` |
+| Postgres password | Helm `postgres.existingCredentialsSecret` → pre-created Secret `postgres-credentials` | `true` (the chart then creates no Secret at all) |
+| Bot size | Helm `runtime.workloadResources.meetingBot` | 1 CPU / 2560 MiB |
+| Our images | Helm `meetingApi.image.*`, `gateway.image.*`, `adminApi.image.*`, `runtime.browserImage` | our GHCR tags |
+| Debug tape off | admin-api platform setting `capture_signal=false` | off (turn on only to debug a meeting) |
+| Where the exporter sends meetings | exporter env `NOTETAKER_URL` | `http://notetaker-api.notetaker.svc.cluster.local:8080` |
+| Exporter buckets | `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX` | `aw-bots`, `aw-chatworks-transcribe`, `recordings/` |
+| How long exported files are kept | the exporter tags each object `retention-class`; the bucket's lifecycle rules act on the tag | `master.webm` = `recording-mp4` (30 days), `audio.wav` = `audio` (7 days), JSON = `metadata` (365 days) |
+| Exporter ↔ AW Bots | `GATEWAY_URL` + `EXPORTER_API_KEY` (the `exporter` key, scopes `tx` + `export`); `EXPORTER_WEBHOOK_SECRET` (the secret of its subscription) | the gateway's in-cluster URL; key from Secret `aw-bots-key-exporter` |
+| Signed identity | `GATEWAY_IDENTITY_KEYS` (a key ring in the webhook ring's format) on the gateway, meeting-api and admin-api (one value); `GATEWAY_IDENTITY_ACTIVE_KEY` (the kid it signs with) on the gateway; `GATEWAY_IDENTITY_MAX_SKEW_S` (the replay window, 60 s) on meeting-api and admin-api, set the same | **required**: without them the gateway refuses to start and meeting-api and admin-api refuse every client request. Rotation: add the new key to the ring on all three and roll; switch the active kid on the gateway and roll; later drop the old key and roll |
+| Webhook secret encryption | `WEBHOOK_SECRET_ENC_KEYS` (a key ring) and `WEBHOOK_SECRET_ENC_ACTIVE_KEY`, on meeting-api and admin-api, read only from an existing Secret | required for webhook subscriptions; unset, subscriptions are off and the services log why |
+| Intake | `ENTRY_MAX_DAYS_AHEAD`, `JOIN_NOW_ADOPT_AHEAD_S`, `ENTRY_BLOCKED_HOSTS`, `INTAKE_MAX_ACTIVE_ENTRIES` (meeting-api); `INTAKE_RATE_LIMIT_PER_MIN` (gateway) | 30 days, 3600 s, empty (no host refused), 100 000, 600 |
+| Webhooks | `WEBHOOK_PRIVATE_HOST_ALLOWLIST` (meeting-api, admin-api); `WEBHOOK_MAX_SUBSCRIPTIONS`, `WEBHOOK_DELIVERY_RETENTION_DAYS` (admin-api) | `portal.notetaker.svc.cluster.local,aw-exporter.aw-bots.svc.cluster.local`, 20, 30 days |
+| Webhook retention batches | `WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE`, `WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES` (admin-api): rows per delete batch, and the per-run cap of batches of each delete | 1000, 100 |
+| Webhook delivery | `WEBHOOK_RETRY_SCHEDULE_S`, `WEBHOOK_DNS_THREADS`, `WEBHOOK_DNS_TIMEOUT_S`, `WEBHOOK_SEND_TIMEOUT_S`, `WEBHOOK_LEASE_S` (more than the send timeout + 5 s), `WEBHOOK_CLAIM_LIMIT` (meeting-api) | `60,300,1800,7200`, 4, 5 s, 10 s, 60 s, 50 |
+| Upstream's system webhook | `VEXA_SYSTEM_WEBHOOK_URL`, `VEXA_SYSTEM_WEBHOOK_SECRET` (meeting-api; both or neither) | unset |
+| Bot sends and retries | `BOT_SEND_MAX_ATTEMPTS`, `BOT_SEND_RETRY_BACKOFF_S` (meeting-api), for meetings entries manage; a bot replaced after it failed spends the same count | 3, 60 s |
+| Proof that a failed bot is gone | `MEETING_UNTRACKED_GRACE_SEC` (meeting-api): how long a runtime 404 must last, and how long past its due time a waiting meeting or an unfinished spawn gets | 600 s |
+| Bounded work | `SWEEP_BATCH_SIZE`, `SWEEP_MAX_ITEM_FAILURES`, `INTAKE_CONFLICT_RETRIES`, `INTAKE_CONFLICT_DELAY_MIN_S`/`_MAX_S` (the pause before each rerun, times the try's number), `INTAKE_STOP_LINK_RETRIES` (reruns of a stop whose meeting moved link) (meeting-api) | 200, 5, 3, 0.01–0.05 s, 1 |
+| Teardowns the runtime doesn't answer | `UNPROVEN_TEARDOWN_MAX_AGE_S` (meeting-api): how long a pending teardown or a stale reconcile row is chased while the runtime doesn't answer, before it is given up | 21600 s (6 h) |
+| Give-up records | `SWEEP_ITEM_FAILURES_RETENTION_S` (meeting-api): an untouched `sweep_item_failures` record is pruned after this | 604800 s (7 days) |
+| Per-user rate limit | `GATEWAY_RATE_LIMIT_BURST`, `GATEWAY_RATE_LIMIT_RPS` (gateway): the per-user token bucket at the single REST funnel | 120, 40/s |
+
+Every meeting-api, admin-api and gateway setting is declared in its service's `config.v1.json`;
+the chart's `meetingApi.*`, `adminApi.*` and `gateway.*` values set every one above. The full list
+of exporter settings (among them `EXPORTER_WEBHOOK_SECRET` and `EXPORT_MAX_RECORDINGS`) is in
+[`integrations/out/aw-notetaker/README.md`](integrations/out/aw-notetaker/README.md). Secret values
+live only in Kubernetes Secrets, never in this repo. On EKS the two key rings and their active ids
+are in `aw-bots-secrets`, and must be there before the gateway, meeting-api and admin-api start.
+`VEXA_SYSTEM_WEBHOOK_SECRET` is not set, because the system webhook is off. Docker Compose, Lite and
+a chart-managed Secret (`secrets.gatewayIdentityKeys`, `secrets.gatewayIdentityActiveKey`) supply
+`GATEWAY_IDENTITY_KEYS` and `GATEWAY_IDENTITY_ACTIVE_KEY` too; they don't need the webhook key ring.
+
+---
+
+## Deploy on EKS
+
+The deployment files live in the **aw-notetaker** repo, next to the rest of AW's infrastructure, not in
+this fork. The step-by-step runbook is `deployment/base/aw-bots/README.md` there. The files:
+
+| aw-notetaker path | What it is |
 |---|---|
-| Bot joins **Meet / Teams / Zoom** | ✅ Production |
-| Bot joins **Jitsi Meet** (meet.jit.si + self-hosted) | 🆕 Built & offline-proven; live validation pending |
-| Real-time transcription (Whisper) + speaker attribution | ✅ Production — attribution is not guaranteed: the binder publishes an empty speaker rather than guessing (~4–7% of rows under heavy crosstalk) |
-| Redis transcript streaming | ✅ Production |
-| Recordings to your own object storage (MinIO) | ✅ Available |
-| **Runtime — Docker backend** (container per workload) | ✅ Production |
-| **Agent chat / routines / events over your workspace** | ✅ Built & proven live |
-| Workspace — git Markdown / OKF `kg/` bundle | 🟡 core proven; bucket-backed store landing |
-| **Runtime — Kubernetes backend** (Pod per dispatch) | ✅ Lifecycle + per-mount isolation; Helm in `deploy/helm` |
-| Live transcript feed as the call runs (+ agent chat over it) | ✅ Built & proven live |
-| Calendar sync (ICS) · planned meetings · scheduled auto-join | ✅ Production |
-| Shared workspaces & shared meetings (invites, real-time feed) | ✅ Built & proven live |
-| Agent chat during a live meeting (live transcript + workspace in context) | ✅ Built & proven live |
-| WebSocket transcript multiplex | 🔵 Planned (poll today) |
-| At-rest encryption (workspace · transcript · tokens) | 🔵 Planned |
-| Mid-call bot config / speak | 🔵 Returns 404 in open-core |
+| `deployment/base/aw-bots/values.yaml` | Our Helm values for the upstream chart |
+| `deployment/base/aw-bots/*.yaml.template` | Secret templates (key names and placeholders only) |
+| `deployment/base/aw-bots/nodepools.yaml` | AW Bots' two Karpenter pools: `aw-bots-services` and `aw-bots-meetings`, both amd64 and on-demand |
+| `deployment/base/aw-exporter/` | The exporter's Deployment, Service, ServiceAccount and kustomization |
+| `deployment/aws/iam/abroadworks-aw-bots-meeting-api-role/`, `…/abroadworks-aw-exporter-role/` | IAM roles (IRSA) |
+| `deployment/aws/s3-lifecycle/aw-bots-lifecycle.json` | 14-day expiry for the `aw-bots` bucket |
 
-✅ Production · 🟡 In progress · 🔵 Planned
+Install order, secrets, and upgrades are the runbook. The order across the whole pipeline
+(transcriber, notetaker-worker, Prometheus rules, this Helm release, the exporter, then the
+calendar module and portal) is its section "Deploying a change". When the images are rolled separately, roll
+the gateway and admin-api first, then meeting-api, then the runtime (its own image and
+`runtime.browserImage`, which is the bot), then the exporter. The new meeting-api refuses the
+unsigned requests an old gateway forwards. A new bot image is the one the runtime starts, and it
+needs a meeting-api that accepts its speaker file. The exporter needs the export route.
 
 ---
 
-## 🤝 Community & contributing
+## Run locally
 
-- **Docs** — [docs.vexa.ai](https://docs.vexa.ai)
-- **Discord** — [discord.gg/Ga9duGkVz9](https://discord.gg/Ga9duGkVz9)
-- **Roadmap** — the [board](https://github.com/orgs/Vexa-ai/projects/2), grouped by contributor
-  lane, with [milestones](https://github.com/Vexa-ai/vexa/milestones) as the version gates.
-- **Contributing** — [how delivery works](https://docs.vexa.ai/governance/delivery): prepared issues
-  with acceptance tables that *guarantee* merge, and human validation credited as a first-class
-  contribution (one page, law and how-to together).
-- **Contributor rights** — [one rights choice plus DCO](CONTRIBUTOR_RIGHTS.md) for individuals;
-  private, head-bound authorization when an employer or client owns the work.
-- **Issues & PRs** — welcome. See [`SECURITY.md`](SECURITY.md) to report vulnerabilities.
-- **Obsidian**: [obsidian-vexa-bridge](https://github.com/rennf93/obsidian-vexa-bridge) turns completed meetings into Obsidian notes or a knowledge graph, a third-party adapter; see [the docs](https://docs.vexa.ai/obsidian).
-
-Vexa is built in the open. If you self-host it, extend it, or run it air-gapped somewhere interesting,
-we'd love to hear about it.
+- **One bot against a real meeting (Lite).** Needs Docker.
+  ```bash
+  make -C deploy/lite up RECORDING_DIR=$PWD/recordings LOCAL_STT=1
+  deploy/lite/aw-recording.sh send <meet-code>       # the bot joins
+  deploy/lite/aw-recording.sh status <meet-code>
+  deploy/lite/aw-recording.sh export <meet-code>     # after the call
+  make -C deploy/lite down RECORDING_DIR=$PWD/recordings
+  ```
+  Optional live copy to S3: `S3_MIRROR=1 S3_BUCKET=<bucket> S3_PREFIX=<prefix>`, with S3 credentials
+  in `.env.local` (gitignored, read only by the mirror).
+- **The full stack (Docker Compose).** `make dev` builds everything from this checkout; `make down`
+  stops it. First run `bash deploy/compose/mint-dev-env.sh`, which creates the gitignored
+  `deploy/compose/.env` with random local-only secrets.
 
 ---
 
-## 📄 License
+## Tests and checks
 
-[Apache-2.0](LICENSE). Own it, run it, fork it, ship it. It's an investment, not a rental.
+| What | Command |
+|---|---|
+| Bot | `cd core/meetings/services/bot && npm test` (and `npx tsc --noEmit -p .`). The Chromium boundary tests (`*.boundary.test.ts`: capture-bridge, channel-recording, csrc-capture, jitsi-session-restart, recording-source, teams-speaker-animation) SKIP unless Playwright's Chromium is installed: from the repo root, `node node_modules/.pnpm/playwright@1.56.0/node_modules/playwright/cli.js install chromium` |
+| meeting-api | `cd core/meetings/services/meeting-api && uv run pytest`. The `*_pg` tests (for example `test_bot_retry_pg.py`) run only with `MEETING_API_TEST_DATABASE_URL` set to a throwaway Postgres; otherwise they skip |
+| admin-api, gateway | the same, in `core/identity/services/admin-api` and `core/gateway/services/gateway` |
+| Exporter | `cd integrations/out/aw-notetaker && uv run pytest -q && uv run black --check . && uv run ruff check . && uv run mypy exporter` |
+| Exporter end-to-end (Docker, MinIO) | `uv run pytest -m integration -q tests/integration` (from `integrations/out/aw-notetaker`) |
+| Repo checks (the full suite) | `pnpm install && node scripts/gates.mjs all` |
+
+**Before you push.** `git push` runs a pre-push hook (`.githooks/pre-push`) with 13 fast static
+checks: READMEs, architecture, contracts and so on. It needs Node 22, `pnpm install` and
+[`uv`](https://docs.astral.sh/uv/) (`brew install uv`). Every folder needs a non-empty `README.md`. A
+local, gitignored folder can opt out with an empty `.gateignore` file.
+
+The full suite additionally starts the whole stack in Docker (`gate:compose`), which needs the
+minted `deploy/compose/.env`. AW does not deploy with Docker Compose, so a `gate:compose` skipped
+for lack of Docker does not block an AW change; the other gates must pass. Docker Hub refuses anonymous pulls of `minio/*`, so if that happens pull
+`quay.io/minio/minio` and `quay.io/minio/mc` and tag them as `minio/minio:latest` and `minio/mc:latest`.
+
+---
+
+## Docs
+
+- [Handbook](docs/aw-bots/README.md): architecture, lifecycle, recording, webhooks, security, data, and alerts. Current behavior.
+- [`/v2` API reference](core/meetings/services/meeting-api/V2-API.md): for client developers — every route, field, reply, error and webhook, with examples.
+- [Decisions](docs/aw-bots/decisions/README.md) and the [archive](docs/aw-bots/archive/README.md) of the dated designs.
+- Upstream Vexa docs: [`docs/docs`](docs/docs) and [docs.vexa.ai](https://docs.vexa.ai).
+
+## License
+
+Apache-2.0, as upstream Vexa. See [`LICENSE`](LICENSE).

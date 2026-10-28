@@ -6,6 +6,7 @@ is eager-created keyed by the bot's connectionId, and the quota / dedup seams su
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -104,6 +105,65 @@ def test_invocation_tape_is_independent_of_recording_enabled():
     # The tape rides the SAME upload endpoint the recording chunks use, so a non-recording spawn
     # still needs the URL — without it the bot has a tape and nowhere to put it.
     assert inv["recordingUploadUrl"].endswith("/internal/recordings/upload")
+
+
+def test_invocation_carries_per_channel_recording_enabled_and_strips_only_none():
+    token = mint_meeting_token(1, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    base = dict(_INV_BASE, token=token)
+    on = build_invocation(**base, per_channel_recording_enabled=True)
+    conforms_invocation(on)
+    assert on["perChannelRecordingEnabled"] is True
+    off = build_invocation(**base, per_channel_recording_enabled=False)
+    conforms_invocation(off)
+    assert off["perChannelRecordingEnabled"] is False
+    assert "perChannelRecordingEnabled" not in build_invocation(**base)
+
+
+@pytest.mark.parametrize("raw,platform,recording,expected", [
+    ("", "jitsi", True, False),                      # empty = off
+    ("   ", "jitsi", True, False),
+    ("google_meet,jitsi", "jitsi", True, True),
+    (" google_meet , jitsi ", "google_meet", True, True),   # whitespace trimmed
+    ("google_meet,jitsi", "teams", True, False),     # platform not listed
+    ("google_meet,jitsi", "jitsi", False, False),    # no recording → no channels
+    ("jitsi_x", "jitsi", True, False),               # whole names only
+])
+def test_per_channel_recording_enabled_from_platform_list(raw, platform, recording, expected):
+    from meeting_api.bot_spawn.service import per_channel_recording_enabled
+
+    assert per_channel_recording_enabled(platform, recording, raw=raw) is expected
+
+
+def test_per_channel_recording_enabled_unset_env_is_off(monkeypatch):
+    from meeting_api.bot_spawn.service import per_channel_recording_enabled
+
+    monkeypatch.delenv("PER_CHANNEL_RECORDING_PLATFORMS", raising=False)
+    assert per_channel_recording_enabled("jitsi", True) is False
+    monkeypatch.setenv("PER_CHANNEL_RECORDING_PLATFORMS", "google_meet,jitsi")
+    assert per_channel_recording_enabled("jitsi", True) is True
+
+
+@pytest.mark.parametrize("env,recording,expected,slug", [
+    (None, True, False, "unset"),
+    ("google_meet,jitsi", True, True, "listed"),
+    ("google_meet,jitsi", False, False, "norec"),
+    ("jitsi", True, False, "other"),
+])
+async def test_spawn_threads_per_channel_recording_from_deployment_env(
+    monkeypatch, env, recording, expected, slug
+):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    if env is None:
+        monkeypatch.delenv("PER_CHANNEL_RECORDING_PLATFORMS", raising=False)
+    else:
+        monkeypatch.setenv("PER_CHANNEL_RECORDING_PLATFORMS", env)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                      native_meeting_id=f"pc-{slug}", redis_url="redis://redis:6379/0",
+                      recording_enabled=recording, token_secret=SECRET)
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    # Off is left out of the invocation, so a bot image without the field still accepts it.
+    assert inv.get("perChannelRecordingEnabled") is (True if expected else None)
 
 
 def test_invocation_carries_stt_model_when_provided():
@@ -225,6 +285,32 @@ async def test_request_bot_dead_on_arrival_fails_the_row(monkeypatch):
     assert row["data"]["completion_reason"] == "start_failed"
     assert "start_failed" in row["data"]["failure_reason"]
     assert repo.sessions == [], "no MeetingSession for a workload that never started"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("no token"), asyncio.CancelledError()])
+async def test_request_bot_a_failure_before_the_create_fails_the_upstream_row(monkeypatch, error):
+    """``POST /bots`` (no claimed row): a failure while the bot is prepared (the token, the
+    invocation, the spec), or a cancel there, fails the row it just inserted, with no workload
+    (none was created). A session-less ``requested`` row would otherwise hold the link for good:
+    the reconcile sweeps list only rows with a session."""
+    import meeting_api.bot_spawn.service as service
+
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+
+    def broken(*a, **k):
+        raise error
+
+    monkeypatch.setattr(service, "build_invocation", broken)
+    repo = InMemoryMeetingRepo()
+    runtime = FakeRuntimeClient()
+    with pytest.raises(type(error)):
+        await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                          native_meeting_id="prep", redis_url="r", token_secret=SECRET)
+    (row,) = repo._meetings.values()
+    assert row["status"] == "failed"
+    assert row["data"]["failure_reason"].startswith("the bot could not be prepared")
+    assert runtime.specs == [] and repo.sessions == []
 
 
 async def test_request_bot_spawnfailed_fails_the_row(monkeypatch):

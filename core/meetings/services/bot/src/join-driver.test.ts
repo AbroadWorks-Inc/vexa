@@ -3,7 +3,7 @@
  * host DENIAL is recorded as a PERMANENT `rejected` (→ `awaiting_admission_rejected`), not collapsed
  * into a TRANSIENT, RETRIED `join_failure`. Regression for the wasted-respawn-on-denial bug: before the
  * fix the admission wait's throw fell through to the orchestrator's blanket `join_failure` catch, and
- * `lifecycle/retry.py` re-spawned a bot that was actually denied.
+ * meeting-api's retry (`intake/retry.py`) re-spawned a bot that was actually denied.
  *
  * Run: tsx src/join-driver.test.ts
  */
@@ -17,9 +17,9 @@ const check = (name: string, cond: boolean) => {
   else { console.log(`  \x1b[31mFAIL\x1b[0m  ${name}`); failed++; }
 };
 
-// JoinOutcomes the orchestrator (OUTCOME_FAIL) + retry.py treat as PERMANENT (no retry):
-// 'rejected' → awaiting_admission_rejected. Transient (retried): 'timeout' → awaiting_admission_timeout,
-// 'error'/'blocked' → join_failure.
+// JoinOutcomes the orchestrator (OUTCOME_FAIL) + meeting-api's NOT_RETRIED treat as not retried:
+// 'rejected'/'blocked' → awaiting_admission_rejected, 'auth_missing' → auth_session_missing.
+// Retried: 'timeout' → awaiting_admission_timeout, 'error' → join_failure.
 const PERMANENT_OUTCOMES = new Set<JoinOutcome>(['rejected', 'auth_missing']);
 
 console.log('\n=== join-driver: AdmissionError outcome → JoinOutcome (G1) ===');

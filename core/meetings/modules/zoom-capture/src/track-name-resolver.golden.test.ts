@@ -153,5 +153,40 @@ function votes(r: TrackNameResolver, ch: number, name: string, n: number, t0: nu
     JSON.stringify(a.bindings()));
 }
 
+// ── 8. First bind needs 5 votes and a margin; a weak channel cannot take a strongly held name ──
+{
+  const free = createTrackNameResolver();
+  let t = votes(free, 1, 'Utpalendu Sarkar', 2, 1_000);
+  check('two votes do not bind even when the name is free', free.nameFor(1) === undefined, String(free.nameFor(1)));
+  t = votes(free, 1, 'Utpalendu Sarkar', 2, t);
+  check('four votes still do not bind', free.nameFor(1) === undefined, String(free.nameFor(1)));
+  votes(free, 1, 'Utpalendu Sarkar', 1, t);
+  check('the fifth vote binds', free.nameFor(1) === 'Utpalendu Sarkar', String(free.nameFor(1)));
+
+  const held = createTrackNameResolver();
+  t = votes(held, 0, 'Utpalendu Sarkar', 68, 1_000);
+  check('the strong channel binds', held.nameFor(0) === 'Utpalendu Sarkar');
+  // The weak channel is hot at the same time and votes the same name. 2 < minVotes,
+  // and 68 is far more than 2, so it must not bind.
+  votes(held, 1, 'Utpalendu Sarkar', 2, t, 0.1);
+  check('2 votes do not take a name a live channel holds with 68', held.nameFor(1) === undefined, String(held.nameFor(1)));
+
+  const close = createTrackNameResolver();
+  t = votes(close, 0, 'Ann', 4, 1_000);
+  t = votes(close, 0, 'Bo', 4, t);
+  check('four against four does not bind', close.nameFor(0) === undefined, String(close.nameFor(0)));
+  t = votes(close, 0, 'Ann', 1, t);
+  check('5 votes do not bind when the runner-up is only 1 behind', close.nameFor(0) === undefined, String(close.nameFor(0)));
+  votes(close, 0, 'Ann', 2, t + 5_000);
+  check('7 against 4 does bind', close.nameFor(0) === 'Ann', String(close.nameFor(0)));
+
+  const cohold = createTrackNameResolver();
+  t = votes(cohold, 0, 'Ann', 40, 1_000);
+  votes(cohold, 1, 'Ann', 5, t);
+  check('5 pure votes do not co-hold a name another live channel holds with 40',
+    cohold.nameFor(1) === undefined, String(cohold.nameFor(1)));
+  check('the holder keeps the name', cohold.nameFor(0) === 'Ann');
+}
+
 console.log(failed ? `\n❌ track-name-resolver: ${failed} failed` : '\n✅ track-name-resolver: all goldens passed');
 process.exit(failed ? 1 : 0);

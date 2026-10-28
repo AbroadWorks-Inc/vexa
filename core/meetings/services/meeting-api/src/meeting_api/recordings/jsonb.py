@@ -2,20 +2,90 @@
 
 Ported from the parent ``recording_jsonb.py``: fold one uploaded chunk into the recording's JSONB
 payload — per-type ``media_files`` cumulative tracking, late-chunk-master-preserve (Pack U.7), and
-sticky COMPLETED status. PURE dict logic, NO IO/DB: the route keeps the storage upload + the row
+sticky COMPLETED status. A per-channel lane's final chunk (``ch<N>``) finalises that channel's media
+file only; the recording completes on a final chunk of a mixed lane (``audio``/``video``), so a
+speaker who leaves mid-meeting does not complete it. PURE dict logic, NO IO/DB: the route keeps the storage upload + the row
 lock + commit; this owns only the record shape (recordings live in ``meetings.data`` JSONB — there
 is NO separate recordings table).
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ..obs import log_event
+
 _STATUS_COMPLETED = "completed"
 _STATUS_IN_PROGRESS = "in_progress"
 _SOURCE_BOT = "bot"
+# Stamped by a per-channel recorder on every chunk. A field is set by the first chunk that
+# carries it and never rewritten or blanked: a later chunk only fills a field still absent (a
+# name resolved after the recorder started), so a re-sent or lost chunk 0 costs nothing.
+_CHANNEL_IDENTITY_KEYS = (
+    "recorder_start_epoch_ms",
+    "channel_kind",
+    "stream_id",
+    "participant_id",
+    "display_name",
+)
+_CHANNEL_KINDS = ("gmeet", "jitsi")
+_CHANNEL_TEXT_LIMIT = 200
+#: A per-channel media type (`ch0`, `ch12`): one remote participant's own recorder.
+CHANNEL_MEDIA = re.compile(r"ch\d+")
+
+
+def channel_identity(raw: Any) -> dict[str, Any]:
+    """Fields a channel recorder may stamp. Anything else is dropped, and the upload still succeeds.
+
+    ``recorder_start_epoch_ms`` is a real int (``bool`` is an int in Python and is rejected).
+    ``channel_kind`` is ``gmeet`` or ``jitsi``; another kind is dropped (``_media_metadata`` warns,
+    naming it, on the media file's first chunk).
+    The three names are non-empty strings, cut to 200 characters: a longer name is kept truncated,
+    since a dropped one would be asked for again on every chunk and never stored.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    kept: dict[str, Any] = {}
+    start = raw.get("recorder_start_epoch_ms")
+    if type(start) is int:
+        kept["recorder_start_epoch_ms"] = start
+    kind = raw.get("channel_kind")
+    if kind in _CHANNEL_KINDS:
+        kept["channel_kind"] = kind
+    for key in ("stream_id", "participant_id", "display_name"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            kept[key] = value[:_CHANNEL_TEXT_LIMIT]
+    return kept
+
+
+def _media_metadata(
+    sample_rate: Optional[int],
+    chunk_metadata: Optional[dict],
+    prior_same_type: Optional[dict],
+) -> dict[str, Any]:
+    """``sample_rate`` from this chunk, plus the channel identity: what earlier chunks stored,
+    and from this chunk only the fields still absent."""
+    metadata: dict[str, Any] = {"sample_rate": sample_rate} if sample_rate else {}
+    prior_meta = (prior_same_type or {}).get("metadata") or {}
+    if isinstance(prior_meta, dict):
+        metadata.update(
+            {key: prior_meta[key] for key in _CHANNEL_IDENTITY_KEYS if key in prior_meta}
+        )
+    for key, value in channel_identity(chunk_metadata).items():
+        metadata.setdefault(key, value)
+    kind = chunk_metadata.get("channel_kind") if isinstance(chunk_metadata, dict) else None
+    if prior_same_type is None and kind is not None and kind not in _CHANNEL_KINDS:
+        # Once per media file, when its identity is first stored: every chunk carries the kind.
+        log_event(
+            "recording_channel_kind_unknown", audience="system", level="warning",
+            span="recordings.upload", fields={"channel_kind": str(kind)[:64]},
+        )
+    return metadata
 
 
 def _now_iso() -> str:
@@ -25,6 +95,17 @@ def _now_iso() -> str:
 def new_recording_numeric_id() -> int:
     """A random 12-digit recording id (parent ``new_recording_numeric_id``)."""
     return int(uuid.uuid4().int % 900000000000 + 100000000000)
+
+
+def session_recording_numeric_id(session_uid: str) -> int:
+    """The 12-digit id of a bot session's one recording, derived from the session.
+
+    Chunk objects are stored under this id before the JSONB fold takes its row lock, so every
+    upload of the session must name it without reading the row: the first chunks of several media
+    types (`audio`, `ch0`, …) arrive at the same moment.
+    """
+    digest = int.from_bytes(hashlib.sha256(session_uid.encode("utf-8")).digest()[:8], "big")
+    return digest % 900000000000 + 100000000000
 
 
 def apply_chunk_to_recording(
@@ -42,13 +123,16 @@ def apply_chunk_to_recording(
     is_final: bool,
     duration_seconds: Optional[float],
     sample_rate: Optional[int],
+    chunk_metadata: Optional[dict] = None,
 ) -> tuple[dict, bool]:
     """Fold one uploaded chunk into the recording payload.
 
     ``existing_rec`` is the prior recording dict for this (session_uid, source=bot), or ``None`` to
     start fresh. Returns ``(rec_payload, status_transitioned_to_completed)``; the caller places
-    ``rec_payload`` into ``data['recordings']`` and commits.
+    ``rec_payload`` into ``data['recordings']`` and commits. Only a final chunk of a mixed lane
+    completes the recording: a channel's final marks that channel's media file final and no more.
     """
+    completes = is_final and not CHANNEL_MEDIA.fullmatch(media_type)
     if existing_rec is None:
         rec_payload: dict[str, Any] = {
             "id": recording_id,
@@ -56,9 +140,9 @@ def apply_chunk_to_recording(
             "user_id": user_id,
             "session_uid": session_uid,
             "source": _SOURCE_BOT,
-            "status": _STATUS_COMPLETED if is_final else _STATUS_IN_PROGRESS,
+            "status": _STATUS_COMPLETED if completes else _STATUS_IN_PROGRESS,
             "created_at": _now_iso(),
-            "completed_at": _now_iso() if is_final else None,
+            "completed_at": _now_iso() if completes else None,
             "media_files": [],
         }
         was_completed = False
@@ -107,7 +191,9 @@ def apply_chunk_to_recording(
         "duration_seconds": duration_seconds,
         "chunk_seq": chunk_seq,
         "first_chunk_at": first_chunk_at,
-        "metadata": {"sample_rate": sample_rate} if sample_rate else {},
+        # sample_rate is rebuilt from this chunk alone. Starting from the prior dict would keep a
+        # rate a later chunk omitted. Channel identity is the opposite: it is never rewritten.
+        "metadata": _media_metadata(sample_rate, chunk_metadata, prior_same_type),
         "created_at": _now_iso(),
         "is_final": new_is_final,
         "finalized_at": (prior_same_type or {}).get("finalized_at"),
@@ -124,7 +210,7 @@ def apply_chunk_to_recording(
         "video": f"/recordings/{recording_id}/master?type=video" if "video" in _types_present else None,
     }
 
-    if is_final:
+    if completes:
         rec_payload["status"] = _STATUS_COMPLETED
         rec_payload["completed_at"] = _now_iso()
         status_transitioned = not was_completed
@@ -133,6 +219,32 @@ def apply_chunk_to_recording(
         rec_payload["status"] = _STATUS_IN_PROGRESS
 
     return rec_payload, status_transitioned
+
+
+def finish_session_recordings(recordings: Any, session_uid: str) -> Optional[list]:
+    """The meeting's recordings once bot session ``session_uid`` has ended, or ``None`` when none
+    changes.
+
+    A recording completes on its mixed lane's final chunk. One that holds only per-channel media
+    files (the mix was not recorded) never gets that chunk, so it completes when its session ends,
+    here. A recording with a mixed lane is left to that lane."""
+    if not isinstance(recordings, list):
+        return None
+    changed = False
+    out: list = []
+    for rec in recordings:
+        if (
+            isinstance(rec, dict)
+            and rec.get("session_uid") == session_uid
+            and rec.get("source") == _SOURCE_BOT
+            and rec.get("status") == _STATUS_IN_PROGRESS
+        ):
+            types = [mf.get("type") for mf in rec.get("media_files") or [] if isinstance(mf, dict)]
+            if types and all(isinstance(t, str) and CHANNEL_MEDIA.fullmatch(t) for t in types):
+                rec = {**rec, "status": _STATUS_COMPLETED, "completed_at": _now_iso()}
+                changed = True
+        out.append(rec)
+    return out if changed else None
 
 
 def chunk_storage_key(
@@ -167,10 +279,11 @@ def master_storage_key(chunk_key: str, media_format: str) -> str:
 _SIGNAL_PREFIX = "signal"
 SIGNAL_ROOT_PREFIX = f"{_SIGNAL_PREFIX}/"
 # The files one bot session leaves: the frame/hint tape, the STT round-trip sidecar, the Teams
-# closed-caption sidecar, the transport (RTP contributing-source) sidecar, and the observations
+# closed-caption sidecar, the transport (RTP contributing-source) sidecar, the observations
 # sidecar (every typed diagnostic the capture path emitted, which used to live only in a pod's
-# log). A CLOSED set — the part name lands in an object key, so it is never caller-shaped (the
-# session_uid in the key is already constrained by find_session).
+# log), and the speaker-activity file (who spoke when, written for every meeting regardless of
+# whether the tape is). A CLOSED set — the part name lands in an object key, so it is never
+# caller-shaped (the session_uid in the key is already constrained by find_session).
 #
 # `stt`, `captions`, `csrc` and `observations` are SIDECARS rather than record types inside the
 # tape because
@@ -188,7 +301,16 @@ SIGNAL_ROOT_PREFIX = f"{_SIGNAL_PREFIX}/"
 # actually left with after every retraction — a fold over the publish stream that every consumer
 # performs and nobody stored, so "what did this meeting say?" could only be answered by re-running
 # it against a redis that no longer exists.
-SIGNAL_TAPE_PARTS = ("captured-signal", "stt", "captions", "csrc", "observations", "botlog", "transcript")
+#
+# `speaker-activity` is the who-spoke-when file the bot writes for EVERY meeting, independent of
+# whether the debug tape is recorded — one line per captured frame (time, channel, display name,
+# loudness, duration) and per active-speaker hint, never audio, which keeps it small (megabytes
+# for hours, against the tape's gigabytes). It is the naming source the downstream exporter reads
+# to attribute a transcript to a speaker. It is its own part rather than a record type inside
+# captured-signal.v1 for the same sealed-contract reason as the sidecars above, and because it
+# must exist when the tape does not: nesting it inside a tape that is off by default would leave
+# every ordinary meeting with no speaker names at all.
+SIGNAL_TAPE_PARTS = ("captured-signal", "stt", "captions", "csrc", "observations", "botlog", "transcript", "speaker-activity")
 # Not every part is JSONL — the bot log is plain text, and its key must carry its real extension or
 # a curator who downloads it gets a file their tools will try to parse a line at a time as JSON.
 SIGNAL_TAPE_PART_FORMATS = {"botlog": "txt"}

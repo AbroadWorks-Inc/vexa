@@ -4,12 +4,12 @@
  * wire codec); this is the recording.v1 master codec.
  *
  * PARALLEL PATH (keep in sync). The Python twin is the pure-core module
- * `services/meeting-api/meeting_api/recording_codec.py` (NOT the finalizer — that's
+ * `services/meeting-api/src/meeting_api/recording_codec.py` (NOT the finalizer — that's
  * the IO/orchestration around this). Same scope, two languages, names aligned and
  * pinned to the shared golden vectors (src/contracts/golden/):
- *      buildRecordingMaster ↔  _build_recording_master   (format dispatch)
- *      buildWebmMaster      ↔  _build_webm_master         (WebM Cluster byte-concat)
- *      buildWavMaster       ↔  _build_wav_master          (WAV RIFF header-merge)
+ *      buildRecordingMaster ↔  build_recording_master    (format dispatch)
+ *      buildWebmMaster      ↔  MasterWriter (webm)       (WebM Cluster byte-concat)
+ *      buildWavMaster       ↔  MasterWriter (wav)        (WAV RIFF header-merge)
  *      parseWavHeader       ↔  _parse_wav_header
  * Change the {webm,wav}-master logic here → mirror it there; the golden tests
  * (golden.test.ts here, test_recording_golden.py there) fail on any drift.

@@ -93,14 +93,53 @@ g.window = g;   // the bundle hangs VexaBrowserUtils on window too
 // Two remote participant streams, both live — the per-track lane's input, and the presence oracle's.
 const remoteStream = (id: string) => ({ id, getAudioTracks: () => [{ id: `${id}-a`, readyState: 'live', muted: false }] });
 g.__vexaCapturedRemoteAudioStreams = [remoteStream('stream-1'), remoteStream('stream-2')];
-// The per-track tap's AudioContext: enough surface for one source + one processor per track.
+// The per-track tap's AudioContext: one source + one processor per track, and the
+// mix destination the recorder taps.
+const mixConnects: string[] = [];
+// Each track's ScriptProcessor, so the test can deliver frames as the browser does.
+const processors: Array<{ onaudioprocess: ((e: unknown) => void) | null }> = [];
+/** One 4096-sample frame on every tapped track, at `peak` (above the lane's 0.005 silence gate = audible). */
+const frame = (peak: number): void => {
+  const input = new Float32Array(4096).fill(peak);
+  for (const p of processors) p.onaudioprocess?.({ inputBuffer: { getChannelData: () => input } });
+};
+let mixConnectFailures = 0;
+let trackCtxClosed = false;
+// The constant source that keeps the mix destination rendering from creation (so the recorder's
+// clock starts at admission, not at the first track): its offset, where it connected, whether started.
+const keepAlive = { offset: NaN, connectedTo: '', started: false };
 (g as any).AudioContext = class {
   destination = {};
   resume(): void { /* no-op */ }
-  close(): void { /* no-op */ }
-  createMediaStreamSource(): unknown { return { connect: () => { /* */ }, disconnect: () => { /* */ } }; }
+  close(): void { trackCtxClosed = true; }
+  createMediaStreamDestination(): unknown {
+    return { stream: { id: 'per-track-mix', getAudioTracks: () => [] } };
+  }
+  createConstantSource(): unknown {
+    const node = {
+      offset: { set value(v: number) { keepAlive.offset = v; }, get value() { return keepAlive.offset; } },
+      connect: (dest: { stream?: { id: string } }) => { keepAlive.connectedTo = dest?.stream?.id ?? ''; },
+      start: () => { keepAlive.started = true; },
+    };
+    return node;
+  }
+  createMediaStreamSource(stream: { id: string }): unknown {
+    return {
+      connect: (dest: { stream?: { id: string } }) => {
+        if (dest?.stream?.id !== 'per-track-mix') return;
+        if (stream.id === 'stream-1' && mixConnectFailures === 0) {
+          mixConnectFailures++;
+          throw new Error('mix connect failed');
+        }
+        mixConnects.push(stream.id);
+      },
+      disconnect: () => { /* */ },
+    };
+  }
   createScriptProcessor(): unknown {
-    return { onaudioprocess: null, connect: () => { /* */ }, disconnect: () => { /* */ } };
+    const proc = { onaudioprocess: null, connect: () => { /* */ }, disconnect: () => { /* */ } };
+    processors.push(proc);
+    return proc;
   }
 };
 
@@ -141,6 +180,7 @@ const activity = {
   ready: () => { /* not driven */ },
   unavailable: () => { /* not driven */ },
   observeStreamPresence: (n: number) => presence.push(n),
+  observeRemoteEnergy: () => { /* the frames the test delivers reach aloneness too */ },
 } as unknown as RemoteAudioActivityTap;
 const inv = { platform: 'zoom', botName: 'Vexa Bot', connectionId: 'test' } as unknown as Invocation;
 
@@ -159,7 +199,8 @@ check('the per-track lane built the resolver from the bundle (not a literal in t
 
 const tick = (n: number) => { for (const cb of [...intervals]) for (let i = 0; i < n; i++) cb(); };
 
-// ── N scripted transitions across the boundary (CONFIRM_POLLS=2 debounce) ──
+// ── N scripted transitions across the boundary (CONFIRM_POLLS=2 debounce), while people talk ──
+frame(0.2);
 setSpeaker('Alice');  tick(2);
 setSpeaker('Bob');    tick(2);
 setSpeaker('Carol');  tick(2);
@@ -192,6 +233,15 @@ check('presence reaches the aloneness tap — 2 live remote streams (RED before 
 check('the per-track topology crossed as DATA (2 tracks captured)',
   observations.some((o) => o.observation.type === 'pertrack-topology' && o.observation.streams === 2),
   JSON.stringify(observations.map((o) => o.observation.type)));
+check('both remote streams are connected to the recording mix',
+  mixConnectFailures === 1 && mixConnects.includes('stream-1') && mixConnects.includes('stream-2'),
+  JSON.stringify({ mixConnects, mixConnectFailures }));
+check('the recording mix stream is published for startRecording',
+  (g as any).__vexaPerTrackMixStream?.id === 'per-track-mix',
+  String((g as any).__vexaPerTrackMixStream?.id));
+check('the mix destination renders from creation: a constant-zero source is connected and started',
+  keepAlive.offset === 0 && keepAlive.connectedTo === 'per-track-mix' && keepAlive.started,
+  JSON.stringify(keepAlive));
 
 // A single-poll flicker must NOT cross the boundary (the debounce holds at wiring altitude).
 setSpeaker('Dave'); tick(2);
@@ -201,9 +251,40 @@ setSpeaker('Dave'); tick(1);    // back before confirm
 check('boundary: a single-poll flicker (Eve) never crosses', !spoken.slice(before).some((s) => s.name === 'Eve'),
   JSON.stringify(spoken.slice(before)));
 
+// A SILENT ROOM. Zoom keeps the last person in its active-speaker panel when nobody talks (a host
+// alone, waiting for a no-show), and the watcher re-asserts that name every ~2 s. A hint is a claim
+// of speech that becomes the exporter's timeline, so with no audio on any track none may cross: the
+// 2026-10-12 one-person calls (meetings 382, 384) read 8-10 min of "speech" over a silent recording
+// and were failed as audio_mismatch.
+const realNow = Date.now;
+Date.now = () => realNow() + 10_000;        // 10 s later; the last audible frame was before this
+frame(0.001);                               // below the silence gate: no audio
+const silentFrom = captured.length;
+const silentSpokenFrom = spoken.length;
+setSpeaker('Frank');  tick(2 + 16);         // the change, then ~4 s of heartbeats
+check('silent room: the lit name sends no hint (no speech claimed on the tape / timeline)',
+  !captured.slice(silentFrom).some((h) => h.name === 'Frank'), JSON.stringify(captured.slice(silentFrom)));
+check('silent room: the resolver still learns the change (naming is not gated)',
+  spoken.slice(silentSpokenFrom).some((s) => s.name === 'Frank' && !s.isEnd), JSON.stringify(spoken.slice(silentSpokenFrom)));
+frame(0.2);                                 // Frank speaks
+tick(8);                                    // the next heartbeat
+check('the same name sends hints again once a track is audible',
+  captured.slice(silentFrom).some((h) => h.name === 'Frank' && !h.isEnd), JSON.stringify(captured.slice(silentFrom)));
+Date.now = () => realNow() + 20_000;        // silent again
+frame(0.001);
+const quietFrom = captured.length;
+setSpeaker('Gina');  tick(2 + 16);
+setSpeaker(null);    tick(2);
+check('a turn that sent no start sends no end either',
+  !captured.slice(quietFrom).some((h) => h.name === 'Gina'), JSON.stringify(captured.slice(quietFrom)));
+Date.now = realNow;
+
+(g as any).__vexaRecordingTap = { stop: async () => { /* recording still owns the mix context */ } };
 await stop();
+check('capture stop leaves the mix context open while a recording tap is live',
+  !trackCtxClosed && (g as any).__vexaTrackCtx != null);
 (g as any).setInterval = realSetInterval;
 (g as any).clearInterval = realClearInterval;
 
 if (failed) { console.error(`\n❌ zoom-speaker-wiring: ${failed} checks FAILED.`); process.exit(1); }
-console.log('\n✅ zoom-speaker-wiring: real bundle + real bridge carry Zoom active-speaker transitions page→Node to the seams the per-track lane actually uses (resolver, tape, presence, typed observations).');
+console.log('\n✅ zoom-speaker-wiring: real bundle + real bridge carry Zoom active-speaker transitions page→Node to the seams the per-track lane actually uses (resolver, tape, presence, typed observations); a silent room claims no speech.');

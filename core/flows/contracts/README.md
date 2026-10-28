@@ -9,5 +9,4 @@ architecture.calm.json follows the repo's contract-version gate.
 but the **carrier census** — every event type with exactly one producing domain, its owner, the refs
 a consumer may rely on, and its cardinality. It is the registry `gate:config-contract` checks a
 service's `publish-edge` keys against, which is what makes a publish edge declarable as the thing it
-is rather than as a dependency. Registered in the chart, deliberately **unsealed** while in
-development.
+is rather than as a dependency. Registered in the chart and sealed in `contracts.seal.json`.

@@ -18,6 +18,7 @@ from admin_api.schema.sync import ensure_schema_sync
 
 from conftest import requires_docker
 from test_stack_admin_api import ADMIN_TOKEN, INTERNAL_SECRET, _admin, _dispose_async_engine
+from gateway_identity import via_gateway
 
 pytestmark = requires_docker
 
@@ -35,7 +36,7 @@ def client(pg_url, pg_async_url, monkeypatch):
     monkeypatch.setenv("INTERNAL_API_SECRET", INTERNAL_SECRET)
     monkeypatch.setenv("DEV_MODE", "false")
     app_db.configure(pg_async_url)
-    with TestClient(create_app()) as c:
+    with TestClient(via_gateway(create_app())) as c:
         yield c
     _dispose_async_engine()
 
@@ -48,8 +49,8 @@ def _user_token(client, email="cal@vexa.ai", max_bots=4):
 
 
 def test_calendar_set_read_masked_and_disconnect(client):
-    _uid, tok = _user_token(client)
-    h = {"X-API-Key": tok}
+    uid, tok = _user_token(client)
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
 
     r = client.put("/user/calendar", headers=h, json={"ics_url": ICS, "auto_join": False})
     assert r.status_code == 200, r.text
@@ -70,8 +71,8 @@ def test_calendar_set_read_masked_and_disconnect(client):
 
 
 def test_calendar_rejects_non_http_url(client):
-    _uid, tok = _user_token(client, email="cal2@vexa.ai")
-    r = client.put("/user/calendar", headers={"X-API-Key": tok},
+    uid, tok = _user_token(client, email="cal2@vexa.ai")
+    r = client.put("/user/calendar", headers={"X-API-Key": tok, "x-user-id": str(uid)},
                    json={"ics_url": "file:///etc/passwd"})
     assert r.status_code == 422
 
@@ -79,22 +80,22 @@ def test_calendar_rejects_non_http_url(client):
 def test_calendar_rejects_embed_page_url(client):
     """The #1 paste mistake: Google Calendar's EMBED page (HTML) instead of the ICS feed. The
     422 must TEACH — name the 'Secret address in iCal format' fix, not just refuse."""
-    _uid, tok = _user_token(client, email="cal-embed@vexa.ai")
-    r = client.put("/user/calendar", headers={"X-API-Key": tok},
+    uid, tok = _user_token(client, email="cal-embed@vexa.ai")
+    r = client.put("/user/calendar", headers={"X-API-Key": tok, "x-user-id": str(uid)},
                    json={"ics_url": "https://calendar.google.com/calendar/embed?src=x%40vexa.ai&ctz=Europe%2FLisbon"})
     assert r.status_code == 422
     assert "Secret address in iCal format" in r.json()["detail"]
 
 
 def test_calendar_auto_join_defaults_true(client):
-    _uid, tok = _user_token(client, email="cal3@vexa.ai")
-    r = client.get("/user/calendar", headers={"X-API-Key": tok})
+    uid, tok = _user_token(client, email="cal3@vexa.ai")
+    r = client.get("/user/calendar", headers={"X-API-Key": tok, "x-user-id": str(uid)})
     assert r.json()["auto_join"] is True
 
 
 def test_calendar_bot_name_is_user_visible_and_reaches_auto_join_context(client):
     uid, tok = _user_token(client, email="cal-name@vexa.ai")
-    h = {"X-API-Key": tok}
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
 
     assert client.get("/user/calendar", headers=h).json()["bot_name"] == "Vexa"
     updated = client.put("/user/calendar", headers=h, json={"bot_name": "  Note Taker  "})
@@ -112,7 +113,7 @@ def test_calendar_bot_name_is_user_visible_and_reaches_auto_join_context(client)
 
 def test_legacy_bot_name_updates_first_calendar_connection(client):
     uid, tok = _user_token(client, email="cal-legacy-name@vexa.ai")
-    h = {"X-API-Key": tok}
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
     client.put("/user/calendar", headers=h, json={"ics_url": ICS})
     updated = client.put("/user/calendar", headers=h, json={"bot_name": "Legacy Notes"})
     assert updated.status_code == 200
@@ -126,7 +127,7 @@ def test_legacy_bot_name_updates_first_calendar_connection(client):
 
 def test_plural_calendars_are_independent_and_never_echo_secret_urls(client):
     uid, tok = _user_token(client, email="cal-many@vexa.ai")
-    h = {"X-API-Key": tok}
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
 
     work = client.post("/user/calendars", headers=h,
                        json={"name": "Work", "ics_url": ICS, "auto_join": True,
@@ -181,8 +182,8 @@ def test_plural_calendars_are_independent_and_never_echo_secret_urls(client):
 
 
 def test_legacy_calendar_endpoint_materializes_first_plural_connection(client):
-    _uid, tok = _user_token(client, email="cal-legacy@vexa.ai")
-    h = {"X-API-Key": tok}
+    uid, tok = _user_token(client, email="cal-legacy@vexa.ai")
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
     legacy = client.put("/user/calendar", headers=h,
                         json={"ics_url": ICS, "auto_join": False})
     assert legacy.status_code == 200
@@ -201,7 +202,7 @@ def test_legacy_calendar_endpoint_materializes_first_plural_connection(client):
 
 def test_internal_calendar_configs_secret_gated(client):
     uid, tok = _user_token(client, email="cal4@vexa.ai")
-    client.put("/user/calendar", headers={"X-API-Key": tok}, json={"ics_url": ICS})
+    client.put("/user/calendar", headers={"X-API-Key": tok, "x-user-id": str(uid)}, json={"ics_url": ICS})
 
     # wrong/missing secret → fail closed
     assert client.get("/internal/calendar-configs").status_code == 403
@@ -220,7 +221,7 @@ def test_internal_calendar_configs_secret_gated(client):
 
 def test_internal_bot_context(client):
     uid, tok = _user_token(client, email="cal5@vexa.ai", max_bots=4)
-    client.put("/user/webhook", headers={"X-API-Key": tok},
+    client.put("/user/webhook", headers={"X-API-Key": tok, "x-user-id": str(uid)},
                json={"webhook_url": "https://example.com/hook", "webhook_secret": "shh"})
 
     assert client.get(f"/internal/users/{uid}/bot-context").status_code == 403

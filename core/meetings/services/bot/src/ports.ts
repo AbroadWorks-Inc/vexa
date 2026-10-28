@@ -14,6 +14,7 @@
  * The L2 harness substitutes in-memory FAKES for every one of these (no client libs needed).
  */
 import type { BotStatus, LifecycleEvent, Act, TranscriptSegment } from './contracts.js';
+import type { CaptureLane } from './config.js';
 
 /** The outcome of the join+admission attempt (an Anti-Corruption verdict, P5 — the
  *  platform's many failure modes translated into the bot's vocabulary). */
@@ -164,7 +165,7 @@ export interface CapturedFrame {
   pcm: string;                      // base64 of the Float32 PCM bytes (LE) — codec wire payload
   pcm_len: number;                  // PCM sample count (Float32 elements)
   rms?: number;                     // root-mean-square level (sink computes if absent)
-  lane: 'gmeet' | 'mixed';          // which pipeline lane this frame feeds
+  lane: CaptureLane;
 }
 
 /** One captured-signal.v1 OUT-OF-BAND speaker hint as it crosses the capture bridge. The mixed
@@ -177,7 +178,7 @@ export interface HintEvent {
   t: number;                        // hint epoch ms — SAME clock domain as CapturedFrame.ts
   name: string;                     // who the platform reports as active
   isEnd?: boolean;                  // marks the END of that speaker's turn
-  lane?: 'gmeet' | 'mixed';
+  lane?: CaptureLane;
 }
 
 /** TelemetrySink port — the OPTIONAL dual-sink the capture bridge tees raw frames into, BEFORE

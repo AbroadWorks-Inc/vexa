@@ -26,18 +26,19 @@ from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+from gateway_identity import via_gateway
 
 USER = 7
 HEADERS = {"x-user-id": str(USER)}
 
 
 def _client(store):
-    return TestClient(create_app(
+    return TestClient(via_gateway(create_app(
         transcript_store=store,
         meeting_repo=InMemoryMeetingRepo(),
         runtime=FakeRuntimeClient(),
         command_publisher=InMemoryCommandPublisher(),
-    ))
+    )))
 
 
 def _seed(store, nid, *, status, created_at, scheduled_at=None, start_time=None):

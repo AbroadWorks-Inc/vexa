@@ -1,0 +1,19 @@
+{
+  "external_id": "google:3n5kq8example",
+  "user": "a@abroadworks.com",
+  "meeting_url": "https://meet.google.com/kxo-misr-avz",
+  "start": "2026-09-29T09:00:00+05:30",
+  "end": "2026-09-29T09:30:00+05:30",
+  "time_zone": "Asia/Kolkata",
+  "title": "Weekly sync",
+  "attendees": [
+    "a@abroadworks.com",
+    "b@client.com"
+  ],
+  "series_id": "google-series:abc123",
+  "join_now": false,
+  "metadata": {
+    "source": "calendar",
+    "calendar_event_id": "abc123"
+  }
+}

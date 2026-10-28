@@ -421,5 +421,5 @@ def test_k8s_discovers_pods_by_label(monkeypatch):
     assert found["mtg-2-d93eee39"]["running"] is True
     assert found["mtg-9-dead"] == {
         "workload_id": "mtg-9-dead", "name": "vexa-mtg-9-dead",
-        "running": False, "exit_code": 137,
+        "running": False, "exit_code": 137, "phase": "Failed",
     }

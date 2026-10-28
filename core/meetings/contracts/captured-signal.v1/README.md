@@ -23,5 +23,5 @@ meeting it was captured under, and a [flagged-issue.v1](../flagged-issue.v1) wit
 `trace_id` ties the bug record, the raw signal, and the cross-system trace into one repro key
 (asserted in `eval/flag.test.mjs`).
 
-`gate:schema` validates goldens ≡ schema. **UNSEALED** (in development) — not yet frozen in
-`contracts.seal.json`.
+`gate:schema` validates goldens ≡ schema. Sealed in `contracts.seal.json`. `Lane` includes
+`pertrack` for Zoom's named per-track frames; `gmeet` and `mixed` are unchanged.

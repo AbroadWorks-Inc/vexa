@@ -18,10 +18,12 @@ the conformance harness never imports it — it injects its own in-process fakes
 """
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from .identity_signature import SIGNATURE_HEADER, KeyRingError, sign_now, signing_key
 from .obs import TRACE_HEADER, get_trace_id
 from .ports import AuthUnavailable
 
@@ -122,16 +124,22 @@ class AdminApiAuthorizer:
             # #495: resolve now raises on infra failure (rather than returning None). Keep the WS
             # subscribe path fail-safe — surface it as an authorization error, not an unhandled 500.
             return {"authorized": [], "errors": [f"authorization_unavailable:{e}"]}
+        url = f"{self._meeting_api_url}/ws/authorize-subscribe"
+        # §6.9 F-E: the signature covers the exact body bytes, so the body is encoded here.
+        body = json.dumps({"meetings": meetings}).encode("utf-8")
+        auth_headers["content-type"] = "application/json"
         if user_data:
+            # §1.10: meeting-api believes x-user-id only with the gateway's signature.
+            try:
+                key = signing_key()
+            except KeyRingError as e:
+                return {"authorized": [], "errors": [f"authorization_unavailable:{e}"]}
             auth_headers["x-user-id"] = str(user_data["user_id"])
             auth_headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
             auth_headers["x-user-limits"] = str(user_data.get("max_concurrent", 3))
+            auth_headers[SIGNATURE_HEADER] = sign_now(key, auth_headers, "POST", url, None, body)
         try:
-            resp = await self._client.post(
-                f"{self._meeting_api_url}/ws/authorize-subscribe",
-                headers=auth_headers,
-                json={"meetings": meetings},
-            )
+            resp = await self._client.post(url, headers=auth_headers, content=body)
             if resp.status_code != 200:
                 return {"authorized": [], "errors": [f"authorization_service_error:{resp.status_code}"]}
             return resp.json()
@@ -198,6 +206,9 @@ def build_production_app(
     # reject every /internal/validate hop (503 on every API-key check), the 2026-04-23 shape. Fail
     # loud at boot with one message naming the missing key, instead of coming up green and 503ing.
     preflight()
+    # §1.10: a ring that is set but wrong (bad JSON, a key that isn't 32 bytes, the active id not
+    # in it) refuses the boot too, naming the fault and never a key.
+    signing_key()
 
     admin_api_url = admin_api_url or os.getenv("ADMIN_API_URL", "http://admin-api:8001")
     meeting_api_url = meeting_api_url or os.getenv("MEETING_API_URL", "http://meeting-api:8080")
@@ -219,6 +230,7 @@ def build_production_app(
         health_check_interval=30, retry_on_timeout=True,
     )
 
+    from .intake_limit import from_env as _intake_limiter_from_env
     from .ratelimit import from_env as _rate_limiter_from_env
 
     app = create_app(
@@ -230,6 +242,7 @@ def build_production_app(
         admin_api_url=admin_api_url,  # /user/webhook self-serve proxies to identity (admin-api)
         mcp_url=mcp_url,              # #795: the MCP streamable-HTTP front door under /mcp
         rate_limiter=_rate_limiter_from_env(),  # WS-6: per-user DoS guard (generous defaults; env-tunable)
+        intake_limiter=_intake_limiter_from_env(redis_client),  # §1.13: per-account entry writes, shared count
     )
 
     # --- fastapi-guard: per-IP rate limiting, IP allow/deny + auto-ban (edge_guard.py) ---

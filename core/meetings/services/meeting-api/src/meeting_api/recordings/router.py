@@ -12,14 +12,15 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from ..callback_auth import internal_secret, secret_matches
 from .ports import RecordingRepo, Storage
 from .deletion import MeetingNotTerminal, delete_owned_recording
+from .jsonb import CHANNEL_MEDIA
 from .service import (
     SIGNAL_MEDIA_TYPE,
     InvalidSignalTape,
@@ -212,9 +213,8 @@ def build_router(
         if media_type == SIGNAL_MEDIA_TYPE:
             part = str(meta.get("part") or "")
             bearer = _bearer_token(authorization)
-            internal_secret = os.getenv("INTERNAL_API_SECRET")
             token_meeting_id = None
-            if not (internal_secret and bearer == internal_secret):
+            if not secret_matches(bearer, internal_secret()):
                 try:
                     claims = _verify_meeting_token(bearer, secret=token_secret)
                 except ValueError as e:
@@ -233,7 +233,7 @@ def build_router(
             except SessionNotFound as e:
                 raise HTTPException(status_code=404, detail=str(e))
             return JSONResponse(content=receipt)
-        chunk_seq = chunk_seq if chunk_seq is not None else int(meta.get("chunk_seq", 0) or 0)
+        seq = chunk_seq if chunk_seq is not None else meta.get("chunk_seq")
         is_final = is_final if is_final is not None else bool(meta.get("is_final", True))
         duration_seconds = duration_seconds if duration_seconds is not None else meta.get("duration_seconds")
         sample_rate = sample_rate if sample_rate is not None else meta.get("sample_rate")
@@ -241,9 +241,8 @@ def build_router(
         # Auth: accept either the INTERNAL_API_SECRET (the bot's internal upload uses it, like the
         # lifecycle callback; meeting is scoped by session_uid) OR a MeetingToken (carries its meeting_id).
         bearer = _bearer_token(authorization)
-        internal_secret = os.getenv("INTERNAL_API_SECRET")
         token_meeting_id: Optional[int] = None
-        if internal_secret and bearer == internal_secret:
+        if secret_matches(bearer, internal_secret()):
             token_meeting_id = None  # internal auth → scope by session; skip the MeetingToken cross-check
         else:
             try:
@@ -251,6 +250,12 @@ def build_router(
             except ValueError as e:
                 raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
             token_meeting_id = int(claims["meeting_id"])
+
+        if seq is None and CHANNEL_MEDIA.fullmatch(media_type):
+            # A channel chunk without its number (absent, or null) would default to 0 and land on
+            # chunk 0's object. A whole-recording upload (one file, no chunks) is chunk 0.
+            raise HTTPException(status_code=422, detail="chunk_seq required for a channel chunk")
+        chunk_seq = int(seq or 0)
 
         data = await file.read()
         try:
@@ -261,6 +266,7 @@ def build_router(
                 media_type=media_type, media_format=media_format,
                 chunk_seq=chunk_seq, is_final=is_final,
                 duration_seconds=duration_seconds, sample_rate=sample_rate,
+                chunk_metadata=meta,
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))

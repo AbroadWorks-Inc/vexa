@@ -24,7 +24,8 @@
  *     onto Scott's channel however often it over-votes it there. It frees up when its owner goes
  *     long-idle (`idleReleaseMs` — a leave/rejoin under a new stream). One exception: this channel's
  *     votes for the name are high-`purity`, which is what distinguishes two genuinely same-named
- *     people (pure votes on each → both named) from contamination (a mixed minority → stays blocked).
+ *     people (pure votes on each → both named) from contamination. Purity is not enough when another
+ *     active holder already leads by 4× and by 10 votes: that name stays with the holder.
  *   • SELF-EXCLUSION — the local participant (our bot) is never a remote channel's identity. The
  *     upstream watcher already filters the self tile by `selfName`, but that marker vanishes
  *     transiently, which is exactly how the host's glow leaked onto a remote channel in the
@@ -42,7 +43,7 @@
  * lights (throughout a screen-share, say) stays unnamed — separated, and labelled, but unnamed.
  */
 
-/** Defaults, kept identical to the page-side literal this replaced (behaviour is unchanged). */
+/** Defaults. `minVotes` is the floor for a first bind and for a purity co-hold. */
 export const TRACK_NAME_DEFAULTS = {
   /** A channel counts as "hot" for this long after its last energetic frame. */
   hotMs: 600,
@@ -52,6 +53,8 @@ export const TRACK_NAME_DEFAULTS = {
   idleReleaseMs: 8_000,
   /** Share of a channel's votes a name needs to be co-held against an active owner. */
   purity: 0.7,
+  /** Votes a free name needs before a first bind or a purity co-hold. */
+  minVotes: 5,
 } as const;
 
 export interface TrackNameResolverOptions {
@@ -64,6 +67,8 @@ export interface TrackNameResolverOptions {
   margin?: number;
   idleReleaseMs?: number;
   purity?: number;
+  /** Votes required before a channel binds a name it does not already hold. */
+  minVotes?: number;
   /** The LOCAL participant (our bot). Never binds a remote channel — see SELF-EXCLUSION above. */
   selfName?: string;
   /** Fired on every committed bind or re-bind. The host reports it as a typed observation. */
@@ -104,6 +109,7 @@ export function createTrackNameResolver(options: TrackNameResolverOptions = {}):
   const margin = options.margin ?? TRACK_NAME_DEFAULTS.margin;
   const idleReleaseMs = options.idleReleaseMs ?? TRACK_NAME_DEFAULTS.idleReleaseMs;
   const purity = options.purity ?? TRACK_NAME_DEFAULTS.purity;
+  const minVotes = options.minVotes ?? TRACK_NAME_DEFAULTS.minVotes;
   const onBind = options.onBind;
 
   /** name → when it was lit (ms). */
@@ -142,7 +148,14 @@ export function createTrackNameResolver(options: TrackNameResolverOptions = {}):
       }
       if (!activeOwner) return true;
       const vn = v.get(name) || 0;
-      return vn >= purity * total && vn >= margin;
+      if (!(vn >= purity * total && vn >= margin && vn >= minVotes)) return false;
+      // A holder at least 4× these votes, and at least 10 ahead, keeps the name.
+      for (const [c, n] of names) {
+        if (n !== name || c === channel) continue;
+        const holderVotes = votes.get(c)?.get(name) || 0;
+        if (holderVotes >= 4 * vn && holderVotes >= vn + 10) return false;
+      }
+      return true;
     };
     let best = '', bestN = -1;
     for (const [n, c] of v) if (c > bestN && available(n)) { bestN = c; best = n; }
@@ -150,9 +163,13 @@ export function createTrackNameResolver(options: TrackNameResolverOptions = {}):
     const cur = names.get(channel);
     if (best === cur) return;
     const curN = cur ? (v.get(cur) || 0) : -1;
-    // Hysteresis: a challenger must beat the incumbent by `margin` before it flips, so a few stray
-    // sticky-DOM votes cannot churn an established name — but real evidence still corrects it.
-    if (bestN < curN + margin) return;
+    // A first bind needs minVotes and a clear lead over the runner-up. An
+    // established name still flips only when the challenger leads by margin.
+    if (!cur) {
+      let runnerUp = 0;
+      for (const [n, c] of v) if (n !== best && c > runnerUp) runnerUp = c;
+      if (bestN < minVotes || bestN < runnerUp + margin) return;
+    } else if (bestN < curN + margin) return;
     // Release only IDLE owners of the name (a leave/reconnect); keep active co-holders (duplicates).
     for (const [c, n] of [...names]) {
       if (n !== best || c === channel) continue;

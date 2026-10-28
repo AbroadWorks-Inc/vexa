@@ -7,6 +7,8 @@ session-resolution seams behave.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -182,6 +184,32 @@ async def test_finalize_master_builds_and_stamps():
     assert mf["storage_path"] == master_key
 
 
+async def test_finalize_master_does_not_concatenate_a_sibling_whose_name_starts_alike():
+    """`.../audio` is a prefix of `.../audio2/`. The list must not pull the sibling in."""
+    repo, storage = _seeded()
+    audio = [_counting_wav(1), _counting_wav(2)]
+    rid = None
+    for seq, part in enumerate(audio):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=part, media_type="audio", media_format="wav", chunk_seq=seq, is_final=False,
+        )
+        rid = receipt["recording_id"]
+    await upload_chunk(
+        repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+        data=_counting_wav(9), media_type="audio2", media_format="wav",
+        chunk_seq=0, is_final=False,
+    )
+    master_key = await finalize_master(
+        repo, storage, meeting_id=MEETING_ID, recording_id=rid, media_type="audio",
+    )
+    assert storage.blobs[master_key] == build_recording_master(audio, "wav")
+    sibling_key = await finalize_master(
+        repo, storage, meeting_id=MEETING_ID, recording_id=rid, media_type="audio2",
+    )
+    assert storage.blobs[sibling_key] == build_recording_master([_counting_wav(9)], "wav")
+
+
 async def test_upload_before_session_is_pending():
     repo, storage = _seeded()
     receipt = await upload_chunk(
@@ -223,6 +251,46 @@ def test_upload_route_accepts_valid_token():
     )
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
+
+
+def test_upload_route_keeps_channel_identity_from_the_first_chunk():
+    """The metadata form part reaches the fold. A second chunk cannot rename the channel."""
+    import asyncio
+
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    first = {
+        "session_uid": SESSION_UID,
+        "media_type": "ch0",
+        "media_format": "webm",
+        "chunk_seq": 0,
+        "is_final": False,
+        "sample_rate": 16000,
+        "recorder_start_epoch_ms": 1_700_000_000_000,
+        "channel_kind": "gmeet",
+        "stream_id": "remote-1",
+        "display_name": "Ada",
+        "ignored": "nope",
+    }
+    second = dict(first, chunk_seq=1, display_name="Bob", sample_rate=None)
+    headers = {"Authorization": f"Bearer {token}"}
+    for body in (first, second):
+        posted = client.post(
+            "/internal/recordings/upload",
+            headers=headers,
+            data={"metadata": json.dumps(body)},
+            files={"file": ("c.webm", b"chunk", "video/webm")},
+        )
+        assert posted.status_code == 200, posted.text
+    recs = asyncio.run(repo.get_recordings(MEETING_ID))
+    mf = next(m for m in recs[0]["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"]["display_name"] == "Ada"
+    assert mf["metadata"]["channel_kind"] == "gmeet"
+    assert mf["metadata"]["stream_id"] == "remote-1"
+    assert mf["metadata"]["recorder_start_epoch_ms"] == 1_700_000_000_000
+    assert "ignored" not in mf["metadata"]
+    assert "sample_rate" not in mf["metadata"]
 
 
 # ── G4: object-storage I/O must not block the event loop ─────────────────────────────────────────
@@ -325,6 +393,35 @@ async def test_concurrent_chunk_uploads_do_not_lose_updates():
     assert len(bot_recs) == 1, f"exactly one recording for the session, got {len(bot_recs)}"
     mf = next(m for m in bot_recs[0]["media_files"] if m["type"] == "audio")
     assert mf["chunk_count"] == 3, f"all 3 chunks must be folded (no lost update), got {mf['chunk_count']}"
+
+
+async def test_concurrent_first_chunks_of_several_media_types_share_one_recording_prefix():
+    """A per-channel bot uploads chunk 0 of `audio`, `ch0` and `ch1` at the same moment. Every
+    object must land under the ONE recording the JSONB keeps, or the audio master is built without
+    chunk 0 (no container header) and cannot be decoded."""
+    import asyncio
+
+    repo, _ = _seeded()
+    storage = _YieldingStorage()
+    await asyncio.gather(*(
+        upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                     data=_counting_wav(seq), media_type=media_type, media_format="wav",
+                     chunk_seq=0, is_final=False)
+        for seq, media_type in enumerate(("audio", "ch0", "ch1"))
+    ))
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=_counting_wav(9), media_type="audio", media_format="wav",
+                       chunk_seq=1, is_final=True)
+
+    recs = [r for r in await repo.get_recordings(MEETING_ID) if r.get("source") == "bot"]
+    assert len(recs) == 1
+    rid = recs[0]["id"]
+    keys = await storage.list("recordings/")
+    assert keys and all(f"/{rid}/" in k for k in keys), keys
+
+    master_key = await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
+    master = await storage.get(master_key)
+    assert master == build_recording_master([_counting_wav(0), _counting_wav(9)], "wav")
 
 
 # ── #509 C2: retrieval serves the assembled master, never the empty final-signal chunk ────────────
@@ -470,6 +567,67 @@ def test_empty_final_fold_never_points_storage_at_signal_chunk():
     assert mf["storage_path"] != signal_key
     assert rec2["status"] == "completed", "empty final still completes the recording"
     assert transitioned is True
+
+
+def _fold_audio(prior, *, chunk_seq, file_size, sample_rate, chunk_metadata=None, storage_path="k"):
+    return apply_chunk_to_recording(
+        prior, recording_id=123, meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID,
+        media_type="ch0", media_format="webm", storage_path=storage_path, file_size=file_size,
+        chunk_seq=chunk_seq, is_final=False, duration_seconds=None, sample_rate=sample_rate,
+        chunk_metadata=chunk_metadata,
+    )
+
+
+def test_channel_identity_sticks_to_the_first_chunk():
+    """Chunk 0 stores the five channel fields beside sample_rate and drops unknown or invalid ones.
+    Chunk 1 may try to rename the speaker; the stored identity stays, and an omitted sample_rate
+    is still dropped (that field is rebuilt from the chunk in hand)."""
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=16000,
+        chunk_metadata={
+            "recorder_start_epoch_ms": 1_700_000_000_000,
+            "channel_kind": "jitsi",
+            "stream_id": "remote-audio-0",
+            "participant_id": "p-1",
+            "display_name": "Ada",
+            "ignored": "nope",
+        },
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {
+        "sample_rate": 16000,
+        "recorder_start_epoch_ms": 1_700_000_000_000,
+        "channel_kind": "jitsi",
+        "stream_id": "remote-audio-0",
+        "participant_id": "p-1",
+        "display_name": "Ada",
+    }
+
+    rejected, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=16000,
+        chunk_metadata={
+            "recorder_start_epoch_ms": True,
+            "channel_kind": "zoom",
+            "stream_id": "",
+            "participant_id": "x" * 201,
+            "display_name": 12,
+        },
+    )
+    rejected_mf = next(m for m in rejected["media_files"] if m["type"] == "ch0")
+    assert rejected_mf["metadata"] == {"sample_rate": 16000, "participant_id": "x" * 200}
+
+    renamed, _ = _fold_audio(
+        rec, chunk_seq=1, file_size=50, sample_rate=None,
+        chunk_metadata={"display_name": "Bob", "channel_kind": "gmeet"},
+    )
+    renamed_mf = next(m for m in renamed["media_files"] if m["type"] == "ch0")
+    assert renamed_mf["metadata"] == {
+        "recorder_start_epoch_ms": 1_700_000_000_000,
+        "channel_kind": "jitsi",
+        "stream_id": "remote-audio-0",
+        "participant_id": "p-1",
+        "display_name": "Ada",
+    }
 
 
 async def test_single_final_chunk_downloads_byte_complete():
@@ -646,3 +804,321 @@ def test_a_persisted_path_outside_the_owners_namespace_is_never_deleted():
 
     assert mine in keys
     assert theirs not in keys, "a foreign-owner path must never enter the delete set"
+
+
+# ── streamed master: bounded parallel reads, written in parts ────────────────────────────────────
+
+
+class _ReadTrackingStorage(InMemoryStorage):
+    """Counts chunk reads in flight (each read yields the loop) and how many reads had started when
+    the master's first piece reached ``upload_stream``."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.reads_started = 0
+        self.reads_started_at_first_piece = None
+
+    async def get(self, key: str) -> bytes:
+        import asyncio
+
+        if "/master." not in key:
+            self.reads_started += 1
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            await asyncio.sleep(0)
+            self.in_flight -= 1
+        return await super().get(key)
+
+    async def upload_stream(self, key, pieces, *, content_type):
+        async def watched():
+            async for piece in pieces:
+                if self.reads_started_at_first_piece is None:
+                    self.reads_started_at_first_piece = self.reads_started
+                yield piece
+
+        await super().upload_stream(key, watched(), content_type=content_type)
+
+
+async def _upload_counting_parts(repo, storage, count):
+    rid = None
+    for seq in range(count):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=_counting_wav(seq), media_format="wav", chunk_seq=seq, is_final=False,
+        )
+        rid = receipt["recording_id"]
+    return rid
+
+
+async def test_finalize_reads_chunks_in_parallel_up_to_the_window_and_keeps_their_order():
+    from meeting_api.recordings.service import MASTER_READ_WINDOW
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = _ReadTrackingStorage()
+    parts = 5 * MASTER_READ_WINDOW
+    rid = await _upload_counting_parts(repo, storage, parts)
+
+    master_key = await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
+
+    assert storage.max_in_flight == MASTER_READ_WINDOW
+    assert storage.blobs[master_key] == build_recording_master(
+        [_counting_wav(seq) for seq in range(parts)], "wav"
+    )
+
+
+async def test_finalize_streams_the_master_before_every_chunk_is_read():
+    from meeting_api.recordings.service import MASTER_READ_WINDOW
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = _ReadTrackingStorage()
+    parts = 5 * MASTER_READ_WINDOW
+    rid = await _upload_counting_parts(repo, storage, parts)
+
+    await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
+
+    assert storage.reads_started_at_first_piece <= MASTER_READ_WINDOW + 1 < parts
+
+
+class _MultipartS3Client:
+    """A stub boto3 S3 client that records single and multipart writes; ``fail_part`` makes that
+    part number raise."""
+
+    def __init__(self, fail_part=None):
+        self.fail_part = fail_part
+        self.calls: list[str] = []
+        self.parts: list[tuple[int, int]] = []
+        self.completed_parts = None
+        self.put_body = None
+
+    def put_object(self, **kw):
+        self.calls.append("put_object")
+        self.put_body = kw["Body"]
+        return {}
+
+    def create_multipart_upload(self, **kw):
+        self.calls.append("create_multipart_upload")
+        return {"UploadId": "up-1"}
+
+    def upload_part(self, **kw):
+        self.calls.append("upload_part")
+        if kw["PartNumber"] == self.fail_part:
+            raise RuntimeError("part upload failed")
+        self.parts.append((kw["PartNumber"], len(kw["Body"])))
+        return {"ETag": f"etag-{kw['PartNumber']}"}
+
+    def complete_multipart_upload(self, **kw):
+        self.calls.append("complete_multipart_upload")
+        self.completed_parts = kw["MultipartUpload"]["Parts"]
+        return {}
+
+    def abort_multipart_upload(self, **kw):
+        self.calls.append("abort_multipart_upload")
+        return {}
+
+
+def _s3_over(client):
+    from meeting_api.recordings.adapters import S3Storage
+
+    class _Stub(S3Storage):
+        def _c(self):
+            return client
+
+    return _Stub(bucket="b")
+
+
+async def _mib_pieces(count):
+    for _ in range(count):
+        yield b"\x01" * (1024 * 1024)
+
+
+async def test_s3_upload_stream_below_one_part_is_a_single_put():
+    client = _MultipartS3Client()
+    await _s3_over(client).upload_stream("k", _mib_pieces(3), content_type="video/webm")
+    assert client.calls == ["put_object"]
+    assert len(client.put_body) == 3 * 1024 * 1024
+
+
+async def test_s3_upload_stream_writes_ordered_parts_of_the_part_size_and_a_short_last_one():
+    from meeting_api.recordings.adapters import MULTIPART_PART_BYTES
+
+    client = _MultipartS3Client()
+    await _s3_over(client).upload_stream("k", _mib_pieces(20), content_type="video/webm")
+    mib = 1024 * 1024
+    assert client.parts == [(1, MULTIPART_PART_BYTES), (2, MULTIPART_PART_BYTES), (3, 20 * mib - 2 * MULTIPART_PART_BYTES)]
+    assert client.completed_parts == [
+        {"ETag": "etag-1", "PartNumber": 1},
+        {"ETag": "etag-2", "PartNumber": 2},
+        {"ETag": "etag-3", "PartNumber": 3},
+    ]
+    assert "put_object" not in client.calls
+
+
+async def test_s3_upload_stream_aborts_the_multipart_upload_when_a_part_fails():
+    client = _MultipartS3Client(fail_part=2)
+    with pytest.raises(RuntimeError, match="part upload failed"):
+        await _s3_over(client).upload_stream("k", _mib_pieces(20), content_type="video/webm")
+    assert client.calls[-1] == "abort_multipart_upload"
+    assert "complete_multipart_upload" not in client.calls
+
+
+def test_a_resent_chunk_0_never_blanks_the_stored_identity():
+    """F3: a re-sent (or defaulted) chunk 0 without identity keeps what is stored."""
+    identity = {"recorder_start_epoch_ms": 1_700_000_000_000, "channel_kind": "jitsi",
+                "stream_id": "remote-audio-2", "display_name": "Ada"}
+    rec, _ = _fold_audio(None, chunk_seq=0, file_size=100, sample_rate=16000, chunk_metadata=identity)
+    again, _ = _fold_audio(rec, chunk_seq=0, file_size=100, sample_rate=16000, chunk_metadata={})
+    mf = next(m for m in again["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"sample_rate": 16000, **identity}
+
+
+def test_a_name_resolved_after_the_recorder_started_is_stored():
+    """F3: chunk 0 had no name; the first chunk that carries one fills it, and it then sticks."""
+    start = {"recorder_start_epoch_ms": 1_700_000_000_000, "channel_kind": "jitsi",
+             "stream_id": "remote-audio-4"}
+    rec, _ = _fold_audio(None, chunk_seq=0, file_size=100, sample_rate=16000, chunk_metadata=start)
+    named, _ = _fold_audio(rec, chunk_seq=1, file_size=50, sample_rate=16000,
+                           chunk_metadata={**start, "participant_id": "p-9", "display_name": "Grace"})
+    later, _ = _fold_audio(named, chunk_seq=2, file_size=50, sample_rate=16000,
+                           chunk_metadata={**start, "display_name": "Someone else"})
+    mf = next(m for m in later["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"]["display_name"] == "Grace"
+    assert mf["metadata"]["participant_id"] == "p-9"
+
+
+def test_a_channel_chunk_without_its_number_is_refused_but_a_whole_upload_is_not():
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def post(meta: dict) -> int:
+        return client.post(
+            "/internal/recordings/upload", headers=headers,
+            data={"metadata": json.dumps({"session_uid": SESSION_UID, **meta})},
+            files={"file": ("c.webm", b"chunk", "video/webm")},
+        ).status_code
+
+    assert post({"media_type": "ch3", "media_format": "webm", "is_final": False}) == 422
+    assert post({"media_type": "ch3", "media_format": "webm", "chunk_seq": None}) == 422
+    assert post({"media_type": "audio", "media_format": "webm"}) == 200
+
+
+def test_a_channel_chunk_without_its_number_is_refused_only_after_auth():
+    """An unauthenticated caller learns nothing about the body: 401 before any 422."""
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    status = client.post(
+        "/internal/recordings/upload", headers={"Authorization": "Bearer not-a-token"},
+        data={"metadata": json.dumps({"session_uid": SESSION_UID, "media_type": "ch3"})},
+        files={"file": ("c.webm", b"chunk", "video/webm")},
+    ).status_code
+    assert status == 401
+
+
+def _fold(prior, media_type, *, chunk_seq, is_final, file_size=100):
+    return apply_chunk_to_recording(
+        prior, recording_id=123, meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID,
+        media_type=media_type, media_format="webm", storage_path=f"k/{media_type}/{chunk_seq}",
+        file_size=file_size, chunk_seq=chunk_seq, is_final=is_final, duration_seconds=None,
+        sample_rate=None,
+    )
+
+
+def test_a_channel_final_finalises_that_channel_and_not_the_recording():
+    """A Jitsi speaker who leaves sends their channel's final mid-meeting. The recording is still
+    being made: only the mixed lane's final completes it."""
+    rec, _ = _fold(None, "audio", chunk_seq=0, is_final=False)
+    rec, _ = _fold(rec, "ch0", chunk_seq=0, is_final=False)
+    rec, transitioned = _fold(rec, "ch0", chunk_seq=1, is_final=True, file_size=0)
+    assert (rec["status"], rec["completed_at"], transitioned) == ("in_progress", None, False)
+    assert next(m for m in rec["media_files"] if m["type"] == "ch0")["is_final"] is True
+    assert next(m for m in rec["media_files"] if m["type"] == "audio")["is_final"] is False
+
+    rec, transitioned = _fold(rec, "audio", chunk_seq=1, is_final=True, file_size=0)
+    assert (rec["status"], transitioned) == ("completed", True)
+    assert rec["completed_at"] is not None
+
+
+def test_a_recording_started_by_a_channel_final_is_in_progress():
+    rec, transitioned = _fold(None, "ch2", chunk_seq=0, is_final=True)
+    assert (rec["status"], rec["completed_at"], transitioned) == ("in_progress", None, False)
+
+
+async def test_a_channel_final_logs_no_recording_completed(capsys):
+    repo, storage = _seeded()
+    for seq, final in ((0, False), (1, True)):
+        receipt = await upload_chunk(
+            repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=b"chunk", media_type="ch1", media_format="webm", chunk_seq=seq, is_final=final,
+        )
+    assert receipt["status"] == "in_progress"
+    assert "recording_completed" not in capsys.readouterr().out
+
+
+def test_an_unknown_channel_kind_is_dropped_with_a_warning_naming_it(capsys):
+    """Warned once per media file, on its first chunk: every chunk carries the kind."""
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=None,
+        chunk_metadata={"channel_kind": "zoom", "display_name": "Ada"},
+    )
+    rec, _ = _fold_audio(
+        rec, chunk_seq=1, file_size=100, sample_rate=None,
+        chunk_metadata={"channel_kind": "zoom", "display_name": "Ada"},
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"display_name": "Ada"}
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    warned = [e for e in lines if e.get("event") == "recording_channel_kind_unknown"]
+    assert len(warned) == 1 and warned[0]["level"] == "warning"
+    assert warned[0]["fields"] == {"channel_kind": "zoom"}
+    assert "Ada" not in json.dumps(warned[0])
+
+
+def test_a_long_name_is_kept_cut_to_200_characters():
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=None,
+        chunk_metadata={"display_name": "a" * 250, "stream_id": "s" * 201},
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"display_name": "a" * 200, "stream_id": "s" * 200}
+
+
+def _channels_only(session_uid=SESSION_UID):
+    rec, _ = _fold(None, "ch1", chunk_seq=0, is_final=False)
+    rec, _ = _fold(rec, "ch1", chunk_seq=1, is_final=True, file_size=0)
+    return {**rec, "session_uid": session_uid}
+
+
+def test_a_recording_of_only_channels_completes_when_its_session_ends():
+    """The mix was not recorded (no mixed lane), so no final chunk can complete the recording:
+    the end of its bot session does."""
+    from meeting_api.recordings.jsonb import finish_session_recordings
+
+    mixed, _ = _fold(None, "audio", chunk_seq=0, is_final=False)
+    other = _channels_only("another-session")
+    out = finish_session_recordings([_channels_only(), mixed, other], SESSION_UID)
+    assert out is not None
+    assert (out[0]["status"], out[0]["completed_at"] is not None) == ("completed", True)
+    assert out[1]["status"] == "in_progress"  # a mixed lane completes on its own final
+    assert out[2]["status"] == "in_progress"  # another session's recording is not this one's
+    assert finish_session_recordings([mixed], SESSION_UID) is None
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_the_session_terminal_write_completes_a_channel_only_recording(terminal):
+    import asyncio
+
+    from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+
+    repo = InMemoryMeetingRepo()
+    m = asyncio.run(repo.create_meeting(
+        user_id=USER, platform="jitsi", native_meeting_id="room", data={"recordings": [_channels_only()]},
+    ))
+    asyncio.run(repo.create_session(meeting_id=m["id"], session_uid=SESSION_UID))
+    repo.set_status(m["id"], "active")
+    asyncio.run(repo.update_meeting_status(session_uid=SESSION_UID, status=terminal))
+    assert repo._meetings[m["id"]]["data"]["recordings"][0]["status"] == "completed"

@@ -18,6 +18,7 @@ from admin_api.schema.sync import ensure_schema_sync
 
 from conftest import requires_docker
 from test_stack_admin_api import ADMIN_TOKEN, INTERNAL_SECRET, _admin, _dispose_async_engine
+from gateway_identity import via_gateway
 
 pytestmark = requires_docker
 
@@ -32,7 +33,7 @@ def client(pg_url, pg_async_url, monkeypatch):
     monkeypatch.setenv("INTERNAL_API_SECRET", INTERNAL_SECRET)
     monkeypatch.setenv("DEV_MODE", "false")
     app_db.configure(pg_async_url)
-    with TestClient(create_app()) as c:
+    with TestClient(via_gateway(create_app())) as c:
         yield c
     _dispose_async_engine()
 
@@ -48,8 +49,8 @@ def _user_token(client, email="models@vexa.ai"):
 
 
 def test_user_models_set_masked_readback_and_clear(client):
-    _uid, tok = _user_token(client)
-    h = {"X-API-Key": tok}
+    uid, tok = _user_token(client)
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
 
     r = client.put("/user/models", headers=h, json={
         "mode": "custom", "model": "qwen3-coder", "base_url": "https://llm.example.com/v1",
@@ -73,8 +74,8 @@ def test_user_models_set_masked_readback_and_clear(client):
 
 
 def test_user_models_validation(client):
-    _uid, tok = _user_token(client, email="val@vexa.ai")
-    h = {"X-API-Key": tok}
+    uid, tok = _user_token(client, email="val@vexa.ai")
+    h = {"X-API-Key": tok, "x-user-id": str(uid)}
     assert client.put("/user/models", headers=h, json={"mode": "yolo"}).status_code == 422
     assert client.put("/user/models", headers=h, json={"base_url": "not-a-url"}).status_code == 422
     assert client.put("/user/transcription", headers=h, json={"url": "ftp://x"}).status_code == 422
@@ -106,7 +107,7 @@ def test_model_config_resolves_user_over_platform(client):
     client.put("/internal/settings/models", headers=_internal(),
                json={"model": "global-model", "meeting_model": "global-meeting",
                      "base_url": "https://global.example.com"})
-    client.put("/user/models", headers={"X-API-Key": tok},
+    client.put("/user/models", headers={"X-API-Key": tok, "x-user-id": str(uid)},
                json={"model": "my-model", "api_key": "sk-user-key"})
 
     r = client.get(f"/internal/users/{uid}/model-config", headers=_internal())
@@ -136,7 +137,7 @@ def test_bot_context_carries_effective_transcription(client):
         "provider": "vexa",
     }
 
-    client.put("/user/transcription", headers={"X-API-Key": tok},
+    client.put("/user/transcription", headers={"X-API-Key": tok, "x-user-id": str(uid)},
                json={"url": "https://stt-mine.example.com"})
     r = client.get(f"/internal/users/{uid}/bot-context", headers=_internal())
     # A customer URL never inherits the platform credential.
@@ -146,6 +147,6 @@ def test_bot_context_carries_effective_transcription(client):
     }
 
     # masked user-facing read-back
-    cfg = client.get("/user/transcription", headers={"X-API-Key": tok}).json()
+    cfg = client.get("/user/transcription", headers={"X-API-Key": tok, "x-user-id": str(uid)}).json()
     assert cfg["url"] == "https://stt-mine.example.com"
     assert cfg["token_set"] is False

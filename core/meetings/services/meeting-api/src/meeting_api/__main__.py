@@ -10,8 +10,12 @@ control-plane background loops alongside the HTTP app via the FastAPI lifespan:
     moves immutable live segments from the redis hash ``meeting:{id}:segments`` into the
     ``transcriptions`` table (upsert on segment identity; redis trimmed only after the confirmed
     write) and drains the copilot's ``proc:meeting:{id}`` notes into ``meeting.data`` JSONB.
-  * **webhook retry-drain** — one ``drain_retry_queue`` sweep per interval over the redis retry
-    queue (failed ``meeting.status_change`` deliveries are retried with backoff).
+  * **webhook retry-drain** — drains the old redis retry queue. The finish path does not enqueue
+    onto it. Subscriber delivery is the publisher and the sender below, from ``webhook_outbox``.
+  * **webhook publisher** (§1.8) — single-flight: turns unpublished ``webhook_outbox`` rows into
+    ``webhook_deliveries`` rows, one per matching active subscriber (``intake.outbox``).
+  * **webhook sender** (§1.8) — one per replica: claims due ``webhook_deliveries`` rows with a lease
+    and posts each signed subscription delivery (``webhooks.sender``). No Redis.
 
 Each loop is a single-tick function the eval drives explicitly; here the entrypoint wraps it in the
 ``while True: tick; sleep`` poll the deployment uses. uvicorn-target: ``uvicorn meeting_api.__main__:app``.
@@ -28,6 +32,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Any, NamedTuple
 
 log = logging.getLogger("meeting_api.entrypoint")
 
@@ -58,6 +63,31 @@ def _require_config(env: "os._Environ | dict | None" = None) -> None:
     from .config_preflight import preflight
 
     preflight(env)
+
+
+def _check_settings() -> None:
+    """Read every number setting a sweep, an item or a request reads after boot (§1.11, §6.9),
+    so a value meeting-api can't run on refuses to start (``settings.SettingsError``, naming the
+    key) instead of failing each item that reads it. The settings read at boot itself go through
+    the same reader where they are read (``MEETING_UNTRACKED_GRACE_SEC``, the sweep intervals
+    this work adds, the webhook sender's). ``GATEWAY_IDENTITY_MAX_SKEW_S`` is read when the
+    middleware stack is built, on the first request, so it is read here too."""
+    from .identity_guard import max_skew_s
+    from .intake.settings import IntakeSettings, auto_join_grace_s
+    from .lifecycle.reconcile import unproven_teardown_max_age_s
+    from .sweeps.item_failures import (
+        sweep_batch_size,
+        sweep_item_failures_retention_s,
+        sweep_max_item_failures,
+    )
+
+    max_skew_s()
+    IntakeSettings.from_env()
+    auto_join_grace_s()
+    unproven_teardown_max_age_s()
+    sweep_batch_size()
+    sweep_max_item_failures()
+    sweep_item_failures_retention_s()
 
 
 # How many users a calendar sweep syncs at once. Users are independent, so the tick's wall time
@@ -97,6 +127,7 @@ async def _sync_user_calendars(store, redis_client, user_id: int, configs: list,
 def build_production_app():
     """Wire the unified meeting-api with the real adapters + the lifespan-driven loops."""
     _require_config()  # A4: refuse to boot a misconfigured deploy (no ADMIN_TOKEN → every spawn 500s).
+    _check_settings()  # §6.9: a setting a sweep reads later refuses to boot now when it's bad.
 
     import redis.asyncio as aioredis
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -114,6 +145,11 @@ def build_production_app():
     # ADMIN_TOKEN, exactly like main. (INTERNAL_API_SECRET is for the gateway↔admin-api internal
     # validation only — a different concern.) None → the recordings verifier falls back to ADMIN_TOKEN.
     token_secret = os.getenv("ADMIN_TOKEN") or None
+    # §2.7: the webhook-secret key ring the sender opens subscription secrets with. Set but wrong
+    # → KeyRingError: refuse to boot. Unset → no box, and the sender stays off.
+    from .webhooks.secret_box import secret_box_from_env
+
+    webhook_secret_box = secret_box_from_env()
 
     engine = build_engine(database_url)  # #635: env-steered pool (pool_pre_ping preserved in the helper)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -148,7 +184,11 @@ def build_production_app():
         secret_key=os.getenv("S3_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY"),
     )
 
-    # Per-user webhook delivery (WebhookSink: SSRF-guard → event-filter → sign → POST → enqueue-retry).
+    # Legacy per-user and system sinks. The lifecycle callback does not post them: a subscriber
+    # (the exporter) is delivered from webhook_outbox by the publisher and the sender below.
+    # These objects stay so an operator tuple that is half-set still refuses to boot, and so a
+    # redis retry queued before this process started can still drain. Nothing enqueues a new
+    # meeting event onto them.
     # httpx transport; failures route to the redis RetryQueue the background drain loop sweeps.
     # WH2: the transport is IP-PINNED — it re-resolves + re-validates the host at connect time and
     # dials the validated IP (preserving Host + TLS SNI), closing the DNS-rebinding TOCTOU window
@@ -165,9 +205,8 @@ def build_production_app():
 
     system_webhook_sink = build_system_webhook_from_env(redis_client)
 
-    # #841: the per-user delivery ledger — the queryable record GET /webhooks/deliveries serves.
-    # A per-user capped Redis list; the lifecycle callback records each delivery outcome so the
-    # dashboard's Delivery History reflects real deliveries, not just its own Test button.
+    # #841: GET /webhooks/deliveries still reads this Redis list. The lifecycle callback no longer
+    # writes it. Subscriber delivery state is webhook_deliveries, written by the outbox publisher.
     from .webhooks import RedisDeliveryLedger
 
     delivery_ledger = RedisDeliveryLedger(redis_client)
@@ -224,6 +263,16 @@ def build_production_app():
         from .calendar_sync import read_stamp
         return await read_stamp(redis_client, user_id, calendar_id)
 
+    # The entry service (§1.3) over Postgres, ONE instance behind the /v2 routes and the scheduler.
+    from .intake import PostgresIntakeReads
+    from .intake.outbox import PostgresWebhookTests
+    from .metrics import PostgresMetricsSource
+
+    intake = _build_intake(
+        session_factory, meeting_repo, runtime_client,
+        service_authority=service_authority, commands=redis_client,
+    )
+
     app = create_app(
         transcript_store=transcript_store,
         redis=segment_bus,
@@ -242,7 +291,17 @@ def build_production_app():
         transcript_finalizer=_transcript_finalizer,
         calendar_sync_now=_calendar_sync_now,
         calendar_sync_status=_calendar_sync_status,
+        intake_service=intake.service,
+        intake_reads=PostgresIntakeReads(session_factory),
+        intake_stop=intake.stop,
+        webhook_tests=PostgresWebhookTests(session_factory),
+        metrics_source=PostgresMetricsSource(session_factory),
     )
+
+    # A waiting meeting a stop ends (§6.9 F-K2), and a meeting a join_now send ends after its
+    # claim (§6.9 F-FIN), get the app's meeting-level finish.
+    intake.stop.finish_meeting = app.state.finish_meeting
+    intake.service.finish_meeting = app.state.finish_meeting
 
     _attach_background_loops(
         app, transcript_store, segment_bus, redis_client, meeting_repo, runtime_client,
@@ -250,6 +309,8 @@ def build_production_app():
         system_webhook_sink=system_webhook_sink,
         session_factory=session_factory,
         storage=storage,
+        intake=intake,
+        webhook_secret_box=webhook_secret_box,
     )
     return app
 
@@ -266,8 +327,13 @@ def _minio_endpoint_url() -> str:
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
     service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
+    *, intake, webhook_secret_box=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
+
+    ``intake`` is the entry service ``build_production_app`` also mounts behind the ``/v2`` routes
+    (``_build_intake``), or ``None`` without Postgres; the auto-join and not-sent sweeps run only
+    with it. It is never built here, so no spawn port exists without its service authority.
 
     #637 — single-flight sweeps: at ``replicaCount>1`` every replica runs these same loops, so each
     live tick body is wrapped in a per-loop Postgres advisory lock (``_guarded``) — the real work runs
@@ -277,6 +343,7 @@ def _attach_background_loops(
     single-delivery is already exact, and guarding it would needlessly serialize the replicas' reads.
     """
     from .collector.ingest import RECLAIM_MIN_IDLE_MS, consume_segments, reclaim_segments
+    from .metrics import sweep_ran
     from .sweeps.single_flight import PgAdvisoryLock, run_single_flight, sweep_lock_key
 
     # One shared advisory-lock backend across the guarded loops (each keyed by its own loop name).
@@ -284,8 +351,12 @@ def _attach_background_loops(
     sweep_lock = PgAdvisoryLock(session_factory) if session_factory is not None else None
 
     async def _guarded(loop_name: str, body):
-        """Run ``body`` (a zero-arg coroutine fn) at most once per interval across replicas."""
-        return await run_single_flight(sweep_lock, sweep_lock_key(loop_name), body)
+        """Run ``body`` (a zero-arg coroutine fn) at most once per interval across replicas. A tick
+        that ran to its end on this replica stamps ``aw_sweep_last_run_timestamp_seconds``."""
+        ran = await run_single_flight(sweep_lock, sweep_lock_key(loop_name), body)
+        if ran:
+            sweep_ran(loop_name)
+        return ran
 
     seg_interval = float(os.getenv("SEGMENT_CONSUMER_INTERVAL", "0.5"))
     # #636: orphan-reclaim cadence — fold a bounded XAUTOCLAIM into the consumer loop every N ticks
@@ -332,7 +403,9 @@ def _attach_background_loops(
     # (runtime 404) CONTINUOUSLY past this window — no runtime re-adoption, no bot callback — is
     # presumed lost (runtime restart on the process backend / external removal) and advanced to
     # `failed` with the evidence note, instead of retrying an error + dead DELETE every sweep forever.
-    untracked_grace = float(os.getenv("MEETING_UNTRACKED_GRACE_SEC", "600"))
+    from .settings import seconds
+
+    untracked_grace = seconds("MEETING_UNTRACKED_GRACE_SEC", "600")
     service_authority_interval = float(
         os.getenv("SERVICE_AUTHORITY_SWEEP_INTERVAL_S", "15")
     )
@@ -481,9 +554,12 @@ def _attach_background_loops(
                     meeting_repo, runtime, _post_lifecycle,
                     stop_grace=stop_grace, active_grace=active_grace, log=log,
                     preactive_grace=preactive_grace, untracked_grace=untracked_grace,
+                    finish_meeting=getattr(app.state, "finish_meeting", None),
+                    item_failures=item_failures,  # §6.9 F-I, shared with the intake sweeps
                 )
             await reconcile_stale_stopping_sweep(
                 meeting_repo, runtime, _post_lifecycle, stop_grace=stop_grace, log=log,
+                item_failures=item_failures,  # §6.9 F-I
             )
 
         while True:
@@ -530,20 +606,22 @@ def _attach_background_loops(
             ticks["service-authority"] = _time.monotonic()
             await asyncio.sleep(service_authority_interval)
 
-    # Auto-join: "scheduled" means the bot joins. The sweep spawns a bot for every scheduled row
-    # whose data.scheduled_at arrived (lead window) and whose auto_join toggle is on, through the
-    # SAME request_bot flow POST /bots runs — the claim/upgrade branch makes it idempotent. The
-    # per-user spawn context (max-bots cap + webhook config the gateway would inject as headers)
-    # is fetched from admin-api's internal edge. Fail-closed: unset ADMIN_API_URL/INTERNAL_API_SECRET
-    # makes the cap unresolvable, so the sweep REFUSES to spawn (AUTO_JOIN_ALLOW_UNCAPPED=1 is the
-    # explicit self-host opt-in); an UNREACHABLE identity likewise skips the tick.
-    from .bot_spawn.auto_join import DEFAULT_LEAD_S
+    # Auto-join: "scheduled" means the bot joins. The sweep reads only the scheduled rows that are
+    # due (§1.5) and spawns each on its exact row through the SAME request_bot flow POST /bots runs
+    # (intake.ExactRowSpawn) — the claim makes it idempotent. Meetings entries manage have their
+    # link checked under the link lock first (wait for a busy link, or merge into an open-ended
+    # join_now meeting). The per-user spawn context (max-bots cap + webhook config the gateway
+    # would inject as headers) is fetched from admin-api's internal edge. Fail-closed: unset
+    # ADMIN_API_URL/INTERNAL_API_SECRET makes the cap unresolvable, so the sweep REFUSES to spawn
+    # (AUTO_JOIN_ALLOW_UNCAPPED=1 is the explicit self-host opt-in); an UNREACHABLE identity
+    # likewise skips the tick. Both sweeps need Postgres (the intake store), so neither runs
+    # without a session factory.
+    from .intake.settings import auto_join_grace_s, auto_join_lead_s
 
     auto_join_interval = float(os.getenv("AUTO_JOIN_SWEEP_INTERVAL_S", "30"))
-    # The DEFAULT lives in one place (``auto_join.DEFAULT_LEAD_S``) so the sweep's own default and
-    # the entrypoint's env fallback can never drift apart. Deploy values may still override it.
-    auto_join_lead = float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S)))
-    auto_join_grace = float(os.getenv("AUTO_JOIN_GRACE_S", "600"))
+    # One reader each (``intake.settings``), with the sweep's own defaults.
+    auto_join_lead = auto_join_lead_s()
+    auto_join_grace = auto_join_grace_s()
     auto_join_backoff = float(os.getenv("AUTO_JOIN_RETRY_BACKOFF_S", "300"))
     admin_api_url = (os.getenv("ADMIN_API_URL") or "").rstrip("/")
     internal_secret = os.getenv("INTERNAL_API_SECRET") or ""
@@ -552,15 +630,40 @@ def _attach_background_loops(
     # self-host opt-in that chooses the uncapped mode (never defaulted).
     from .bot_spawn.env_flags import env_flag
     auto_join_allow_uncapped = env_flag("AUTO_JOIN_ALLOW_UNCAPPED", default=False)
+    fetch_bot_context = _bot_context_fetcher(admin_api_url, internal_secret)
+
+    # The scheduler's intake side (§1.5): the store (link locks, the link check, typed failure
+    # codes) and the entry service it merges through (R2). Its events stay
+    # in the outbox for the outbox publisher (§1.8).
+    intake_store = intake_service = scheduler_publisher = None
+    if intake is not None:
+        intake_store, intake_service = intake.store, intake.service
+        scheduler_publisher = intake.publisher
+
+    # §6.9 F-I: the sweeps read in pages of SWEEP_BATCH_SIZE, and an item that fails
+    # SWEEP_MAX_ITEM_FAILURES times (counted in sweep_item_failures, shared by the replicas) is
+    # given up. Without Postgres (Lite) the counts live in one in-memory record for the process,
+    # so the bound holds there too.
+    from .sweeps.item_failures import (
+        InMemoryItemFailures,
+        PostgresItemFailures,
+        sweep_batch_size,
+        sweep_max_item_failures,
+    )
+
+    sweep_batch = sweep_batch_size()
+    item_failures = (
+        PostgresItemFailures(session_factory, max_failures=sweep_max_item_failures())
+        if session_factory is not None
+        else InMemoryItemFailures(max_failures=sweep_max_item_failures())
+    )
 
     async def _auto_join_loop() -> None:
-        if meeting_repo is None or runtime is None or not hasattr(meeting_repo, "list_scheduled_meetings"):
+        if intake_store is None or not hasattr(meeting_repo, "list_due_meetings"):
             return
         import json as _json
 
         from .bot_spawn.auto_join import auto_join_tick
-
-        fetch_bot_context = _bot_context_fetcher(admin_api_url, internal_secret)
 
         async def publish_status(*, user_id, meeting_id, native_id, status, when):
             frame = {"type": "meeting.status", "meeting_id": meeting_id,
@@ -573,6 +676,9 @@ def _attach_background_loops(
         async def _tick():
             await auto_join_tick(
                 meeting_repo, runtime,
+                store=intake_store,
+                intake=intake_service,
+                publisher=scheduler_publisher,
                 authority=service_authority,
                 fetch_bot_context=fetch_bot_context,
                 publish_status=publish_status,
@@ -581,6 +687,10 @@ def _attach_background_loops(
                 token_secret=os.getenv("ADMIN_TOKEN") or None,
                 redis_url=os.getenv("REDIS_URL"),
                 allow_uncapped=auto_join_allow_uncapped,
+                item_failures=item_failures,
+                batch_size=sweep_batch,
+                untracked_grace=untracked_grace,
+                finish_meeting=getattr(app.state, "finish_meeting", None),
             )
 
         while True:
@@ -593,6 +703,125 @@ def _attach_background_loops(
             except Exception:
                 log.exception("auto-join tick failed")
             await asyncio.sleep(auto_join_interval)
+
+    # Not-sent sweep (§1.5, R6): a meeting entries manage that reaches its end without a bot ends
+    # `failed`, outcome `not_sent`, with its cause. An open-ended meeting has no end to pass: its
+    # bounded bot sends end it (BOT_SEND_MAX_ATTEMPTS).
+    not_sent_interval = seconds("NOT_SENT_SWEEP_INTERVAL_S", "30")
+
+    async def _not_sent_loop() -> None:
+        if intake_store is None:
+            return
+        from datetime import datetime, timezone
+
+        from .intake import sweeps
+
+        async def _tick():
+            await sweeps.not_sent_tick(
+                intake_store,
+                publisher=scheduler_publisher,
+                now=datetime.now(timezone.utc),
+                failures=item_failures,
+                batch_size=sweep_batch,
+            )
+
+        while True:
+            try:
+                await _guarded("not-sent", _tick)  # one sweep per interval across replicas
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("not-sent sweep tick failed")
+            await asyncio.sleep(not_sent_interval)
+
+    # Subscription webhooks (§1.8). The publisher and the sender share one subscription read
+    # (admin-api's internal door, cached 30 s). The sender runs on EVERY replica, unguarded: rows are claimed
+    # with FOR UPDATE SKIP LOCKED and a 60 s lease, so the replicas share the work instead of
+    # taking turns. It needs Postgres, the admin edge (the subscription read, cached 30 s) and the
+    # secret key ring; without them deliveries wait in webhook_deliveries (no Redis anywhere here).
+    from .webhooks.ssrf import DEFAULT_PRIVATE_HOST_ALLOWLIST, parse_allowlist
+    from .webhooks.subscriptions import AdminSubscriptions
+
+    webhook_send_interval = seconds("WEBHOOK_SEND_INTERVAL_S", "1")
+    webhook_allowlist = parse_allowlist(
+        os.getenv("WEBHOOK_PRIVATE_HOST_ALLOWLIST", DEFAULT_PRIVATE_HOST_ALLOWLIST)
+    )
+    webhook_subscriptions = AdminSubscriptions(admin_api_url, internal_secret)
+    # Read at boot: a malformed sender setting refuses to start (settings.SettingsError).
+    from .webhooks.sender import SenderSettings
+
+    webhook_sender_settings = SenderSettings.from_env()
+
+    # The publisher is single-flight, every WEBHOOK_PUBLISH_INTERVAL_S: one replica fans the outbox
+    # out per tick (a second one would only find the rows already published). It needs Postgres and
+    # the admin edge; without the edge the rows stay unpublished (and alert), never published empty.
+    webhook_publish_interval = seconds("WEBHOOK_PUBLISH_INTERVAL_S", "1")
+
+    async def _webhook_publish_loop() -> None:
+        if session_factory is None:
+            return
+        if not webhook_subscriptions.configured:
+            log.warning(
+                "webhook publisher off: it needs ADMIN_API_URL + INTERNAL_API_SECRET; "
+                "outbox rows stay unpublished"
+            )
+            return
+        from .intake.outbox import OutboxPublisher
+
+        publisher = OutboxPublisher(
+            session_factory,
+            webhook_subscriptions,
+            batch_size=sweep_batch,
+            failures=item_failures,
+        )
+
+        async def _tick():
+            await publisher.run_once()
+
+        while True:
+            try:
+                await _guarded("webhook-publisher", _tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("webhook publisher tick failed")
+            await asyncio.sleep(webhook_publish_interval)
+
+    async def _webhook_send_loop() -> None:
+        if session_factory is None:
+            return
+        if webhook_secret_box is None or not webhook_subscriptions.configured:
+            log.warning(
+                "webhook sender off: it needs WEBHOOK_SECRET_ENC_KEYS + "
+                "WEBHOOK_SECRET_ENC_ACTIVE_KEY and ADMIN_API_URL + INTERNAL_API_SECRET; "
+                "subscription deliveries wait in webhook_deliveries"
+            )
+            return
+        from .webhooks.sender import HttpxPoster, PostgresDeliveryStore, WebhookSender
+
+        sender = WebhookSender(
+            PostgresDeliveryStore(session_factory),
+            webhook_subscriptions,
+            webhook_secret_box,
+            HttpxPoster(
+                allowlist=webhook_allowlist,
+                timeout_s=webhook_sender_settings.send_timeout_s,
+            ),
+            allowlist=webhook_allowlist,
+            settings=webhook_sender_settings,
+        )
+        try:
+            while True:
+                try:
+                    await sender.run_once()
+                    sweep_ran("webhook-sender")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("webhook sender tick failed")
+                await asyncio.sleep(webhook_send_interval)
+        finally:
+            sender.close()  # the app's shutdown ends the sender's own DNS threads
 
     # Calendar sync: each sweep discovers every user with a connected ICS feed (admin-api internal
     # edge), fetches it over the SSRF-pinned transport, and upserts planned meetings (one row per
@@ -741,6 +970,9 @@ def _attach_background_loops(
                 name="service-authority",
             ),
             asyncio.create_task(_auto_join_loop(), name="auto-join"),
+            asyncio.create_task(_not_sent_loop(), name="not-sent"),
+            asyncio.create_task(_webhook_publish_loop(), name="webhook-publisher"),
+            asyncio.create_task(_webhook_send_loop(), name="webhook-sender"),
             asyncio.create_task(_calendar_sync_loop(), name="calendar-sync"),
             asyncio.create_task(_signal_tape_janitor_loop(), name="signal-tape-janitor"),
             asyncio.create_task(_ensure_fts_index_once(), name="ensure-fts-index"),
@@ -768,12 +1000,61 @@ def __getattr__(name: str):
 
 
 
+class _Intake(NamedTuple):
+    store: Any
+    service: Any
+    stop: Any
+    publisher: Any
+
+
+def _build_intake(session_factory, meeting_repo, runtime, *, service_authority, commands):
+    """The entry service over Postgres (§1.3), with the production ports: the exact-row spawn
+    (§1.5) under the same service authority ``POST /bots`` uses and the auto-join sweep's spawn
+    context (``_bot_context_fetcher``, its ``AUTO_JOIN_ALLOW_UNCAPPED`` opt-in), the stop of the
+    bot in the call (§1.7) over the bot command bus and the runtime, and ``OutboxOnly``: every
+    event is already in ``webhook_outbox``, where the outbox publisher picks it up.
+
+    ``service_authority`` is required: the spawn would read ``None`` as allow-all."""
+    if service_authority is None:
+        raise ValueError("the entry service needs the service authority POST /bots uses")
+    from .bot_spawn.env_flags import env_flag
+    from .intake import (
+        ExactRowSpawn,
+        IntakeService,
+        IntakeSettings,
+        IntakeStop,
+        PostgresIntakeStore,
+    )
+    from .intake.sweeps import OutboxOnly
+
+    store = PostgresIntakeStore(session_factory)
+    publisher = OutboxOnly()
+    stop = IntakeStop(store, commands, runtime, publisher=publisher)
+    spawn = ExactRowSpawn(
+        meeting_repo, runtime,
+        store=store,
+        fetch_bot_context=_bot_context_fetcher(
+            (os.getenv("ADMIN_API_URL") or "").rstrip("/"),
+            os.getenv("INTERNAL_API_SECRET") or "",
+        ),
+        publisher=publisher,
+        authority=service_authority,
+        token_secret=os.getenv("ADMIN_TOKEN") or None,
+        redis_url=os.getenv("REDIS_URL"),
+        allow_uncapped=env_flag("AUTO_JOIN_ALLOW_UNCAPPED", default=False),
+    )
+    service = IntakeService(store, spawn, stop, publisher, IntakeSettings.from_env())
+    return _Intake(store, service, stop, publisher)
+
+
 def _bot_context_fetcher(admin_api_url: str, internal_secret: str):
-    """The per-user spawn context from identity for the AUTO-JOIN SWEEP, or None when no identity
-    edge is configured.
+    """The per-user spawn context from identity for the AUTO-JOIN SWEEP and the exact-row spawn
+    (``intake.ExactRowSpawn``, behind the sweep and the ``/v2`` instant join), or None when no
+    identity edge is configured.
 
     The sweep needs its own fetcher because it spawns bots OUTSIDE a request — it stands in for the
     headers the gateway would have injected, and it caches one answer per user across a whole tick.
+    The ``/v2`` routes receive no such headers either, so the exact-row spawn reads the same door.
 
     NOT USED BY `POST /bots` any more. The direct path used to be handed this same builder so the
     person's default name reached it too, which made that one request fetch

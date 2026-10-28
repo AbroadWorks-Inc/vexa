@@ -9,8 +9,10 @@ Drives the SHIPPED ``auto_join_tick`` over the in-memory fakes, OFFLINE.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
+from intake_builders import send_clock, sweep_intake
 from meeting_api.bot_spawn.auto_join import DEFAULT_LEAD_S, auto_join_tick, due_rows
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 
@@ -44,7 +46,10 @@ async def _tick(repo, runtime, **kw):
     # Legacy spawn-mechanics tests don't wire an admin edge; opt them into uncapped spawns so they
     # exercise the spawn path. The #656 fail-closed tests pass allow_uncapped=False explicitly.
     kw.setdefault("allow_uncapped", True)
-    return await auto_join_tick(repo, runtime, **kw)
+    # §1.5: every spawn claims the exact row through the intake store, and the claim stamps the
+    # send time with the repo's clock — pinned here to the tick's.
+    with send_clock(kw["now"]):
+        return await auto_join_tick(repo, runtime, **sweep_intake(**kw))
 
 
 # ---- fires at lead time -------------------------------------------------------------
@@ -149,7 +154,7 @@ async def test_manual_spawn_race_counts_as_already():
         """Delegates to the real repo but serves the STALE scheduled snapshot."""
         def __getattr__(self, name):
             return getattr(repo, name)
-        async def list_scheduled_meetings(self):
+        async def list_due_meetings(self, now, lead_s, *, after, limit):
             return snapshot
 
     counters = await _tick(_FrozenRepo(), runtime)
@@ -277,14 +282,15 @@ def test_default_lead_dispatches_two_minutes_before_the_start():
 
 
 def test_entrypoint_lead_default_matches_the_sweep_default(monkeypatch):
-    """One default, two readers: the entrypoint's env fallback IS ``DEFAULT_LEAD_S``, so the sweep's
-    own default and the deployed default can never drift apart. Deploy values still override."""
-    import os
+    """One default, one reader: ``AUTO_JOIN_LEAD_S`` is read only by ``auto_join_lead_s``, whose
+    fallback IS ``DEFAULT_LEAD_S``, so the sweep's own default and the deployed default can never
+    drift apart. Deploy values still override."""
+    from meeting_api.intake.settings import auto_join_lead_s
 
     monkeypatch.delenv("AUTO_JOIN_LEAD_S", raising=False)
-    assert float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))) == 120.0
+    assert auto_join_lead_s() == DEFAULT_LEAD_S == 120
     monkeypatch.setenv("AUTO_JOIN_LEAD_S", "60")
-    assert float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S))) == 60.0
+    assert auto_join_lead_s() == 60
 
 
 def test_lead_and_lobby_budget_together_cover_a_late_host():
@@ -371,10 +377,16 @@ async def test_dispatch_records_the_attempt_before_making_it():
     assert repo._meetings[mid]["data"]["auto_join_last_attempt"] == NOW.isoformat()
 
 
-async def test_attempt_stamp_survives_a_failed_spawn_and_holds_the_next_tick():
+async def test_attempt_stamp_survives_a_failed_spawn_and_holds_the_next_tick(capsys):
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient(fail=True)
     mid = _seed(repo)
     assert (await _tick(repo, runtime))["errors"] == 1
+    # §1.5: the spawn port ends a claimed row not_sent through the intake store; this
+    # rig's store holds no copy of the repo's row, so that best-effort write logs and moves on.
+    logged = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+              if line.startswith("{")]
+    (failure,) = [e for e in logged if e.get("event") == "spawn_not_sent_record_failed"]
+    assert failure["fields"]["error"] == "LookupError"
     assert repo._meetings[mid]["data"]["auto_join_last_attempt"] == NOW.isoformat()
     assert (await _tick(repo, runtime, now=NOW + timedelta(seconds=1)))["due"] == 0
 

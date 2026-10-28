@@ -33,7 +33,8 @@ import { createBrowserJoinDriver } from './join-driver.js';
 import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
 import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
-import { uploadSignalTapes } from './signal-upload.js';
+import { uploadSignalTapes, uploadSpeakerActivity } from './signal-upload.js';
+import { createSpeakerActivityWriter } from './speaker-activity.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
 import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
@@ -204,6 +205,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       ? createCaptureSignalRecorder(inv)
       : null;
   if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
+  // WHO WAS TALKING WHEN, with no audio (design doc 2026-09-23-speaker-activity-design.md).
+  // Unlike signalRecorder above, this is ALWAYS created — it is the exporter's only source for a
+  // speaker's name across the whole meeting, not a debugging tool gated behind capture-signal.
+  const speakerActivity = createSpeakerActivityWriter(inv);
+  console.log(`[bot] speaker-activity → ${speakerActivity.path}`);
   // The bot's own commentary, teed beside the tape. Started HERE — before the browser launches —
   // because the lines that explain a failed join are the ones emitted before anything else exists.
   const botLog = signalRecorder ? startBotLogSidecar(signalRecorder.botlogPath) : null;
@@ -287,7 +293,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
-      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
+      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity, speakerActivity),   // on the live meeting page
       startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
       engine: bp,
       onFault: (stage, e) => {
@@ -338,6 +344,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
     // path that skipped the orchestrator's teardown. (#593)
     await pipeline.stop().catch(() => { /* best-effort */ });
+    // The small, important file ships first, inside the grace window: close it (capture already
+    // stopped above) and upload it before the debug tape's own, larger files below.
+    await speakerActivity.close().catch(() => { /* best-effort */ });
+    await uploadSpeakerActivity(speakerActivity, { inv });
     await signalRecorder?.close().catch(() => { /* best-effort */ });
     // The two teardown sidecars, written BEFORE the upload reads the directory. Both are
     // best-effort by construction: a diagnostic that can change how a meeting ended is worse than

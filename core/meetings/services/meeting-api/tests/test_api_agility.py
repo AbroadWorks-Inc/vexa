@@ -32,6 +32,7 @@ from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
 
 from collector_contracts import assert_api_conforms
+from gateway_identity import via_gateway
 
 USER = 7
 HEADERS = {"x-user-id": str(USER)}
@@ -67,12 +68,12 @@ def _seeded_store():
 
 
 def _client(*, store=None, repo=None, runtime=None, publisher=None):
-    return TestClient(create_app(
+    return TestClient(via_gateway(create_app(
         transcript_store=store if store is not None else InMemoryTranscriptStore(),
         meeting_repo=repo if repo is not None else InMemoryMeetingRepo(),
         runtime=runtime if runtime is not None else FakeRuntimeClient(),
         command_publisher=publisher if publisher is not None else InMemoryCommandPublisher(),
-    ))
+    )))
 
 
 def _assert_error_envelope(resp):

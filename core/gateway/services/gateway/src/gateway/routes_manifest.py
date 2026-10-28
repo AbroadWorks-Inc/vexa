@@ -39,7 +39,7 @@ CONTRACT = "routes.v1"
 #: The scope vocabulary `docs/docs/authentication.mdx` defines. A manifest may not invent one: an
 #: unknown scope name would be a set no key can satisfy, which reads as a deny and looks like a
 #: policy decision somebody made on purpose.
-SCOPES = frozenset({"bot", "tx", "browser"})
+SCOPES = frozenset({"bot", "tx", "browser", "erase", "webhooks", "export"})
 METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"})
 
 RouteKey = Tuple[str, str]

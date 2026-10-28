@@ -17,7 +17,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { isMixedLanePlatform, type Invocation } from './config.js';
+import { captureLane, type Invocation } from './config.js';
 import {
   rmsOf,
   type CaptionCapableSink, type CsrcCapableSink, type CsrcRecord,
@@ -325,7 +325,7 @@ export function sessionHeader(inv: Invocation, startedAt: number): Record<string
     platform: inv.platform,
     native_meeting_id: inv.nativeMeetingId ?? inv.connectionId ?? 'session',
     language: inv.language ?? null,
-    lane: isMixedLanePlatform(inv.platform) ? 'mixed' : 'gmeet',
+    lane: captureLane(inv.platform),
     sample_rate: 16000,
     started_at: new Date(startedAt).toISOString(),
     // Which build produced this tape. A prod fixture outlives the deployment that made it, and

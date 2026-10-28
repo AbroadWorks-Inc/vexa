@@ -114,6 +114,7 @@ class FakeAudioContext {
   destination = {};
   createMediaStreamDestination(): unknown { return { stream: { id: 'mix', getAudioTracks: () => [{ id: 'mainAudio-mix' }] } }; }
   createMediaStreamSource(): unknown { return { connect: () => { /* connected */ } }; }
+  createConstantSource(): unknown { return { offset: { value: 1 }, connect: () => { /* connected */ }, start: () => { /* started */ } }; }
   resume(): void { /* no-op */ }
   close(): void { /* no-op */ }
 }

@@ -181,8 +181,8 @@ def test_mock_failure_attribution(stack, scenario, want_reason, want_stage):
 
 @mock_only
 def test_mock_join_timeout_fails_with_reason(stack):
-    """A transient timeout: the control plane records the timeout reason (the deterministic backoff
-    re-spawn is proven offline by P3 test_join_retry.py — forcing it on a live bot is slow/flaky)."""
+    """A transient timeout: the control plane records the timeout reason (the retry of a failed bot
+    is proven offline by test_bot_retry.py — forcing it on a live bot is slow/flaky)."""
     user_id = _create_user(stack, max_bots=5)
     native_id, _ = _spawn(stack, user_id, "join-timeout")
     m = _wait_meeting(stack, user_id, native_id, statuses={"failed"}, timeout=150)

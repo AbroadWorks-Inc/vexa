@@ -17,7 +17,8 @@ fakes (an in-memory blob store + an in-memory meeting store).
 """
 from __future__ import annotations
 
-from typing import Optional, Protocol, runtime_checkable
+import builtins
+from typing import AsyncIterator, Optional, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -25,6 +26,14 @@ class Storage(Protocol):
     """Object storage for recording chunks + masters (MinIO/S3 in prod)."""
 
     async def upload(self, key: str, data: bytes, *, content_type: str) -> None: ...
+
+    async def upload_stream(
+        self, key: str, pieces: AsyncIterator[bytes], *, content_type: str
+    ) -> None:
+        """Write ONE object from ``pieces`` in order without holding the whole object, so a
+        master's memory does not grow with the meeting. Nothing is written under ``key`` unless
+        every piece arrived; a failure leaves any previous object there untouched."""
+        ...
 
     async def list(self, prefix: str) -> list[str]:
         """Object keys under ``prefix`` (sorted) — used by finalize to gather a recording's chunks."""
@@ -44,7 +53,7 @@ class Storage(Protocol):
         ``get_object`` so seeking fetches only the requested window, not the whole object."""
         ...
 
-    async def list_detailed(self, prefix: str) -> list[dict]:
+    async def list_detailed(self, prefix: str) -> builtins.list[dict]:
         """``[{key, size, last_modified}]`` under ``prefix`` — key, byte size and mtime in ONE call.
 
         The captured-signal budget janitor needs all three for every tape to decide what to evict.

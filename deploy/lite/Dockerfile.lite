@@ -200,6 +200,7 @@ COPY core/meetings/services/meeting-api/src /app/meeting-api/src
 COPY core/meetings/contracts/invocation.v1/invocation.schema.json /app/meeting-api/meetings/contracts/invocation.v1/invocation.schema.json
 COPY core/meetings/contracts/lifecycle.v1/lifecycle.schema.json   /app/meeting-api/meetings/contracts/lifecycle.v1/lifecycle.schema.json
 COPY core/meetings/contracts/webhook.v1/webhook.schema.json       /app/meeting-api/meetings/contracts/webhook.v1/webhook.schema.json
+COPY core/meetings/contracts/intake.v1/intake.schema.json         /app/meeting-api/meetings/contracts/intake.v1/intake.schema.json
 COPY core/runtime/contracts/runtime.v1/runtime.schema.json        /app/meeting-api/runtime/contracts/runtime.v1/runtime.schema.json
 COPY core/runtime/contracts/schedule.v1/schedule.schema.json      /app/meeting-api/runtime/contracts/schedule.v1/schedule.schema.json
 # agent control plane + worker (PYTHONPATH=/app/agent; repo_root walk-up == /app/agent).
@@ -258,7 +259,7 @@ ENV LOG_LEVEL=info \
     AGENT_WORKER_COMMAND=/usr/local/bin/vexa-agent-worker \
     DB_HOST=localhost DB_PORT=5432 DB_NAME=vexa DB_USER=postgres DB_PASSWORD=postgres \
     REDIS_HOST=localhost REDIS_PORT=6379 \
-    ADMIN_API_TOKEN= INTERNAL_API_SECRET= \
+    ADMIN_API_TOKEN= INTERNAL_API_SECRET= GATEWAY_IDENTITY_KEYS= GATEWAY_IDENTITY_ACTIVE_KEY= \
     TRANSCRIPTION_SERVICE_URL= TRANSCRIPTION_SERVICE_TOKEN= \
     MINIO_ENDPOINT= MINIO_ACCESS_KEY= MINIO_SECRET_KEY= MINIO_BUCKET=vexa MINIO_SECURE=false \
     VEXA_AGENT_DEFAULT_SUBJECT=u_live VEXA_DISPATCH_SIGNING_KEY=dev-dispatch-signing-key \

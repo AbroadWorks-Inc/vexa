@@ -36,9 +36,11 @@ from meeting_api.lifecycle.machine import (
     MeetingStore,
     TransitionSource,
 )
+from internal_callers import BOT, runtime_callback
 
 LIFECYCLE = "/bots/internal/callback/lifecycle"
-RUNTIME = "/runtime/callback"
+# The tokened callbackUrl meeting-api hands the runtime for workload wl-1 (§1.10).
+RUNTIME = runtime_callback("wl-1")
 
 
 class _StreamRedis:
@@ -107,7 +109,7 @@ def test_runtime_destroy_completes_stopping_after_only_joining_e2e():
         app = create_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             # The bot's only lifecycle event lands: joining. In-process FSM record → JOINING.
-            r = await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": "joining"})
+            r = await c.post(LIFECYCLE, headers=BOT, json={"connection_id": "sess-uid", "status": "joining"})
             assert r.status_code == 200, r.text
             # The user stops the still-joining bot: the DB row moves to `stopping` (server-side state).
             repo.set_status(m["id"], "stopping")
@@ -149,6 +151,7 @@ def test_runtime_destroy_completes_stopping_after_active_e2e():
                 assert (
                     await c.post(
                         LIFECYCLE,
+                        headers=BOT,
                         json={
                             "connection_id": "sess-uid",
                             "status": st,
@@ -197,6 +200,7 @@ def test_runtime_destroy_with_invalid_time_does_not_fabricate_provenance():
                 assert (
                     await c.post(
                         LIFECYCLE,
+                        headers=BOT,
                         json={
                             "connection_id": "sess-uid",
                             "status": status,
@@ -234,7 +238,7 @@ def test_runtime_destroy_fails_pre_active_e2e():
         app = create_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             for st in ("joining", "awaiting_admission"):
-                assert (await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": st})).status_code == 200
+                assert (await c.post(LIFECYCLE, headers=BOT, json={"connection_id": "sess-uid", "status": st})).status_code == 200
             rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
             assert rc.status_code == 200, rc.text
         return repo, redis, m
@@ -264,7 +268,7 @@ def test_runtime_destroy_pre_active_before_admission_is_join_failure_e2e(callbac
         app = create_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             for st in callbacks:
-                assert (await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": st})).status_code == 200
+                assert (await c.post(LIFECYCLE, headers=BOT, json={"connection_id": "sess-uid", "status": st})).status_code == 200
             rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
             assert rc.status_code == 200, rc.text
         return repo, redis, m
@@ -276,16 +280,12 @@ def test_runtime_destroy_pre_active_before_admission_is_join_failure_e2e(callbac
 
 
 def test_pre_active_attribution_is_retry_neutral():
-    """RETRY PARITY (the "no behavior change" guard): both pre-active teardown reasons are TRANSIENT,
+    """RETRY PARITY (the "no behavior change" guard): both pre-active teardown reasons are retried,
     so status-accurate attribution never flips a destroy-path bot's retry class."""
-    from meeting_api.lifecycle.machine import CompletionReason
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    from meeting_api.intake.retry import NOT_RETRIED
 
-    assert (
-        classify_retry(CompletionReason.AWAITING_ADMISSION_TIMEOUT)
-        is classify_retry(CompletionReason.JOIN_FAILURE)
-        is RetryClass.TRANSIENT
-    )
+    assert "awaiting_admission_timeout" not in NOT_RETRIED
+    assert "join_failure" not in NOT_RETRIED
 
 
 def test_runtime_destroy_noop_on_already_terminal_e2e():
@@ -301,7 +301,7 @@ def test_runtime_destroy_noop_on_already_terminal_e2e():
                 ev = {"connection_id": "sess-uid", "status": st}
                 if st == "completed":
                     ev["completion_reason"] = "left_alone"
-                assert (await c.post(LIFECYCLE, json=ev)).status_code == 200
+                assert (await c.post(LIFECYCLE, headers=BOT, json=ev)).status_code == 200
             rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
             assert rc.status_code == 200, rc.text
         return repo, redis, m
@@ -322,7 +322,7 @@ def test_runtime_nonterminal_state_does_not_advance_e2e():
         app = create_app(meeting_repo=repo)
         async with _asgi(app) as c:
             for st in ("joining", "active"):
-                assert (await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": st})).status_code == 200
+                assert (await c.post(LIFECYCLE, headers=BOT, json={"connection_id": "sess-uid", "status": st})).status_code == 200
             repo.set_status(m["id"], "stopping")
             assert (await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "running"})).status_code == 200
         return repo, m

@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import InMemoryMeetingRepo
+from internal_callers import BOT
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
 
@@ -55,7 +56,7 @@ def test_rehydration_terminal_after_restart_is_200(goldens):
     # Brand-new app → brand-new EMPTY MeetingStore (simulates the post-restart empty in-memory FSM).
     client = TestClient(create_app(meeting_repo=repo))
 
-    r = client.post(ENDPOINT, json=goldens["completed-stopped"])
+    r = client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
 
     assert r.status_code == 200, r.text  # NOT 409
     body = r.json()
@@ -85,7 +86,7 @@ def test_rehydration_preserves_admission_timestamp_for_runtime_billing(goldens):
         "timestamp": "2026-07-28T10:25:10.000Z",
     }
 
-    response = client.post(ENDPOINT, json=terminal)
+    response = client.post(ENDPOINT, headers=BOT, json=terminal)
 
     assert response.status_code == 200, response.text
     trail = repo._meetings[m["id"]]["data"]["status_transition"]
@@ -110,7 +111,7 @@ def test_rehydration_emits_status_change_and_no_409(goldens):
     app = create_app(meeting_repo=repo)
     client = TestClient(app)
 
-    r = client.post(ENDPOINT, json=goldens["completed-stopped"])
+    r = client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
     assert r.status_code == 200, r.text
     envelopes = app.state.status_change_webhooks
     assert envelopes, "no status_change envelope emitted on the rehydrated terminal advance"
@@ -126,7 +127,7 @@ def test_rehydration_seeds_stopping_as_active(goldens):
     repo.set_status(m["id"], "stopping")
     client = TestClient(create_app(meeting_repo=repo))
 
-    r = client.post(ENDPOINT, json=goldens["completed-stopped"])
+    r = client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
     assert r.status_code == 200, r.text
     assert r.json()["meeting_status"] == "completed"
 
@@ -139,8 +140,8 @@ def test_idempotent_terminal_redelivery_is_200(goldens):
     _seed_active_meeting(repo)
     client = TestClient(create_app(meeting_repo=repo))
 
-    r1 = client.post(ENDPOINT, json=goldens["completed-stopped"])
-    r2 = client.post(ENDPOINT, json=goldens["completed-stopped"])
+    r1 = client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
+    r2 = client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
 
     assert r1.status_code == 200, r1.text
     assert r2.status_code == 200, r2.text
@@ -157,8 +158,8 @@ def test_idempotent_same_status_replay_is_200():
     asyncio.run(repo.create_session(meeting_id=m["id"], session_uid="sess-uid"))
     client = TestClient(create_app(meeting_repo=repo))
 
-    assert client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "joining"}).status_code == 200
-    assert client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "joining"}).status_code == 200
+    assert client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "joining"}).status_code == 200
+    assert client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "joining"}).status_code == 200
 
 
 def test_genuinely_illegal_transition_still_409_after_reconcile():
@@ -170,7 +171,7 @@ def test_genuinely_illegal_transition_still_409_after_reconcile():
     client = TestClient(create_app(meeting_repo=repo))
 
     # active→...→completed already; now a DIFFERENT terminal `failed` on a completed record.
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "failed", "exit_code": 1})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "failed", "exit_code": 1})
     assert r.status_code == 409, r.text
     assert r.json()["from"] == "completed" and r.json()["to"] == "failed"
 
@@ -187,7 +188,7 @@ def test_ws_status_published_on_advance(goldens):
     redis = _RecordingRedis()
     client = TestClient(create_app(meeting_repo=repo, redis=redis))
 
-    r = client.post(ENDPOINT, json=goldens["completed-stopped"])
+    r = client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
     assert r.status_code == 200, r.text
 
     chan = f"bm:meeting:{m['id']}:status"
@@ -208,7 +209,7 @@ def test_ws_status_frame_matches_010_6_contract(goldens):
     _seed_active_meeting(repo)
     redis = _RecordingRedis()
     client = TestClient(create_app(meeting_repo=repo, redis=redis))
-    client.post(ENDPOINT, json=goldens["completed-stopped"])
+    client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
 
     # The legacy per-meeting frame (bm:meeting:{id}:status) carries the nested 0.10.6 shape. A second
     # FLAT frame now also lands on the user channel (u:{id}:meetings, Track ②) — select the bm: one.
@@ -229,7 +230,7 @@ def test_no_publish_on_idempotent_replay(goldens):
     redis = _RecordingRedis()
     client = TestClient(create_app(meeting_repo=repo, redis=redis))
 
-    client.post(ENDPOINT, json=goldens["completed-stopped"])
+    client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])
     n_after_first = len(redis.published)
-    client.post(ENDPOINT, json=goldens["completed-stopped"])  # redelivery
+    client.post(ENDPOINT, headers=BOT, json=goldens["completed-stopped"])  # redelivery
     assert len(redis.published) == n_after_first, "duplicate publish on idempotent replay"

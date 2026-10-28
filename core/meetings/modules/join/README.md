@@ -22,6 +22,17 @@ test-only (real CSS engine for the no-browser fixtures + the selector-validity g
 Verified by `pnpm --filter @vexa/join check:isolation` (gate:isolation, P2). CommonJS by
 design — see `tsconfig.json`; ESM consumers import it via Node interop.
 
+## Google Meet: an unanswered knock expires
+Meet withdraws an unanswered "Ask to join" about 10 minutes after the knock (the page logs
+`DisconnectedError, EndCause = 72`; measured on seven bots on 2026-10-01, each at exactly
++10:00). The waiting room then disappears with nothing in its place — no denial copy, no
+in-call controls. `waitForGoogleMeetingAdmission` treats a lobby gone for `KNOCK_LOST_GRACE_MS`
+(20 s) with neither as the knock having expired and throws the typed `lobby_timeout` (the
+driver's `awaiting_admission_timeout`, a legit retry with a fresh knock). Before this it polled
+the dead page for the rest of the lobby budget and threw `join_failure` — the join layer's own
+failure class — for what was the host's silence. A real admission replaces the lobby with the
+meeting UI within seconds and a denial shows its copy at once, so neither trips the grace.
+
 ## Selector conventions
 Selector validity is **per execution context**, not per engine: Playwright engines
 (`text=`, `:has-text()`) exist only on the locator side; anything shipped into

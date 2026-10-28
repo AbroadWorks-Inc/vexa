@@ -1,0 +1,101 @@
+import pytest
+
+from exporter.config import Settings
+from exporter.naming import folder_name
+
+
+def test_meet_example() -> None:
+    assert (
+        folder_name("google_meet", "eyw-igia-bab", "2026-09-22T17:02:34.432140Z")
+        == "google_meet_eyw-igia-bab_20260922T170234432Z"
+    )
+
+
+def test_offset_is_normalised_to_utc() -> None:
+    assert (
+        folder_name("zoom", "85012345678", "2026-09-22T22:32:34.001+05:30")
+        == "zoom_85012345678_20260922T170234001Z"
+    )
+
+
+def test_no_fraction_means_000() -> None:
+    assert folder_name("teams", "123", "2026-09-22T17:02:34Z").endswith("T170234000Z")
+
+
+def test_native_id_sanitised_so_underscore_only_separates() -> None:
+    assert (
+        folder_name("teams", "meet/a_b c", "2026-09-22T17:02:34Z")
+        == "teams_meet-a-b-c_20260922T170234000Z"
+    )
+
+
+def test_missing_start_time_raises() -> None:
+    with pytest.raises(ValueError):
+        folder_name("zoom", "1", "")
+
+
+BASE = {
+    "GATEWAY_URL": "http://gateway:8000/",
+    "EXPORTER_API_KEY": "test-exporter-key",
+    "EXPORTER_WEBHOOK_SECRET": "test-secret",
+    "VEXA_BUCKET": "aw-bots",
+    "EXPORT_BUCKET": "aw-chatworks-transcribe",
+    "NOTETAKER_URL": "http://notetaker-api:8080",
+}
+
+
+def test_settings_defaults() -> None:
+    s = Settings.from_env(BASE)
+    assert s.gateway_url == "http://gateway:8000"
+    assert s.exporter_api_key == "test-exporter-key"
+    assert s.export_prefix == "recordings/"
+    assert s.debug is False and s.concurrency == 4
+    assert s.rms_speech_threshold == 0.026
+    assert s.record_chunk_timeslice_ms == 15000
+    assert s.activity_wait_seconds == 120.0
+    assert s.max_recordings == 50
+    assert s.retry_backoff_seconds == 30.0
+
+
+def test_settings_retry_backoff_env_override() -> None:
+    s = Settings.from_env({**BASE, "EXPORT_RETRY_BACKOFF_SECONDS": "5"})
+    assert s.retry_backoff_seconds == 5.0
+
+
+def test_settings_max_recordings_env_override() -> None:
+    s = Settings.from_env({**BASE, "EXPORT_MAX_RECORDINGS": "7"})
+    assert s.max_recordings == 7
+
+
+def test_settings_activity_env_overrides() -> None:
+    s = Settings.from_env({**BASE, "ACTIVITY_WAIT_SECONDS": "30"})
+    assert s.activity_wait_seconds == 30.0
+
+
+@pytest.mark.parametrize("name", ["GATEWAY_URL", "EXPORTER_API_KEY"])
+def test_settings_gateway_and_key_are_required(name: str) -> None:
+    with pytest.raises(RuntimeError, match=name):
+        Settings.from_env({k: v for k, v in BASE.items() if k != name})
+
+
+def test_settings_no_longer_read_meeting_api_url() -> None:
+    s = Settings.from_env({**BASE, "MEETING_API_URL": "http://meeting-api:8080"})
+    assert not hasattr(s, "meeting_api_url")
+
+
+def test_settings_missing_required() -> None:
+    with pytest.raises(RuntimeError, match="EXPORTER_WEBHOOK_SECRET"):
+        Settings.from_env(
+            {k: v for k, v in BASE.items() if k != "EXPORTER_WEBHOOK_SECRET"}
+        )
+
+
+def test_the_webhook_secret_is_the_subscriptions() -> None:
+    s = Settings.from_env(BASE)
+    assert s.webhook_secret == "test-secret"
+
+
+def test_the_system_hook_secret_is_not_read() -> None:
+    env = {k: v for k, v in BASE.items() if k != "EXPORTER_WEBHOOK_SECRET"}
+    with pytest.raises(RuntimeError, match="EXPORTER_WEBHOOK_SECRET"):
+        Settings.from_env({**env, "VEXA_WEBHOOK_SECRET": "test-secret"})

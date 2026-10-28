@@ -18,6 +18,7 @@
   "recordingEnabled": true,
   "captureModes": ["audio", "video"],
   "captureSignalEnabled": true,
+  "perChannelRecordingEnabled": true,
   "recordingUploadUrl": "https://s3.example.com/recordings/42",
   "automaticLeave": { "waitingRoomTimeout": 300000, "noOneJoinedTimeout": 600000, "everyoneLeftTimeout": 120000 },
   "voiceAgentEnabled": true,

@@ -32,6 +32,7 @@ from meeting_api.service_authority import (
     run_service_authority_sweep,
 )
 from meeting_api.webhooks.delivery import clean_meeting_data
+from gateway_identity import via_gateway
 
 
 UTC = timezone.utc
@@ -242,12 +243,12 @@ def test_http_deny_is_typed_and_preserves_opaque_identity() -> None:
     )
     repo = InMemoryMeetingRepo()
     runtime = FakeRuntimeClient()
-    client = TestClient(create_app(
+    client = TestClient(via_gateway(create_app(
         meeting_repo=repo,
         runtime=runtime,
         service_authority=authority,
         token_secret="fixture-token-secret",
-    ))
+    )))
 
     response = client.post(
         "/bots",

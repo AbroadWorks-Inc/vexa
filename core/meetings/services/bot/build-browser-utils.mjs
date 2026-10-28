@@ -68,6 +68,7 @@ import {
   pickBoundName,
   GmeetChannelBinder,
   createPcmCaptureNode,
+  createLevelNode,
 } from ${JSON.stringify(GMEET)};
 import {
   createMixedAudioCapture,
@@ -78,11 +79,14 @@ import {
 } from ${JSON.stringify(MIXED)};
 import {
   createRecordingTap,
+  selectJitsiChannels,
+  createJitsiChannelNumbers,
 } from ${JSON.stringify(RECORD)};
 import {
   createJitsiSpeakers,
   createJitsiChat,
   sendJitsiChatMessage,
+  jitsiNameForStream,
 } from ${JSON.stringify(JITSI)};
 import {
   createTeamsSpeakers,
@@ -101,6 +105,7 @@ const VexaBrowserUtils = {
   pickBoundName,
   GmeetChannelBinder,
   createPcmCaptureNode,
+  createLevelNode,           // capture-bridge.ts: a jitsi channel's loudness, measured in its worklet
   // ── mixed lane (zoom/teams single combined stream) ──
   createMixedAudioCapture,   // capture-bridge.ts: w.VexaBrowserUtils.createMixedAudioCapture
   installRemoteAudioHook,
@@ -109,8 +114,11 @@ const VexaBrowserUtils = {
   createCsrcPoll,            // capture-bridge.ts: the transport sensor (RTP contributing sources → transitions)
   // ── recording (all platforms): MediaRecorder → recording.v1 chunks ──
   createRecordingTap,        // capture-bridge.ts: w.VexaBrowserUtils.createRecordingTap
+  selectJitsiChannels,       // capture-bridge.ts: the Jitsi streams that are speaker channels
+  createJitsiChannelNumbers, // capture-bridge.ts: a channel number per Jitsi stream object
   // ── jitsi lane (dominant-speaker naming hints + chat over the app's own state) ──
   createJitsiSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createJitsiSpeakers
+  jitsiNameForStream,        // capture-bridge.ts: name a remote-audio stream at recorder start
   createJitsiChat,           // capture-bridge.ts: w.VexaBrowserUtils.createJitsiChat
   sendJitsiChatMessage,
   // ── teams lane (voice-level "blue-square" outline → speaker hints) ──

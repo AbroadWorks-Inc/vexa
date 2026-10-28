@@ -14,6 +14,7 @@ from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.bot_spawn.service import request_bot
 from meeting_api.webhooks import DeliveryResult
+from internal_callers import BOT
 
 
 class _CaptureSink:
@@ -66,28 +67,25 @@ def _seed(repo, *, session_uid, data):
     return m
 
 
-def test_status_change_webhook_delivered(goldens):
+def test_status_change_is_not_posted_to_the_per_user_url(goldens):
+    """A meeting.data webhook_url is not a second sender. Subscribers are delivered
+    from the outbox row the status write commits."""
     repo, sink = InMemoryMeetingRepo(), _CaptureSink()
     _seed(repo, session_uid="sess-uid", data={
         "webhook_url": "https://hook.example/x", "webhook_secret": "s3cr3t",
         "webhook_events": {"meeting.status_change": True},
     })
     client = TestClient(create_app(meeting_repo=repo, webhook_sink=sink))
-    r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
-    assert sink.calls, "no webhook delivered on FSM advance"
-    c = sink.calls[0]
-    assert c["url"] == "https://hook.example/x"
-    assert c["event_type"] == "meeting.status_change"
-    assert c["secret"] == "s3cr3t"
-    assert c["events_config"] == {"meeting.status_change": True}
+    assert sink.calls == []
 
 
 def test_no_webhook_when_url_unconfigured(goldens):
     repo, sink = InMemoryMeetingRepo(), _CaptureSink()
     _seed(repo, session_uid="sess-uid", data={})  # no webhook_url on the meeting
     client = TestClient(create_app(meeting_repo=repo, webhook_sink=sink))
-    r = client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
     assert r.status_code == 200, r.text
     assert not sink.calls
 
@@ -113,39 +111,23 @@ def _wired_client():
 
 
 def _post(client, event):
-    r = client.post("/bots/internal/callback/lifecycle", json=event)
+    r = client.post("/bots/internal/callback/lifecycle", headers=BOT, json=event)
     assert r.status_code == 200, r.text
 
 
-def test_meeting_started_emitted_on_active(goldens):
+def test_meeting_started_is_not_posted_to_the_per_user_url(goldens):
     client, sink = _wired_client()
     _post(client, goldens["joining"])
     _post(client, goldens["active"])
-    types = [c["event_type"] for c in sink.calls]
-    assert types == ["meeting.status_change", "meeting.status_change", "meeting.started"]
-    started = sink.calls[-1]["envelope"]
-    sc = started["data"]["status_change"]
-    assert sc["from"] == "joining" and sc["to"] == "active"
-    assert sc["transition_source"] == "bot_callback"
-    assert started["data"]["meeting"]["status"] == "active"
+    assert sink.calls == []
 
 
-def test_meeting_completed_emitted_with_post_meeting_envelope(goldens):
+def test_meeting_completed_is_not_posted_to_the_per_user_url(goldens):
     client, sink = _wired_client()
     _post(client, goldens["joining"])
     _post(client, goldens["active"])
     _post(client, goldens["completed-stopped"])
-    types = [c["event_type"] for c in sink.calls]
-    assert types[-2:] == ["meeting.status_change", "meeting.completed"]
-    completed = sink.calls[-1]["envelope"]
-    # The post-meeting envelope: data = {meeting} only (golden Envelope.meeting-completed.json) —
-    # no status_change block, completion_reason hoisted, internal keys (webhook_secret) stripped.
-    assert set(completed["data"].keys()) == {"meeting"}
-    m = completed["data"]["meeting"]
-    assert m["status"] == "completed"
-    assert m["completion_reason"] == "stopped"
-    assert "webhook_secret" not in m["data"]
-    assert "webhook_url" not in m["data"]
+    assert sink.calls == []
 
 
 def test_meeting_completed_exposes_frozen_privacy_safe_service_provenance():
@@ -178,7 +160,8 @@ def test_meeting_completed_exposes_frozen_privacy_safe_service_provenance():
     ):
         _post(client, event)
 
-    completed = sink.calls[-1]["envelope"]["data"]["meeting"]
+    assert sink.calls == []
+    completed = repo._meetings[seeded["id"]]["data"]
     assert completed["service_provenance"] == {
         "bot_admitted_at": "2026-07-28T10:05:00.000Z",
         "bot_departed_at": "2026-07-28T10:30:00.000Z",
@@ -187,14 +170,13 @@ def test_meeting_completed_exposes_frozen_privacy_safe_service_provenance():
         "transcription_outcome": "served",
         "lifecycle_contract_version": "2026-07-28",
     }
-    assert "transcription_provider" not in completed["data"]
-    assert "transcription_service_url" not in repr(completed)
+    assert "transcription_service_url" not in repr(completed["service_provenance"])
     assert repo._meetings[seeded["id"]]["data"]["segments_captured"] == 3
 
 
 def test_finalization_failure_never_claims_vexa_transcription_was_served():
     repo, sink = InMemoryMeetingRepo(), _CaptureSink()
-    _seed(repo, session_uid="sess-uid", data={
+    seeded = _seed(repo, session_uid="sess-uid", data={
         "webhook_url": "https://hook.example/x",
         "webhook_events": dict(_ALL_EVENTS),
         "transcribe_enabled": True,
@@ -221,29 +203,23 @@ def test_finalization_failure_never_claims_vexa_transcription_was_served():
     ):
         _post(client, event)
 
-    provenance = sink.calls[-1]["envelope"]["data"]["meeting"]["service_provenance"]
+    assert sink.calls == []
+    provenance = repo._meetings[seeded["id"]]["data"]["service_provenance"]
     assert provenance["transcription_provider"] == "vexa"
     assert provenance["transcription_outcome"] == "failed"
 
 
-def test_bot_failed_emitted_on_terminal_failure(goldens):
+def test_bot_failed_is_not_posted_to_the_per_user_url(goldens):
     client, sink = _wired_client()
     _post(client, goldens["joining"])
     _post(client, goldens["failed-join"])
-    types = [c["event_type"] for c in sink.calls]
-    assert types[-2:] == ["meeting.status_change", "bot.failed"]
-    failed = sink.calls[-1]["envelope"]
-    assert failed["data"]["meeting"]["status"] == "failed"
-    sc = failed["data"]["status_change"]
-    assert sc["to"] == "failed"
-    assert sc["reason"] == "host denied admission"
+    assert sink.calls == []
 
 
-def test_no_typed_event_on_intermediate_transition(goldens):
-    """joining has no typed mapping — only meeting.status_change fires."""
+def test_an_intermediate_transition_posts_no_per_user_webhook(goldens):
     client, sink = _wired_client()
     _post(client, goldens["joining"])
-    assert [c["event_type"] for c in sink.calls] == ["meeting.status_change"]
+    assert sink.calls == []
 
 
 def test_typed_event_suppressed_by_real_event_filter(goldens):
@@ -292,26 +268,12 @@ class _OutcomeSink:
         return self._result
 
 
-def _delivery_logs(capsys):
-    import json as _json
-
-    out = []
-    for line in capsys.readouterr().out.splitlines():
-        try:
-            rec = _json.loads(line)
-        except ValueError:
-            continue
-        if rec.get("event") == "webhook_delivery":
-            out.append(rec)
-    return out
-
-
 def _run_advance(repo, sink, goldens):
     client = TestClient(create_app(meeting_repo=repo, webhook_sink=sink))
-    return client.post("/bots/internal/callback/lifecycle", json=goldens["joining"])
+    return client.post("/bots/internal/callback/lifecycle", headers=BOT, json=goldens["joining"])
 
 
-def test_delivered_outcome_is_logged(goldens, capsys):
+def test_the_callback_logs_no_per_user_delivery(goldens, capsys):
     repo = InMemoryMeetingRepo()
     _seed(repo, session_uid="sess-uid", data={
         "webhook_url": "https://hook.example/x?token=SECRET-IN-URL",
@@ -319,39 +281,8 @@ def test_delivered_outcome_is_logged(goldens, capsys):
     })
     r = _run_advance(repo, _OutcomeSink(DeliveryResult(status="delivered", status_code=200)), goldens)
     assert r.status_code == 200, r.text
-    logs = _delivery_logs(capsys)
-    assert logs, "a delivered webhook emitted no webhook_delivery logevent"
-    rec = logs[0]
-    assert rec["fields"]["outcome"] == "delivered"
-    assert rec["fields"]["event_type"] == "meeting.status_change"
-    assert rec["fields"]["status_code"] == 200
-    # The target is reported as HOST ONLY — a webhook URL can carry a secret in its path/query.
-    assert rec["fields"]["target_host"] == "hook.example"
-    assert "SECRET-IN-URL" not in _json_dumps(rec)
+    captured = capsys.readouterr().out
+    assert "webhook_delivery" not in captured
+    assert "SECRET-IN-URL" not in captured
 
 
-def test_silent_non_delivery_outcomes_are_logged_as_warnings(goldens, capsys):
-    """suppressed (unsubscribed event) and blocked (SSRF) are the two silent killers in production."""
-    for outcome, result in (
-        ("suppressed", DeliveryResult(status="suppressed")),
-        ("blocked", DeliveryResult(status="blocked", error="Webhook URL cannot target internal or private networks")),
-        ("failed", DeliveryResult(status="failed", status_code=400, error="HTTP 400")),
-    ):
-        repo = InMemoryMeetingRepo()
-        _seed(repo, session_uid="sess-uid", data={
-            "webhook_url": "https://hook.example/x",
-            "webhook_events": {"meeting.status_change": True},
-        })
-        r = _run_advance(repo, _OutcomeSink(result), goldens)
-        assert r.status_code == 200, r.text
-        logs = _delivery_logs(capsys)
-        assert logs, f"{outcome} webhook emitted no webhook_delivery logevent — silent non-delivery"
-        rec = logs[0]
-        assert rec["fields"]["outcome"] == outcome
-        assert rec["level"] == "warning", f"{outcome} must not be logged as a success"
-
-
-def _json_dumps(rec):
-    import json as _json
-
-    return _json.dumps(rec)

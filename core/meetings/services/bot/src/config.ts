@@ -47,6 +47,28 @@ export function isPerTrackLanePlatform(p: Platform | string): boolean {
   return p === 'zoom';
 }
 
+/** What the activity header and the captured-signal tape record.
+ *  Zoom's frames are named per track, so they are not the mixed lane. */
+export type CaptureLane = 'gmeet' | 'mixed' | 'pertrack';
+
+export function captureLane(p: Platform | string): CaptureLane {
+  if (isPerTrackLanePlatform(p)) return 'pertrack';
+  if (isMixedLanePlatform(p)) return 'mixed';
+  return 'gmeet';
+}
+
+/** Where the page-side recorder reads its audio. The per-track and mixed lanes record the LIVE
+ *  graph their PCM capture reads — one audio graph, two sinks — so a track that arrives after the
+ *  recorder started is in the recording. Only the gmeet lane records its page media elements. The
+ *  ONE predicate `startRecording` reads; never restate it inline. */
+export type RecordingSource = 'pertrack-mix' | 'mixed-mix' | 'element-snapshot';
+
+export function recordingSource(p: Platform | string): RecordingSource {
+  if (isPerTrackLanePlatform(p)) return 'pertrack-mix';
+  if (isMixedLanePlatform(p)) return 'mixed-mix';
+  return 'element-snapshot';
+}
+
 export interface AutomaticLeave {
   waitingRoomTimeout?: number;
   noOneJoinedTimeout?: number;
@@ -81,6 +103,9 @@ export interface Invocation {
   // ── recording ──
   recordingEnabled?: boolean;
   captureSignalEnabled?: boolean;
+  /** Extra per-channel MediaRecorders beside the mixed master (Google Meet and Jitsi only; Teams and
+   *  Zoom never start them). Set per platform by the deployment through meeting-api; absent = off. */
+  perChannelRecordingEnabled?: boolean;
   captureModes?: string[];
   recordingUploadUrl?: string;
   // ── lifecycle timeouts ──

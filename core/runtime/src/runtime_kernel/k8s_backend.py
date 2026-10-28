@@ -10,6 +10,7 @@ merge replaces the generated container wholesale and strips its image, env and c
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from typing import Optional
@@ -18,6 +19,13 @@ from .backend import WorkloadHandle
 from .models import Resources
 from .mounts import k8s_volume_mounts
 from .profiles import Runnable
+
+log = logging.getLogger("runtime_kernel.k8s")
+
+# How much of a failed pod's own log is copied into the runtime log before the pod
+# object is deleted. The full stream is already in the node log store; this tail is
+# what an operator can still read from the runtime pod after the bot pod is gone.
+_LOG_TAIL_BYTES = 4096
 
 MANAGED_LABEL = "runtime.managed"
 WORKLOAD_ID_LABEL = "runtime.workload_id"
@@ -70,6 +78,20 @@ def _kubectl(*args: str, check: bool = True, stdin: Optional[str] = None) -> sub
     if check and r.returncode != 0:
         raise RuntimeError(f"kubectl {' '.join(args)} failed: {r.stderr.strip()}")
     return r
+
+
+def _already_gone(result: subprocess.CompletedProcess) -> bool:
+    """kubectl answered that this pod is not in the cluster. A connection failure is not this."""
+    text = f"{result.stderr or ''}\n{result.stdout or ''}"
+    return "(NotFound)" in text
+
+
+def _require_accepted(result: subprocess.CompletedProcess, what: str) -> None:
+    """A delete counts only when kubectl accepted it, or the pod was already gone."""
+    if result.returncode == 0 or _already_gone(result):
+        return
+    detail = (result.stderr or result.stdout or "").strip()
+    raise RuntimeError(f"{what} failed ({result.returncode}): {detail[:200]}")
 
 
 def _stop_grace_sec() -> int:
@@ -153,6 +175,32 @@ def resource_requirements(resources: Optional[Resources]) -> Optional[dict]:
     return block or None
 
 
+# Same default as the bot's deriveMaxActiveMs. Fifteen minutes lets that exit flush
+# the recording before Kubernetes SIGKILLs a wedged loop. Counted from pod start.
+_DEFAULT_ACTIVE_CAP_S = 4 * 60 * 60
+_ACTIVE_DEADLINE_GRACE_S = 15 * 60
+
+
+def _meeting_bot_deadline_seconds(env: dict[str, str]) -> Optional[int]:
+    """Backstop for a meeting bot only. Other workloads return None.
+
+    ``BOT_MAX_ACTIVE_MS`` replaces the 4h default, matching the bot process.
+    A non-numeric value keeps the default rather than dropping the deadline.
+    """
+    if "VEXA_BOT_CONFIG" not in env:
+        return None
+    cap_s = _DEFAULT_ACTIVE_CAP_S
+    raw = env.get("BOT_MAX_ACTIVE_MS", "").strip()
+    if raw:
+        try:
+            ms = int(raw)
+        except ValueError:
+            ms = 0
+        if ms > 0:
+            cap_s = (ms + 999) // 1000
+    return cap_s + _ACTIVE_DEADLINE_GRACE_S
+
+
 def build_pod(
     *,
     name: str,
@@ -203,12 +251,20 @@ def build_pod(
         metadata["namespace"] = namespace
 
     # restart=Never: the kernel owns restart policy, so the Pod must not resurrect itself.
+    # Meeting bots also get a deadline. Agent workers do not: their lifetime is the
+    # profile's max_lifetime_sec, enforced in-process, and a meeting-bot cap would reap them.
     pod: dict = {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": metadata,
-        "spec": {"containers": [container], "restartPolicy": "Never"},
+        "spec": {
+            "containers": [container],
+            "restartPolicy": "Never",
+        },
     }
+    deadline = _meeting_bot_deadline_seconds(env)
+    if deadline is not None:
+        pod["spec"]["activeDeadlineSeconds"] = deadline
 
     overlay_source = env if overlay_env is None else overlay_env
     overlay = (pod_overrides(overlay_source, container_name=name) or {}).get("spec", {})
@@ -230,6 +286,9 @@ class K8sBackend:
     def __init__(self, name_prefix: str = "vexa-", namespace: Optional[str] = None) -> None:
         self._prefix = name_prefix
         self._ns = namespace
+        # Pod names already reaped this life. A second observation must not log the
+        # tail again. start() drops the name: a respawn reuses it.
+        self._reaped: set[str] = set()
 
     def _pname(self, workload_id: str) -> str:
         return f"{self._prefix}{workload_id}"            # must be DNS-1123 (lowercase alnum + '-')
@@ -265,6 +324,9 @@ class K8sBackend:
             overlay_env={**env, **_runtime_scheduling_env()},
         )
         _kubectl("create", "-f", "-", *self._ns_args(), stdin=json.dumps(pod))
+        # The name now belongs to this new pod. Keeping the previous reap mark
+        # would skip the next exit and leave that pod on the node.
+        self._reaped.discard(name)
         return WorkloadHandle(id=workload_id, impl=name)
 
     def find(self, workload_id: str) -> Optional[WorkloadHandle]:
@@ -308,16 +370,26 @@ class K8sBackend:
                     "name": meta.get("name", self._pname(wid)),
                     "running": running,
                     "exit_code": exit_code,
+                    "phase": phase,
                 })
             return out
         except Exception:  # noqa: BLE001 — discovery is a boot aid; it must never crash the boot
             return []
 
     def exit_code(self, h: WorkloadHandle) -> Optional[int]:
+        """None while the pod is running, or when kubectl did not answer.
+
+        A failed ``kubectl get`` used to return 0 for every error. The kernel stores that as a
+        clean exit, and a second bot can be sent into a call that is still going. A timeout and
+        a missing pod are both a non-zero exit, so only the NotFound answer means the pod is gone.
+        """
         r = _kubectl("get", "pod", h._impl, "-o", "json", *self._ns_args(), check=False)  # type: ignore[attr-defined]
         if r.returncode != 0:
-            return 0                                     # gone (deleted/never-found) → no longer running
-        status = json.loads(r.stdout).get("status", {})
+            return 0 if _already_gone(r) else None
+        try:
+            status = json.loads(r.stdout).get("status", {})
+        except (json.JSONDecodeError, AttributeError):
+            return None
         phase = status.get("phase")
         if phase in ("Pending", "Running"):
             return None                                  # still scheduling / running
@@ -332,13 +404,66 @@ class K8sBackend:
         return None
 
     def terminate(self, h: WorkloadHandle) -> None:      # graceful: SIGTERM + grace, then SIGKILL
-        _kubectl("delete", "pod", h._impl, f"--grace-period={_stop_grace_sec()}", "--wait=false",
-                 *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        name = h._impl  # type: ignore[attr-defined]
+        _require_accepted(
+            _kubectl("delete", "pod", name, f"--grace-period={_stop_grace_sec()}", "--wait=false",
+                     *self._ns_args(), check=False),
+            f"kubectl delete pod {name}",
+        )
 
     def kill(self, h: WorkloadHandle) -> None:           # force: immediate SIGKILL + drop the object
-        _kubectl("delete", "pod", h._impl, "--grace-period=0", "--force", "--wait=false",
-                 *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        name = h._impl  # type: ignore[attr-defined]
+        _require_accepted(
+            _kubectl("delete", "pod", name, "--grace-period=0", "--force", "--wait=false",
+                     *self._ns_args(), check=False),
+            f"kubectl delete pod {name}",
+        )
+
+    def _log_tail(self, name: str) -> str:
+        """The container's own log, clipped. Empty when kubectl cannot read it.
+
+        Read this before ``cleanup``. Deleting the pod drops ``kubectl logs`` for it.
+        """
+        result = _kubectl("logs", name, "--tail=200", *self._ns_args(), check=False)
+        if result.returncode != 0:
+            return ""
+        text = (result.stdout or "").strip()
+        if len(text) > _LOG_TAIL_BYTES:
+            text = text[-_LOG_TAIL_BYTES:]
+        return text
+
+    def reap_exited(self, h: WorkloadHandle, code: int) -> bool:
+        """Delete a pod whose container has already exited.
+
+        A Succeeded pod and a Failed pod both keep a node from scaling to zero.
+        The exit code is the caller's to store first. A non-zero exit's log tail
+        is written here, on the runtime, before the pod object is removed.
+        Returns whether this call removed it. A repeat is a no-op.
+        """
+        name = h._impl  # type: ignore[attr-defined]
+        if not isinstance(name, str) or name in self._reaped:
+            return False
+        # The tail has to be copied before cleanup: deleting the pod drops kubectl logs.
+        if code != 0:
+            tail = self._log_tail(name)
+            log.error(
+                "workload %s exited %s — pod %s container log tail:\n%s",
+                h.id, code, name, tail or "<no container log>",
+            )
+        self.cleanup(h)
+        self._reaped.add(name)
+        log.info("removed exited pod %s for workload %s (exit %s)", name, h.id, code)
+        return True
 
     def cleanup(self, h: WorkloadHandle) -> None:
-        _kubectl("delete", "pod", h._impl, "--ignore-not-found", "--grace-period=0", "--force",
-                 "--wait=false", *self._ns_args(), check=False)  # type: ignore[attr-defined]
+        """Reclaim the pod. Raises unless kubectl accepted the delete or the pod is already gone.
+
+        ``kernel.destroy`` marks the workload destroyed only after this returns. A failed delete
+        must not become that mark: meeting-api treats a destroyed workload as the bot having left.
+        """
+        name = h._impl  # type: ignore[attr-defined]
+        _require_accepted(
+            _kubectl("delete", "pod", name, "--ignore-not-found", "--grace-period=0", "--force",
+                     "--wait=false", *self._ns_args(), check=False),
+            f"kubectl delete pod {name}",
+        )

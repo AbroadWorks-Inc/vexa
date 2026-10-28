@@ -32,6 +32,7 @@ spec:
       # node cluster they distribute and avoid Linode's 7-vol-per-instance
       # cap during chart-upgrade rolling restarts (which retains old PVs
       # under reclaimPolicy=Retain, briefly causing 8+ volumes/node).
+      {{- if .Values.statefulAntiAffinity }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -43,6 +44,7 @@ spec:
                       operator: In
                       values: [redis, minio, tts-service]
                 topologyKey: kubernetes.io/hostname
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

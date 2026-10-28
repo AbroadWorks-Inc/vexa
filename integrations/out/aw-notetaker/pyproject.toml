@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exporter"
+version = "0.1.0"
+description = "Vexa meeting.completed -> AbroadWorks notetaker folder + /process hand-off"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "httpx>=0.27,<1",
+    "boto3>=1.34,<2",
+    "pydantic>=2.7,<3",
+]
+
+# Test and lint tools only; `uv run` installs this group by default, and the image (pip install .)
+# never does.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "moto[s3]>=5",
+    "boto3-stubs[s3]>=1.34",
+    "black==25.1.0",
+    "ruff==0.15.3",
+    "mypy==1.17.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["exporter*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+markers = ["integration: needs the compose MinIO + stub notetaker"]
+addopts = ["-m", "not integration"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

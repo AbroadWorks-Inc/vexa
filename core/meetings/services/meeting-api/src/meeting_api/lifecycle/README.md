@@ -12,9 +12,9 @@ server-side `requested`/`stopping` states.
 ## The machine
 ```
 <new>              → joining
-joining            → awaiting_admission · active · failed
+joining            → awaiting_admission · needs_help · active · failed
 awaiting_admission → active · needs_help · failed
-needs_help         → active · failed
+needs_help         → awaiting_admission · active · failed
 active             → completed · failed
 completed          ∅   (terminal)
 failed             ∅   (terminal)
@@ -38,10 +38,8 @@ parent's FM-003 discipline). `active → joining` (and any re-open of a terminal
 - `stop.py` (P3b) — the user-stop path: `request_stop(record, publisher, meeting_id)` sets
   `stop_requested` + publishes the `bot_commands:meeting:{id}` `{action:"leave"}` command;
   `classify_user_stop` / `stop_event_for` resolve the bot's exit to an ATTRIBUTED terminal.
-- `retry.py` (P3d) — `JoinRetryController` + the transient/permanent taxonomy
-  (`classify_retry` / `is_transient`): on a TRANSIENT join-failure schedule a fresh re-spawn (a new
-  `meeting_session`) through the runtime scheduler with bounded exponential backoff; a PERMANENT
-  reason never retries.
+- `occurrence.py` — `disposition` / `may_dispatch_again`: whether a terminal calendar occurrence
+  is owed another bot. What is not retried is `intake.retry.NOT_RETRIED`, the one list.
 
 ## P3a — lifecycle diagnostics (attributable reasons)
 Every FSM advance captures `completion_reason` · `failure_stage` (DERIVED SERVER-SIDE from the
@@ -52,13 +50,14 @@ trimmed oldest-first + `bot_resources`). `MeetingRecord.data` is the `meeting.da
 the parent persists. Each advance returns a `StatusChange` carrying the `meeting.status_change`
 webhook body `{old_status, new_status, reason, transition_source ∈ user_stop|bot_callback|scheduler_timeout}`.
 
-## P3d taxonomy
-TRANSIENT → retry: `awaiting_admission_timeout`, `join_failure`. PERMANENT → no retry → failed:
-`awaiting_admission_rejected`, `evicted`, `validation_error`, `max_bot_time_exceeded`, user `stopped`
-(+ `left_alone`/`startup_alone`, which are normal outcomes). Unknown/None → PERMANENT (fail-safe).
+## Retry taxonomy
+One list, `intake/retry.py` `NOT_RETRIED`: `stopped`, `evicted`, `startup_alone`,
+`awaiting_admission_rejected`, `auth_session_missing`, `validation_error`, `max_bot_time_exceeded`.
+A failed bot with any other reason is retried on its live meeting (§6.9 F-K2), and a terminal
+calendar occurrence that never reached the room is dispatched again (`occurrence.py`).
 
 ## Evals
 `tests/test_lifecycle_machine.py` (FSM) · `test_lifecycle_http.py` (receiver) ·
 `test_lifecycle_diagnostics.py` (P3a: per-terminal-cause attribution + webhook) ·
-`test_lifecycle_fixtures.py` (P3b: normal / user-stop+leave-command / join-failure) ·
-`test_join_retry.py` (P3d: FakeClock-driven bounded retries). Ride `gate:python`.
+`test_lifecycle_fixtures.py` (P3b: normal / user-stop+leave-command / join-failure). The retry of a
+failed bot is `intake/retry.py`'s, tested in `test_bot_retry.py`. Ride `gate:python`.

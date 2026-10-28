@@ -60,14 +60,6 @@ from .occurrence import (
     disposition,
     may_dispatch_again,
 )
-from .retry import (
-    JoinRetryController,
-    RetryClass,
-    RetryOutcome,
-    RetryPolicy,
-    classify_retry,
-    is_transient,
-)
 from .stop import (
     LeaveCommandPublisher,
     classify_user_stop,
@@ -95,16 +87,10 @@ __all__ = [
     "build_join_evidence",
     "classify_join_failure",
     "LeaveCommandPublisher",
-    "JoinRetryController",
-    "RetryClass",
-    "RetryOutcome",
-    "RetryPolicy",
     "build_status_change_envelope",
     "build_typed_envelope",
     "typed_event_type",
-    "classify_retry",
     "classify_user_stop",
-    "is_transient",
     "leave_command_channel",
     "leave_command_payload",
     "request_stop",

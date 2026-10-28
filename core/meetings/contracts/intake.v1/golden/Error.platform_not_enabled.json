@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "platform_not_enabled",
+    "message": "meeting links on meet.google.com are not enabled"
+  }
+}

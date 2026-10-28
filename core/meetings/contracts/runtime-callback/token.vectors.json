@@ -1,0 +1,25 @@
+{
+  "description": "Test vectors for the runtime-callback token (design §1.10). meeting-api builds the callbackUrl it hands the runtime as <MEETING_API_URL>/runtime/callback?t=<token>, and POST /runtime/callback recomputes the token from the event's workloadId. The secret here is a test-only literal, never deployed.",
+  "algorithm": "hex HMAC-SHA256, key = INTERNAL_API_SECRET (UTF-8)",
+  "message": "aw-runtime-callback.<workloadId>",
+  "id_rule": "workloadId: meeting-api names the workload at spawn (mtg-<meeting id>-<first 8 of the connection id>) and the runtime echoes it in every RuntimeEvent (runtime.v1, required)",
+  "query_parameter": "t",
+  "secret": "test-internal-api-secret-0001",
+  "vectors": [
+    {
+      "workload_id": "mtg-1-abcdef12",
+      "message": "aw-runtime-callback.mtg-1-abcdef12",
+      "token": "596d24ddf119b5041f7d5dfaf96ad560ea6dfab804d3ab26a70b0c6bc15852ec"
+    },
+    {
+      "workload_id": "mtg-205-0f1e2d3c",
+      "message": "aw-runtime-callback.mtg-205-0f1e2d3c",
+      "token": "a9e5502a4483c0db545a5d9d79d9aba64f8f5781a7c4b7556edc4561de78f4ec"
+    },
+    {
+      "workload_id": "mtg-99999-conn0001",
+      "message": "aw-runtime-callback.mtg-99999-conn0001",
+      "token": "9236868f5a64588658496c0489ed8203808caf091a67a2b206b50520a4e551b3"
+    }
+  ]
+}

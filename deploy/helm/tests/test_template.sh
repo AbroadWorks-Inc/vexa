@@ -39,7 +39,7 @@ need 1 'serviceAccountName: vexa-vexa-runtime' "runtime SA bound"
 # must stay green, the env ref is optional:true).
 need 1 'key: CLAUDE_CODE_OAUTH_TOKEN' "agent-api CLAUDE_CODE_OAUTH_TOKEN secret ref"
 need 2 'key: ANTHROPIC_AUTH_TOKEN'    "ANTHROPIC_AUTH_TOKEN secret refs (agent-api + runtime)"
-need 2 'name: MEETING_API_URL' "MEETING_API_URL set on gateway AND meeting-api"
+need 3 'name: MEETING_API_URL' "MEETING_API_URL set on gateway, meeting-api AND admin-api"
 # A terminating meeting-api must stay alive until EndpointSlice/kube-proxy stops routing its IP.
 # Without this drain, deleting co-located replicas produces immediate connection refusals even
 # while another replica remains Ready.
@@ -431,5 +431,333 @@ if grep -q 'image: "reg.example/flows@sha256:abc"' <<< "$FLOWS_OVERRIDE"; then
 else
   echo "  FAIL: an explicit flows.image no longer wins over global.imageTag (#A12)"; fail=1
 fi
+
+# IRSA — optional dedicated ServiceAccount for meeting-api (deploy/helm meetingApi.serviceAccount).
+# Default MUST stay byte-identical to before this feature: still exactly 1 ServiceAccount (the
+# runtime's), no serviceAccountName on meeting-api's Deployment.
+sa_count_default="$(grep -cE '^kind: ServiceAccount' <<< "$RENDER" || true)"
+if [ "$sa_count_default" -eq 1 ]; then
+  echo "  OK: default render still has exactly 1 ServiceAccount (runtime only)"
+else
+  echo "  FAIL: default render ServiceAccount count changed — want 1 got $sa_count_default"; fail=1
+fi
+mapi_deploy_default="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /app.kubernetes.io\/component: meeting-api/' <<< "$RENDER")"
+if grep -q 'serviceAccountName' <<< "$mapi_deploy_default"; then
+  echo "  FAIL: default meeting-api Deployment renders serviceAccountName (should be absent)"; fail=1
+else
+  echo "  OK: default meeting-api Deployment has no serviceAccountName"
+fi
+
+# meetingApi.serviceAccount.create=true renders a SECOND ServiceAccount named for meeting-api,
+# carrying the given annotations (e.g. the IRSA role-arn), and binds it on the Deployment.
+RENDER_MAPI_SA="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set meetingApi.serviceAccount.create=true \
+  --set-string 'meetingApi.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::000000000000:role/test')"
+sa_count_created="$(grep -cE '^kind: ServiceAccount' <<< "$RENDER_MAPI_SA" || true)"
+if [ "$sa_count_created" -eq 2 ]; then
+  echo "  OK: meetingApi.serviceAccount.create=true renders a second ServiceAccount ($sa_count_created)"
+else
+  echo "  FAIL: meetingApi.serviceAccount.create=true — want 2 ServiceAccounts got $sa_count_created"; fail=1
+fi
+sa_docs_created="$(awk 'BEGIN{RS="\n---\n"} /kind: ServiceAccount/' <<< "$RENDER_MAPI_SA")"
+if grep -q 'name: vexa-vexa-meeting-api' <<< "$sa_docs_created"; then
+  echo "  OK: meeting-api ServiceAccount named vexa-vexa-meeting-api"
+else
+  echo "  FAIL: meeting-api ServiceAccount missing expected name"; fail=1
+fi
+if grep -q 'eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/test' <<< "$sa_docs_created"; then
+  echo "  OK: meeting-api ServiceAccount carries the IRSA role-arn annotation"
+else
+  echo "  FAIL: meeting-api ServiceAccount missing the IRSA role-arn annotation"; fail=1
+fi
+mapi_deploy_created="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /app.kubernetes.io\/component: meeting-api/' <<< "$RENDER_MAPI_SA")"
+if grep -q 'serviceAccountName: vexa-vexa-meeting-api' <<< "$mapi_deploy_created"; then
+  echo "  OK: meeting-api Deployment binds the created ServiceAccount"
+else
+  echo "  FAIL: meeting-api Deployment does not bind the created ServiceAccount"; fail=1
+fi
+
+# meetingApi.serviceAccount.name alone (create left false) binds an EXISTING account by name —
+# no new ServiceAccount rendered.
+RENDER_MAPI_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set meetingApi.serviceAccount.name=existing-sa)"
+sa_count_existing="$(grep -cE '^kind: ServiceAccount' <<< "$RENDER_MAPI_EXISTING" || true)"
+if [ "$sa_count_existing" -eq 1 ]; then
+  echo "  OK: meetingApi.serviceAccount.name alone renders no new ServiceAccount ($sa_count_existing)"
+else
+  echo "  FAIL: meetingApi.serviceAccount.name alone — want 1 ServiceAccount (unchanged) got $sa_count_existing"; fail=1
+fi
+mapi_deploy_existing="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /app.kubernetes.io\/component: meeting-api/' <<< "$RENDER_MAPI_EXISTING")"
+if grep -q 'serviceAccountName: existing-sa' <<< "$mapi_deploy_existing"; then
+  echo "  OK: meeting-api Deployment binds the existing ServiceAccount by name"
+else
+  echo "  FAIL: meeting-api Deployment does not bind the existing ServiceAccount name"; fail=1
+fi
+
+# postgres.existingCredentialsSecret=true: the in-cluster Postgres reads a PRE-CREATED Secret, so the
+# chart renders no postgres-credentials Secret of its own (a helm upgrade then never rewrites the
+# database password) while every consumer still references the Secret by name. Default: rendered.
+pg_secret_docs() { awk 'BEGIN{RS="\n---\n"} /kind: Secret/ && /name: postgres-credentials/' <<< "$1"; }
+if [ -n "$(pg_secret_docs "$RENDER")" ]; then
+  echo "  OK: default render still creates the postgres-credentials Secret"
+else
+  echo "  FAIL: default render lost the postgres-credentials Secret"; fail=1
+fi
+RENDER_PG_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set postgres.existingCredentialsSecret=true)"
+if [ -z "$(pg_secret_docs "$RENDER_PG_EXISTING")" ]; then
+  echo "  OK: postgres.existingCredentialsSecret=true renders no postgres-credentials Secret"
+else
+  echo "  FAIL: postgres.existingCredentialsSecret=true still renders a postgres-credentials Secret"; fail=1
+fi
+pg_refs_existing="$(grep -cE 'name: "?postgres-credentials"?$' <<< "$RENDER_PG_EXISTING" || true)"
+if [ "$pg_refs_existing" -ge 3 ]; then
+  echo "  OK: postgres, admin-api and meeting-api still reference postgres-credentials ($pg_refs_existing)"
+else
+  echo "  FAIL: postgres-credentials references — want >=3 got $pg_refs_existing"; fail=1
+fi
+
+# statefulAntiAffinity (default true) keeps the stateful pods' spread-across-nodes preference;
+# false drops it from postgres, redis and minio, for a deployment that runs them on ONE node (a
+# node autoscaler treats the preference as a reason to start extra nodes).
+stateful_docs() { awk 'BEGIN{RS="\n---\n"} (/kind: StatefulSet/ || /kind: Deployment/) && /app.kubernetes.io\/component: (postgres|redis|minio)/' <<< "$1"; }
+aa_default="$(stateful_docs "$RENDER" | grep -c 'podAntiAffinity:' || true)"
+if [ "$aa_default" -ge 3 ]; then
+  echo "  OK: default render keeps the stateful anti-affinity on postgres, redis, minio ($aa_default)"
+else
+  echo "  FAIL: default stateful anti-affinity — want >=3 got $aa_default"; fail=1
+fi
+RENDER_NO_AA="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set statefulAntiAffinity=false)"
+aa_off="$(stateful_docs "$RENDER_NO_AA" | grep -c 'podAntiAffinity:' || true)"
+if [ "$aa_off" -eq 0 ] && [ -n "$(stateful_docs "$RENDER_NO_AA")" ]; then
+  echo "  OK: statefulAntiAffinity=false drops it from postgres, redis, minio"
+else
+  echo "  FAIL: statefulAntiAffinity=false — want 0 anti-affinity blocks got $aa_off"; fail=1
+fi
+
+# Meeting intake + webhooks (§1.11): every setting the three services read renders on its own
+# Deployment with the chart default. Value-level, on the component's Deployment document only, so a
+# key on one service cannot satisfy a claim about another.
+component_deploy() { awk -v c="$2" 'BEGIN{RS="\n---\n"} /kind: Deployment/ && $0 ~ ("app.kubernetes.io/component: " c "\n")' <<< "$1"; }
+env_is() {  # env_is <render> <component> <KEY> <expected value line>
+  if grep -A1 "name: $3\$" <<< "$(component_deploy "$1" "$2")" | grep -qxF "              $4"; then
+    echo "  OK: $2 $3 $4"
+  else
+    echo "  FAIL: $2 $3 — want $4"; fail=1
+  fi
+}
+for kv in \
+  'ENTRY_MAX_DAYS_AHEAD|value: "30"' \
+  'JOIN_NOW_ADOPT_AHEAD_S|value: "3600"' \
+  'ENTRY_BLOCKED_HOSTS|value: ""' \
+  'INTAKE_MAX_ACTIVE_ENTRIES|value: "100000"' \
+  'INTAKE_CONFLICT_RETRIES|value: "3"' \
+  'INTAKE_CONFLICT_DELAY_MIN_S|value: "0.01"' \
+  'INTAKE_CONFLICT_DELAY_MAX_S|value: "0.05"' \
+  'INTAKE_STOP_LINK_RETRIES|value: "1"' \
+  'GATEWAY_IDENTITY_MAX_SKEW_S|value: "60"' \
+  'AUTO_JOIN_LEAD_S|value: "120"' \
+  'NOT_SENT_SWEEP_INTERVAL_S|value: "30"' \
+  'BOT_SEND_MAX_ATTEMPTS|value: "3"' \
+  'BOT_SEND_RETRY_BACKOFF_S|value: "60"' \
+  'SWEEP_BATCH_SIZE|value: "200"' \
+  'SWEEP_MAX_ITEM_FAILURES|value: "5"' \
+  'MEETING_UNTRACKED_GRACE_SEC|value: "600"' \
+  'UNPROVEN_TEARDOWN_MAX_AGE_S|value: "21600"' \
+  'SWEEP_ITEM_FAILURES_RETENTION_S|value: "604800"' \
+  'VEXA_JITSI_HOSTS|value: ""' \
+  'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' \
+  'WEBHOOK_PUBLISH_INTERVAL_S|value: "1"' \
+  'WEBHOOK_SEND_INTERVAL_S|value: "1"' \
+  'WEBHOOK_RETRY_SCHEDULE_S|value: "60,300,1800,7200"' \
+  'WEBHOOK_DNS_THREADS|value: "4"' \
+  'WEBHOOK_DNS_TIMEOUT_S|value: "5"' \
+  'WEBHOOK_SEND_TIMEOUT_S|value: "10"' \
+  'WEBHOOK_LEASE_S|value: "60"' \
+  'WEBHOOK_CLAIM_LIMIT|value: "50"' ; do
+  env_is "$RENDER" meeting-api "${kv%%|*}" "${kv##*|}"
+done
+for kv in \
+  'MEETING_API_URL|value: "http://vexa-vexa-meeting-api:8080"' \
+  'WEBHOOK_MAX_SUBSCRIPTIONS|value: "20"' \
+  'WEBHOOK_DELIVERY_RETENTION_DAYS|value: "30"' \
+  'WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE|value: "1000"' \
+  'WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES|value: "100"' \
+  'GATEWAY_IDENTITY_MAX_SKEW_S|value: "60"' \
+  'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' ; do
+  env_is "$RENDER" admin-api "${kv%%|*}" "${kv##*|}"
+done
+env_is "$RENDER" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "600"'
+env_is "$RENDER" gateway GATEWAY_RATE_LIMIT_BURST 'value: "120"'
+env_is "$RENDER" gateway GATEWAY_RATE_LIMIT_RPS 'value: "40"'
+# A deployment's own values reach the env (the hosts lists are the ones a deployment sets).
+RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set meetingApi.entryBlockedHosts=meet.example.org --set meetingApi.autoJoinLeadSeconds=300 \
+  --set meetingApi.jitsiHosts=meet.example.org \
+  --set meetingApi.intakeConflictRetries=5 --set meetingApi.botSendMaxAttempts=7 \
+  --set meetingApi.botSendRetryBackoffSeconds=45 \
+  --set meetingApi.sweepBatchSize=50 --set meetingApi.sweepMaxItemFailures=2 \
+  --set meetingApi.meetingUntrackedGraceSeconds=900 \
+  --set meetingApi.webhookRetryScheduleSeconds=30\\,120 --set meetingApi.webhookDnsThreads=8 \
+  --set meetingApi.webhookDnsTimeoutSeconds=2 \
+  --set meetingApi.intakeConflictDelayMinSeconds=0.02 --set meetingApi.intakeConflictDelayMaxSeconds=0.2 \
+  --set meetingApi.intakeStopLinkRetries=3 --set meetingApi.gatewayIdentityMaxSkewSeconds=30 \
+  --set meetingApi.unprovenTeardownMaxAgeSeconds=7200 \
+  --set meetingApi.sweepItemFailuresRetentionSeconds=86400 \
+  --set meetingApi.webhookSendTimeoutSeconds=5 --set meetingApi.webhookLeaseSeconds=30 \
+  --set meetingApi.webhookClaimLimit=20 \
+  --set adminApi.webhookPrivateHostAllowlist=portal.example.svc.cluster.local \
+  --set adminApi.webhookDeliveryRetentionBatchSize=500 \
+  --set adminApi.webhookDeliveryRetentionMaxBatches=10 --set adminApi.gatewayIdentityMaxSkewSeconds=30 \
+  --set gateway.intakeRateLimitPerMin=900 \
+  --set gateway.rateLimitBurst=240 --set gateway.rateLimitRps=80)"
+env_is "$RENDER_INTAKE" meeting-api ENTRY_BLOCKED_HOSTS 'value: "meet.example.org"'
+env_is "$RENDER_INTAKE" meeting-api AUTO_JOIN_LEAD_S 'value: "300"'
+env_is "$RENDER_INTAKE" meeting-api VEXA_JITSI_HOSTS 'value: "meet.example.org"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_RETRIES 'value: "5"'
+env_is "$RENDER_INTAKE" meeting-api BOT_SEND_MAX_ATTEMPTS 'value: "7"'
+env_is "$RENDER_INTAKE" meeting-api BOT_SEND_RETRY_BACKOFF_S 'value: "45"'
+env_is "$RENDER_INTAKE" meeting-api SWEEP_BATCH_SIZE 'value: "50"'
+env_is "$RENDER_INTAKE" meeting-api SWEEP_MAX_ITEM_FAILURES 'value: "2"'
+env_is "$RENDER_INTAKE" meeting-api MEETING_UNTRACKED_GRACE_SEC 'value: "900"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_RETRY_SCHEDULE_S 'value: "30,120"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_THREADS 'value: "8"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_DNS_TIMEOUT_S 'value: "2"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_DELAY_MIN_S 'value: "0.02"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_DELAY_MAX_S 'value: "0.2"'
+env_is "$RENDER_INTAKE" meeting-api INTAKE_STOP_LINK_RETRIES 'value: "3"'
+env_is "$RENDER_INTAKE" meeting-api GATEWAY_IDENTITY_MAX_SKEW_S 'value: "30"'
+env_is "$RENDER_INTAKE" meeting-api UNPROVEN_TEARDOWN_MAX_AGE_S 'value: "7200"'
+env_is "$RENDER_INTAKE" meeting-api SWEEP_ITEM_FAILURES_RETENTION_S 'value: "86400"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_SEND_TIMEOUT_S 'value: "5"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_LEASE_S 'value: "30"'
+env_is "$RENDER_INTAKE" meeting-api WEBHOOK_CLAIM_LIMIT 'value: "20"'
+env_is "$RENDER_INTAKE" admin-api WEBHOOK_PRIVATE_HOST_ALLOWLIST 'value: "portal.example.svc.cluster.local"'
+env_is "$RENDER_INTAKE" admin-api WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE 'value: "500"'
+env_is "$RENDER_INTAKE" admin-api WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES 'value: "10"'
+env_is "$RENDER_INTAKE" admin-api GATEWAY_IDENTITY_MAX_SKEW_S 'value: "30"'
+env_is "$RENDER_INTAKE" gateway INTAKE_RATE_LIMIT_PER_MIN 'value: "900"'
+env_is "$RENDER_INTAKE" gateway GATEWAY_RATE_LIMIT_BURST 'value: "240"'
+env_is "$RENDER_INTAKE" gateway GATEWAY_RATE_LIMIT_RPS 'value: "80"'
+
+# §1.10/§1.11 secrets reach the services by secretKeyRef to the shared Secret (existingSecretName
+# when set): the gateway identity ring GATEWAY_IDENTITY_KEYS on all three services and its active
+# kid GATEWAY_IDENTITY_ACTIVE_KEY on the gateway, the webhook key ring on meeting-api and admin-api.
+# The gateway cannot run without the identity ring, so its references are NOT optional (a missing
+# key stops the pod at creation); the other two degrade without it, so theirs are.
+RENDER_EXISTING="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set secrets.existingSecretName=aw-test-secrets --set postgres.existingCredentialsSecret=true)"
+secret_ref() {  # secret_ref <component> <KEY> <optional:yes|no>
+  local block
+  block="$(grep -A5 "name: $2\$" <<< "$(component_deploy "$RENDER_EXISTING" "$1")" || true)"
+  if grep -q 'name: aw-test-secrets' <<< "$block" && grep -q "key: $2\$" <<< "$block"; then
+    echo "  OK: $1 $2 from secretKeyRef aw-test-secrets/$2"
+  else
+    echo "  FAIL: $1 $2 is not a secretKeyRef to existingSecretName"; fail=1
+  fi
+  if [ "$3" = yes ] && ! grep -q 'optional: true' <<< "$block"; then
+    echo "  FAIL: $1 $2 reference should be optional"; fail=1
+  elif [ "$3" = no ] && grep -q 'optional: true' <<< "$block"; then
+    echo "  FAIL: $1 $2 reference must not be optional (the service refuses to boot without it)"; fail=1
+  fi
+}
+secret_ref gateway GATEWAY_IDENTITY_KEYS no
+secret_ref gateway GATEWAY_IDENTITY_ACTIVE_KEY no
+for comp in meeting-api admin-api; do
+  for key in GATEWAY_IDENTITY_KEYS WEBHOOK_SECRET_ENC_KEYS WEBHOOK_SECRET_ENC_ACTIVE_KEY; do
+    secret_ref "$comp" "$key" yes
+  done
+done
+# With both Secrets pre-created (the aw-bots shape) the chart renders no Secret at all.
+if grep -qE '^kind: Secret' <<< "$RENDER_EXISTING"; then
+  echo "  FAIL: a Secret rendered with existingSecretName + existingCredentialsSecret set"; fail=1
+else
+  echo "  OK: no Secret rendered with existingSecretName + existingCredentialsSecret set"
+fi
+# Without existingSecretName the chart-managed Secret supplies GATEWAY_IDENTITY_KEYS and
+# GATEWAY_IDENTITY_ACTIVE_KEY from secrets.gatewayIdentityKeys / secrets.gatewayIdentityActiveKey
+# (required, like internalApiSecret) and the gateway reads both from there; the webhook key ring
+# is never in it (the services switch webhooks off without it).
+if grep -qxF '  GATEWAY_IDENTITY_KEYS: "{\"render-test\": \"aGVsbS1yZW5kZXItdGVzdC1pZGVudGl0eS1vbmx5ISE=\"}"' <<< "$RENDER" \
+    && grep -qxF '  GATEWAY_IDENTITY_ACTIVE_KEY: "render-test"' <<< "$RENDER"; then
+  echo "  OK: the chart-managed Secret carries the identity ring and its active kid"
+else
+  echo "  FAIL: the chart-managed Secret does not carry the identity ring and its active kid"; fail=1
+fi
+for key in GATEWAY_IDENTITY_KEYS GATEWAY_IDENTITY_ACTIVE_KEY; do
+  if grep -A5 "name: $key\$" <<< "$(component_deploy "$RENDER" gateway)" | grep -q 'name: vexa-vexa-secrets'; then
+    echo "  OK: gateway reads $key from the chart-managed Secret"
+  else
+    echo "  FAIL: gateway does not read $key from the chart-managed Secret"; fail=1
+  fi
+done
+if grep -qE '^  GATEWAY_IDENTITY_SECRET:' <<< "$RENDER"; then
+  echo "  FAIL: the chart-managed Secret still carries GATEWAY_IDENTITY_SECRET"; fail=1
+else
+  echo "  OK: the chart-managed Secret carries no GATEWAY_IDENTITY_SECRET"
+fi
+if grep -qE '^  (WEBHOOK_SECRET_ENC_KEYS|WEBHOOK_SECRET_ENC_ACTIVE_KEY):' <<< "$RENDER"; then
+  echo "  FAIL: the chart-managed Secret carries a webhook key-ring key"; fail=1
+else
+  echo "  OK: the chart-managed Secret carries no webhook key-ring key"
+fi
+for value in gatewayIdentityKeys gatewayIdentityActiveKey; do
+  if NO_IDENTITY="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+      --set "secrets.$value=" 2>&1)"; then
+    echo "  FAIL: the chart-managed Secret rendered without secrets.$value"; fail=1
+  elif grep -q "secrets.$value is required" <<< "$NO_IDENTITY"; then
+    echo "  OK: the chart-managed Secret refuses to render without secrets.$value"
+  else
+    echo "  FAIL: render without secrets.$value failed for another reason"; fail=1
+  fi
+done
+
+# Per-service pod annotations (meetingApi/adminApi.podAnnotations) merge over
+# global.podAnnotations; the per-service key wins, the global-only key stays, other services keep
+# the global map alone. Empty by default.
+for comp in meeting-api admin-api; do
+  if grep -A1 '^      annotations:' <<< "$(component_deploy "$RENDER" "$comp")" | grep -qx '        {}'; then
+    echo "  OK: $comp pod annotations empty by default"
+  else
+    echo "  FAIL: $comp pod annotations not empty by default"; fail=1
+  fi
+done
+RENDER_ANN="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set-string 'global.podAnnotations.prometheus\.io/scrape=false' \
+  --set-string 'global.podAnnotations.team=platform' \
+  --set-string 'meetingApi.podAnnotations.prometheus\.io/scrape=true' \
+  --set-string 'meetingApi.podAnnotations.prometheus\.io/port=8080' \
+  --set-string 'adminApi.podAnnotations.prometheus\.io/scrape=true')"
+pod_ann() { awk '/^      annotations:/{p=1;next} p&&/^    spec:/{exit} p' <<< "$(component_deploy "$RENDER_ANN" "$1")"; }
+for check in \
+  'meeting-api|prometheus.io/scrape: "true"' \
+  'meeting-api|prometheus.io/port: "8080"' \
+  'meeting-api|team: platform' \
+  'admin-api|prometheus.io/scrape: "true"' \
+  'admin-api|team: platform' \
+  'gateway|prometheus.io/scrape: "false"' ; do
+  comp="${check%%|*}"; line="${check##*|}"
+  if grep -qF "$line" <<< "$(pod_ann "$comp")"; then
+    echo "  OK: $comp pod annotation $line"
+  else
+    echo "  FAIL: $comp pod annotation missing $line"; fail=1
+  fi
+done
+if grep -qF 'prometheus.io/scrape: "false"' <<< "$(pod_ann meeting-api)"; then
+  echo "  FAIL: global.podAnnotations overrode meetingApi.podAnnotations"; fail=1
+fi
+
+# The gateway and admin-api images are overridable the way meeting-api's is.
+RENDER_IMG="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set gateway.image.repository=reg.example/gw --set gateway.image.tag=t1 \
+  --set adminApi.image.repository=reg.example/admin --set adminApi.image.tag=t2)"
+for pair in 'gateway|image: "reg.example/gw:t1"' 'admin-api|image: "reg.example/admin:t2"'; do
+  if grep -qF "${pair##*|}" <<< "$(component_deploy "$RENDER_IMG" "${pair%%|*}")"; then
+    echo "  OK: ${pair%%|*} ${pair##*|}"
+  else
+    echo "  FAIL: ${pair%%|*} image override did not render ${pair##*|}"; fail=1
+  fi
+done
 
 [ "$fail" -eq 0 ] && { echo "gate:helm PASS"; exit 0; } || { echo "gate:helm FAIL"; exit 1; }

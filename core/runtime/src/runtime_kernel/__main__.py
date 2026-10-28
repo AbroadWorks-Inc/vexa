@@ -126,6 +126,28 @@ def _kernel_grace_sec() -> float:
     return backend_grace + 5.0
 
 
+def _start_exited_pod_reaper(runtime) -> None:
+    """Delete Succeeded and Failed bot pods so a meeting node can scale to zero.
+
+    Boot already ran one pass, after adopt. This loop sleeps first so that pass
+    is not repeated immediately. The thread is a daemon so shutdown is not blocked.
+    """
+    if not hasattr(runtime.backend, "reap_exited"):
+        return
+
+    def _loop() -> None:
+        while True:
+            time.sleep(30)
+            try:
+                removed = runtime.reap_exited_workloads()
+                if removed:
+                    logger.info("removed %d exited workload pod(s)", removed)
+            except Exception as exc:  # noqa: BLE001 — one bad pass must not stop the loop
+                logger.warning("exited-pod reaper failed: %s", exc)
+
+    threading.Thread(target=_loop, name="exited-pod-reaper", daemon=True).start()
+
+
 def build_production_app():
     """Wire the runtime API with the env-selected spawn backend + the env-driven profile registry,
     plus the durable cron scheduler (REDIS_URL) with a background tick loop."""
@@ -179,6 +201,16 @@ def build_production_app():
             )
     except Exception as e:  # noqa: BLE001 — adoption is a boot aid; it must never block the boot
         logger.warning("workload re-adoption failed: %s", e)
+    # After adopt, so a restarted runtime records the real exit before the pod object
+    # is deleted. A Failed pod and a Succeeded pod both keep the meeting node up.
+    if hasattr(backend, "reap_exited"):
+        try:
+            removed = runtime.reap_exited_workloads()
+            if removed:
+                logger.info("removed %d exited workload pod(s)", removed)
+        except Exception as e:  # noqa: BLE001 — reaping is a boot aid; it must never block the boot
+            logger.warning("exited-pod reaper failed: %s", e)
+        _start_exited_pod_reaper(runtime)
     return create_app(runtime, scheduler=scheduler)
 
 

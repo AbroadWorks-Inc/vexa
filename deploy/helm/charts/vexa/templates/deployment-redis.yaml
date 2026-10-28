@@ -23,6 +23,7 @@ spec:
     spec:
       # v0.10.5 Pack I.s — stateful-pod anti-affinity (#272 iter-5).
       # See deployment-minio.yaml header for the full rationale.
+      {{- if .Values.statefulAntiAffinity }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -34,6 +35,7 @@ spec:
                       operator: In
                       values: [postgres, minio, tts-service]
                 topologyKey: kubernetes.io/hostname
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

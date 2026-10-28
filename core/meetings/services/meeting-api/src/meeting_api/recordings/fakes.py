@@ -11,7 +11,8 @@ in-process.
 """
 from __future__ import annotations
 
-from typing import Optional
+import builtins
+from typing import AsyncIterator, Optional
 
 
 class InMemoryStorage:
@@ -33,6 +34,12 @@ class InMemoryStorage:
         self._clock += 1.0
         self.mtimes[key] = self._clock
 
+    async def upload_stream(
+        self, key: str, pieces: AsyncIterator[bytes], *, content_type: str
+    ) -> None:
+        data = b"".join([piece async for piece in pieces])
+        await self.upload(key, data, content_type=content_type)
+
     def touch(self, key: str, when: float) -> None:
         """Set an object's mtime (epoch seconds) so a test can order tapes by age explicitly."""
         self.mtimes[key] = when
@@ -40,7 +47,7 @@ class InMemoryStorage:
     async def list(self, prefix: str) -> list[str]:
         return sorted(k for k in self.blobs if k.startswith(prefix))
 
-    async def list_detailed(self, prefix: str) -> list[dict]:
+    async def list_detailed(self, prefix: str) -> builtins.list[dict]:
         return [
             {"key": k, "size": len(self.blobs[k]), "last_modified": self.mtimes.get(k, 0.0)}
             for k in sorted(self.blobs)

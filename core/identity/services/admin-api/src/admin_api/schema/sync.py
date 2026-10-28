@@ -95,11 +95,12 @@ def _sync_indexes(conn: Connection, base):
 
     A non-unique index is a performance hint: losing one degrades latency, nothing else, so a
     failed CREATE stays tolerated at DEBUG. A UNIQUE index is an *invariant the application code
-    relies on* — ``uq_meeting_active_user_platform_native`` is the documented DB backstop for the
-    one-bot-per-room spawn guard (meeting-api ``bot_spawn/adapters.py``). Logging that one and
-    continuing produced exactly the failure #1186 records: the index never existed in production
-    because 4 stale duplicate rows blocked it, every restart re-attempted and re-swallowed it, and
-    the WARNING log-rotated away inside a day while the service reported itself healthy.
+    relies on* — ``uq_meeting_live_user_platform_native`` is the DB backstop for the
+    one-bot-per-room spawn guard (meeting-api ``bot_spawn/adapters.py``). Logging a failed unique
+    index and continuing produced exactly the failure #1186 records: the dedup index never existed
+    in production because 4 stale duplicate rows blocked it, every restart re-attempted and
+    re-swallowed it, and the WARNING log-rotated away inside a day while the service reported
+    itself healthy.
 
     So a unique-index failure now raises ``SchemaInvariantError``, which aborts ``ensure_schema``
     and therefore the admin-api startup hook — the process never binds, /health never answers, the

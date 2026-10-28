@@ -171,6 +171,67 @@ async function main(): Promise<void> {
     check('timeout: completion_reason=awaiting_admission_timeout', last(lc.events).completion_reason === 'awaiting_admission_timeout');
   }
 
+  // ── P11: `needs_help` before any lobby (Zoom's automated-bot wall) reaches the control plane ──
+  // `joining → needs_help` used to be refused by the bot's own machine, so the report was logged
+  // ("illegal transition joining → needs_help") and never sent. The stage stays `joining`: the bot
+  // never stood in a waiting room. A `blocked` verdict is a refusal, filed like a denial (D7).
+  {
+    const lc = recordingSink();
+    const wall: JoinDriver = {
+      async join(report) { await report('needs_help'); return { outcome: 'blocked', reason: "join ended in state 'blocked' without admission" }; },
+      onRemoval() { return () => { /* */ }; }, async leave() { /* */ }, async withdraw() { /* */ },
+    };
+    const res = await createOrchestrator(inv({ platform: 'zoom' }), { lifecycle: lc, join: wall, pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness() }).run();
+    check('pre-lobby needs_help: reported (joining→needs_help→failed)',
+      JSON.stringify(seq(lc.events)) === JSON.stringify(['joining', 'needs_help', 'failed']), JSON.stringify(seq(lc.events)));
+    check('pre-lobby needs_help: failure_stage=joining (never reached the lobby)', last(lc.events).failure_stage === 'joining', String(last(lc.events).failure_stage));
+    check('blocked (D7): completion_reason=awaiting_admission_rejected (not retried)', res.completionReason === 'awaiting_admission_rejected' && last(lc.events).completion_reason === 'awaiting_admission_rejected', String(last(lc.events).completion_reason));
+    check('pre-lobby needs_help: sequence legal + conforms', allLegal(seq(lc.events)) && allConform(lc.events), ajv.errorsText(validateLifecycle.errors));
+  }
+
+  // ── P11: a consent gate clears and the bot reaches the lobby: needs_help → awaiting_admission ──
+  {
+    const lc = recordingSink();
+    const gate: JoinDriver = {
+      async join(report) { await report('needs_help'); await report('awaiting_admission'); return 'timeout'; },
+      onRemoval() { return () => { /* */ }; }, async leave() { /* */ }, async withdraw() { /* */ },
+    };
+    await createOrchestrator(inv(), { lifecycle: lc, join: gate, pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness() }).run();
+    check('consent gate: joining→needs_help→awaiting_admission→failed',
+      JSON.stringify(seq(lc.events)) === JSON.stringify(['joining', 'needs_help', 'awaiting_admission', 'failed']), JSON.stringify(seq(lc.events)));
+    check('consent gate: failure_stage=awaiting_admission', last(lc.events).failure_stage === 'awaiting_admission', String(last(lc.events).failure_stage));
+  }
+
+  // ── a raw throw after the lobby: the stage is where the bot got to, not a fixed `joining` ──
+  {
+    const lc = recordingSink();
+    const crash: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); throw new Error('Target page, context or browser has been closed'); },
+      onRemoval() { return () => { /* */ }; }, async leave() { /* */ }, async withdraw() { /* */ },
+    };
+    await createOrchestrator(inv(), { lifecycle: lc, join: crash, pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness() }).run();
+    check('crash in the lobby: failure_stage=awaiting_admission', last(lc.events).failure_stage === 'awaiting_admission', String(last(lc.events).failure_stage));
+    check('crash in the lobby: the evidence names the lobby stage too', last(lc.events).join_evidence?.stage === 'awaiting_admission', JSON.stringify(last(lc.events).join_evidence));
+  }
+
+  // ── a stop while escalated: the stage names the lobby only if the bot stood in it ──
+  for (const [label, reports, expected] of [
+    ['stop in needs_help after the lobby', ['awaiting_admission', 'needs_help'], 'awaiting_admission'],
+    ['stop in needs_help before any lobby', ['needs_help'], 'joining'],
+  ] as const) {
+    const lc = recordingSink();
+    const escalated: JoinDriver = {
+      async join(report) { for (const r of reports) await report(r); return new Promise<JoinOutcome>(() => { /* never resolves */ }); },
+      onRemoval() { return () => { /* */ }; }, async leave() { /* */ }, async withdraw() { /* */ },
+    };
+    const o = createOrchestrator(inv(), { lifecycle: lc, join: escalated, pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness() });
+    const runP = o.run();
+    setTimeout(() => o.stop(), 5);
+    await runP;
+    check(`${label}: needs_help was reported`, seq(lc.events).includes('needs_help'), JSON.stringify(seq(lc.events)));
+    check(`${label}: failure_stage=${expected}`, last(lc.events).failure_stage === expected, String(last(lc.events).failure_stage));
+  }
+
   // ── #926: a non-admitted terminal ALWAYS carries a human `reason` text ──
   // Prod signature: a Zoom bot exited code 1 with reason:None because the non-admitted branch
   // emitted completion_reason but no `reason`, so meeting-api synthesized "Bot exited with code 1;

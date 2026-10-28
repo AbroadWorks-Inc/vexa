@@ -39,6 +39,10 @@ _INTERNAL_DATA_KEYS = frozenset({
     # Internal rating input. Consumers receive only the privacy-safe, frozen
     # `service_provenance` projection assembled at terminal finalization.
     "transcription_provider",
+    # The bot retry's bookkeeping (§6.9 F-K2): intake.retry.MARKER, bot_spawn.ports.SPAWN_SESSION
+    # and bot_spawn.ports.UNPROVEN_TEARDOWN, and the finish's (§6.9 F-FIN):
+    # bot_spawn.ports.FINISHED_END. They name workloads and sessions.
+    "bot_retry", "spawn_session", "unproven_teardown", "finished_end",
 })
 
 

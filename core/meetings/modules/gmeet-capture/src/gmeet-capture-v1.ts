@@ -17,7 +17,7 @@
  * `sink` to its in-process CaptureV1Sink; the extension wires `sink` to the WS
  * codec (encodeAudioFrame now carries speakerName). Same module, two services.
  */
-import { createGmeetCapture, type GmeetCaptureOptions } from './gmeet-capture.js';
+import { createGmeetCapture, type GmeetCaptureOptions, type GmeetChannelRef } from './gmeet-capture.js';
 import { createGmeetSpeakers } from './gmeet-speakers.js';
 import type { CaptureV1Sink } from '@vexa/capture-codec';   // capture.v1 SSOT (model + codec)
 
@@ -40,6 +40,8 @@ export interface GmeetCaptureV1 {
   stop(): void;
   /** Number of currently-connected participant streams. */
   streamCount(): number;
+  /** The underlying capture's stream id → channel number. */
+  channels(): GmeetChannelRef[];
 }
 
 /**
@@ -80,5 +82,6 @@ export function createGmeetCaptureV1(opts: GmeetCaptureV1Options): GmeetCaptureV
     start: () => capture.start(),
     stop: () => { capture.stop(); speakers.destroy(); },
     streamCount: () => capture.streamCount(),
+    channels: () => capture.channels(),
   };
 }

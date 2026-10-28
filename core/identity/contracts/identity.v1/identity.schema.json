@@ -5,8 +5,8 @@
   "description": "The identity contract: a scoped API token (subject + scopes + expiry, derived from the admin-api APIToken/`/internal/validate` shape) and an access decision (the canAccess verdict over a resource). Auth itself is transport-layer; these are the data shapes the identity core mints, validates, and decides over.",
   "$defs": {
     "Scope": {
-      "description": "A capability a token carries. Mirrors admin-models VALID_SCOPES: bot (spawn/control bots), tx (read transcripts), browser (browser sessions).",
-      "enum": ["bot", "tx", "browser"]
+      "description": "A capability a token carries. Mirrors admin-models VALID_SCOPES: bot (spawn/control bots), tx (read transcripts), browser (browser sessions), and the least-privilege webhooks (manage webhook subscriptions), erase (erase a finished meeting's data) and export (report an export result).",
+      "enum": ["bot", "tx", "browser", "webhooks", "erase", "export"]
     },
     "ResourceKind": {
       "description": "The kind of resource an access decision is made over. The three guarded read paths: a meeting's transcript, a recording, and the WS subscribe / agent read.",

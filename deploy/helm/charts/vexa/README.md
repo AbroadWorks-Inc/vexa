@@ -21,7 +21,9 @@ runtime · agent-api**, the **terminal** web UI, and infra (`postgres` · `redis
 helm upgrade --install vexa . -n vexa --create-namespace \
   --set global.imageTag=YYMMDD-HHMM \
   --set secrets.adminApiToken=$ADMIN_TOKEN \
-  --set secrets.internalApiSecret=$INTERNAL_API_SECRET
+  --set secrets.internalApiSecret=$INTERNAL_API_SECRET \
+  --set-file secrets.gatewayIdentityKeys=gateway-identity-ring.json \
+  --set secrets.gatewayIdentityActiveKey=$GATEWAY_IDENTITY_ACTIVE_KEY
 ```
 
 See [`../../README.md`](../../README.md) for the cookbook (local k3s smoke, managed backing,

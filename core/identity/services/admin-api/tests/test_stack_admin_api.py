@@ -22,6 +22,7 @@ from admin_api.schema.models import Base
 from admin_api.schema.sync import ensure_schema_sync
 
 from conftest import requires_docker
+from gateway_identity import via_gateway
 
 pytestmark = requires_docker
 
@@ -53,7 +54,7 @@ def client(pg_url, pg_async_url, monkeypatch):
 
     app_db.configure(pg_async_url)
     app = create_app()
-    with TestClient(app) as c:
+    with TestClient(via_gateway(app)) as c:
         yield c
 
     _dispose_async_engine()
@@ -93,14 +94,14 @@ def test_golden_identity_flow(client):
     assert set(tok["scopes"]) == {"bot", "tx"}
 
     # 2b. set a webhook (user tier — writes user.data JSONB)
-    r = client.put("/user/webhook", headers={"X-API-Key": token_value},
+    r = client.put("/user/webhook", headers={"X-API-Key": token_value, "x-user-id": str(user_id)},
                    json={"webhook_url": "https://example.com/hook",
                          "webhook_secret": "shh",
                          "webhook_events": {"meeting.completed": True}})
     assert r.status_code == 200, r.text
 
     # 2c. read the config back (self-serve GET) — the secret is MASKED, never in the clear
-    r = client.get("/user/webhook", headers={"X-API-Key": token_value})
+    r = client.get("/user/webhook", headers={"X-API-Key": token_value, "x-user-id": str(user_id)})
     assert r.status_code == 200, r.text
     cfg = r.json()
     assert cfg["webhook_url"] == "https://example.com/hook"
@@ -167,7 +168,7 @@ def test_admin_get_user_by_id_is_exact_side_effect_free_and_authenticated(client
     ).json()["token"]
     updated = client.put(
         "/user/webhook",
-        headers={"X-API-Key": token},
+        headers={"X-API-Key": token, "x-user-id": str(created["id"])},
         json={
             "webhook_url": "https://example.com/by-id",
             "webhook_secret": "never-return-this",
@@ -221,7 +222,7 @@ def test_admin_patch_user_merges_entitlement_without_erasing_private_data(client
     ).json()["token"]
     webhook = client.put(
         "/user/webhook",
-        headers={"X-API-Key": token},
+        headers={"X-API-Key": token, "x-user-id": str(user_id)},
         json={
             "webhook_url": "https://example.com/entitlement",
             "webhook_secret": "private-hook-secret",
@@ -399,7 +400,7 @@ def test_user_webhook_serializes_with_concurrent_platform_billing_update(
             future = pool.submit(
                 client.put,
                 "/user/webhook",
-                headers={"X-API-Key": token_value},
+                headers={"X-API-Key": token_value, "x-user-id": str(user_id)},
                 json={
                     "webhook_url": "https://example.com/user-settings",
                     "webhook_secret": "test-webhook-secret",
@@ -455,7 +456,7 @@ def test_user_webhook_serializes_with_concurrent_platform_billing_update(
     }
     masked = client.get(
         "/user/webhook",
-        headers={"X-API-Key": token_value},
+        headers={"X-API-Key": token_value, "x-user-id": str(user_id)},
     )
     assert masked.status_code == 200, masked.text
     assert masked.json() == {

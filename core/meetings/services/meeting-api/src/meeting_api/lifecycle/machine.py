@@ -59,8 +59,8 @@ def dominant_completion_reason(reason: Any, *, stop_requested: bool) -> Any:
     A stop that loses a race still ends the run, and the row must record WHY THE USER ENDED IT, not
     whichever fault the race happened to reach first. Witnessed on stage rev 193 (row 26313): a
     DELETE landed 0.4s after the POST, the bot was torn down before it could join, and the terminal
-    was written ``join_failure`` — a reason ``retry.py`` classes TRANSIENT, so the occurrence stayed
-    eligible for re-dispatch while ``data.stop_requested`` was true the whole time. The reason is the
+    was written ``join_failure`` — a reason that is retried (not in ``intake.retry.NOT_RETRIED``), so
+    the occurrence stayed eligible for re-dispatch while ``data.stop_requested`` was true the whole time. The reason is the
     user's intent; the race is an accident of scheduling and has no business overwriting it.
 
     Founder ruling 2026-08-17: *"explicit stop must be stop, evict."*
@@ -113,13 +113,19 @@ class TransitionSource(str, Enum):
 # status is `joining`, so that is the machine's de-facto entry.
 LEGAL_TRANSITIONS: Dict[Optional[BotStatus], frozenset[BotStatus]] = {
     None: frozenset({BotStatus.JOINING}),  # initial: a record's first event must be `joining`
+    # `needs_help` from `joining`: a blocker met before any waiting room (Zoom's "automated bots
+    # aren't allowed" RTMS wall, a captcha, a consent gate) escalates instead of being refused (#1251).
     BotStatus.JOINING: frozenset(
-        {BotStatus.AWAITING_ADMISSION, BotStatus.ACTIVE, BotStatus.FAILED}
+        {BotStatus.AWAITING_ADMISSION, BotStatus.NEEDS_HELP, BotStatus.ACTIVE, BotStatus.FAILED}
     ),
     BotStatus.AWAITING_ADMISSION: frozenset(
         {BotStatus.ACTIVE, BotStatus.NEEDS_HELP, BotStatus.FAILED}
     ),
-    BotStatus.NEEDS_HELP: frozenset({BotStatus.ACTIVE, BotStatus.FAILED}),
+    # `needs_help -> awaiting_admission`: the blocker cleared (a consent gate answered) and the bot
+    # reached the waiting room. The bot's `LIFECYCLE_TRANSITIONS` (contracts.ts) is the same table.
+    BotStatus.NEEDS_HELP: frozenset(
+        {BotStatus.AWAITING_ADMISSION, BotStatus.ACTIVE, BotStatus.FAILED}
+    ),
     BotStatus.ACTIVE: frozenset({BotStatus.COMPLETED, BotStatus.FAILED}),
     BotStatus.COMPLETED: frozenset(),  # terminal
     BotStatus.FAILED: frozenset(),  # terminal
@@ -159,6 +165,57 @@ def bot_status_from_persisted(status: Optional[str]) -> Optional[BotStatus]:
     if status is None:
         return None
     return _PERSISTED_STATUS_TO_BOTSTATUS.get(status)
+
+def persisted_statuses_for(status: Optional[BotStatus]) -> frozenset:
+    """The persisted meeting statuses the FSM reads as `status` (the inverse of
+    `bot_status_from_persisted`): an FSM edge's `from`, as the statuses the row may hold."""
+    return frozenset(s for s, b in _PERSISTED_STATUS_TO_BOTSTATUS.items() if b == status)
+
+
+# The persisted statuses only the bot's own reports move: its non-terminal `BotStatus` values.
+# The server moves a row in any other status (`requested`, `stopping`, `completed`, `failed`), so a
+# bot report it refuses is not retried.
+LIVE_BOT_STATUSES = frozenset(s.value for s in BotStatus if s not in _TERMINAL)
+
+
+def _reachable(src: Optional[BotStatus], dst: BotStatus) -> bool:
+    """True when `dst` is a later state on some legal path out of `src`."""
+    seen: set[Optional[BotStatus]] = set()
+    stack: list[Optional[BotStatus]] = [src]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        for nxt in LEGAL_TRANSITIONS.get(cur, frozenset()):
+            if nxt == dst:
+                return True
+            if nxt not in seen:
+                stack.append(nxt)
+    return False
+
+
+def durable_status_repairs_edge(
+    local: Optional[BotStatus], durable: Optional[str], target: BotStatus
+) -> bool:
+    """Whether a refused status write should be applied again from the stored row.
+
+    Each meeting-api replica keeps its own record. A replica that last saw
+    `joining` accepts `active` without re-reading, then the write names only
+    `joining`. A row another replica already moved to `awaiting_admission`
+    refuses that write. Re-apply when the stored status is ahead of `local` and
+    the event is legal from it.
+
+    `stopping` maps to ACTIVE, so it counts as ahead of `joining`, but the only
+    repair from a stop is a no-op when the event is already `active`. A `failed`
+    report must not close a stop from here.
+    """
+    mapped = bot_status_from_persisted(durable)
+    if mapped is None or mapped == local or not _reachable(local, mapped):
+        return False
+    if durable == "stopping":
+        return mapped == target
+    return mapped == target or can_transition(mapped, target)
 
 # Stage a record was in maps to the FailureStage to record if it terminates `failed`.
 # (Mirrors the parent's `_failure_stage_from_status`: derive server-side from current
@@ -375,6 +432,10 @@ class MeetingStore:
             self._records[connection_id] = rec
         return rec
 
+    def forget(self, connection_id: str) -> None:
+        """Drop the record, so the next event for it is applied from the stored row."""
+        self._records.pop(connection_id, None)
+
     def rehydrate(
         self,
         connection_id: str,
@@ -413,6 +474,19 @@ class MeetingStore:
                     rec.status_transition = [
                         dict(entry) for entry in trail if isinstance(entry, dict)
                     ]
+                    # `history` answers "did the bot reach the lobby?" for the failure stage and
+                    # the join evidence. Another replica may have stored the lobby, so it is the
+                    # stored trail's statuses, not this process's own.
+                    rec.history = [
+                        status
+                        for status in (
+                            bot_status_from_persisted(entry.get("to"))
+                            for entry in rec.status_transition
+                        )
+                        if status is not None
+                    ]
+            if seeded is not None and (not rec.history or rec.history[-1] is not seeded):
+                rec.history.append(seeded)
         return rec
 
     def __len__(self) -> int:  # pragma: no cover - trivial
@@ -559,8 +633,11 @@ class LifecycleSink:
         if to is BotStatus.COMPLETED:
             rec.completion_reason = self._terminal_reason(rec, event)
         elif to is BotStatus.FAILED:
-            # FM-003: derive failure_stage from the stage we were IN, not the payload.
+            # FM-003: derive failure_stage from the stage we were IN, not the payload. `needs_help`
+            # entered from `joining` is a pre-lobby blocker: its stage is `joining`, never the lobby.
             rec.failure_stage = _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)
+            if frm is BotStatus.NEEDS_HELP and BotStatus.AWAITING_ADMISSION not in rec.history:
+                rec.failure_stage = FailureStage.JOINING
             rec.completion_reason = self._terminal_reason(rec, event)
             # The parent builds an `error_details` string on a failed exit when none supplied.
             if rec.error_details is None and (rec.exit_code is not None or rec.reason):

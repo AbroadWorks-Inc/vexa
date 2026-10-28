@@ -74,11 +74,14 @@ export interface LifecycleEvent {
   };
 }
 
-/** The legal transitions — the machine the bot MUST obey (lifecycle.v1/README.md). */
+/** The legal transitions — the machine the bot MUST obey (lifecycle.v1/README.md). `needs_help`
+ *  is entered from `joining` when a blocker stands before any waiting room (Zoom's automated-bot
+ *  wall, a consent gate), and leaves for `awaiting_admission` when the blocker clears and the bot
+ *  reaches the lobby. meeting-api's `LEGAL_TRANSITIONS` is the same table. */
 export const LIFECYCLE_TRANSITIONS: Record<BotStatus, readonly BotStatus[]> = {
-  joining: ['awaiting_admission', 'active', 'failed'],
+  joining: ['awaiting_admission', 'needs_help', 'active', 'failed'],
   awaiting_admission: ['active', 'needs_help', 'failed'],
-  needs_help: ['active', 'failed'],
+  needs_help: ['awaiting_admission', 'active', 'failed'],
   active: ['completed', 'failed'],
   completed: [],
   failed: [],

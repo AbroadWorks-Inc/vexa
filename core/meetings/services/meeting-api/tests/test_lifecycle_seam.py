@@ -35,7 +35,10 @@ from meeting_api.lifecycle.machine import (
     LifecycleSink,
     MeetingStore,
     can_transition,
+    durable_status_repairs_edge,
 )
+from gateway_identity import via_gateway
+from internal_callers import BOT, runtime_callback
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
 
@@ -98,7 +101,7 @@ def _seed(repo: InMemoryMeetingRepo, *, status: str, session_uid: str = "sess-ui
 
 
 def _post(client: TestClient, **event):
-    return client.post(ENDPOINT, json=event)
+    return client.post(ENDPOINT, headers=BOT, json=event)
 
 
 def _drive_to(client: TestClient, target: str, *, connection_id: str = "c") -> None:
@@ -292,20 +295,19 @@ def test_rehydration_requested_then_skip_joining_is_409():
     assert r.json()["from"] is None and r.json()["to"] == "active"
 
 
-def test_rehydration_in_memory_record_wins_over_stale_db():
-    """A live in-process record (already advanced) must NOT be overwritten by a staler DB read:
-    drive joining→active in-process, then flip the DB BACK to `joining`; the next `completed` must
-    still succeed (the in-memory ACTIVE is the source of truth, not the stale DB `joining`)."""
+def test_a_row_behind_the_record_is_not_walked_forward_from_memory():
+    """The in-process record says `active` but the row says `joining`. `completed` is not
+    applied from the record's memory: the row keeps `joining` and the bot is told it was not
+    stored."""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
     assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
     assert _post(client, connection_id="sess-uid", status="active").status_code == 200
-    # Simulate a stale DB read regressing to joining (it shouldn't reseed the live record).
     repo.set_status(m["id"], "joining")
     r = _post(client, connection_id="sess-uid", status="completed", exit_code=0, completion_reason="stopped")
-    assert r.status_code == 200, r.text
-    assert r.json()["meeting_status"] == "completed"
+    assert r.status_code == 409, r.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "joining"
 
 
 def test_illegal_local_edge_refreshes_newer_db_state_from_another_replica():
@@ -330,6 +332,220 @@ def test_illegal_local_edge_refreshes_newer_db_state_from_another_replica():
     assert response.json()["meeting_status"] == "completed"
 
 
+def test_legal_local_edge_adopts_a_later_status_from_another_replica():
+    """A replica stuck at `joining` is given `active` after another replica stored
+    `awaiting_admission`. `joining` → `active` looks legal, so the illegal-edge
+    refresh does not run, and a write that names only `joining` is refused. The
+    event is applied again from the stored status, and the meeting becomes active."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    app = create_app(meeting_repo=repo)
+    client = TestClient(app)
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], "awaiting_admission")
+
+    response = _post(client, connection_id="sess-uid", status="active")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["meeting_status"] == "active"
+    assert response.json()["status_transition"][-1]["from"] == "awaiting_admission"
+    assert response.json()["status_transition"][-1]["to"] == "active"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+    active = [
+        env["data"]["status_change"]
+        for env in app.state.status_change_webhooks
+        if env["data"]["status_change"]["new_status"] == "active"
+    ]
+    assert active == [{"old_status": "awaiting_admission", "new_status": "active",
+                       "reason": None, "transition_source": "bot_callback"}]
+
+    done = _post(
+        client, connection_id="sess-uid", status="completed",
+        exit_code=0, completion_reason="left_alone",
+    )
+    assert done.status_code == 200, done.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "completed"
+
+
+@pytest.mark.parametrize("stored_trail", [True, False], ids=["trail", "status-only"])
+def test_a_lobby_stored_by_another_replica_decides_the_failure_stage(stored_trail):
+    """A replica that last saw `joining` takes `needs_help` (legal locally) after another replica
+    stored `awaiting_admission`. The write is refused and repaired from the row; the bot's later
+    `failed` must still be filed at the lobby — not `joining` / never reached the lobby, which
+    would move a host's lobby outcome into our own system-fault count."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], "awaiting_admission")
+    if stored_trail:
+        repo._meetings[meeting["id"]]["data"].setdefault("status_transition", []).append(
+            {"from": "joining", "to": "awaiting_admission", "source": "bot_callback"}
+        )
+
+    assert _post(client, connection_id="sess-uid", status="needs_help").status_code == 200
+    failed = _post(
+        client, connection_id="sess-uid", status="failed",
+        exit_code=1, completion_reason="awaiting_admission_timeout",
+    )
+
+    assert failed.status_code == 200, failed.text
+    data = repo._meetings[meeting["id"]]["data"]
+    assert data["failure_stage"] == "awaiting_admission"
+    assert data["join_evidence"]["reason"] != "never_reached_lobby"
+
+
+def test_legal_local_edge_does_not_overwrite_a_stop():
+    """A replica that last saw `joining` must not move a meeting another replica
+    already moved to `stopping`. `active` is a no-op against that row. `failed`
+    is refused and is not applied again from the stop."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], "stopping")
+
+    active = _post(client, connection_id="sess-uid", status="active")
+    assert active.status_code == 200, active.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "stopping"
+
+    fresh = InMemoryMeetingRepo()
+    stopped = _seed(fresh, status="requested")
+    other = TestClient(create_app(meeting_repo=fresh))
+    assert _post(other, connection_id="sess-uid", status="joining").status_code == 200
+    fresh.set_status(stopped["id"], "stopping")
+    failed = _post(
+        other, connection_id="sess-uid", status="failed",
+        exit_code=1, completion_reason="join_failure",
+    )
+    assert failed.status_code == 200, failed.text
+    assert asyncio.run(fresh.get_status_by_session(session_uid="sess-uid")) == "stopping"
+
+
+def test_durable_status_repairs_only_an_ahead_row():
+    assert durable_status_repairs_edge(
+        BotStatus.JOINING, "awaiting_admission", BotStatus.ACTIVE
+    )
+    assert not durable_status_repairs_edge(
+        BotStatus.ACTIVE, "joining", BotStatus.COMPLETED
+    )
+    assert not durable_status_repairs_edge(
+        BotStatus.JOINING, "stopping", BotStatus.FAILED
+    )
+    assert durable_status_repairs_edge(
+        BotStatus.JOINING, "stopping", BotStatus.ACTIVE
+    )
+
+
+class _FlakyRepo(InMemoryMeetingRepo):
+    """Fails the next N status writes / state reads, as a database blip would."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_writes = 0
+        self.fail_reads = 0
+
+    async def update_meeting_status(self, **kw):
+        if self.fail_writes:
+            self.fail_writes -= 1
+            raise RuntimeError("db blip")
+        return await super().update_meeting_status(**kw)
+
+    async def get_lifecycle_state_by_session(self, *, session_uid):
+        if self.fail_reads:
+            self.fail_reads -= 1
+            raise RuntimeError("db blip")
+        return await super().get_lifecycle_state_by_session(session_uid=session_uid)
+
+
+def test_a_status_the_row_did_not_take_is_answered_409_and_lands_on_retry():
+    """The `active` write fails and the row still says `joining`. The bot is told (409),
+    sends `active` again, and the row becomes `active`."""
+    repo = _FlakyRepo()
+    _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+
+    repo.fail_writes = 1
+    first = _post(client, connection_id="sess-uid", status="active")
+    assert first.status_code == 409, first.text
+    assert first.json()["stored"] == "joining" and first.json()["to"] == "active"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "joining"
+
+    retry = _post(client, connection_id="sess-uid", status="active")
+    assert retry.status_code == 200, retry.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+
+
+def test_completed_on_a_row_that_never_stored_active_is_409():
+    """`active` was not stored, so the row is still in the lobby when `completed` comes.
+    `completed` is not stored either, and the bot is told."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    assert _post(client, connection_id="sess-uid", status="active").status_code == 200
+    repo.set_status(meeting["id"], "awaiting_admission")
+
+    done = _post(
+        client, connection_id="sess-uid", status="completed",
+        exit_code=0, completion_reason="left_alone",
+    )
+    assert done.status_code == 409, done.text
+    assert done.json()["stored"] == "awaiting_admission"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "awaiting_admission"
+
+
+def test_an_unreadable_row_answers_503_and_the_retry_lands():
+    repo = _FlakyRepo()
+    _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+
+    repo.fail_writes, repo.fail_reads = 1, 2  # the write, the repair read, the stored check
+    r = _post(client, connection_id="sess-uid", status="active")
+    assert r.status_code == 503, r.text
+
+    retry = _post(client, connection_id="sess-uid", status="active")
+    assert retry.status_code == 200, retry.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+
+
+@pytest.mark.parametrize("stored", ["completed", "failed", "requested"])
+def test_a_finished_or_waiting_row_keeps_200(stored):
+    """A row that is finished, or waiting for its next bot, is not the bot's to move:
+    the refusal is answered 200, so the bot does not retry for nothing."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], stored)
+
+    r = _post(client, connection_id="sess-uid", status="active")
+    assert r.status_code == 200, r.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == stored
+
+
+def test_an_unknown_session_keeps_200():
+    client = TestClient(create_app(meeting_repo=InMemoryMeetingRepo()))
+    r = _post(client, connection_id="no-such-session", status="joining")
+    assert r.status_code == 200, r.text
+
+
+def test_a_replaced_session_changes_nothing():
+    """A late report from a session the meeting has replaced is refused by the row,
+    whatever the answer."""
+    repo = InMemoryMeetingRepo()
+    meeting = _seed(repo, status="requested", session_uid="old")
+    client = TestClient(create_app(meeting_repo=repo))
+    assert _post(client, connection_id="old", status="joining").status_code == 200
+    asyncio.run(repo.create_session(meeting_id=meeting["id"], session_uid="new"))
+
+    r = _post(client, connection_id="old", status="active")
+    assert r.status_code in (200, 409), r.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="new")) == "joining"
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ 4. MALFORMED CALLBACKS                                                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
@@ -338,7 +554,7 @@ def test_missing_status_is_422():
     repo = InMemoryMeetingRepo()
     _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid"})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid"})
     assert r.status_code == 422, r.text
     assert "schema violation" in r.json()["detail"]
 
@@ -346,7 +562,7 @@ def test_missing_status_is_422():
 def test_missing_connection_id_is_422():
     repo = InMemoryMeetingRepo()
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"status": "joining"})
+    r = client.post(ENDPOINT, headers=BOT, json={"status": "joining"})
     assert r.status_code == 422, r.text
 
 
@@ -354,7 +570,7 @@ def test_bad_status_enum_is_422():
     repo = InMemoryMeetingRepo()
     _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "bogus"})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "bogus"})
     assert r.status_code == 422, r.text
 
 
@@ -364,7 +580,7 @@ def test_unknown_connection_id_joining_is_accepted_but_not_persisted():
     the current behaviour — the callback does not 404 an unknown session."""
     repo = InMemoryMeetingRepo()  # no meeting/session seeded
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "joining"})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "ghost", "status": "joining"})
     assert r.status_code == 200, r.text
     assert r.json()["meeting_status"] == "joining"
     # Nothing persisted (no such session) — get_status_by_session stays None.
@@ -377,7 +593,7 @@ def test_unknown_connection_id_terminal_is_409():
     session the control plane never saw."""
     repo = InMemoryMeetingRepo()
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "completed", "exit_code": 0})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "ghost", "status": "completed", "exit_code": 0})
     assert r.status_code == 409, r.text
     assert r.json()["from"] is None and r.json()["to"] == "completed"
 
@@ -395,7 +611,7 @@ def _reconcile_once(client: TestClient, repo: _ReconcileRepo) -> list[tuple[int,
     POST the synthetic completed callback. Returns [(meeting_id, session_uid, status_code), …]."""
     out = []
     for meeting_id, session_uid, _bot_container_id in repo.list_stale_stopping_sync():
-        r = client.post(ENDPOINT, json={
+        r = client.post(ENDPOINT, headers=BOT, json={
             "connection_id": session_uid, "status": "completed", "completion_reason": "stopped",
         })
         out.append((meeting_id, session_uid, r.status_code))
@@ -447,7 +663,7 @@ def test_reconcile_then_late_bot_terminal_is_idempotent_200():
     assert [c for *_, c in _reconcile_once(client, repo)] == [200]
 
     # The bot finally sends its terminal (the one the reconcile pre-empted).
-    r = client.post(ENDPOINT, json={
+    r = client.post(ENDPOINT, headers=BOT, json={
         "connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped",
     })
     assert r.status_code == 200, r.text
@@ -461,7 +677,7 @@ def test_bot_terminal_then_reconcile_finds_nothing():
     _seed(repo, status="stopping")
     client = TestClient(create_app(meeting_repo=repo))
     # Bot's own terminal lands first (rehydrates stopping→active, completes).
-    r = client.post(ENDPOINT, json={
+    r = client.post(ENDPOINT, headers=BOT, json={
         "connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped",
     })
     assert r.status_code == 200, r.text
@@ -476,7 +692,7 @@ def test_reconcile_late_bot_failed_after_completed_is_409():
     _seed(repo, status="stopping")
     client = TestClient(create_app(meeting_repo=repo))
     assert [c for *_, c in _reconcile_once(client, repo)] == [200]
-    r = client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "failed", "exit_code": 1})
+    r = client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "failed", "exit_code": 1})
     assert r.status_code == 409, r.text
     assert r.json()["from"] == "completed" and r.json()["to"] == "failed"
 
@@ -497,7 +713,7 @@ def test_one_webhook_envelope_per_real_advance():
         ("active", {"status": "active"}),
         ("completed", {"status": "completed", "exit_code": 0, "completion_reason": "stopped"}),
     ]:
-        assert client.post(ENDPOINT, json={"connection_id": "sess-uid", **ev}).status_code == 200
+        assert client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", **ev}).status_code == 200
     envs = app.state.status_change_webhooks
     assert len(envs) == 3, [e["data"]["status_change"] for e in envs]
     news = [e["data"]["status_change"]["new_status"] for e in envs]
@@ -511,9 +727,9 @@ def test_no_ws_publish_on_idempotent_replay():
     redis = _RecordingRedis()
     client = TestClient(create_app(meeting_repo=repo, redis=redis))
     ev = {"connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped"}
-    client.post(ENDPOINT, json=ev)
+    client.post(ENDPOINT, headers=BOT, json=ev)
     n = len(redis.published)
-    client.post(ENDPOINT, json=ev)  # redelivery
+    client.post(ENDPOINT, headers=BOT, json=ev)  # redelivery
     assert len(redis.published) == n, f"duplicate ws publish on no-op replay: {redis.published}"
 
 
@@ -555,9 +771,9 @@ def test_no_extra_webhook_envelope_on_idempotent_replay():
     app = create_app(meeting_repo=repo)
     client = TestClient(app)
     ev = {"connection_id": "sess-uid", "status": "completed", "exit_code": 0, "completion_reason": "stopped"}
-    client.post(ENDPOINT, json=ev)
+    client.post(ENDPOINT, headers=BOT, json=ev)
     n = len(app.state.status_change_webhooks)
-    client.post(ENDPOINT, json=ev)  # redelivery — pure no-op
+    client.post(ENDPOINT, headers=BOT, json=ev)  # redelivery — pure no-op
     assert len(app.state.status_change_webhooks) == n, (
         "no_op replay appended a duplicate status_change envelope to app.state.status_change_webhooks "
         f"(expected {n}, got {len(app.state.status_change_webhooks)})"
@@ -576,7 +792,7 @@ def test_webhook_old_new_status_correct_across_full_path():
         {"status": "active"},
         {"status": "completed", "exit_code": 0, "completion_reason": "stopped"},
     ]:
-        client.post(ENDPOINT, json={"connection_id": "sess-uid", **ev})
+        client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", **ev})
     pairs = [(e["data"]["status_change"]["old_status"], e["data"]["status_change"]["new_status"])
              for e in app.state.status_change_webhooks]
     assert pairs == [
@@ -622,6 +838,7 @@ def test_sink_history_only_grows_on_real_advance():
 # persist → webhook → ws publish path is exercised end-to-end, no while/sleep wrapper.
 
 from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep  # noqa: E402
+from meeting_api.sweeps.item_failures import InMemoryItemFailures  # noqa: E402
 
 
 def _set_updated_now(repo: InMemoryMeetingRepo, meeting_id: int) -> None:
@@ -636,12 +853,13 @@ def _run_general_sweep(client: TestClient, repo: InMemoryMeetingRepo, *, stop_gr
     import logging
 
     async def _post(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, None, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"), **extra,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
 
 
@@ -731,12 +949,13 @@ def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grac
     import logging
 
     async def _post(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, runtime, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"), **extra,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
 
 
@@ -859,7 +1078,7 @@ def test_bot_callback_evidence_still_completes_during_runtime_desync():
     assert _run_general_sweep_rt(client, repo, runtime) == 0        # 404 → no reap
     assert repo._meetings[m["id"]]["status"] == "active"
 
-    r = client.post(ENDPOINT, json={                                 # the bot's own evidence
+    r = client.post(ENDPOINT, headers=BOT, json={                                 # the bot's own evidence
         "connection_id": "sess-uid", "status": "completed", "completion_reason": "left_alone",
     })
     assert r.status_code == 200
@@ -881,12 +1100,13 @@ def _run_general_sweep_esc(client, repo, runtime, tracker, *, untracked_grace,
     import logging
 
     async def _post_cb(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, runtime, _post_cb, stop_grace=stop_grace, active_grace=active_grace,
         log=logging.getLogger("test.reconcile"),
         untracked_grace=untracked_grace, untracked_since=tracker,
+        item_failures=InMemoryItemFailures(max_failures=5),
     ))
 
 
@@ -1023,7 +1243,7 @@ def _consume_runtime_terminal(client, repo, workload_id, state):
     import logging
 
     async def _drive(body: dict):
-        return client.post(ENDPOINT, json=body).status_code
+        return client.post(ENDPOINT, headers=BOT, json=body).status_code
 
     return asyncio.run(synthesize_terminal_for_dead_workload(
         repo, workload_id, state, _drive, log=logging.getLogger("test.runtime-cb"),
@@ -1099,7 +1319,7 @@ def test_runtime_destroyed_noop_on_already_terminal_meeting():
     repo._meetings[m["id"]]["bot_container_id"] = "wl-done"
     client = TestClient(create_app(meeting_repo=repo))
     # The bot completes it itself first.
-    client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "completed",
+    client.post(ENDPOINT, headers=BOT, json={"connection_id": "sess-uid", "status": "completed",
                                 "completion_reason": "left_alone"})
     assert repo._meetings[m["id"]]["status"] == "completed"
 
@@ -1262,11 +1482,11 @@ def _stop_then_destroy(status: str):
     repo, pub = _ReconcileRepo(), InMemoryCommandPublisher()
     m = _seed(repo, status=status)
     repo._meetings[m["id"]]["bot_container_id"] = "wl-stopped"
-    client = TestClient(create_app(meeting_repo=repo, command_publisher=pub))
+    client = TestClient(via_gateway(create_app(meeting_repo=repo, command_publisher=pub)))
 
     r = client.delete("/bots/google_meet/m1", headers={"x-user-id": "1"})
     assert r.status_code == 200, r.text
-    rc = client.post("/runtime/callback", json={"workloadId": "wl-stopped", "state": "destroyed"})
+    rc = client.post(runtime_callback("wl-stopped"), json={"workloadId": "wl-stopped", "state": "destroyed"})
     assert rc.status_code == 200, rc.text
     return repo._meetings[m["id"]]
 
@@ -1284,25 +1504,24 @@ def test_user_stop_of_a_never_admitted_bot_is_failed_not_completed():
 
 
 def test_user_stop_before_admission_is_never_retried():
-    """The reason must be the USER-terminal one. `awaiting_admission_timeout` is TRANSIENT
-    (retry.py), so attributing a deliberate cancellation to it would re-spawn the bot three times
-    against a meeting the user already walked away from — spending their quota to do it."""
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
-    from meeting_api.lifecycle.machine import CompletionReason
+    """The reason must be the USER-terminal one. `awaiting_admission_timeout` is retried
+    (not in `intake.retry.NOT_RETRIED`), so attributing a deliberate cancellation to it would
+    re-spawn the bot against a meeting the user already walked away from — spending their quota
+    to do it."""
+    from meeting_api.intake.retry import NOT_RETRIED
 
     for stage in ("requested", "joining", "awaiting_admission"):
         row = _stop_then_destroy(stage)
         reason = row["data"].get("completion_reason")
         assert reason == "stopped", f"{stage}: expected the user-terminal reason, got {reason!r}"
-        assert classify_retry(CompletionReason(reason)) is RetryClass.PERMANENT
+        assert reason in NOT_RETRIED
         assert row["data"].get("stop_requested") is True
 
 
 def test_a_timed_out_admission_is_still_transient_and_still_retried():
     """No-regression: without a user stop, an admission wait that dies on its own keeps the
-    TRANSIENT reason — the retry behaviour this fix must not disturb."""
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
-    from meeting_api.lifecycle.machine import CompletionReason
+    retried reason — the retry behaviour this fix must not disturb."""
+    from meeting_api.intake.retry import NOT_RETRIED
 
     repo = _ReconcileRepo()
     m = _seed(repo, status="awaiting_admission")
@@ -1313,7 +1532,7 @@ def test_a_timed_out_admission_is_still_transient_and_still_retried():
     row = repo._meetings[m["id"]]
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "awaiting_admission_timeout"
-    assert classify_retry(CompletionReason("awaiting_admission_timeout")) is RetryClass.TRANSIENT
+    assert "awaiting_admission_timeout" not in NOT_RETRIED
 
 
 def test_user_stop_of_a_live_bot_still_completes():
@@ -1345,7 +1564,7 @@ def test_status_change_envelope_log_is_bounded_under_sustained_callbacks():
     for i in range(overshoot):
         uid = f"leak-sess-{i}"
         _seed(repo, status="requested", session_uid=uid)
-        r = client.post(ENDPOINT, json={"connection_id": uid, "status": "joining"})
+        r = client.post(ENDPOINT, headers=BOT, json={"connection_id": uid, "status": "joining"})
         assert r.status_code == 200, r.text
 
     cap = _ENVELOPE_LOG_CAP
@@ -1365,8 +1584,8 @@ def test_status_change_envelope_log_is_bounded_under_sustained_callbacks():
 # `waitingRoomTimeout`), and a lobby bot emits `awaiting_admission` ONCE then polls silently — there
 # is no heartbeat, so `updated_at` stops moving for the whole wait. The sweep reaped at 300s. Because
 # the liveness gate covered only `active`/`needs_help`, a pre-active row skipped the probe entirely
-# and was force-deleted with a MANUFACTURED `left_alone` (`_PERMANENT` in retry.py → the legitimate
-# re-spawn was cancelled too). Both halves are fixed here: pre-active statuses are liveness-gated,
+# and was force-deleted with a MANUFACTURED `left_alone` (an active-phase reason on a bot that never
+# got in, which also cancelled the legitimate re-spawn). Both halves are fixed here: pre-active statuses are liveness-gated,
 # and a genuinely-dead pre-active workload is attributed from the stage + the probe's own evidence.
 
 def _set_updated_age(repo: InMemoryMeetingRepo, meeting_id: int, seconds: float) -> None:
@@ -1423,9 +1642,8 @@ def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence()
     """A1 — when the probe says the workload is GENUINELY gone, the reason is DERIVED from the stage
     (`awaiting_admission` → `awaiting_admission_timeout`) and carries the probe's own evidence
     (workload state + exit code). No more manufactured `left_alone`/"bot gone while …", which was
-    written with zero liveness evidence AND is `_PERMANENT` — it cancelled the legitimate re-spawn."""
-    from meeting_api.lifecycle.machine import CompletionReason
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    written with zero liveness evidence — it cancelled the legitimate re-spawn."""
+    from meeting_api.intake.retry import NOT_RETRIED
 
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="awaiting_admission")
@@ -1443,8 +1661,8 @@ def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence()
     assert reason_code == "awaiting_admission_timeout", (
         f"a never-admitted bot cannot have been 'left alone'; got {reason_code!r}"
     )
-    # the row is RETRY-ELIGIBLE again (left_alone is _PERMANENT; this reason is TRANSIENT)
-    assert classify_retry(CompletionReason(reason_code)) is RetryClass.TRANSIENT
+    # the row is RETRY-ELIGIBLE again
+    assert reason_code not in NOT_RETRIED
     note = _terminal_reason(repo, m["id"])
     assert "exited" in note and "137" in note, f"reason must carry the probe evidence: {note!r}"
     assert "bot gone" not in note, f"the manufactured phrase must be gone: {note!r}"
@@ -1453,9 +1671,8 @@ def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence()
 
 def test_dead_joining_workload_is_attributed_to_join_failure():
     """The earlier pre-active stages never reached the waiting room → `join_failure` (also
-    TRANSIENT), not the admission-timeout reason and not `left_alone`."""
-    from meeting_api.lifecycle.machine import CompletionReason
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    retried), not the admission-timeout reason and not `left_alone`."""
+    from meeting_api.intake.retry import NOT_RETRIED
 
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="joining")
@@ -1470,16 +1687,15 @@ def test_dead_joining_workload_is_attributed_to_join_failure():
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "join_failure"
     assert row["data"].get("failure_stage") == "joining"
-    assert classify_retry(CompletionReason("join_failure")) is RetryClass.TRANSIENT
+    assert "join_failure" not in NOT_RETRIED
     assert "crashed" in _terminal_reason(repo, m["id"])
 
 
 def test_user_stopped_pre_active_reap_is_never_retried():
     """`stop_requested` still overrides the stage attribution (#807): a deliberate cancellation
-    seals as the PERMANENT `stopped`, so the re-spawn machinery never spends the user's quota
-    re-joining a meeting they walked away from."""
-    from meeting_api.lifecycle.machine import CompletionReason
-    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    seals as `stopped` (in `intake.retry.NOT_RETRIED`), so the re-spawn machinery never spends
+    the user's quota re-joining a meeting they walked away from."""
+    from meeting_api.intake.retry import NOT_RETRIED
 
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="awaiting_admission")
@@ -1494,7 +1710,7 @@ def test_user_stopped_pre_active_reap_is_never_retried():
     row = repo._meetings[m["id"]]
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "stopped"
-    assert classify_retry(CompletionReason("stopped")) is RetryClass.PERMANENT
+    assert "stopped" in NOT_RETRIED
 
 
 # ── negative controls: the behaviours this change must NOT disturb ───────────────────────────────
@@ -1544,21 +1760,25 @@ def test_stopping_row_still_reaps_on_its_short_grace():
 
 
 def test_pre_active_row_with_no_workload_at_all_still_reconciles():
-    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with NO recorded workload has
-    nothing that could be alive — the gate does not apply, so it still converges on the time window,
-    with a note that says so instead of claiming a bot went missing. (`joining`, not `requested`:
-    the FSM's only legal first edge is `<new>` → `joining`, so a never-reported row's convergence
-    rides the runtime-destroy force path, not this callback — unchanged by #862.)"""
+    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with a session and NO recorded
+    workload may still have the workload its spawn asked for (``workload_id_for``: a cancel between
+    the session write and the container write, §6.9 F-K2), so the sweep asks the runtime about that
+    id. A 404 is not evidence: the row converges on the bounded untracked window, with the
+    stage-derived reason. (`joining`, not `requested`: the FSM's only legal first edge is `<new>` →
+    `joining`.)"""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="joining")
     runtime = FakeRuntimeClient(workloads={})
     client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
 
-    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "joining"  # window opened only
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 1
     row = repo._meetings[m["id"]]
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "join_failure"
-    assert "no workload recorded" in _terminal_reason(repo, m["id"])
+    assert "presumed lost" in _terminal_reason(repo, m["id"])
 
 
 def test_pre_active_untracked_workload_still_escalates_on_the_bounded_window():
@@ -1650,3 +1870,52 @@ def test_pre_active_grace_follows_the_lobby_budget_env_override(monkeypatch):
     assert default_preactive_grace() == 1860.0
     monkeypatch.setenv("VEXA_LOBBY_BUDGET_S", "300")
     assert default_preactive_grace() == 360.0
+
+
+# ── `needs_help` is PRE-active: a blocked bot never got in (`active -> needs_help` is not an edge) ──
+
+def test_a_destroyed_workload_of_a_needs_help_bot_fails_and_is_not_served():
+    """A runtime-confirmed destroy of a bot escalated before the lobby is a failed join, not a
+    finished visit: it was filed `completed`/`left_alone`, which reads as SERVED (no new bot) and as
+    a finished meeting to every reader."""
+    from meeting_api.lifecycle.occurrence import Disposition, disposition
+
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="needs_help")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-blocked"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "wl-blocked", "destroyed") is True
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"]["completion_reason"] == "join_failure"
+    assert row["data"]["failure_stage"] == "joining"  # derived: the row never showed a lobby
+    assert disposition(row) is Disposition.RETRY
+
+
+def test_an_untracked_needs_help_bot_escalates_at_its_own_stage():
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="needs_help")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-404"
+    runtime = FakeRuntimeClient(workloads={})
+    client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"]["failure_stage"] == "joining"
+    assert row["data"]["completion_reason"] == "join_failure"
+
+
+def test_a_needs_help_bot_counts_against_the_concurrency_cap():
+    repo = InMemoryMeetingRepo()
+    _seed(repo, status="needs_help")
+    assert asyncio.run(repo.count_active_bots(user_id=1)) == 1
+
+
+def test_a_needs_help_row_waits_out_the_pre_active_grace():
+    from meeting_api.bot_spawn.ports import reconcile_grace_for_status
+
+    assert reconcile_grace_for_status("needs_help", 45.0, 300.0, 900.0) == 900.0

@@ -6,7 +6,14 @@
  * node/back imports; the host wires the emitted frames to a capture.v1 sink (bot: in-process;
  * extension: WebSocket via @vexa/capture-codec). The capture.v1 model + wire codec is @vexa/capture-codec.
  */
-export { createPcmCaptureNode, WORKLET_SRC, PCM_WORKLET_PROCESSOR } from "./pcm-capture.js";
+export {
+  createPcmCaptureNode,
+  WORKLET_SRC,
+  PCM_WORKLET_PROCESSOR,
+  createLevelNode,
+  LEVEL_WORKLET_SRC,
+  LEVEL_WORKLET_PROCESSOR,
+} from "./pcm-capture.js";
 export { createGmeetCapture } from "./gmeet-capture.js";
 export type { GmeetCapture } from "./gmeet-capture.js";
 export { createGmeetSpeakers } from "./gmeet-speakers.js";

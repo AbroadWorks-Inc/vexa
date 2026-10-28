@@ -214,7 +214,7 @@ stack still boots.
 | `DEFAULT_BOT_NAME` | `Vexa` | The bot's display name in the meeting. The terminal omits `bot_name` when it sends a bot, so this names those bots; an explicit `bot_name` still wins. Blank it and meeting-api falls back to `VexaBot-{random}`. |
 | `AUTO_JOIN_SWEEP_INTERVAL_S` | `30` | How often scheduled meetings are checked for a due start. |
 | `AUTO_JOIN_LEAD_S` | `120` | The bot is sent this many seconds *before* the scheduled time, so it is already standing in the lobby when the meeting starts. |
-| `VEXA_LOBBY_BUDGET_S` | `900` | How long a spawned bot waits for admission before giving up (`automatic_leave.waitingRoomTimeout`). The reconciler's pre-active grace derives from this, so raising it never leaves a waiting bot reaped early. |
+| `VEXA_LOBBY_BUDGET_S` | `900` | How long a spawned bot waits for admission before giving up (`automatic_leave.waitingRoomTimeout`). The reconciler's pre-active grace derives from this, so raising it never leaves a waiting bot reaped early. On Google Meet the budget is rarely reached: Meet withdraws an unanswered "Ask to join" after about 10 minutes, and the bot then ends `awaiting_admission_timeout` within `KNOCK_LOST_GRACE_MS` (20 s) instead of waiting out the budget. |
 | `AUTO_JOIN_GRACE_S` | `600` | A meeting whose start passed longer ago than this is skipped — never joined hours late. |
 | `AUTO_JOIN_RETRY_BACKOFF_S` | `300` | Wait after a loud auto-join failure (cap/quota/spawn) before retrying that meeting. |
 | `CALENDAR_SYNC_INTERVAL_S` | `300` | How often connected ICS feeds are re-fetched and upserted. |

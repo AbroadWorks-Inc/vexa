@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "meeting_not_found",
+    "message": "no such meeting"
+  }
+}

@@ -99,7 +99,9 @@ function mockPage(visible: string[], captcha: CaptchaMode = false, participantLa
     mouse: { move: async () => {} },
     url: () => 'https://meet.google.com/abc-defg-hij',
     screenshot: async () => {},
-    waitForTimeout: async (_ms: number) => {},
+    // A real (tiny) wait, so a wait loop that polls a non-terminal page yields instead of
+    // spinning: the knock-expiry scenarios below hold a lobby for a few ticks before it vanishes.
+    waitForTimeout: async (_ms: number) => { await new Promise(r => setTimeout(r, 2)); },
     frames: () => (captcha
       ? [{ url: () => 'https://meet.google.com/' }, { url: () => 'https://www.google.com/recaptcha/enterprise/anchor?ar=1' }]
       : [{ url: () => 'https://meet.google.com/' }]),
@@ -323,6 +325,59 @@ async function outcomeOf(run: Promise<unknown>, watchdogMs = 10_000): Promise<st
     await checkForGoogleAdmissionIndicators(mockPage([], false, ['John Doe'])),
     true,
   );
+
+  console.log('\n=== Meet knock expiry — the waiting room vanishes unanswered (2026-10-01) ===');
+
+  // Google Meet withdraws an unanswered "Ask to join" about 10 minutes after the knock: the
+  // page logs `DisconnectedError, EndCause = 72` and the waiting room disappears with nothing
+  // in its place — no denial copy, no in-call controls (seven of seven bots on 2026-10-01,
+  // each at exactly +10:00). The shipped wait polled that dead page for the rest of the
+  // 15-minute budget and then threw `join_failure` — the selector-rot class — for what was
+  // really "nobody admitted the bot". A lobby gone for KNOCK_LOST_GRACE_MS with neither an
+  // admission nor a denial is a typed `lobby_timeout` (→ `awaiting_admission_timeout`, a
+  // legit retry with a fresh knock). The watchdog is the "polls the dead page" detector.
+  {
+    resetEscalation();
+    const visible = ['text=Asking to be let in'];
+    const page = mockPage(visible);
+    setTimeout(() => { visible.length = 0; }, 30); // the knock expires: lobby gone, nothing replaces it
+    const got = await outcomeOf(waitForGoogleMeetingAdmission(page, 20_000, {} as any), 5_000);
+    check(
+      "lobby → nothing: AdmissionError('lobby_timeout') inside the grace, not join_failure after the budget",
+      got === "AdmissionError:lobby_timeout", true, got,
+    );
+  }
+  {
+    resetEscalation();
+    const visible = ['text=Asking to be let in'];
+    const tiles: string[] = [];
+    const page = mockPage(visible, false, tiles);
+    setTimeout(() => { visible.length = 0; tiles.push('John Doe'); }, 30); // the host admits
+    const got = await outcomeOf(waitForGoogleMeetingAdmission(page, 20_000, {} as any), 5_000);
+    check("lobby → admitted: resolves (a real admission never trips the grace)", got === 'resolved', true, got);
+  }
+  {
+    resetEscalation();
+    const visible = ['text=Asking to be let in'];
+    const page = mockPage(visible);
+    setTimeout(() => { visible.length = 0; visible.push('text=denied your request'); }, 30);
+    const got = await outcomeOf(waitForGoogleMeetingAdmission(page, 20_000, {} as any), 5_000);
+    check("lobby → denial: AdmissionError('denial') still wins", got === 'AdmissionError:denial', true, got);
+  }
+  {
+    // The LATE path — the one every 2026-10-01 bot took: no lobby on the first poll, the lobby
+    // appears during polling, then vanishes. This loop had no lobby-vanished handling at all.
+    resetEscalation();
+    const visible: string[] = [];
+    const page = mockPage(visible);
+    setTimeout(() => { visible.push('text=Asking to be let in'); }, 20);
+    setTimeout(() => { visible.length = 0; }, 80);
+    const got = await outcomeOf(waitForGoogleMeetingAdmission(page, 20_000, {} as any), 5_000);
+    check(
+      "polling → lobby → nothing: AdmissionError('lobby_timeout') on the late path too",
+      got === 'AdmissionError:lobby_timeout', true, got,
+    );
+  }
 
   console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);
   process.exit(failed > 0 ? 1 : 0);

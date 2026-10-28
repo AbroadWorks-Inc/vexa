@@ -41,6 +41,7 @@ spec:
       # without breaking single-node test deployments. Aligns with the
       # Pack I (chart availability defaults) shape — robustness defaults
       # should be safe-by-default, not require operator opt-in.
+      {{- if .Values.statefulAntiAffinity }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -52,6 +53,7 @@ spec:
                       operator: In
                       values: [postgres, redis, tts-service]
                 topologyKey: kubernetes.io/hostname
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

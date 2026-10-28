@@ -138,45 +138,50 @@ def test_meeting_session_unique_constraint(engine):
             s.commit()
 
 
-def test_meeting_active_unique_partial_index(engine):
-    """uq_meeting_active_user_platform_native — the ROB1/ROB2 spawn-dedup DB backstop.
+def test_meeting_live_unique_partial_index(engine):
+    """uq_meeting_live_user_platform_native (§1.2) — the ROB1/ROB2 spawn-dedup DB backstop.
 
-    At most ONE active (status NOT IN completed/failed) meeting per (user, platform, native id):
-      - two active rows for the same key  → IntegrityError (the backstop fires);
-      - active + a terminal (completed) row for the same key → allowed (terminal not covered);
-      - re-opening a NEW active row once the prior one is terminal → allowed.
+    At most ONE LIVE (bot-lifecycle: requested/joining/awaiting_admission/needs_help/active/
+    stopping) meeting per (user, platform, native id):
+      - two live rows for the same key  → IntegrityError (the backstop fires);
+      - live + a terminal (completed) row for the same key → allowed (terminal not covered);
+      - re-opening a NEW live row once the prior one is terminal → allowed;
+      - `scheduled` is deliberately NOT covered — many scheduled occurrences of one recurring
+        link may coexist (MIGRATION-0008 swapped this index for exactly this reason).
     Also asserts `ensure_schema_sync` actually built the index (it is partial+unique, so the
-    additive _sync_indexes path must emit `WHERE` / `UNIQUE` correctly).
+    additive _sync_indexes path must emit `WHERE` / `UNIQUE` correctly), and that the OLD
+    (pre-0008) index is gone.
     """
     from sqlalchemy.exc import IntegrityError
 
     # The index exists with the partial predicate (not silently skipped by _sync_indexes).
     idx = {i["name"]: i for i in inspect(engine).get_indexes("meetings")}
-    assert "uq_meeting_active_user_platform_native" in idx, "backstop index missing"
-    assert idx["uq_meeting_active_user_platform_native"]["unique"] is True
+    assert "uq_meeting_live_user_platform_native" in idx, "backstop index missing"
+    assert idx["uq_meeting_live_user_platform_native"]["unique"] is True
+    assert "uq_meeting_active_user_platform_native" not in idx, "old index should be gone (§1.2)"
 
     key = dict(user_id=7, platform="google_meet", platform_specific_id="abc-defg-hij")
 
-    # Two active rows for the same (user, platform, native) → rejected.
+    # Two live rows for the same (user, platform, native) → rejected.
     with Session(engine) as s:
         s.add(Meeting(status="requested", **key))
         s.add(Meeting(status="active", **key))
         with pytest.raises(IntegrityError):
             s.commit()
 
-    # active + terminal(completed) for the same key → allowed (terminal rows are NOT covered).
+    # live + terminal(completed) for the same key → allowed (terminal rows are NOT covered).
     with Session(engine) as s:
         s.add(Meeting(status="completed", **key))
         s.add(Meeting(status="active", **key))
         s.commit()
 
-    # With one active row present, a second active row still collides...
+    # With one live row present, a second live row still collides...
     with Session(engine) as s:
         s.add(Meeting(status="active", **key))
         with pytest.raises(IntegrityError):
             s.commit()
 
-    # ...but once that active row goes terminal, a fresh active row is allowed (re-meet / reopen).
+    # ...but once that live row goes terminal, a fresh live row is allowed (re-meet / reopen).
     with Session(engine) as s:
         live = (
             s.query(Meeting)
@@ -190,16 +195,24 @@ def test_meeting_active_unique_partial_index(engine):
         s.add(Meeting(status="requested", **key))
         s.commit()   # no collision — all prior rows are terminal
 
+    # `scheduled` is NOT a live status — many occurrences of one recurring link may coexist.
+    series_key = dict(user_id=8, platform="google_meet", platform_specific_id="series-1")
+    with Session(engine) as s:
+        s.add(Meeting(status="scheduled", **series_key))
+        s.add(Meeting(status="scheduled", **series_key))
+        s.commit()   # no collision — 'scheduled' isn't in the live predicate
 
-def test_meeting_active_unique_index_blocked_fails_closed(engine):
-    """#1186 — real Postgres: duplicate active rows block the backstop index → ensure_schema RAISES.
+
+def test_meeting_live_unique_index_blocked_fails_closed(engine):
+    """#1186 — real Postgres: duplicate live rows block the backstop index → ensure_schema RAISES.
 
     Reproduces the production shape exactly (verified 2026-08-17: the index had NEVER existed,
     blocked by 4 stale duplicate rows, re-attempted and re-swallowed on every restart while the
-    WARNING log-rotated away inside a day):
+    WARNING log-rotated away inside a day) — against `uq_meeting_live_user_platform_native` (§1.2;
+    MIGRATION-0008 swapped the old `uq_meeting_active_user_platform_native` for this one):
 
-      1. drop `uq_meeting_active_user_platform_native` (the state prod was actually in);
-      2. plant two active rows for the same (user, platform, native id) — legal without the index;
+      1. drop `uq_meeting_live_user_platform_native` (the state prod was actually in, pre-#1186);
+      2. plant two live rows for the same (user, platform, native id) — legal without the index;
       3. re-converge → SchemaInvariantError naming the index, the table, the underlying Postgres
          error, and the remediation. BEFORE this fix: one WARNING, convergence "succeeds",
          admin-api boots green with a decorative backstop.
@@ -208,7 +221,7 @@ def test_meeting_active_unique_index_blocked_fails_closed(engine):
     from admin_api.schema.errors import SchemaInvariantError
     from admin_api.schema.sync import ensure_schema_sync
 
-    idx_name = "uq_meeting_active_user_platform_native"
+    idx_name = "uq_meeting_live_user_platform_native"
     key = dict(user_id=99, platform="google_meet", platform_specific_id="blk-ced-idx")
 
     with engine.begin() as c:

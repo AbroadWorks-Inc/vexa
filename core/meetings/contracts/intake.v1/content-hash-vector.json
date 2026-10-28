@@ -1,0 +1,29 @@
+{
+  "description": "Shared cross-language test vector for intake.v1's content_hash (§2, task A4). meeting-api's meeting_api.intake.validation._content_hash produces this; the calendar module (Part B) computes the SAME hash from the SAME normalised fields and must match this vector bit-for-bit. content_hash is the sha256 hex of the canonical JSON (json.dumps(..., sort_keys=True, separators=(\",\", \":\"))) of the `normalised` object below — built from the ENTRY's mutable content fields ONLY (external_id/user are the entry's identity key used to look the row up, not its content, so they are excluded).",
+  "raw_input": {
+    "external_id": "google:3n5kq8example",
+    "user": "A@AbroadWorks.com",
+    "meeting_url": "https://meet.google.com/kxo-misr-avz",
+    "start": "2026-09-29T09:00:00+05:30",
+    "end": "2026-09-29T09:30:00+05:30",
+    "time_zone": "Asia/Kolkata",
+    "title": "Weekly sync",
+    "attendees": ["A@abroadworks.com", "B@Client.com"],
+    "series_id": null,
+    "join_now": false,
+    "metadata": null
+  },
+  "normalised": {
+    "attendees": ["a@abroadworks.com", "b@client.com"],
+    "end": "2026-09-29T04:00:00Z",
+    "join_now": false,
+    "meeting_url": "https://meet.google.com/kxo-misr-avz",
+    "metadata": null,
+    "series_id": null,
+    "start": "2026-09-29T03:30:00Z",
+    "time_zone": "Asia/Kolkata",
+    "title": "Weekly sync"
+  },
+  "canonical_json": "{\"attendees\":[\"a@abroadworks.com\",\"b@client.com\"],\"end\":\"2026-09-29T04:00:00Z\",\"join_now\":false,\"meeting_url\":\"https://meet.google.com/kxo-misr-avz\",\"metadata\":null,\"series_id\":null,\"start\":\"2026-09-29T03:30:00Z\",\"time_zone\":\"Asia/Kolkata\",\"title\":\"Weekly sync\"}",
+  "content_hash": "fd7a005d05177e2d33b75cdb001856a8e7720391abc66118984a8cdfe636a03f"
+}

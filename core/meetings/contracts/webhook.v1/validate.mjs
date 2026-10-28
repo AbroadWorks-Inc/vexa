@@ -13,8 +13,11 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const schema = JSON.parse(readFileSync(join(HERE, "webhook.schema.json"), "utf8"));
+// MeetingEvent's data.meeting is intake.v1's Meeting (the one §2.4 projection), referenced by $id.
+const intake = JSON.parse(readFileSync(join(HERE, "..", "intake.v1", "intake.schema.json"), "utf8"));
 const ajv = new Ajv2020({ strict: false, allErrors: true });
 addFormats(ajv);
+ajv.addSchema(intake);
 ajv.addSchema(schema);
 
 const dir = join(HERE, "golden");
