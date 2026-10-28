@@ -58,8 +58,8 @@ const argsFor = (text: string) => ({
 
 (async () => {
   console.log("\n=== the notice text is the recording disclosure, not a leave promise ===");
-  check("names AW Notetaker and transcription", MEET_RECORDING_NOTICE.includes("AW Notetaker is recording this meeting for transcription"), true);
-  check("links the privacy notice", MEET_RECORDING_NOTICE.includes("https://abroadworks.com/notetaker-privacy"), true);
+  check("names Olanote, Olamee Corp and transcription", MEET_RECORDING_NOTICE.includes("Olanote by Olamee Corp is recording this meeting for transcription"), true);
+  check("links the privacy notice", MEET_RECORDING_NOTICE.includes("https://olamee.com/legal#privacy"), true);
   check("tells people to ask the host", MEET_RECORDING_NOTICE.includes("ask the host to remove this bot"), true);
   check("does not promise the bot will leave", MEET_RECORDING_NOTICE.includes("stop recording"), false);
 
