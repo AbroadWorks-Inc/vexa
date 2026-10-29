@@ -209,7 +209,7 @@ activity frames' glow names say who was on it when.
 After Meet admits the bot, join posts a chat message
 (`core/meetings/modules/join/src/googlemeet/chat.ts`, `MEET_RECORDING_NOTICE`):
 
-> AW Notetaker is recording this meeting for transcription. See https://abroadworks.com/notetaker-privacy for details. If you'd prefer the meeting not be recorded, ask the host to remove this bot.
+> Olanote by Olamee Corp is recording this meeting for transcription. See https://olamee.com/legal?tab=privacy for details. If you'd prefer the meeting not be recorded, ask the host to remove this bot.
 
 A missing chat control is logged and the join continues. This is not the `chat_send` act, and
 `voiceAgentEnabled` does not turn it on. Teams, Zoom, and Jitsi are unchanged.

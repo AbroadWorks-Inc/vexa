@@ -18,8 +18,8 @@ import {
 // The unsigned legal draft that says the bot leaves and deletes the recording
 // is not used: the bot does not do that.
 export const MEET_RECORDING_NOTICE =
-  "AW Notetaker is recording this meeting for transcription. " +
-  "See https://abroadworks.com/notetaker-privacy for details. " +
+  "Olanote by Olamee Corp is recording this meeting for transcription. " +
+  "See https://olamee.com/legal?tab=privacy for details. " +
   "If you'd prefer the meeting not be recorded, ask the host to remove this bot.";
 
 export type GoogleMeetChatSendArgs = {
