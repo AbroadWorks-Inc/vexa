@@ -19,7 +19,7 @@ import {
 // is not used: the bot does not do that.
 export const MEET_RECORDING_NOTICE =
   "Olanote by Olamee Corp is recording this meeting for transcription. " +
-  "See https://olamee.com/legal#privacy for details. " +
+  "See https://olamee.com/legal?tab=privacy for details. " +
   "If you'd prefer the meeting not be recorded, ask the host to remove this bot.";
 
 export type GoogleMeetChatSendArgs = {
