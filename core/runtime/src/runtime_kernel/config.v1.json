@@ -157,6 +157,13 @@
    "targets": ["compose", "helm", "lite"]
   },
   {
+   "key": "BOT_IGNORED_PARTICIPANTS",
+   "class": "defaulted",
+   "default": "(unset — nobody is ignored)",
+   "description": "comma-separated name fragments of other notetaker bots; a Teams participant whose name contains one does not keep the bot in an empty meeting; forwarded to spawned bots when set",
+   "targets": ["helm"]
+  },
+  {
    "key": "BOT_SPEAKER_MIN_AUDIO_SEC",
    "class": "defaulted",
    "default": "(unset — bot default)",

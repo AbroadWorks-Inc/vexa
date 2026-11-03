@@ -248,6 +248,20 @@ export function resolveAloneSilenceWindowMs(
   return DEFAULT_ALONE_SILENCE_WINDOW_MS;
 }
 
+/** Name fragments of other notetaker bots, from `BOT_IGNORED_PARTICIPANTS` (comma-separated):
+ *  trimmed, lower-cased, blanks and repeats dropped. Unset or empty ignores nobody. */
+export function resolveIgnoredParticipants(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.BOT_IGNORED_PARTICIPANTS ?? '';
+  return [...new Set(raw.split(',').map((f) => f.trim().toLowerCase()).filter((f) => f.length > 0))];
+}
+
+/** The roster count the leave decision reads: the producer's `humans` (participants without other
+ *  notetaker bots) when it sent a usable one, else `participants`. Never more than `participants`. */
+export function rosterCountForLeave(participants: number, humans: number | undefined): number {
+  if (typeof humans !== 'number' || !Number.isFinite(humans) || humans < 0) return participants;
+  return Math.min(humans, participants);
+}
+
 export function createSilenceAlonenessSource(options: {
   activity: RemoteAudioActivitySource;
   windowMs: number;

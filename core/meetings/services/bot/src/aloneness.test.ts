@@ -7,6 +7,8 @@ import {
   createSilenceAlonenessSource,
   deafCaptureGuardAdapter,
   resolveAloneSilenceWindowMs,
+  resolveIgnoredParticipants,
+  rosterCountForLeave,
   silenceAlonenessAdapter,
 } from './aloneness.js';
 
@@ -476,6 +478,52 @@ function fixture(windowMs = 1_000, extra: {
     DEFAULT_ALONE_SILENCE_WINDOW_MS === 600_000);
   check('invalid env falls back to module default',
     resolveAloneSilenceWindowMs(undefined, { BOT_ALONE_SILENCE_WINDOW_MS: 'nope' }, () => {}) === 600_000);
+}
+
+// Other notetaker bots (BOT_IGNORED_PARTICIPANTS): a comma-separated list of name fragments.
+{
+  const parsed = resolveIgnoredParticipants({ BOT_IGNORED_PARTICIPANTS: ' Fireflies.ai Notetaker, otter.ai ,,READ.AI ' });
+  check('ignored list: fragments are trimmed, lower-cased and blanks dropped',
+    JSON.stringify(parsed) === JSON.stringify(['fireflies.ai notetaker', 'otter.ai', 'read.ai']), JSON.stringify(parsed));
+  check('ignored list: unset means nobody is ignored',
+    resolveIgnoredParticipants({}).length === 0);
+  check('ignored list: empty or only commas means nobody is ignored',
+    resolveIgnoredParticipants({ BOT_IGNORED_PARTICIPANTS: '' }).length === 0
+    && resolveIgnoredParticipants({ BOT_IGNORED_PARTICIPANTS: ' , ,' }).length === 0);
+  check('ignored list: a repeated fragment appears once',
+    JSON.stringify(resolveIgnoredParticipants({ BOT_IGNORED_PARTICIPANTS: 'Fathom,fathom' })) === JSON.stringify(['fathom']));
+}
+
+// The leave decision reads the humans count when the producer sends one, else today's count.
+{
+  check('leave count: humans wins when it is sent', rosterCountForLeave(1, 0) === 0);
+  check('leave count: a producer without humans keeps the participant count', rosterCountForLeave(1, undefined) === 1);
+  check('leave count: a nonsense humans value keeps the participant count',
+    rosterCountForLeave(2, Number.NaN) === 2 && rosterCountForLeave(2, -1) === 2);
+  check('leave count: humans never exceeds participants', rosterCountForLeave(1, 3) === 1);
+}
+
+// Only an ignored bot left (participants 1, humans 0): the bot leaves after the silence window;
+// a muted human beside it keeps the hold.
+{
+  const f = fixture(1_000, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 5_000 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(1);
+  f.activity.observeRoster(rosterCountForLeave(1, 0));
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_001); f.scheduler.tick();
+  check('only an ignored bot left — the bot leaves after the window', fired === 1);
+}
+{
+  const f = fixture(1_000, { adapters: [silenceAlonenessAdapter, createDeafCaptureGuardAdapter({ stalenessMs: 5_000 })] });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeStreamPresence(1);
+  f.activity.observeRoster(rosterCountForLeave(2, 1));
+  f.source.onAlone(() => fired++);
+  f.clock.advance(1_001); f.scheduler.tick();
+  check('a muted human beside an ignored bot keeps the deaf hold', fired === 0);
 }
 
 console.log(failed

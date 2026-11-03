@@ -41,7 +41,7 @@ import { captureLane, isMixedLanePlatform, isPerTrackLanePlatform, recordingSour
 import type { BotPipeline } from './pipeline.js';
 import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
-import type { RemoteAudioActivityTap } from './aloneness.js';
+import { resolveIgnoredParticipants, rosterCountForLeave, type RemoteAudioActivityTap } from './aloneness.js';
 import { createTtsPlayback } from './tts-playback.js';
 import type { SpeakerActivityWriter } from './speaker-activity.js';
 
@@ -230,8 +230,9 @@ export function makeObservationSink(
    *  the same reason the transport edges are — a fixture that lacks what the run acted on cannot
    *  reproduce the run. */
   consumeRosterName?: (name: string, tMs: number) => void,
-  /** …and the producer's account of how much of the roster it could read. */
-  consumeRosterCoverage?: (named: number, participants: number, tMs: number) => void,
+  /** …and the producer's account of how much of the roster it could read. `humans` is the count
+   *  without other notetaker bots, `undefined` when the producer did not send a number. */
+  consumeRosterCoverage?: (named: number, participants: number, tMs: number, humans: number | undefined) => void,
 ): { sink: (source: string, obs: unknown, tMs?: number) => void; crossed: () => number; stored: () => number } {
   let crossed = 0;
   let stored = 0;
@@ -261,7 +262,8 @@ export function makeObservationSink(
       }
       if (payload.type === 'roster-coverage'
         && typeof payload.named === 'number' && typeof payload.participants === 'number') {
-        try { consumeRosterCoverage?.(payload.named, payload.participants, t); } catch { /* never breaks capture */ }
+        const humans = typeof payload.humans === 'number' ? payload.humans : undefined;
+        try { consumeRosterCoverage?.(payload.named, payload.participants, t, humans); } catch { /* never breaks capture */ }
       }
     },
   };
@@ -803,11 +805,11 @@ export async function startCaptureBridge(
   const { sink: onObservation, crossed: obsBridgeCrossed } = makeObservationSink(
     lane, telemetry, undefined,
     mixed ? (name, tMs) => pipeline.recordRosterName?.(name, tMs) : undefined,
-    mixed ? (named, participants, tMs) => {
+    mixed ? (named, participants, tMs, humans) => {
       pipeline.recordRosterCoverage?.(named, participants, tMs);
-      // The leave decision reads this count, not the voice-outline "observing N".
-      // Coverage is emitted only when it changes, so the tap keeps the last value.
-      activity?.observeRoster?.(participants);
+      // The leave decision reads the roster without other notetaker bots, not the voice-outline
+      // "observing N". Coverage is emitted only when it changes, so the tap keeps the last value.
+      activity?.observeRoster?.(rosterCountForLeave(participants, humans));
     } : undefined,
   );
   // C1: the four hint hops on one periodic, cumulative counter line —
@@ -851,7 +853,7 @@ export async function startCaptureBridge(
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
-  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
+  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, ignoredParticipants, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
     const w = (globalThis as any) as Record<string, any>;
     // A destination with no input renders nothing, and a MediaRecorder on it emits no data until
     // the first source connects — the recording's t=0 would be the first participant's track, not
@@ -1352,6 +1354,7 @@ export async function startCaptureBridge(
         if (w.VexaBrowserUtils?.createTeamsSpeakers && !w.__vexaTeamsSpeakers) {
           w.__vexaTeamsSpeakers = w.VexaBrowserUtils.createTeamsSpeakers({
             selfName: botName,
+            ignoredParticipants,
             log: (m: string) => w.logBot?.('[TeamsSpeakers] ' + m),
             onSpeaking: (name: string, _id: string, isEnd: boolean, tMs: number) =>
               w.__vexaSpeakerHint?.(name, tMs, isEnd),
@@ -1457,6 +1460,8 @@ export async function startCaptureBridge(
       await w.__vexaRemoteAudioReady?.();
     }
   }, { isMixed: mixed, isPerTrack: perTrack, isJitsi: jitsi, isTeams: inv.platform === 'teams', isZoom: inv.platform === 'zoom', botName: inv.botName,
+      // Other notetaker bots' name fragments (BOT_IGNORED_PARTICIPANTS); the Teams roster's humans count leaves them out.
+      ignoredParticipants: resolveIgnoredParticipants(process.env),
       // How long the Teams lane waits for the server mix before capturing every track instead.
       mainAudioGraceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_GRACE_MS || 15000),
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.

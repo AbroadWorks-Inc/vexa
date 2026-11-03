@@ -704,6 +704,149 @@ const ofType = (observations: TeamsProducerObservation[], type: string): TeamsPr
   h.watcher.destroy();
 }
 
+// ── 5c. IGNORED PARTICIPANTS — other notetaker bots are not people ───────────
+// A silent notetaker bot left alone with ours must not read as a person to the leave decision.
+// `humans` is the roster without the configured bot names; `participants` is unchanged, because
+// speaker naming reasons over everyone in the room.
+const lastCoverage = (h: Harness): any => {
+  const all = ofType(h.observations, 'roster-coverage') as any[];
+  return all[all.length - 1];
+};
+{
+  const tiles = [
+    makeTile('p1', 'Greg Higgins', { outline: true }).tile,
+    makeTile('p2', 'Fireflies.ai Notetaker Alex', { outline: false }).tile,
+  ];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['fireflies.ai notetaker'] });
+  await settle();
+  const last = lastCoverage(h);
+  check('ignored: a configured bot is left out of humans',
+    last?.humans === 1, JSON.stringify(last));
+  check('ignored: participants and named are unchanged — speaker naming still sees the bot',
+    last?.participants === 2 && last?.named === 2, JSON.stringify(last));
+  h.watcher.destroy();
+}
+{
+  const tiles = [makeTile('p1', 'Fireflies.ai Notetaker Alex', { outline: false }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['fireflies.ai notetaker'] });
+  await settle();
+  const last = lastCoverage(h);
+  check('ignored: only a configured bot left reads humans=0, participants=1',
+    last?.humans === 0 && last?.participants === 1, JSON.stringify(last));
+  h.watcher.destroy();
+}
+{
+  const tiles = [makeTile('p1', 'Fireflies.ai Notetaker Alex', { outline: false }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['FIREFLIES.AI NOTETAKER'] });
+  await settle();
+  check('ignored: matching ignores upper/lower case', lastCoverage(h)?.humans === 0,
+    JSON.stringify(lastCoverage(h)));
+  h.watcher.destroy();
+}
+{
+  const tiles = [
+    makeTile('p1', 'Greg Higgins', { outline: true }).tile,
+    makeTile('p2', 'Fireflies.ai Notetaker Alex', { outline: false }).tile,
+  ];
+  for (const ignoredParticipants of [undefined, []]) {
+    const h = start(tiles, { selfName: 'Olanote', ignoredParticipants });
+    await settle();
+    const last = lastCoverage(h);
+    check(`ignored: with ${JSON.stringify(ignoredParticipants)} nobody is ignored — humans equals participants`,
+      last?.humans === 2 && last?.participants === 2, JSON.stringify(last));
+    h.watcher.destroy();
+  }
+}
+{
+  // A human whose name only resembles a bot is a human: matching is on the configured fragment.
+  const tiles = [makeTile('p1', 'Otto Fireflies', { outline: true }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['fireflies.ai notetaker'] });
+  await settle();
+  check('ignored: a name that does not contain a configured fragment still counts',
+    lastCoverage(h)?.humans === 1, JSON.stringify(lastCoverage(h)));
+  h.watcher.destroy();
+}
+{
+  // An entry whose name could not be read might be a person: it always counts.
+  const tiles = [
+    makeTile('p1', 'Fireflies.ai Notetaker Alex', { outline: false }).tile,
+    makeTile('p2', 'video-stream-2', { outline: false }).tile,
+  ];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['fireflies.ai notetaker'] });
+  await settle();
+  const last = lastCoverage(h);
+  check('ignored: an unnamed entry still counts as a human',
+    last?.humans === 1 && last?.participants === 2, JSON.stringify(last));
+  h.watcher.destroy();
+}
+{
+  // The roster PANEL is the other surface a participant appears on.
+  const panelRows = [
+    new FakeEl('div', { role: 'treeitem' }, [new FakeEl('span', {}, [], 'Fireflies.ai Notetaker Alex')]),
+    new FakeEl('div', { role: 'treeitem' }, [new FakeEl('span', {}, [], 'Dmitry Grankin')]),
+  ];
+  const h = start([], { selfName: 'Olanote', panelRows, ignoredParticipants: ['fireflies.ai notetaker'] });
+  await settle();
+  const last = lastCoverage(h);
+  check('ignored: a configured bot on the roster panel is left out of humans',
+    last?.humans === 1 && last?.participants === 2, JSON.stringify(last));
+  h.watcher.destroy();
+}
+{
+  // The fragment may sit anywhere in the name, not only at its start.
+  const tiles = [makeTile('p1', "Alex's Notetaker (Otter.ai)", { outline: false }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['otter.ai'] });
+  await settle();
+  check('ignored: a fragment in the middle of a name matches', lastCoverage(h)?.humans === 0,
+    JSON.stringify(lastCoverage(h)));
+  h.watcher.destroy();
+}
+{
+  // Fragments arrive untrimmed, and display names may carry non-breaking or doubled spaces.
+  const tiles = [makeTile('p1', 'Fireflies.ai\u00a0Notetaker  Alex', { outline: false }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['  Fireflies.ai   Notetaker '] });
+  await settle();
+  check('ignored: spacing differences between name and fragment do not prevent a match',
+    lastCoverage(h)?.humans === 0, JSON.stringify(lastCoverage(h)));
+  h.watcher.destroy();
+}
+{
+  // Only strings are fragments: a stray non-string must not become "null" or "0" and match a name.
+  const tiles = [makeTile('p1', 'Null Zero 0', { outline: true }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: [null, 0, undefined] as unknown as string[] });
+  await settle();
+  check('ignored: a non-string entry ignores nobody', lastCoverage(h)?.humans === 1,
+    JSON.stringify(lastCoverage(h)));
+  h.watcher.destroy();
+}
+{
+  // A blank fragment would match every name. It must be ignored, never ignore everyone.
+  const tiles = [makeTile('p1', 'Greg Higgins', { outline: true }).tile];
+  const h = start(tiles, { selfName: 'Olanote', ignoredParticipants: ['', '   '] });
+  await settle();
+  check('ignored: a blank fragment ignores nobody', lastCoverage(h)?.humans === 1,
+    JSON.stringify(lastCoverage(h)));
+  h.watcher.destroy();
+}
+{
+  // Coverage is reported on CHANGE. A human replaced by a bot changes neither named nor
+  // participants, only humans — and that change is exactly what the leave decision needs to see.
+  // Real timers: the watcher's 5 s rescan is what picks up the new room.
+  const human = makeTile('p2', 'Priya Nair', { outline: false }).tile;
+  const bot = makeTile('p3', 'Fireflies.ai Notetaker Alex', { outline: false }).tile;
+  const greg = makeTile('p1', 'Greg Higgins', { outline: true }).tile;
+  const h = start([greg, human], { selfName: 'Olanote', ignoredParticipants: ['fireflies.ai notetaker'] });
+  await settle();
+  const before = lastCoverage(h);
+  installDocument([greg, bot]);
+  await new Promise((r) => setTimeout(r, 5_200));
+  const after = lastCoverage(h);
+  check('ignored: a change in humans alone is reported',
+    before?.humans === 2 && after?.humans === 1 && after?.participants === 2 && after?.named === 2,
+    JSON.stringify({ before, after }));
+  h.watcher.destroy();
+}
+
 // ── 6. REALISTIC CADENCE — the shape every other block above was blind to ────
 // Every check above drives exactly ONE sample per DOM change. A real page does
 // not: rAF samples at ~60fps while a voice bar updates every ~150ms, so ~8 of

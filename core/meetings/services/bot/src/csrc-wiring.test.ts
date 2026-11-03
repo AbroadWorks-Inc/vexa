@@ -87,6 +87,26 @@ const check = (name: string, cond: boolean, detail?: string) => {
     warnings.some((w) => w.includes('observation-clock-skew')) && stored[2].t >= t, warnings.join(' | '));
 }
 
+{
+  // roster-coverage crosses with the producer's humans count (participants minus other notetaker
+  // bots); a producer that does not send it, or sends nonsense, crosses `undefined`.
+  const seen: Array<{ named: number; participants: number; humans: number | undefined }> = [];
+  const sink = makeObservationSink(
+    'mixed', undefined, () => { /* quiet */ }, undefined,
+    (named, participants, _t, humans) => seen.push({ named, participants, humans }),
+  );
+  const t = Date.now();
+  sink.sink('teams-speakers', { type: 'roster-coverage', platform: 'teams', named: 1, participants: 1, humans: 0 }, t);
+  sink.sink('teams-speakers', { type: 'roster-coverage', platform: 'teams', named: 2, participants: 2 }, t);
+  sink.sink('teams-speakers', { type: 'roster-coverage', platform: 'teams', named: 2, participants: 2, humans: 'two' }, t);
+  check('observation sink: roster-coverage carries humans when the producer sends it',
+    seen[0]?.humans === 0 && seen[0]?.participants === 1 && seen[0]?.named === 1, JSON.stringify(seen));
+  check('observation sink: no humans (an older producer) crosses undefined',
+    seen.length === 3 && seen[1].humans === undefined, JSON.stringify(seen));
+  check('observation sink: a non-number humans crosses undefined',
+    seen[2]?.humans === undefined, JSON.stringify(seen));
+}
+
 // ── The real bundle (built by build-browser-utils.mjs — turbo test depends on build) ─────────────
 const BUNDLE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'browser-utils.global.js');
 if (!existsSync(BUNDLE)) {
