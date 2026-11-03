@@ -321,6 +321,11 @@ runtime:
     idleTimeoutSec: ""
   # Active-phase remote-audio silence window. Empty uses the bot's 10-minute default.
   aloneSilenceWindowMs: ""
+  # Other notetaker bots, as comma-separated name fragments (case-insensitive), e.g.
+  # "fireflies.ai notetaker,otter.ai". A Teams participant whose name contains one does not keep the
+  # bot in an empty meeting. Use each bot's full display prefix: a short fragment such as "ai" also
+  # matches people. Set it in a values file — `--set` splits on commas. Empty ignores nobody.
+  ignoredParticipants: ""
   resources:
     requests: { cpu: 50m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 768Mi }

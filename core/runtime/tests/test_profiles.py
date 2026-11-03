@@ -70,6 +70,31 @@ def test_meeting_bot_forwards_speaker_stream_tuning(monkeypatch):
     }
 
 
+def test_meeting_bot_forwards_ignored_participants(monkeypatch):
+    # Other notetaker bots' name fragments reach every bot pod, so the list changes with a Helm
+    # value and a runtime restart, never a bot image build.
+    for key in (
+        "BOT_ALONE_SILENCE_WINDOW_MS",
+        "BOT_SPEAKER_MIN_AUDIO_SEC",
+        "BOT_SPEAKER_SUBMIT_INTERVAL_SEC",
+        "BOT_SPEAKER_CONFIRM_THRESHOLD",
+        "BOT_SPEAKER_MAX_BUFFER_SEC",
+        "BOT_SPEAKER_IDLE_TIMEOUT_SEC",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("BOT_IGNORED_PARTICIPANTS", "fireflies.ai notetaker,otter.ai")
+    reg = default_registry()
+    assert reg.get("meeting-bot").base_env == {
+        "BOT_IGNORED_PARTICIPANTS": "fireflies.ai notetaker,otter.ai",
+    }
+
+
+def test_meeting_bot_omits_ignored_participants_when_unset(monkeypatch):
+    monkeypatch.delenv("BOT_IGNORED_PARTICIPANTS", raising=False)
+    reg = default_registry()
+    assert "BOT_IGNORED_PARTICIPANTS" not in reg.get("meeting-bot").base_env
+
+
 def test_meeting_bot_env_is_a_valid_invocation():
     """The bot's whole config is delivered as VEXA_BOT_CONFIG — a JSON-encoded Invocation. Build the
     env the control plane would hand the profile and prove the payload conforms to invocation.v1."""

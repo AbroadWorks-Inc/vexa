@@ -133,7 +133,12 @@ inside the gateway's 30 s timeout for buffered requests.
 The bot leaves when no remote audio above the capture floor (peak 0.005) has reached it for
 `BOT_ALONE_SILENCE_WINDOW_MS` (default 10 minutes, `aloneness.ts`), and ends `completed` with
 reason `left_alone`; that ending is not retried. A bot whose streams are connected but deliver no
-frames is treated as deaf, not alone, and does not leave on that rule.
+frames is treated as deaf, not alone, and does not leave on that rule. On MS Teams, which keeps
+one stream connected after everyone leaves, it leaves on that rule once the participant list has
+held nobody but itself for the whole window. Other notetaker bots named in
+`BOT_IGNORED_PARTICIPANTS` (Helm `runtime.ignoredParticipants`, comma-separated, case-insensitive
+fragments) do not count as people there; an entry whose name cannot be read always counts.
+Changing the list needs a `helm upgrade`, not a bot build, and applies to bots started after it.
 meeting-api's own `left_alone`, for a bot whose pod vanished mid-meeting (`reconcile.py`), is a
 lost bot and is retried.
 

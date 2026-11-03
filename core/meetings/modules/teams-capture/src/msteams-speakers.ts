@@ -602,6 +602,9 @@ export interface TeamsRosterCoverageObservation {
   participants: number;
   /** …of which a display name resolved. */
   named: number;
+  /** `participants` without the ones whose name contains an `ignoredParticipants` fragment (other
+   *  notetaker bots). An entry with no readable name is always counted here. */
+  humans: number;
   tMs: number;
 }
 
@@ -662,6 +665,9 @@ export interface TeamsSpeakerHealth {
 export interface TeamsSpeakersOptions {
   /** Local participant / bot display name — its tiles are never reported. */
   selfName?: string;
+  /** Name fragments of other notetaker bots. A participant whose display name contains one
+   *  (case-insensitive) is left out of the roster's `humans` count and nothing else. */
+  ignoredParticipants?: readonly string[];
   /** Debounced speaking state change: isEnd=false → started speaking,
    *  isEnd=true → stopped. tMs = wall-clock at emit. */
   onSpeaking: (name: string, id: string, isEnd: boolean, tMs: number) => void;
@@ -710,6 +716,16 @@ export function createTeamsSpeakers(opts: TeamsSpeakersOptions): TeamsSpeakers {
   const indicatorHoldMs = opts.indicatorHoldMs ?? 400;
   const rosterEmitScans = opts.rosterEmitScans ?? 3;
   const now = opts.now ?? (() => Date.now());
+  // Whitespace runs (a non-breaking space included) compare as one space, on both sides.
+  const foldForMatch = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const ignoredFragments = [...new Set((opts.ignoredParticipants ?? [])
+    .filter((f): f is string => typeof f === 'string')
+    .map(foldForMatch)
+    .filter((f) => f.length > 0))];
+  const isIgnoredParticipant = (name: string): boolean => {
+    const folded = foldForMatch(name);
+    return ignoredFragments.some((f) => folded.includes(f));
+  };
 
   // ── Coverage accounting (Gate A) ──
   // Every canonical participant surface is COUNTED, whether or not it is observable.
@@ -1342,12 +1358,14 @@ export function createTeamsSpeakers(opts: TeamsSpeakersOptions): TeamsSpeakers {
       (name): name is string => !!name && isTeamsDisplayNameCandidate(name, nameContext)));
     const unresolvedPanelParticipants = Math.max(
       0, nonSelfPanelEntries.length - distinctUsablePanelNames.size);
-    const participants = usableNames.size + unresolvedParticipantSurfaces + unresolvedPanelParticipants;
-    const coverageKey = `${usableNames.size}/${participants}`;
+    const unresolved = unresolvedParticipantSurfaces + unresolvedPanelParticipants;
+    const participants = usableNames.size + unresolved;
+    const humans = [...usableNames].filter((n) => !isIgnoredParticipant(n)).length + unresolved;
+    const coverageKey = `${usableNames.size}/${participants}/${humans}`;
     if (coverageKey !== lastCoverageKey) {
       lastCoverageKey = coverageKey;
-      deliver({ type: 'roster-coverage', platform: 'teams', participants, named: usableNames.size, tMs: now() });
-      log(`[TeamsSpeakers] roster-coverage named=${usableNames.size} participants=${participants}`);
+      deliver({ type: 'roster-coverage', platform: 'teams', participants, named: usableNames.size, humans, tMs: now() });
+      log(`[TeamsSpeakers] roster-coverage named=${usableNames.size} participants=${participants} humans=${humans}`);
     }
     coverage.found = found;
     coverage.observable = observable;
