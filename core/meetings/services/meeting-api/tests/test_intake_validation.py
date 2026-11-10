@@ -310,6 +310,22 @@ def test_content_hash_matches_the_shared_vector():
     e = parse_entry(vector["raw_input"], now=NOW, max_days_ahead=30)
     assert e.content_hash == vector["content_hash"]
 
+    # The cases carrying real metadata — the shape the calendar module sends on
+    # every entry since the olanote flag. The original case above has
+    # `metadata: null`, which production has retired, so on its own it pinned a
+    # shape that can no longer occur. This side PRODUCED these hashes; the
+    # calendar module's suite reproduces them from the same raw input.
+    assert len(vector["cases"]) >= 4, "the vector lost cases"
+    assert vector["revision"] == "2026-11-10.olanote-metadata-cases"
+    for case in vector["cases"]:
+        # Metadata is passed through untouched on this side too.
+        assert case["normalised"]["metadata"] == case["raw_input"]["metadata"], case["name"]
+        canonical = json.dumps(case["normalised"], sort_keys=True, separators=(",", ":"))
+        assert canonical == case["canonical_json"], case["name"]
+        assert sha256(canonical.encode("utf-8")).hexdigest() == case["content_hash"], case["name"]
+        parsed = parse_entry(case["raw_input"], now=NOW, max_days_ahead=30)
+        assert parsed.content_hash == case["content_hash"], case["name"]
+
 
 # ── parse_remove ──────────────────────────────────────────────────────────────
 

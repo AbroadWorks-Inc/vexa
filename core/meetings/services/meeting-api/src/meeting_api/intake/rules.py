@@ -18,7 +18,12 @@ has started.
     and ``start <= now + adopt_ahead``. A live meeting counts as not ended however long it runs
     past its planned end: its bot is in the call now, and a pasted link never gets a second bot.
   * ``recompute`` — a meeting's plan from its active entries: earliest start, latest end (none if
-    any entry is open-ended), and the first title, time zone and link in start order.
+    any entry is open-ended), the first title, time zone and link in start order, and auto-join
+    (on unless an entry says otherwise — several entries can point at one meeting, and any one of
+    them saying ``false`` keeps the bot away, the cautious branch, matching what ``end`` already
+    does with a missing value).
+  * ``entry_auto_join`` — one entry's ``metadata.olanote.auto_join``. Absent means on; only an
+    explicit ``false`` turns the bot off.
   * ``finished_window`` — R10: a started meeting's window is ``[meeting start, finish)``, the end
     clamped to be no earlier than the start.
   * ``is_future_move`` — R7: an update moves the entry to a new future time, away from a meeting
@@ -43,6 +48,7 @@ __all__ = [
     "FINISHED_STATUSES",
     "Plan",
     "as_utc",
+    "entry_auto_join",
     "finished_window",
     "is_future_move",
     "is_live",
@@ -79,6 +85,9 @@ class Planned(Timed, Protocol):
     @property
     def meeting_url(self) -> str: ...
 
+    @property
+    def metadata(self) -> Optional[Any]: ...
+
 
 class MeetingLike(Protocol):
     @property
@@ -99,13 +108,14 @@ _M = TypeVar("_M", bound=MeetingLike)
 
 @dataclass(frozen=True)
 class Plan:
-    """A meeting's time, title, time zone and link, as its active entries give them."""
+    """A meeting's time, title, time zone, link and auto-join, as its active entries give them."""
 
     start: datetime
     end: Optional[datetime]
     title: Optional[str]
     time_zone: Optional[str]
     meeting_url: str
+    auto_join: bool = True
 
 
 def as_utc(value: Any) -> Optional[datetime]:
@@ -118,6 +128,30 @@ def as_utc(value: Any) -> Optional[datetime]:
         else value
     )
     return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def entry_auto_join(metadata: Optional[Any]) -> bool:
+    """An entry's ``metadata.olanote.auto_join``: ``False`` only when it is exactly ``False``.
+
+    Absent means on, at every step: no metadata, metadata that is not an object, no ``olanote``
+    key, an ``olanote`` value that is not an object, no ``auto_join`` inside it, or an
+    ``auto_join`` that is not a boolean. Opting out is the deliberate act, so only a sender that
+    says ``false`` in so many words keeps the bot away.
+
+    ``metadata`` is whatever the JSONB column holds, so it is any JSON value and may be a string,
+    a number or a list. This is total: it never raises, because one sender's malformed blob must
+    not break intake for a meeting other senders also point at.
+
+    ``True`` and ``False`` are instances of ``int``, so the boolean check is ``is False`` rather
+    than ``== False`` or ``not value``: ``0`` is not a decision, and the string ``"false"`` is
+    truthy, which is the trap a ``bool()`` would fall into in both directions.
+    """
+    if not isinstance(metadata, dict):
+        return True
+    olanote = metadata.get("olanote")
+    if not isinstance(olanote, dict):
+        return True
+    return olanote.get("auto_join") is not False
 
 
 def is_live(status: Optional[str]) -> bool:
@@ -218,6 +252,7 @@ def recompute(entries: Sequence[Planned]) -> Plan:
         title=next((e.title for e in ordered if e.title is not None), None),
         time_zone=next((e.time_zone for e in ordered if e.time_zone is not None), None),
         meeting_url=ordered[0].meeting_url,
+        auto_join=all(entry_auto_join(e.metadata) for e in ordered),
     )
 
 

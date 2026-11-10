@@ -261,6 +261,7 @@ class InMemoryIntakeStore:
                 "scheduled_at": iso_utc(plan.start),
                 "title": plan.title,
                 "constructed_meeting_url": plan.meeting_url,
+                "auto_join": plan.auto_join,
             },
         }
         self.aw[meeting_id] = {
@@ -424,11 +425,6 @@ class _FakeTx:
         self, user_id: int, room: Room, plan: Plan, *, join_now: bool
     ) -> MeetingView:
         meeting_id = self._s.seed_meeting(user_id, room, status="scheduled", plan=plan)
-        row = self._s.meetings[meeting_id]
-        self._s.meetings[meeting_id] = {
-            **row,
-            "data": {**row["data"], "auto_join": True},
-        }
         return self._s.view(meeting_id)
 
     async def save_entry(

@@ -1,4 +1,5 @@
 {
+  "revision": "2026-11-10.olanote-metadata-cases",
   "description": "Shared cross-language test vector for intake.v1's content_hash (§2, task A4). meeting-api's meeting_api.intake.validation._content_hash produces this; the calendar module (Part B) computes the SAME hash from the SAME normalised fields and must match this vector bit-for-bit. content_hash is the sha256 hex of the canonical JSON (json.dumps(..., sort_keys=True, separators=(\",\", \":\"))) of the `normalised` object below — built from the ENTRY's mutable content fields ONLY (external_id/user are the entry's identity key used to look the row up, not its content, so they are excluded).",
   "raw_input": {
     "external_id": "google:3n5kq8example",
@@ -8,13 +9,19 @@
     "end": "2026-09-29T09:30:00+05:30",
     "time_zone": "Asia/Kolkata",
     "title": "Weekly sync",
-    "attendees": ["A@abroadworks.com", "B@Client.com"],
+    "attendees": [
+      "A@abroadworks.com",
+      "B@Client.com"
+    ],
     "series_id": null,
     "join_now": false,
     "metadata": null
   },
   "normalised": {
-    "attendees": ["a@abroadworks.com", "b@client.com"],
+    "attendees": [
+      "a@abroadworks.com",
+      "b@client.com"
+    ],
     "end": "2026-09-29T04:00:00Z",
     "join_now": false,
     "meeting_url": "https://meet.google.com/kxo-misr-avz",
@@ -25,5 +32,198 @@
     "title": "Weekly sync"
   },
   "canonical_json": "{\"attendees\":[\"a@abroadworks.com\",\"b@client.com\"],\"end\":\"2026-09-29T04:00:00Z\",\"join_now\":false,\"meeting_url\":\"https://meet.google.com/kxo-misr-avz\",\"metadata\":null,\"series_id\":null,\"start\":\"2026-09-29T03:30:00Z\",\"time_zone\":\"Asia/Kolkata\",\"title\":\"Weekly sync\"}",
-  "content_hash": "fd7a005d05177e2d33b75cdb001856a8e7720391abc66118984a8cdfe636a03f"
+  "content_hash": "fd7a005d05177e2d33b75cdb001856a8e7720391abc66118984a8cdfe636a03f",
+  "cases_description": "The object above is the ORIGINAL single case and carries `metadata: null`. From the Olanote change onward the calendar module always attaches `{\"olanote\": {\"auto_join\": ...}}`, plus any keys another system wrote, so that shape is retired in production and a vector covering only it would pin a case that can no longer occur. These cases cover the shapes that are actually sent. Every one was produced by meeting-api's own `parse_entry` (the producer owns the contract); the calendar module must reproduce each `content_hash` from the same `raw_input`. The last case exists because `sort_keys` has to recurse into nested objects: it is the property most likely to break if either side ever swaps its serialiser.",
+  "cases": [
+    {
+      "name": "our key, switched off",
+      "raw_input": {
+        "external_id": "google:3n5kq8example",
+        "user": "A@AbroadWorks.com",
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "start": "2026-09-29T09:00:00+05:30",
+        "end": "2026-09-29T09:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync",
+        "attendees": [
+          "A@abroadworks.com",
+          "B@Client.com"
+        ],
+        "series_id": null,
+        "join_now": false,
+        "metadata": {
+          "olanote": {
+            "auto_join": false
+          }
+        }
+      },
+      "normalised": {
+        "attendees": [
+          "a@abroadworks.com",
+          "b@client.com"
+        ],
+        "end": "2026-09-29T04:00:00Z",
+        "join_now": false,
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "metadata": {
+          "olanote": {
+            "auto_join": false
+          }
+        },
+        "series_id": null,
+        "start": "2026-09-29T03:30:00Z",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync"
+      },
+      "canonical_json": "{\"attendees\":[\"a@abroadworks.com\",\"b@client.com\"],\"end\":\"2026-09-29T04:00:00Z\",\"join_now\":false,\"meeting_url\":\"https://meet.google.com/kxo-misr-avz\",\"metadata\":{\"olanote\":{\"auto_join\":false}},\"series_id\":null,\"start\":\"2026-09-29T03:30:00Z\",\"time_zone\":\"Asia/Kolkata\",\"title\":\"Weekly sync\"}",
+      "content_hash": "a50f5617a31894b4de38ad985f245ea7ee43aae7f2280471cfb67cf5e35396a7"
+    },
+    {
+      "name": "our key, switched on",
+      "raw_input": {
+        "external_id": "google:3n5kq8example",
+        "user": "A@AbroadWorks.com",
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "start": "2026-09-29T09:00:00+05:30",
+        "end": "2026-09-29T09:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync",
+        "attendees": [
+          "A@abroadworks.com",
+          "B@Client.com"
+        ],
+        "series_id": null,
+        "join_now": false,
+        "metadata": {
+          "olanote": {
+            "auto_join": true
+          }
+        }
+      },
+      "normalised": {
+        "attendees": [
+          "a@abroadworks.com",
+          "b@client.com"
+        ],
+        "end": "2026-09-29T04:00:00Z",
+        "join_now": false,
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "metadata": {
+          "olanote": {
+            "auto_join": true
+          }
+        },
+        "series_id": null,
+        "start": "2026-09-29T03:30:00Z",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync"
+      },
+      "canonical_json": "{\"attendees\":[\"a@abroadworks.com\",\"b@client.com\"],\"end\":\"2026-09-29T04:00:00Z\",\"join_now\":false,\"meeting_url\":\"https://meet.google.com/kxo-misr-avz\",\"metadata\":{\"olanote\":{\"auto_join\":true}},\"series_id\":null,\"start\":\"2026-09-29T03:30:00Z\",\"time_zone\":\"Asia/Kolkata\",\"title\":\"Weekly sync\"}",
+      "content_hash": "cbb814db5086be4f8b3e9218b9af0f9f3e0bda161a890048a91291e739f41b84"
+    },
+    {
+      "name": "our key beside somebody else's",
+      "raw_input": {
+        "external_id": "google:3n5kq8example",
+        "user": "A@AbroadWorks.com",
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "start": "2026-09-29T09:00:00+05:30",
+        "end": "2026-09-29T09:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync",
+        "attendees": [
+          "A@abroadworks.com",
+          "B@Client.com"
+        ],
+        "series_id": null,
+        "join_now": false,
+        "metadata": {
+          "olanote": {
+            "auto_join": false
+          },
+          "vexa": {
+            "source": "import",
+            "rank": 2
+          }
+        }
+      },
+      "normalised": {
+        "attendees": [
+          "a@abroadworks.com",
+          "b@client.com"
+        ],
+        "end": "2026-09-29T04:00:00Z",
+        "join_now": false,
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "metadata": {
+          "olanote": {
+            "auto_join": false
+          },
+          "vexa": {
+            "source": "import",
+            "rank": 2
+          }
+        },
+        "series_id": null,
+        "start": "2026-09-29T03:30:00Z",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync"
+      },
+      "canonical_json": "{\"attendees\":[\"a@abroadworks.com\",\"b@client.com\"],\"end\":\"2026-09-29T04:00:00Z\",\"join_now\":false,\"meeting_url\":\"https://meet.google.com/kxo-misr-avz\",\"metadata\":{\"olanote\":{\"auto_join\":false},\"vexa\":{\"rank\":2,\"source\":\"import\"}},\"series_id\":null,\"start\":\"2026-09-29T03:30:00Z\",\"time_zone\":\"Asia/Kolkata\",\"title\":\"Weekly sync\"}",
+      "content_hash": "fafd340a84a36ca87cae73f0fa46438aac724ba039f8d2fa1be4a0040bc937c6"
+    },
+    {
+      "name": "keys given out of order, nested — sort_keys must recurse",
+      "raw_input": {
+        "external_id": "google:3n5kq8example",
+        "user": "A@AbroadWorks.com",
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "start": "2026-09-29T09:00:00+05:30",
+        "end": "2026-09-29T09:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync",
+        "attendees": [
+          "A@abroadworks.com",
+          "B@Client.com"
+        ],
+        "series_id": null,
+        "join_now": false,
+        "metadata": {
+          "zeta": {
+            "b": 2,
+            "a": 1
+          },
+          "olanote": {
+            "auto_join": true
+          },
+          "alpha": null
+        }
+      },
+      "normalised": {
+        "attendees": [
+          "a@abroadworks.com",
+          "b@client.com"
+        ],
+        "end": "2026-09-29T04:00:00Z",
+        "join_now": false,
+        "meeting_url": "https://meet.google.com/kxo-misr-avz",
+        "metadata": {
+          "zeta": {
+            "b": 2,
+            "a": 1
+          },
+          "olanote": {
+            "auto_join": true
+          },
+          "alpha": null
+        },
+        "series_id": null,
+        "start": "2026-09-29T03:30:00Z",
+        "time_zone": "Asia/Kolkata",
+        "title": "Weekly sync"
+      },
+      "canonical_json": "{\"attendees\":[\"a@abroadworks.com\",\"b@client.com\"],\"end\":\"2026-09-29T04:00:00Z\",\"join_now\":false,\"meeting_url\":\"https://meet.google.com/kxo-misr-avz\",\"metadata\":{\"alpha\":null,\"olanote\":{\"auto_join\":true},\"zeta\":{\"a\":1,\"b\":2}},\"series_id\":null,\"start\":\"2026-09-29T03:30:00Z\",\"time_zone\":\"Asia/Kolkata\",\"title\":\"Weekly sync\"}",
+      "content_hash": "b8fffa79a9d94276024329cd3cc8e9e1bb9f86d898d2a365bccb8237181ec8fa"
+    }
+  ]
 }
