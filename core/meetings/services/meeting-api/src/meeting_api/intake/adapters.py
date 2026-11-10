@@ -192,11 +192,18 @@ def violated_constraint(error: Any) -> Optional[str]:
 
 
 def _plan_data(plan: Plan) -> dict[str, Any]:
-    """The plan's keys in ``meetings.data``: the join time auto-join reads, the title and link."""
+    """The plan's keys in ``meetings.data``: the join time auto-join reads, the title, the link
+    and the auto-join flag itself.
+
+    ``auto_join`` belongs here rather than beside this call so that the create path and the update
+    path (``apply_plan``, which merges this over the stored data) carry it from ONE place. A
+    meeting goes dormant and is re-armed through the update path, so a flag written only at
+    creation would be a flag that can be switched off and never switched back on."""
     return {
         "scheduled_at": iso_utc(plan.start),
         "title": plan.title,
         "constructed_meeting_url": plan.meeting_url,
+        "auto_join": plan.auto_join,
     }
 
 
@@ -449,7 +456,7 @@ class PostgresIntakeTx:
             platform=room.platform,
             native_meeting_id=room.native_meeting_id,
             status="scheduled",
-            data={**_plan_data(plan), "auto_join": True},
+            data=_plan_data(plan),
             first_event=None,
             scheduled_end_at=plan.end,
             time_zone=plan.time_zone,

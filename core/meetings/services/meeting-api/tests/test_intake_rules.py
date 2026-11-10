@@ -49,6 +49,10 @@ class E:
     title: Optional[str] = None
     time_zone: Optional[str] = None
     meeting_url: str = "https://meet.google.com/kxo-misr-avz"
+    # `Planned` reads an entry's metadata for the Olanote auto-join flag; these cases are about
+    # times, titles and links, so they carry none. `test_olanote_auto_join.py` is where the flag
+    # itself is pinned.
+    metadata: Optional[dict] = None
 
 
 # ── overlaps ─────────────────────────────────────────────────────────────────────────────────

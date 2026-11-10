@@ -200,11 +200,16 @@ class PgHarness(Requests):
                         "uid": user_id,
                         "p": room.platform,
                         "n": room.native_meeting_id,
+                        # `auto_join` is on an upstream-planned row too: every real creation
+                        # path writes it (`calendar_sync/service.py` `_planned_data`,
+                        # `collector/adapters.py` `insert_meeting`). Omitting it here modelled a
+                        # row production never makes.
                         "d": json.dumps(
                             {
                                 "scheduled_at": iso_utc(plan.start),
                                 "title": plan.title,
                                 "constructed_meeting_url": plan.meeting_url,
+                                "auto_join": plan.auto_join,
                             }
                         ),
                     },
@@ -1119,3 +1124,94 @@ async def test_the_postgres_store_matches_the_fake(make_pg, scenario, now, failu
     actual = await _pg_snapshot(pg_h, pg_replies)
     for key in expected:
         assert actual[key] == expected[key], key
+
+
+# ── the Olanote auto-join flag, read back out of real Postgres ───────────────────────────────
+#
+# `test_olanote_auto_join.py` pins the rule offline. These four prove the part no offline test
+# can: what the JSONB column actually DECODES to on the way back, and that one particular lie is
+# not available to us.
+#
+# All 2,016 entry rows in production hold `'null'::jsonb`. That is a real JSONB value, so
+# `metadata IS NOT NULL` is TRUE for every one of them while every value means nothing. Any
+# reader that asked SQL "is a flag present" would answer yes for the entire table.
+
+
+async def _plan_now(h: PgHarness, mid: int, room: Room):
+    """The plan the store computes from the meeting's rows AS THEY STAND — the same call
+    `_replan` makes, so this is the production read, not a re-parse of our own fixture."""
+    from meeting_api.intake.rules import recompute
+
+    async with h.store.room_lock(1, [room]) as tx:
+        return recompute(await tx.active_entries(mid))
+
+
+async def test_pg_the_flag_survives_the_round_trip_through_jsonb(make_pg):
+    """PUT → `meeting_entries.metadata` → re-read → `meetings.data`. End to end, real columns."""
+    h = make_pg()
+    off = await h.put("google:off", metadata={"olanote": {"auto_join": False}})
+    on = await h.put("google:on", meeting_url=GMEET_OTHER)
+
+    off_mid, on_mid = await h.meeting_id(off["meeting"]["id"]), await h.meeting_id(on["meeting"]["id"])
+    assert await scalar(h.engine, "SELECT data->'auto_join' FROM meetings WHERE id = :i", i=off_mid) is False
+    assert await scalar(h.engine, "SELECT data->'auto_join' FROM meetings WHERE id = :i", i=on_mid) is True
+
+
+async def test_pg_json_null_metadata_is_not_null_in_sql_but_still_means_the_bot_is_on(make_pg):
+    """The trap, proven in the database rather than argued. The row's metadata IS NOT NULL — and
+    the flag is still absent, so the bot stays on."""
+    h = make_pg()
+    reply = await h.put()
+    mid = await h.meeting_id(reply["meeting"]["id"])
+    async with h.engine.begin() as conn:
+        await conn.execute(text("UPDATE meeting_entries SET metadata = 'null'::jsonb"))
+
+    present = await scalar(h.engine, "SELECT metadata IS NOT NULL FROM meeting_entries WHERE meeting_id = :i", i=mid)
+    assert present is True, "a JSON null IS a value: this is why nothing may use IS NOT NULL"
+
+    assert (await _plan_now(h, mid, GROOM)).auto_join is True
+
+
+async def test_pg_sql_null_metadata_means_the_bot_is_on(make_pg):
+    h = make_pg()
+    reply = await h.put()
+    mid = await h.meeting_id(reply["meeting"]["id"])
+    async with h.engine.begin() as conn:
+        await conn.execute(text("UPDATE meeting_entries SET metadata = NULL"))
+
+    present = await scalar(h.engine, "SELECT metadata IS NOT NULL FROM meeting_entries WHERE meeting_id = :i", i=mid)
+    assert present is False
+    assert (await _plan_now(h, mid, GROOM)).auto_join is True
+
+
+async def test_pg_metadata_that_is_not_a_json_object_never_breaks_the_replan(make_pg):
+    """JSONB holds any JSON value. A sender storing a string or a list there must not take the
+    meeting down for everybody else pointing at it."""
+    h = make_pg()
+    reply = await h.put()
+    mid = await h.meeting_id(reply["meeting"]["id"])
+    for blob in ('"hello"', "5", "[1, 2]", "true", "false"):
+        async with h.engine.begin() as conn:
+            await conn.execute(text(f"UPDATE meeting_entries SET metadata = '{blob}'::jsonb"))
+        assert (await _plan_now(h, mid, GROOM)).auto_join is True, blob
+
+
+async def test_pg_a_near_miss_auto_join_value_still_leaves_the_bot_on(make_pg):
+    """JSON carries types, and the ones that look like a decision are not one. The string
+    "false" is TRUTHY in Python and `0` is falsy, so a reader built on `bool()` would get both
+    of these backwards — off for the number, on for the word. Only `false` itself decides."""
+    h = make_pg()
+    reply = await h.put()
+    mid = await h.meeting_id(reply["meeting"]["id"])
+    for blob in ('{"olanote": {"auto_join": "false"}}', '{"olanote": {"auto_join": 0}}',
+                 '{"olanote": {"auto_join": null}}', '{"olanote": "off"}',
+                 '{"olanote": {}}', '{"other": {"auto_join": false}}'):
+        async with h.engine.begin() as conn:
+            await conn.execute(text(f"UPDATE meeting_entries SET metadata = '{blob}'::jsonb"))
+        assert (await _plan_now(h, mid, GROOM)).auto_join is True, blob
+
+    async with h.engine.begin() as conn:
+        await conn.execute(
+            text("""UPDATE meeting_entries SET metadata = '{"olanote": {"auto_join": false}}'::jsonb""")
+        )
+    assert (await _plan_now(h, mid, GROOM)).auto_join is False, "the positive control"
