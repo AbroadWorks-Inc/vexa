@@ -73,6 +73,22 @@ Bot status callbacks carry the internal secret. Each bot's runtime callback URL 
 bot's own token. `/internal/*` between admin-api and meeting-api checks the internal secret.
 Those paths are how a pod inside the cluster reports progress without presenting a user API key.
 
+## LiveKit meeting tokens
+
+A LiveKit bot gets its token only from Meet's waiting room on the meeting's own host, scoped to one
+room, without `roomAdmin`. Only hosts in `VEXA_LIVEKIT_HOSTS` reach a bot: meeting-api refuses any
+other at intake and at `POST /bots`, which also requires the URL to parse to the same room. The
+knock refuses `http`, a port, credentials in the URL, and redirects, and the bot accepts only a
+`wss`/`https` LiveKit URL without credentials.
+
+The token is never logged, never written to a file, and sent only to LiveKit. Chrome logs a failed
+WebSocket's URL, which carries the token as `access_token`, so the capture bridge redacts every page
+console line before it forwards it to the bot's log (`redactPageConsole`): the token becomes `<redacted>`, and a
+signed-in person's LiveKit identity (`f:<uuid>:<email>`) becomes `<identity>`. A channel carries the
+participant sid and display name, never the identity.
+
+Phase 1 adds no secret to aw-bots.
+
 ## Webhook receivers
 
 The signature a subscriber checks is in [export and webhooks](export-and-webhooks.md#delivery).
