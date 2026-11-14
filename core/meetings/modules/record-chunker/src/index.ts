@@ -338,5 +338,19 @@ export function createRecordingTap(opts: CreateRecordingTapOptions): RecordingTa
   };
 }
 
-export { createJitsiChannelNumbers, jitsiChannel, selectJitsiChannels } from "./channel-targets.js";
-export type { ChannelCandidate, ChannelTarget, JitsiChannelNumbers } from "./channel-targets.js";
+export {
+  createJitsiChannelNumbers,
+  createLivekitChannelNumbers,
+  jitsiChannel,
+  selectJitsiChannels,
+  selectLivekitChannels,
+} from "./channel-targets.js";
+export type {
+  ChannelCandidate,
+  ChannelTarget,
+  JitsiChannelNumbers,
+  LivekitChannelCandidate,
+  LivekitChannelNumbers,
+  LivekitChannelTarget,
+  LivekitSubscribedTrack,
+} from "./channel-targets.js";

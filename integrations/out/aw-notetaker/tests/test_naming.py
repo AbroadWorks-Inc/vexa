@@ -11,6 +11,13 @@ def test_meet_example() -> None:
     )
 
 
+def test_livekit_room_code() -> None:
+    assert (
+        folder_name("livekit", "abc-defg-hij", "2026-11-14T07:10:00Z")
+        == "livekit_abc-defg-hij_20261114T071000000Z"
+    )
+
+
 def test_offset_is_normalised_to_utc() -> None:
     assert (
         folder_name("zoom", "85012345678", "2026-09-22T22:32:34.001+05:30")

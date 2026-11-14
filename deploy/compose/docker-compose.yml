@@ -371,6 +371,8 @@ services:
       - VEXA_FLOWS_API_KEY=${VEXA_FLOWS_API_KEY:-}
       # Self-hosted Jitsi hostnames (comma-separated) recognized in pasted + calendar links.
       - VEXA_JITSI_HOSTS=${VEXA_JITSI_HOSTS:-}
+      # LiveKit website-meeting hostnames (comma-separated): the only hosts a livekit bot is sent to.
+      - VEXA_LIVEKIT_HOSTS=${VEXA_LIVEKIT_HOSTS:-}
       - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-vexa-access-key}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-vexa-secret-key}

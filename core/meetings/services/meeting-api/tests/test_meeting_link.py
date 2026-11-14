@@ -233,3 +233,80 @@ class TestTeamsThreadIdIsBounded:
         start = time.monotonic()
         assert parse_meeting_url(f"https://teams.microsoft.com/l/meetup-join/{payload}") is None
         assert time.monotonic() - start < 2.0
+
+
+class TestParseLivekit:
+    """A LiveKit website meeting: a ``VEXA_LIVEKIT_HOSTS`` host and a single room-code segment.
+    The native id is the code alone (one Meet deployment serves every listed host)."""
+
+    HOST = "meet-next.olamee.com"
+
+    def _hosts(self, monkeypatch, hosts: str = HOST) -> None:
+        monkeypatch.setenv("VEXA_LIVEKIT_HOSTS", hosts)
+
+    def test_room_url_in_both_modes(self, monkeypatch):
+        self._hosts(monkeypatch)
+        for strict in (True, False):
+            assert parse_meeting_url(f"https://{self.HOST}/abc-defg-hij", generic_hosts=strict) == (
+                "livekit",
+                "abc-defg-hij",
+            )
+
+    def test_case_trailing_slash_and_query(self, monkeypatch):
+        self._hosts(monkeypatch)
+        for url in (
+            "https://Meet-Next.olamee.com/ABC-DEFG-HIJ",
+            f"https://{self.HOST}/abc-defg-hij/",
+            f"https://{self.HOST}/abc-defg-hij?lang=en#x",
+        ):
+            assert parse_meeting_url(url) == ("livekit", "abc-defg-hij"), url
+
+    def test_anything_else_on_a_livekit_host_is_none(self, monkeypatch):
+        self._hosts(monkeypatch)
+        for url in (
+            f"https://{self.HOST}/abc-defg-hij/extra",
+            f"https://{self.HOST}/standup",
+            f"https://{self.HOST}/",
+            f"https://{self.HOST}/abcd-defg-hij",
+            f"https://{self.HOST}:8443/abc-defg-hij",
+            f"https://{self.HOST}:443/abc-defg-hij",
+            f"http://{self.HOST}/abc-defg-hij",
+            f"https://{self.HOST}/abc-defg-hij;x",
+            f"https://{self.HOST}./abc-defg-hij",
+        ):
+            assert parse_meeting_url(url) is None, url
+
+    def test_unlisted_host_is_not_livekit(self, monkeypatch):
+        self._hosts(monkeypatch)
+        assert parse_meeting_url("https://meet-next.example.org/abc-defg-hij") != (
+            "livekit",
+            "abc-defg-hij",
+        )
+
+    def test_unset_hosts_means_no_livekit(self, monkeypatch):
+        monkeypatch.delenv("VEXA_LIVEKIT_HOSTS", raising=False)
+        assert parse_meeting_url(f"https://{self.HOST}/abc-defg-hij") != ("livekit", "abc-defg-hij")
+
+    def test_listed_livekit_host_beats_jitsi_rules(self, monkeypatch):
+        self._hosts(monkeypatch)
+        monkeypatch.setenv("VEXA_JITSI_HOSTS", self.HOST)
+        assert parse_meeting_url(f"https://{self.HOST}/abc-defg-hij") == ("livekit", "abc-defg-hij")
+
+    def test_a_trailing_dot_host_is_not_read_as_jitsi(self, monkeypatch):
+        # meet.olamee.com moves to LiveKit later; its trailing-dot spelling must not become a
+        # Jitsi room on the LiveKit host through the pasted-link "meet" label rule.
+        self._hosts(monkeypatch, "meet.olamee.com")
+        assert parse_meeting_url("https://meet.olamee.com./abc-defg-hij") is None
+
+    def test_jitsi_host_stays_jitsi(self, monkeypatch):
+        self._hosts(monkeypatch)
+        monkeypatch.setenv("VEXA_JITSI_HOSTS", "meet.olamee.com")
+        assert parse_meeting_url("https://meet.olamee.com/Standup") == (
+            "jitsi",
+            "standup@meet.olamee.com",
+        )
+
+    def test_found_in_calendar_text(self, monkeypatch):
+        self._hosts(monkeypatch)
+        url = f"https://{self.HOST}/abc-defg-hij"
+        assert find_meeting_link(f"Join here: {url} — see you") == ("livekit", "abc-defg-hij", url)

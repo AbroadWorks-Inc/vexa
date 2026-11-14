@@ -10,7 +10,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource } from './config.js';
+import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, recordingSource, captureLane } from './config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_DIR = join(HERE, '..', '..', '..', 'contracts', 'invocation.v1', 'golden');
@@ -24,7 +24,7 @@ const throws = (fn: () => unknown): Error | null => { try { fn(); return null; }
 
 // ── every committed invocation.v1 golden parses ──
 const goldens = readdirSync(GOLDEN_DIR).filter((n) => n.startsWith('Invocation.') && n.endsWith('.json'));
-check('found all invocation goldens', goldens.length === 3, `got ${goldens.join(', ')}`);
+check('found all invocation goldens', goldens.length === 4, `got ${goldens.join(', ')}`);
 for (const g of goldens) {
   const raw = readFileSync(join(GOLDEN_DIR, g), 'utf8');
   const err = throws(() => parseInvocation(raw));
@@ -105,6 +105,8 @@ console.log('\n✅ config (L1/L2): the goldens parse, the env helper round-trips
   check('recordingSource: teams records the mixed-lane graph', rs('teams') === 'mixed-mix', rs('teams'));
   check('recordingSource: jitsi records the mixed-lane graph', rs('jitsi') === 'mixed-mix', rs('jitsi'));
   check('recordingSource: google_meet keeps the element snapshot', rs('google_meet') === 'element-snapshot', rs('google_meet'));
+  check('recordingSource: livekit records the mixed-lane graph', rs('livekit') === 'mixed-mix', rs('livekit'));
+  check('captureLane: livekit rides the mixed lane', captureLane('livekit') === 'mixed', String(captureLane('livekit')));
 }
 
 // ── per-channel recorders: read from the invocation only; absent = off, never from the bot env ──

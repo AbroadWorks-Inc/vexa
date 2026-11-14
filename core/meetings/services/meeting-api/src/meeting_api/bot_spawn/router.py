@@ -365,6 +365,16 @@ def build_router(
             platform = derived_platform
             if not passcode:
                 passcode = _passcode_from_url(meeting_url)
+        # A LiveKit bot asks the meeting_url's host to let it in, so that URL must be the same room
+        # on a VEXA_LIVEKIT_HOSTS host — a supplied native_meeting_id never skips the host check.
+        if platform == "livekit" and meeting_url and parse_meeting_url(meeting_url) != ("livekit", native_meeting_id):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"meeting_url '{meeting_url}' is not LiveKit room '{native_meeting_id}' on a "
+                    "host listed in VEXA_LIVEKIT_HOSTS"
+                ),
+            )
         if not platform or (not native_meeting_id and not meeting_url):
             raise HTTPException(
                 status_code=422,
@@ -439,7 +449,7 @@ def build_router(
                 status_code=422,
                 detail=(
                     f"unsupported platform '{platform}' without a meeting_url — "
-                    "use google_meet/teams, or provide meeting_url (required for zoom/jitsi)"
+                    "use google_meet/teams, or provide meeting_url (required for zoom/jitsi/livekit)"
                 ),
             )
 

@@ -604,6 +604,14 @@ export interface BrowserSession {
  * remote-browser auth args, so the page the JoinDriver receives is configured identically to
  * what @vexa/join expects.  // L4 (O6/VM): live-validated against a real meeting.
  */
+/** A page console line as the container log may see it: a LiveKit token (Chrome prints a failed
+ *  WebSocket's URL, query included) and a LiveKit identity holding an email are redacted. */
+export function redactPageConsole(text: string): string {
+  return text
+    .replace(/access_token=[^&'"\s]+/g, 'access_token=<redacted>')
+    .replace(/\bf:[^\s:,'"}]+:[^\s,'"}]*@[^\s,'"}]+/g, '<identity>');
+}
+
 export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   // Every bot gets its OWN profile dir — concurrent bots sharing one dir die on Chromium's
   // SingletonLock (#478: joining → failed <1s, "Opening in existing browser session").
@@ -685,7 +693,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   await context.exposeFunction('logBot', (m: string) => console.log(`[page] ${m}`)).catch(() => { /* already registered */ });
   page.on('console', (msg) => {
     const t = msg.text();
-    if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);
+    if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${redactPageConsole(t)}`);
   });
 
   return {
@@ -737,6 +745,7 @@ export async function startCaptureBridge(
   const perTrack = isPerTrackLanePlatform(inv.platform);   // Zoom: per-track through the per-channel lane
   const useMix = mixed && !perTrack;                        // Teams/Jitsi: the pyannote mixed lane
   const jitsi = inv.platform === 'jitsi';
+  const livekit = inv.platform === 'livekit';
   const lane: CaptureLane = captureLane(inv.platform);
 
   // ── O-TEL-1 raw-signal tap (a DUAL-sink) ──────────────────────────────────────────────────
@@ -826,7 +835,7 @@ export async function startCaptureBridge(
   await page.exposeFunction('__vexaPerSpeakerAudioData', onPerSpeakerAudio).catch((e: Error) => {
     if (!String(e.message).includes('already registered')) throw e;
   });
-  if (inv.perChannelRecordingEnabled === true && jitsi) {
+  if (inv.perChannelRecordingEnabled === true && (jitsi || livekit)) {
     await page.exposeFunction('__vexaChannelActivity', makeChannelActivitySink(speakerActivity))
       .catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
   }
@@ -853,7 +862,7 @@ export async function startCaptureBridge(
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
-  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, ignoredParticipants, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
+  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isLivekit, isTeams, isZoom, botName, ignoredParticipants, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
     const w = (globalThis as any) as Record<string, any>;
     // A destination with no input renders nothing, and a MediaRecorder on it emits no data until
     // the first source connects — the recording's t=0 would be the first participant's track, not
@@ -1438,6 +1447,18 @@ export async function startCaptureBridge(
           });
         }
       }
+      if (isLivekit && !w.VexaLivekit) {
+        w.logBot?.('[LiveKit] the LiveKit session is missing — no speaker hints and no roster for this meeting');
+      }
+      if (isLivekit && w.VexaLivekit && !w.__vexaLivekitWired) {
+        // LiveKit contributes the WHO signal from the session: the server's active speakers, and the
+        // exact roster the leave rule counts (without other notetaker bots).
+        w.__vexaLivekitWired = true;
+        w.VexaLivekit.onSpeaking((name: string, isEnd: boolean, tMs: number) =>
+          w.__vexaSpeakerHint?.(name, tMs, isEnd, 'dominant'));
+        w.VexaLivekit.onRoster(ignoredParticipants, (r: { participants: number; named: number; humans: number; tMs: number }) =>
+          w.__vexaObservation?.('mixed', { type: 'roster-coverage', platform: 'livekit', ...r }, r.tMs));
+      }
       // (Zoom's watcher lives in the per-track branch above — it feeds the resolver, not the mix.)
       return;
     }
@@ -1459,7 +1480,7 @@ export async function startCaptureBridge(
       await w.__vexaGmeetCapture.start();
       await w.__vexaRemoteAudioReady?.();
     }
-  }, { isMixed: mixed, isPerTrack: perTrack, isJitsi: jitsi, isTeams: inv.platform === 'teams', isZoom: inv.platform === 'zoom', botName: inv.botName,
+  }, { isMixed: mixed, isPerTrack: perTrack, isJitsi: jitsi, isLivekit: livekit, isTeams: inv.platform === 'teams', isZoom: inv.platform === 'zoom', botName: inv.botName,
       // Other notetaker bots' name fragments (BOT_IGNORED_PARTICIPANTS); the Teams roster's humans count leaves them out.
       ignoredParticipants: resolveIgnoredParticipants(process.env),
       // How long the Teams lane waits for the server mix before capturing every track instead.
@@ -1583,7 +1604,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     const n = raw ? parseInt(raw, 10) : NaN;
     return Number.isFinite(n) && n > 0 ? n : 15000;
   })();
-  const recordChannels = inv.perChannelRecordingEnabled === true && (inv.platform === 'google_meet' || inv.platform === 'jitsi');
+  const recordChannels = inv.perChannelRecordingEnabled === true && (inv.platform === 'google_meet' || inv.platform === 'jitsi' || inv.platform === 'livekit');
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
   const decodeChunk = (base64: string, mimeType: string): { bytes: Uint8Array; format: RecordingMasterFormat } => ({
     bytes: base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0),
@@ -1649,12 +1670,21 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       w.logBot?.('[channels] selectJitsiChannels or createJitsiChannelNumbers missing — channel recorders skipped');
       return;
     }
+    if (platform === 'livekit' && (typeof w.VexaBrowserUtils.selectLivekitChannels !== 'function'
+      || typeof w.VexaBrowserUtils.createLivekitChannelNumbers !== 'function' || !w.VexaLivekit)) {
+      w.logBot?.('[channels] selectLivekitChannels, createLivekitChannelNumbers or the LiveKit session missing — channel recorders skipped');
+      return;
+    }
     const MediaStreamRef = w.MediaStream;
     // Every channel number ever opened in this session: a released one is never reopened. A Jitsi
     // channel number names one stream object (createJitsiChannelNumbers): a new bridge session's
     // streams reuse the ids remote-audio-<n> as new objects, and those get new numbers.
     const started = new Set<number>();
     const jitsiNumbers = platform === 'jitsi' ? w.VexaBrowserUtils.createJitsiChannelNumbers() : null;
+    // A LiveKit channel number names one person on one track (`<sid>|<track id>`); a released key is
+    // forgotten, so a returning person gets a new number.
+    const livekitNumbers = platform === 'livekit' ? w.VexaBrowserUtils.createLivekitChannelNumbers() : null;
+    const livekitKeys = new Map<number, string>();
     // The live ones: channel -> its recorder, its stream and stream id, and its activity source and node.
     // Whoever takes an entry out of this map (a release, or the stop) stops its recorder.
     w.__vexaChannels = new Map<number, { tap: any; streamId: string; stream: any; src?: any; node?: any; missingSince?: number }>();
@@ -1668,6 +1698,10 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       const entry = w.__vexaChannels.get(channel);
       if (!entry) return Promise.resolve();
       w.__vexaChannels.delete(channel);
+      // A released LiveKit key is forgotten, whatever released it (unsubscribe, track ended), so a
+      // returning person gets a new channel instead of a number that is never reopened.
+      const livekitKey = livekitKeys.get(channel);
+      if (livekitKey !== undefined) { livekitKeys.delete(channel); livekitNumbers?.forget(livekitKey); }
       const done = (async () => {
         try { entry.node?.disconnect?.(); } catch { /* best-effort */ }
         try { entry.src?.disconnect?.(); } catch { /* best-effort */ }
@@ -1678,17 +1712,17 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       void done.finally(() => w.__vexaChannelReleases.delete(done));
       return done;
     };
-    const mediaStreams = (): { streamId: string; paused: boolean; audioTracks: number; stream: any }[] => {
-      const out: { streamId: string; paused: boolean; audioTracks: number; stream: any }[] = [];
+    const mediaStreams = (): { streamId: string; paused: boolean; audioTracks: number; trackId: string; stream: any }[] => {
+      const out: { streamId: string; paused: boolean; audioTracks: number; trackId: string; stream: any }[] = [];
       const all = w.document?.querySelectorAll?.('audio, video') ?? [];
       for (let i = 0; i < all.length; i++) {
         const el = all[i];
         const stream = el?.srcObject;
         if (!(stream instanceof MediaStreamRef)) continue;
         // Live tracks only: an element left holding a stream whose tracks ended is not a candidate.
-        let tracks = 0;
-        try { tracks = stream.getAudioTracks().filter((t: any) => t.readyState !== 'ended').length; } catch { tracks = 0; }
-        out.push({ streamId: String(stream.id), paused: !!el.paused, audioTracks: tracks, stream });
+        let live: any[] = [];
+        try { live = stream.getAudioTracks().filter((t: any) => t.readyState !== 'ended'); } catch { live = []; }
+        out.push({ streamId: String(stream.id), paused: !!el.paused, audioTracks: live.length, trackId: String(live[0]?.id ?? ''), stream });
       }
       return out;
     };
@@ -1729,7 +1763,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
       try {
         for (const track of stream.getAudioTracks()) track.addEventListener('ended', () => { void release(channel); });
       } catch { /* the scan's absence check releases it */ }
-      if (kind !== 'jitsi' || typeof w.VexaBrowserUtils.createLevelNode !== 'function' || !w.AudioContext) return;
+      if ((kind !== 'jitsi' && kind !== 'livekit') || typeof w.VexaBrowserUtils.createLevelNode !== 'function' || !w.AudioContext) return;
       try {
         // ONE shared 16 kHz context for every channel's activity tap: Chromium hard-caps concurrent
         // AudioContexts at about 6, so a context per channel would leave the 7th+ speaker with no
@@ -1778,6 +1812,37 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
             const found = byId.get(row.streamId);
             if (!found || found.audioTracks < 1) continue;
             await openChannel(row.index, found.stream, 'gmeet', row.streamId);
+          }
+        } else if (platform === 'livekit') {
+          // A channel is a track the session reports as subscribed. LiveKit pre-allocates receivers
+          // and hands a freed one to the next subscription, so the subscription, not the element,
+          // says whose voice a stream carries.
+          const subscribed = w.VexaLivekit.subscribedTracks() as { trackId: string; sid: string; name: string }[];
+          const subscribedKeys = new Set(subscribed.map((t) => `${t.sid}|${t.trackId}`));
+          const targets = (w.VexaBrowserUtils.selectLivekitChannels(present, subscribed) as { streamId: string; key: string; sid: string }[])
+            .filter((target) => byId.has(target.streamId));
+          const live = new Set(targets.map((target) => target.key));
+          // Releases first: a receiver LiveKit hands to someone else must stop recording under the
+          // old key before the new key opens on the same stream.
+          // Unsubscribed: released at once (its stream may already carry someone else). Subscribed but
+          // its stream briefly off the page: kept for channelGoneMs, like a Jitsi stream.
+          const now = Date.now();
+          for (const [channel, entry] of Array.from(w.__vexaChannels.entries()) as [number, { missingSince?: number }][]) {
+            const key = livekitKeys.get(channel);
+            if (key && live.has(key)) { entry.missingSince = undefined; continue; }
+            entry.missingSince ??= now;
+            if (!key || !subscribedKeys.has(key) || now - entry.missingSince >= channelGoneMs) await release(channel);
+          }
+          for (const target of targets) {
+            const found = byId.get(target.streamId)!;
+            const channel = livekitNumbers.channelFor(target.key);
+            livekitKeys.set(channel, target.key);
+            const nameOf = (): { participantId?: string; displayName?: string } => {
+              const now = (w.VexaLivekit.subscribedTracks() as { trackId: string; sid: string; name: string }[])
+                .find((t) => `${t.sid}|${t.trackId}` === target.key);
+              return { participantId: target.sid, displayName: now?.name || undefined };
+            };
+            await openChannel(channel, found.stream, 'livekit', target.streamId, nameOf);
           }
         } else if (platform === 'jitsi') {
           for (const target of w.VexaBrowserUtils.selectJitsiChannels(present)) {

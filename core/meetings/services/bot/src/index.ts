@@ -37,7 +37,7 @@ import { uploadSignalTapes, uploadSpeakerActivity } from './signal-upload.js';
 import { createSpeakerActivityWriter } from './speaker-activity.js';
 import { createSttFaultReporter } from './stt-faults.js';
 import { launchBrowser, startCaptureBridge, startRecording, restartMixedCapture, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
-import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
+import { alonenessAdaptersFor, createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
 import { installSignalHandlers } from './signals.js';
 import type {
   JoinDriver,
@@ -232,9 +232,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   const aloneness = createSilenceAlonenessSource({
     activity: remoteAudioActivity,
     windowMs: aloneSilenceWindowMs,
+    adapters: alonenessAdaptersFor(inv.platform),
     onCaptureFault: () => restartCapture?.(),
   });
-  console.log(`[bot] aloneness: silence adapter + deaf-capture guard enabled (window_ms=${aloneSilenceWindowMs})`);
+  console.log(`[bot] aloneness: ${alonenessAdaptersFor(inv.platform).map((a) => a.name).join(' + ')} (window_ms=${aloneSilenceWindowMs})`);
   if (speakerStreamConfig) console.log(`[bot] speaker-stream tuning enabled: ${JSON.stringify(speakerStreamConfig)}`);
 
   try {

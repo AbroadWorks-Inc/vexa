@@ -178,6 +178,13 @@
    "targets": ["compose", "helm"]
   },
   {
+   "key": "VEXA_LIVEKIT_HOSTS",
+   "class": "defaulted",
+   "default": "",
+   "description": "Comma-separated LiveKit website-meeting hostnames (La Suite Meet, e.g. meet.example.org): a link https://<host>/<abc-defg-hij> on a listed host is a livekit meeting, in pasted and calendar (ICS) links, checked before the Jitsi rules; a livekit bot may only be sent to a listed host — unset ⇒ no link is read as livekit",
+   "targets": ["compose", "helm"]
+  },
+  {
    "key": "RECORDING_ENABLED",
    "class": "defaulted",
    "default": "true",
@@ -190,7 +197,7 @@
    "key": "PER_CHANNEL_RECORDING_PLATFORMS",
    "class": "defaulted",
    "default": "",
-   "description": "deployment-scoped per-speaker recording: comma-separated platforms (google_meet, jitsi) whose bots record each remote channel beside the mixed master. Only when recording is on for that bot; empty or unset is off. Rides invocation.v1 perChannelRecordingEnabled, sent only when on.",
+   "description": "deployment-scoped per-speaker recording: comma-separated platforms (google_meet, jitsi, livekit) whose bots record each remote channel beside the mixed master. Only when recording is on for that bot; empty or unset is off. Rides invocation.v1 perChannelRecordingEnabled, sent only when on.",
    "targets": [
     "compose",
     "helm"

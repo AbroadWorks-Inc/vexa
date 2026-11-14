@@ -1,0 +1,34 @@
+{
+  "name": "@vexa/livekit-capture",
+  "version": "0.1.0",
+  "description": "LiveKit meeting capture (browser): the bot's own page joins a LiveKit room audio-only with livekit-client and exposes subscribed tracks, active-speaker hints, the roster, chat send and the disconnect reason to the capture bridge. Audio rides the shared WebRTC hook (@vexa/mixed-capture-core).",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./page": {
+      "types": "./dist/page.d.ts",
+      "default": "./dist/page.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx src/livekit-capture.test.ts",
+    "check:isolation": "node scripts/check-isolation.js"
+  },
+  "dependencies": {
+    "livekit-client": "2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

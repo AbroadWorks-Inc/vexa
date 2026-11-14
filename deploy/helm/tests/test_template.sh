@@ -567,6 +567,7 @@ for kv in \
   'UNPROVEN_TEARDOWN_MAX_AGE_S|value: "21600"' \
   'SWEEP_ITEM_FAILURES_RETENTION_S|value: "604800"' \
   'VEXA_JITSI_HOSTS|value: ""' \
+  'VEXA_LIVEKIT_HOSTS|value: ""' \
   'WEBHOOK_PRIVATE_HOST_ALLOWLIST|value: ""' \
   'WEBHOOK_PUBLISH_INTERVAL_S|value: "1"' \
   'WEBHOOK_SEND_INTERVAL_S|value: "1"' \
@@ -595,6 +596,7 @@ env_is "$RENDER" gateway GATEWAY_RATE_LIMIT_RPS 'value: "40"'
 RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
   --set meetingApi.entryBlockedHosts=meet.example.org --set meetingApi.autoJoinLeadSeconds=300 \
   --set meetingApi.jitsiHosts=meet.example.org \
+  --set meetingApi.livekitHosts=meet-next.example.org \
   --set meetingApi.intakeConflictRetries=5 --set meetingApi.botSendMaxAttempts=7 \
   --set meetingApi.botSendRetryBackoffSeconds=45 \
   --set meetingApi.sweepBatchSize=50 --set meetingApi.sweepMaxItemFailures=2 \
@@ -615,6 +617,7 @@ RENDER_INTAKE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml
 env_is "$RENDER_INTAKE" meeting-api ENTRY_BLOCKED_HOSTS 'value: "meet.example.org"'
 env_is "$RENDER_INTAKE" meeting-api AUTO_JOIN_LEAD_S 'value: "300"'
 env_is "$RENDER_INTAKE" meeting-api VEXA_JITSI_HOSTS 'value: "meet.example.org"'
+env_is "$RENDER_INTAKE" meeting-api VEXA_LIVEKIT_HOSTS 'value: "meet-next.example.org"'
 env_is "$RENDER_INTAKE" meeting-api INTAKE_CONFLICT_RETRIES 'value: "5"'
 env_is "$RENDER_INTAKE" meeting-api BOT_SEND_MAX_ATTEMPTS 'value: "7"'
 env_is "$RENDER_INTAKE" meeting-api BOT_SEND_RETRY_BACKOFF_S 'value: "45"'

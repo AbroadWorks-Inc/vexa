@@ -242,7 +242,7 @@ meetingApi:
   # makes every spawned bot restore the provisioned browser session and join signed-in. The BOT_S3
   # values are SCOPED userdata-store credentials, never the deployment's admin S3 creds.
   botAuthenticated: "false"
-  # Per-speaker recording (deployment-scoped): comma-separated platforms (google_meet, jitsi) whose
+  # Per-speaker recording (deployment-scoped): comma-separated platforms (google_meet, jitsi, livekit) whose
   # bots record each remote channel beside the mixed master. Empty is off.
   perChannelRecordingPlatforms: ""
   botUserdataS3Path: ""
@@ -271,6 +271,7 @@ meetingApi:
   unprovenTeardownMaxAgeSeconds: "21600"  # UNPROVEN_TEARDOWN_MAX_AGE_S — how long a teardown is chased while the runtime doesn't answer (pending teardowns and stale reconcile rows)
   sweepItemFailuresRetentionSeconds: "604800"  # SWEEP_ITEM_FAILURES_RETENTION_S — an untouched sweep_item_failures record is pruned after this
   jitsiHosts: ""                        # VEXA_JITSI_HOSTS — comma-separated self-hosted Jitsi hostnames
+  livekitHosts: ""                      # VEXA_LIVEKIT_HOSTS — comma-separated LiveKit (La Suite Meet) website-meeting hostnames
   gatewayIdentityMaxSkewSeconds: "60"   # GATEWAY_IDENTITY_MAX_SKEW_S — a gateway signature's freshness window; set adminApi's the same
   # Webhook subscriptions (meeting-api side: the outbox publisher and the sender).
   webhookPrivateHostAllowlist: ""       # WEBHOOK_PRIVATE_HOST_ALLOWLIST — same list as adminApi's, applied on send

@@ -109,7 +109,7 @@ function channelExtra(channel: number, identity: ChannelChunkIdentity | undefine
   const metadata: Record<string, string | number> = {};
   const start = identity.recorder_start_epoch_ms;
   if (typeof start === 'number' && Number.isInteger(start) && start > 0) metadata.recorder_start_epoch_ms = start;
-  if (identity.channel_kind === 'gmeet' || identity.channel_kind === 'jitsi') metadata.channel_kind = identity.channel_kind;
+  if (identity.channel_kind === 'gmeet' || identity.channel_kind === 'jitsi' || identity.channel_kind === 'livekit') metadata.channel_kind = identity.channel_kind;
   const streamId = textField(identity.stream_id);
   if (streamId) metadata.stream_id = streamId;
   const participantId = textField(identity.participant_id);

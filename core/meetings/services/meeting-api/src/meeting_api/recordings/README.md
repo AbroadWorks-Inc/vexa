@@ -33,7 +33,7 @@ per-channel media type (`ch<N>`) marks that media file final only; the recording
 `completed` on a final chunk of a mixed lane (`audio`/`video`); a recording of only channels (no
 mixed lane) completes when its bot session's terminal status is written (`finish_session_recordings`,
 called by the meeting repo's `update_meeting_status`). Channel identity names longer than
-200 characters are stored cut to 200; a `channel_kind` other than `gmeet`/`jitsi` is dropped with a
+200 characters are stored cut to 200; a `channel_kind` other than `gmeet`/`jitsi`/`livekit` is dropped with a
 `recording_channel_kind_unknown` warning naming the kind.
 
 ## P3 seams (NOT built here)

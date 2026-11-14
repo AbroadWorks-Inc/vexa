@@ -8,7 +8,7 @@
  * Run: tsx src/join-driver.test.ts
  */
 import { AdmissionError, AuthSessionError, TeamsJoinRedirectError, TEAMS_AUTH_REDIRECT } from '@vexa/join';
-import { admissionOutcomeToJoinOutcome } from './join-driver.js';
+import { admissionOutcomeToJoinOutcome, joinPlatform } from './join-driver.js';
 import type { JoinOutcome } from './ports.js';
 
 let passed = 0, failed = 0;
@@ -58,6 +58,11 @@ check('TeamsJoinRedirectError is NOT an AdmissionError (driver re-raises → mes
   !(teamsRedirect instanceof AdmissionError));
 check('TeamsJoinRedirectError carries the typed reasonCode in its message',
   teamsRedirect.message.startsWith(`${TEAMS_AUTH_REDIRECT}:`));
+
+// ── the platform the join layer is asked to drive ──
+for (const p of ['google_meet', 'teams', 'zoom', 'jitsi', 'livekit']) {
+  check(`joinPlatform('${p}') drives ${p}`, joinPlatform(p) === p);
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

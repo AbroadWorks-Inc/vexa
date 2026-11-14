@@ -1,6 +1,6 @@
 # AW Bots
 
-AbroadWorks's meeting bots. A bot joins a **Google Meet, Microsoft Teams, Zoom, or Jitsi** call before it
+AbroadWorks's meeting bots. A bot joins a **Google Meet, Microsoft Teams, Zoom, Jitsi, or LiveKit (Olamee website)** call before it
 starts, records the audio and notes **who was speaking when**. After the call, the meeting goes to the
 AW notetaker pipeline, which produces a **named transcript and a summary**.
 
@@ -11,6 +11,10 @@ Apache-2.0). We run Vexa as-is wherever we can and keep our own changes small an
 
 Jitsi, including `meet.abroadworks.com`, uses the same bot. `VEXA_JITSI_HOSTS` lists that host so
 the link parses. `ENTRY_BLOCKED_HOSTS` is empty, so intake does not refuse it.
+
+LiveKit website meetings (`meet-next.olamee.com`, listed in `VEXA_LIVEKIT_HOSTS`) use the same bot:
+it asks Meet's waiting room to enter, then joins the room audio-only from its own page. See
+[decision 0017](docs/aw-bots/decisions/0017-livekit-meetings-through-aw-bots.md).
 
 ---
 
@@ -46,7 +50,7 @@ doesn't know who is speaking. The bot's `speaker-activity.jsonl` says who was ta
 `notetaker-worker` matches the two by time and writes the names. This is the same method Jitsi uses
 with Prosody's speaker timeline.
 
-On Google Meet and Jitsi the bot also records each remote channel beside that mix. The exporter
+On Google Meet, Jitsi and LiveKit the bot also records each remote channel beside that mix. The exporter
 adds `channels/ch<N>.webm`, `channels/index.json`, and `speaker_activity_frames.json`. The worker
 setting `CHANNEL_TRANSCRIPT_MODE` is `deliver`: the per-person transcript is the one users receive
 (`transcript.txt`), and the mixed recording is transcribed only when that path fails or returns
@@ -105,7 +109,7 @@ Everything else is upstream Vexa, unchanged.
 | Change | Where | Why |
 |---|---|---|
 | **Speaker activity file.** The bot always writes `speaker-activity.jsonl`: who spoke when, with no audio, about 1–40 MB for a 3-hour meeting. meeting-api accepts it as a new signal file. | `core/meetings/services/bot/src/speaker-activity.ts` (+ small wiring in `capture-bridge.ts`, `index.ts`, `signal-upload.ts`); `core/meetings/services/meeting-api/src/meeting_api/recordings/jsonb.py` | Vexa kept this data only inside its debug tape, which also stores everyone's audio and stops at 250 MB (about 50 minutes). Long meetings lost their speaker names. |
-| **Per-speaker channel files.** On Google Meet and Jitsi, when the deployment lists the platform, the bot records each remote channel beside the mixed master (`media_type` `ch<N>`). Jitsi also writes activity lines marked `"src":"channel"`. Those lines do not enter the mixed timeline. The exporter copies each channel into the notetaker folder. | `capture-bridge.ts`, `core/meetings/modules/record-chunker/src/channel-targets.ts`, `meeting_api/bot_spawn/service.py`, `exporter/job.py` | One mixed recording loses words when people talk at once, and a Meet glow name can land on the wrong channel. The mixed folder is still always written. |
+| **Per-speaker channel files.** On Google Meet, Jitsi and LiveKit, when the deployment lists the platform, the bot records each remote channel beside the mixed master (`media_type` `ch<N>`). Jitsi also writes activity lines marked `"src":"channel"`. Those lines do not enter the mixed timeline. The exporter copies each channel into the notetaker folder. | `capture-bridge.ts`, `core/meetings/modules/record-chunker/src/channel-targets.ts`, `meeting_api/bot_spawn/service.py`, `exporter/job.py` | One mixed recording loses words when people talk at once, and a Meet glow name can land on the wrong channel. The mixed folder is still always written. |
 | **Exporter.** A new small service. It learns that a meeting finished from its own `/v2/webhooks` subscription (the v2 meeting carries `upstream_id`, `started_at` and `ended_at` for it), reads through the gateway with its own key and names everything by the meeting's UUID. Its queue is bounded: conditional writes, a retry and a crash budget, a job timeout, a stop wait on SIGTERM, and memory that stays flat at any meeting length. | `integrations/out/aw-notetaker/` | Turns each finished meeting that has a recording (completed, or failed after its bot recorded part of the call) into the folder the AW notetaker pipeline reads, and hands it over. Its trigger is stored in Postgres and retried on a bounded schedule, like every other subscriber's. |
 | **Helm chart: meeting-api service account.** Optional `meetingApi.serviceAccount` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/serviceaccount-meeting-api.yaml`, `deployment-meeting-api.yaml`) | Lets meeting-api get its own IAM role (IRSA) for the `aw-bots` bucket, like our other services' service accounts. |
 | **Helm chart: pre-created Postgres credentials.** Optional `postgres.existingCredentialsSecret` (default off; the default render is unchanged). | `deploy/helm/charts/vexa` (`values.yaml`, `templates/secret.yaml`), tests in `deploy/helm/tests/test_template.sh` | Keeps the in-cluster Postgres but reads its password from a Secret we create, so a `helm upgrade` never rewrites it. |

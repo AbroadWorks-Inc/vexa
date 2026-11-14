@@ -412,7 +412,7 @@ function gateEvalBaseline() {
 // FINOS licence classifier (ADR-0004), shared by gate:licenses (npm/py deps) and gate:image-licenses
 // (baked apt packages + pinned container images). B is tested before X so LGPL never trips the GPL
 // match. Cat X is where Redis ≥7.4's RSALv2/SSPLv1 lands — the exact class #653 keeps out of our images.
-const LICENSE_A = [/^MIT/, /^Apache-2\.0/i, /^BSD\b/, /^BSD-/, /^ISC/, /^0BSD/, /^Unlicense/, /^CC0-/, /^CC-BY-/, /^Python-2\.0/, /^PostgreSQL$/i, /^BlueOak/, /^Zlib/i, /^MIT-0/, /^WTFPL/i, /^SIL OPEN FONT LICENSE/i, /OR CC0-1\.0/];
+const LICENSE_A = [/^MIT/, /^Apache-2\.0/i, /^BSD\b/, /^BSD-/, /^ISC/, /^0BSD/, /^Unlicense/, /^CC0-/, /^CC-BY-/, /^Python-2\.0/, /^PostgreSQL$/i, /^BlueOak/, /^Zlib/i, /^MIT-0/, /^WTFPL/i, /^SIL OPEN FONT LICENSE/i, /OR CC0-1\.0/, /^\(Apache-2\.0 AND BSD-3-Clause\)$/];
 const LICENSE_B = [/LGPL/i, /^MPL/i, /^EPL/i];                                    // weak copyleft — needs a logged exception
 const LICENSE_X = [/(^|[^L])GPL/i, /AGPL/i, /SSPL/i, /\bBSL\b/i, /Business Source/i, /Elastic-/i, /Commons.?Clause/i, /Proprietary/i, /UNLICENSED/, /\bRSALv?\d/i, /Redis Source Available/i];
 // → "A" (permissive, passes) | "B" (weak-copyleft, needs a logged exception) | "X" (forbidden) | "?" (unclassified)

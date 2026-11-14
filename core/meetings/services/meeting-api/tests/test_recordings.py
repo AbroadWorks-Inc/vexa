@@ -1078,6 +1078,16 @@ def test_an_unknown_channel_kind_is_dropped_with_a_warning_naming_it(capsys):
     assert "Ada" not in json.dumps(warned[0])
 
 
+def test_a_livekit_channel_keeps_its_kind_and_identity(capsys):
+    rec, _ = _fold_audio(
+        None, chunk_seq=0, file_size=100, sample_rate=None,
+        chunk_metadata={"channel_kind": "livekit", "participant_id": "PA_a", "display_name": "Asha"},
+    )
+    mf = next(m for m in rec["media_files"] if m["type"] == "ch0")
+    assert mf["metadata"] == {"channel_kind": "livekit", "participant_id": "PA_a", "display_name": "Asha"}
+    assert "recording_channel_kind_unknown" not in capsys.readouterr().out
+
+
 def test_a_long_name_is_kept_cut_to_200_characters():
     rec, _ = _fold_audio(
         None, chunk_seq=0, file_size=100, sample_rate=None,
