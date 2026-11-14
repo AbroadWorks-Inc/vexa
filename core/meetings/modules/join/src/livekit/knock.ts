@@ -11,8 +11,9 @@ import { AdmissionError } from "../shared/admission";
 
 /** Every 3 s: under Meet's 6 s drop, about 20 calls a minute against its 150/minute per-entry limit. */
 export const KNOCK_INTERVAL_MS = 3000;
-/** After a 429, a 5xx or a network error: 4 s, then 5 s while the failures last — every wait stays
- *  under Meet's 6 s drop, so the bot keeps its place in the waiting room. */
+/** After a 429, a 5xx, a network error or a knock unanswered within KNOCK_INTERVAL_MS: 4 s, then
+ *  5 s while the failures last — every wait stays under Meet's 6 s drop, so the bot keeps its place
+ *  in the waiting room. */
 const BACKOFF_MS = [4000, 5000];
 const ROOM_CODE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 
@@ -87,8 +88,15 @@ export async function knockUntilAdmitted(o: KnockOptions): Promise<{ url: string
     const body = participantId ? { username: o.botName, participant_id: participantId } : { username: o.botName };
     let res: Response;
     try {
-      // A redirect is refused: the bot calls only the meeting's own host.
-      res = await doFetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), redirect: "error" });
+      // A redirect is refused: the bot calls only the meeting's own host. A knock that hangs is
+      // abandoned like a network error, so it never outlasts Meet's 6 s drop, the budget or a withdraw.
+      res = await doFetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        redirect: "error",
+        signal: AbortSignal.timeout(KNOCK_INTERVAL_MS),
+      });
     } catch (e) {
       failures++;
       log(`[LiveKit] knock: network error (${(e as Error)?.name ?? "error"}), backing off`);

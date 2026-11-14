@@ -17,7 +17,7 @@ function check(name: string, ok: boolean, detail?: string) {
 }
 
 const fixture = (name: string) => readFileSync(join(__dirname, "fixtures", `${name}.json`), "utf8");
-type Step = "waiting" | "accepted" | "denied" | "404" | "429" | "500" | "neterr" | "html" | "badurl";
+type Step = "waiting" | "accepted" | "denied" | "404" | "429" | "500" | "neterr" | "hang" | "html" | "badurl";
 
 function harness(steps: Step[], over: Partial<KnockOptions> = {}) {
   let t = 0;
@@ -27,11 +27,18 @@ function harness(steps: Step[], over: Partial<KnockOptions> = {}) {
   let waitingCalls = 0;
   let i = 0;
   const inits: { redirect?: string }[] = [];
-  const fetch = (async (_url: string, init: { body: string; redirect?: string }) => {
+  const fetch = (async (_url: string, init: { body: string; redirect?: string; signal?: AbortSignal }) => {
     bodies.push(JSON.parse(init.body));
     inits.push(init);
     const step = steps[Math.min(i++, steps.length - 1)];
     if (step === "neterr") throw new TypeError("fetch failed");
+    // A server that accepts the request and never answers: only the request's own signal ends it.
+    if (step === "hang") {
+      return new Promise<Response>((_resolve, reject) => {
+        if (!init.signal) return; // no signal: hangs forever, and the test's own timer fails it
+        init.signal.addEventListener("abort", () => reject(init.signal!.reason));
+      });
+    }
     if (step === "429") return new Response("", { status: 429 });
     if (step === "500") return new Response("", { status: 500 });
     if (step === "404") return new Response(fixture("404"), { status: 404 });
@@ -81,6 +88,16 @@ async function main() {
     await knockUntilAdmitted(h.opts);
     check("network errors and 5xx back off 4, 5, 5 s (under Meet's 6 s drop) and continue", JSON.stringify(h.sleeps) === JSON.stringify([4000, 5000, 5000, 3000]), JSON.stringify(h.sleeps));
     check("the first answer that says waiting calls onWaiting", h.waiting() === 1);
+  }
+  {
+    const h = harness(["waiting", "hang", "accepted"]);
+    // The guard also keeps the process alive: AbortSignal.timeout's own timer does not.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const guard = new Promise<string>((r) => { timer = setTimeout(() => r("still hanging after 10 s"), 10_000); });
+    const o = await Promise.race([outcome(knockUntilAdmitted(h.opts)), guard]);
+    clearTimeout(timer);
+    check("a knock Meet never answers is abandoned within 3 s and backs off 4 s", o === "resolved" && JSON.stringify(h.sleeps) === JSON.stringify([3000, 4000]), `${o} sleeps=${JSON.stringify(h.sleeps)}`);
+    check("the abandoned knock is logged as a timeout", h.logs.some((m) => m.includes("TimeoutError")), h.logs.join(" | "));
   }
   {
     const o = await outcome(knockUntilAdmitted(harness(["html"]).opts));

@@ -115,6 +115,19 @@ Google Meet admission (`core/meetings/modules/join/src/googlemeet/admission.ts`)
 - Google Meet's "take notes for me" consent prompt is a blocker: the bot reports `needs_help`, does
   not click it, and keeps polling. Admission continues once someone answers it.
 
+LiveKit admission (`core/meetings/modules/join/src/livekit/knock.ts`): the bot asks the meeting
+host's waiting room over HTTP, with no browser page involved.
+
+- It asks every 3 seconds. The waiting room drops an entry after 6 seconds without a request, so
+  every wait stays under 6 seconds.
+- Each request has a 3-second time limit. A request with no answer in that time, a network error,
+  a 429 or a 5xx makes the bot wait 4 seconds, then 5 seconds while the failures last, and ask
+  again. Without the limit, Node's `fetch` waits up to 300 seconds for an answer: the bot would lose
+  its place, overrun the lobby budget and ignore a stop for that long.
+- A redirect is refused. The LiveKit URL in the answer must be `wss` or `https` with no credentials.
+- The host's denial is `awaiting_admission_rejected`. Still waiting at the end of the lobby budget is
+  `awaiting_admission_timeout`; never reaching the waiting room in that time is `join_failure`.
+
 `awaiting_admission_timeout` is a bot failure, so an entry-managed meeting retries it until the
 send budget is used. `awaiting_admission_rejected` is not retried. The alerts treat both as the
 host's answer and store them at severity info.
