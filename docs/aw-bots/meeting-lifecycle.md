@@ -115,18 +115,35 @@ Google Meet admission (`core/meetings/modules/join/src/googlemeet/admission.ts`)
 - Google Meet's "take notes for me" consent prompt is a blocker: the bot reports `needs_help`, does
   not click it, and keeps polling. Admission continues once someone answers it.
 
-LiveKit admission (`core/meetings/modules/join/src/livekit/knock.ts`): the bot asks the meeting
-host's waiting room over HTTP, with no browser page involved.
+LiveKit admission (`core/meetings/modules/join/src/livekit/knock.ts`, `join.ts`):
 
-- It asks every 3 seconds. The waiting room drops an entry after 6 seconds without a request, so
-  every wait stays under 6 seconds.
-- Each request has a 3-second time limit. A request with no answer in that time, a network error,
-  a 429 or a 5xx makes the bot wait 4 seconds, then 5 seconds while the failures last, and ask
-  again. Without the limit, Node's `fetch` waits up to 300 seconds for an answer: the bot would lose
-  its place, overrun the lobby budget and ignore a stop for that long.
-- A redirect is refused. The LiveKit URL in the answer must be `wss` or `https` with no credentials.
-- The host's denial is `awaiting_admission_rejected`. Still waiting at the end of the lobby budget is
-  `awaiting_admission_timeout`; never reaching the waiting room in that time is `join_failure`.
+- The bot does not open Meet's website. Node calls
+  `POST https://<host>/api/v1.0/rooms/<code>/request-entry/` with the configured bot name, then
+  repeats it with the `participant_id` from the first answer every 3 seconds
+  (`KNOCK_INTERVAL_MS`). Meet 1.37 drops a waiting entry after 6 seconds without a call, and its
+  throttle (150 a minute) counts per waiting participant, not per address. The first `waiting`
+  answer reports `awaiting_admission`; the bot logs `[LiveKit] Asking to enter room <code> on <host>`.
+- `accepted` carries the LiveKit URL and token. The bot's Chrome opens its own page
+  (`https://livekit.aw-bots.invalid`, served by Playwright, loading `/app/livekit-page.global.js`)
+  and connects audio-only; admission is the room reaching `connected`
+  (`[LiveKit] Connected to room <code>`).
+- `denied` is `awaiting_admission_rejected`, not retried. Still waiting at the end of the lobby
+  budget is `awaiting_admission_timeout`; never reaching the waiting room in that time is
+  `join_failure`.
+- Each call has a 3-second limit (`KNOCK_INTERVAL_MS`): without one, Node's `fetch` waits up to
+  300 seconds, and the bot would lose its place, overrun the budget and ignore a stop for that long.
+- A 429, a 5xx, a network error or a call with no answer within 3 seconds backs off 4 seconds, then
+  5, inside the budget. Any other HTTP
+  error (404: no such room), a body that is not JSON, a redirect, or an `accepted` answer without a
+  `wss`/`https` LiveKit URL and token is `join_failure`.
+- A room where another participant publishes end-to-end encrypted media is left at once as
+  `join_failure` (`encrypted room`); an encrypted track that appears later is never subscribed.
+  Meet 1.37 has no encryption, so this guards a later Meet or app version.
+- A stop before admission stops knocking; Meet drops the entry 6 seconds later.
+
+A Meet upgrade can change these answers: before a new Meet version goes live, run
+`npx tsx src/livekit/knock.test.ts` in `core/meetings/modules/join` against answers recorded from
+the new version (`src/livekit/fixtures/`).
 
 `awaiting_admission_timeout` is a bot failure, so an entry-managed meeting retries it until the
 send budget is used. `awaiting_admission_rejected` is not retried. The alerts treat both as the

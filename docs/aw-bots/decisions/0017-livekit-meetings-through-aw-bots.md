@@ -30,5 +30,26 @@ Facts the design rests on, checked live on 2026-11-14: direct UDP from bot nodes
 subscription, the hook's element carrying the audio, receivers LiveKit pre-allocates, reason
 `PARTICIPANT_REMOVED` on removal, no "end for everyone" in Meet 1.37, chat on `lk.chat`.
 
+Meet is pinned (`lasuite/meet-backend:v1.37.0`, talke `deployment/base/ola-live/meet-values.yaml`);
+the knock relies on its waiting-room timings (a waiting entry dropped after 6 s) and its throttle
+counting per waiting participant. Deployed 2026-11-14 (aw-bots `48571c60`).
+
+Decided and left as is: meeting-api is the only host check (the bot does not re-check the list);
+spawn does not re-check a host removed from `VEXA_LIVEKIT_HOSTS`, so a host is removed only when
+nothing on it is planned; the MCP link parser is not taught LiveKit (not on AW's path).
+
+Moving `meet.olamee.com` from Jitsi to LiveKit: take it off `jitsiHosts` / `AW_BOTS_JITSI_HOSTS`
+and add it to both LiveKit lists in the same release, the day the site moves. Listed in both at
+once, the calendar module labels the link Jitsi while aw-bots reads it as LiveKit.
+
+Phase 2, chat-app calls (after the token service): link
+`https://chat.olamee.com/meet/<URL-encoded Matrix room ID>`; the token comes from the token
+service's notetaker endpoint with its shared secret (a new Secret in `aw-bots`), with no waiting
+room; the bot joins the call's `livekit_room` (a UUID in the `m.call.livekit.*` events), not the
+Matrix room ID; names are Matrix user IDs; ChatWorks' **Add notetaker** creates an entry with
+`join_now` with its own aw-bots key. Check the exporter folder name with `!` and `:` before
+choosing the native id's encoding. Everything after the token is phase 1's code.
+
 Current behavior: [recording and speakers](../recording-and-speakers.md),
-[meeting lifecycle](../meeting-lifecycle.md).
+[meeting lifecycle](../meeting-lifecycle.md) (LiveKit admission), [security](../security.md)
+(LiveKit meeting tokens).
