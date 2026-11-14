@@ -21,3 +21,4 @@ Short records of choices that are still in force. The long argument is in the
 | [0014](0014-master-built-on-read.md) | The master recording is built when it is read. |
 | [0015](0015-jitsi-channels-have-no-cap.md) | Per-speaker Jitsi has no channel cap; the bot is optimised instead. |
 | [0016](0016-zoom-hints-need-audio.md) | A Zoom speaker hint is sent only while remote audio arrives. |
+| [0017](0017-livekit-meetings-through-aw-bots.md) | LiveKit website meetings: knock on Meet's waiting room over HTTP, then the bot's own page joins audio-only. |

@@ -283,6 +283,23 @@ async function main(): Promise<void> {
     seen[1]?.extra?.metadata?.display_name === 'Grace' && seen[1]?.extra?.metadata?.participant_id === 'p9', JSON.stringify(seen[1]));
 }
 
+  // ── a LiveKit channel keeps its kind; a kind the bot does not know is still dropped ──
+{
+  const seen: { seq: number; extra?: ChunkUploadExtra }[] = [];
+  const sink = createBotRecordingSink({
+    inv: inv(), uploadChunk: (seq, _f, _fmt, _b, extra) => { seen.push({ seq, extra }); },
+  });
+  sink.channelChunk(0, 0, false, 'webm', new Uint8Array([1]), { channel_kind: 'livekit', stream_id: 's1', participant_id: 'PA_a', display_name: 'Asha' });
+  sink.channelChunk(1, 0, false, 'webm', new Uint8Array([1]), { channel_kind: 'webex', stream_id: 's2' });
+  await new Promise((r) => setTimeout(r, 0));
+  await new Promise((r) => setTimeout(r, 0));
+  const lk = seen.find((s) => s.extra?.mediaType === 'ch0')?.extra?.metadata;
+  check('livekit channel: kind, participant id and name are kept',
+    lk?.channel_kind === 'livekit' && lk.participant_id === 'PA_a' && lk.display_name === 'Asha', JSON.stringify(lk));
+  check('an unknown channel kind is still dropped',
+    seen.find((s) => s.extra?.mediaType === 'ch1')?.extra?.metadata?.channel_kind === undefined, JSON.stringify(seen));
+}
+
   // ── L1/D5: the page-side channel recorders' lifecycle (startRecording's page code, run in-process
   //    over a fake page: every browser object it touches is a fake below) ──
   await channelLifecycle();

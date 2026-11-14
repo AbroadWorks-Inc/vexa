@@ -2396,6 +2396,32 @@ def test_an_index_row_names_only_the_identity_its_recorder_stored() -> None:
     assert row == {"channel": 3, "kind": "jitsi", "offset_s": 2.5}
 
 
+def test_a_livekit_channel_is_indexed_with_its_sid_and_name() -> None:
+    meta = {
+        "channel_kind": "livekit",
+        "recorder_start_epoch_ms": 1,
+        "stream_id": "s1",
+        "participant_id": "PA_a",
+        "display_name": "Asha",
+    }
+    row = job_module._channel_index_row(0, job_module._channel_identity(0, meta), 1000)
+    assert row == {
+        "channel": 0,
+        "kind": "livekit",
+        "offset_s": 1.0,
+        "stream_id": "s1",
+        "participant_id": "PA_a",
+        "display_name": "Asha",
+    }
+
+
+def test_an_unknown_channel_kind_is_still_refused() -> None:
+    with pytest.raises(job_module.ChannelIdentityMissing):
+        job_module._channel_identity(
+            0, {"channel_kind": "webex", "recorder_start_epoch_ms": 1}
+        )
+
+
 def test_a_channel_that_started_before_the_session_origin_is_logged(
     storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -1,0 +1,7 @@
+{
+  "platform": "livekit",
+  "meetingUrl": "https://meet-next.olamee.com/abc-defg-hij",
+  "botName": "Vexa",
+  "nativeMeetingId": "abc-defg-hij",
+  "redisUrl": "redis://redis:6379"
+}

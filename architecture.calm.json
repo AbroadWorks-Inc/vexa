@@ -409,6 +409,17 @@
    ]
   },
   {
+   "unique-id": "livekit-capture",
+   "node-type": "module",
+   "name": "livekit-capture",
+   "description": "livekit-capture — atomic module in meetings",
+   "metadata": [
+    {
+     "path": "core/meetings/modules/livekit-capture"
+    }
+   ]
+  },
+  {
    "unique-id": "mixed-capture-core",
    "node-type": "module",
    "name": "mixed-capture-core",
@@ -1492,6 +1503,7 @@
       "gmeet-pipeline",
       "jitsi-capture",
       "join",
+      "livekit-capture",
       "mixed-capture-core",
       "mixed-pipeline",
       "record-chunker",

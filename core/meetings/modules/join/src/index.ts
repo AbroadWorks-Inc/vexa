@@ -24,6 +24,9 @@ import { joinJitsiMeeting, buildJitsiMeetingUrl } from "./jitsi/join";
 import { waitForJitsiMeetingAdmission, checkForJitsiAdmissionSilent } from "./jitsi/admission";
 import { leaveJitsiMeeting } from "./jitsi/leave";
 import { startJitsiRemovalMonitor } from "./jitsi/removal";
+import { joinLivekitMeeting, announceLivekitAdmission } from "./livekit/join";
+import { leaveLivekitMeeting } from "./livekit/leave";
+import { startLivekitRemovalMonitor } from "./livekit/removal";
 import { startDebugView } from "./shared/escalation";
 import { setHooks, type BotConfig, type Hooks, type JoinState } from "./_host";
 import { JOIN_BROWSER_ARGS, getJoinBrowserArgs } from "./browser-args";
@@ -34,7 +37,7 @@ export { startDebugView, setHooks };
 // build on this ONE set (browser-args.ts), so join↔bot flags never drift.
 export { JOIN_BROWSER_ARGS, getJoinBrowserArgs };
 
-export type Platform = "google_meet" | "teams" | "zoom" | "jitsi";
+export type Platform = "google_meet" | "teams" | "zoom" | "jitsi" | "livekit";
 
 export interface JoinResult {
   admitted: boolean;
@@ -120,6 +123,12 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     admitted = await waitForJitsiMeetingAdmission(
       page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
+  } else if (platform === "livekit") {
+    // Knocking on Meet's waiting room IS the admission wait: a return means the room is connected.
+    await joinLivekitMeeting(
+      page, opts.meetingUrl, botConfig.botName!, botConfig, botConfig.automaticLeave!.waitingRoomTimeout,
+    );
+    admitted = true;
   } else if (platform === "google_meet") {
     await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
     admitted = await waitForGoogleMeetingAdmission(
@@ -130,14 +139,17 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     // MEET join flow against whatever URL it was handed — the wrong flow on the wrong site, failing
     // minutes later with misattributed selector errors instead of naming the real problem here.
     throw new Error(
-      `Unsupported platform '${platform}' — this join layer drives google_meet, teams, zoom, jitsi`,
+      `Unsupported platform '${platform}' — this join layer drives google_meet, teams, zoom, jitsi, livekit`,
     );
   }
 
-  // Meet chat only. Teams, Zoom, and Jitsi keep their own chat surfaces.
-  // announceGoogleMeetAdmission swallows its own errors.
+  // Meet and LiveKit post the recording notice in chat. Teams, Zoom, and Jitsi do not.
+  // Both announce functions swallow their own errors.
   if (admitted && platform === "google_meet") {
     await announceGoogleMeetAdmission(page);
+  }
+  if (admitted && platform === "livekit") {
+    await announceLivekitAdmission(page);
   }
 
   return { admitted: !!admitted, state: admitted ? "admitted" : "awaiting_admission" };
@@ -164,3 +176,4 @@ export {
 export type { TeamsJoinRedirectReason } from "./msteams/auth-redirect";
 export { joinZoomMeeting, buildZoomWebClientUrl, waitForZoomMeetingAdmission, checkForZoomAdmissionSilent, leaveZoomMeeting, dismissZoomPopups, startZoomRemovalMonitor };
 export { joinJitsiMeeting, buildJitsiMeetingUrl, waitForJitsiMeetingAdmission, checkForJitsiAdmissionSilent, leaveJitsiMeeting, startJitsiRemovalMonitor };
+export { joinLivekitMeeting, leaveLivekitMeeting, startLivekitRemovalMonitor };

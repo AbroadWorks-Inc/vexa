@@ -209,6 +209,8 @@ spec:
               value: {{ .Values.meetingApi.sweepItemFailuresRetentionSeconds | default "604800" | quote }}
             - name: VEXA_JITSI_HOSTS
               value: {{ .Values.meetingApi.jitsiHosts | default "" | quote }}
+            - name: VEXA_LIVEKIT_HOSTS
+              value: {{ .Values.meetingApi.livekitHosts | default "" | quote }}
             # Webhook subscriptions: the outbox publisher and the sender.
             - name: WEBHOOK_PRIVATE_HOST_ALLOWLIST
               value: {{ .Values.meetingApi.webhookPrivateHostAllowlist | default "" | quote }}

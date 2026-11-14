@@ -32,7 +32,7 @@ _CHANNEL_IDENTITY_KEYS = (
     "participant_id",
     "display_name",
 )
-_CHANNEL_KINDS = ("gmeet", "jitsi")
+_CHANNEL_KINDS = ("gmeet", "jitsi", "livekit")
 _CHANNEL_TEXT_LIMIT = 200
 #: A per-channel media type (`ch0`, `ch12`): one remote participant's own recorder.
 CHANNEL_MEDIA = re.compile(r"ch\d+")
@@ -42,7 +42,7 @@ def channel_identity(raw: Any) -> dict[str, Any]:
     """Fields a channel recorder may stamp. Anything else is dropped, and the upload still succeeds.
 
     ``recorder_start_epoch_ms`` is a real int (``bool`` is an int in Python and is rejected).
-    ``channel_kind`` is ``gmeet`` or ``jitsi``; another kind is dropped (``_media_metadata`` warns,
+    ``channel_kind`` is ``gmeet``, ``jitsi`` or ``livekit``; another kind is dropped (``_media_metadata`` warns,
     naming it, on the media file's first chunk).
     The three names are non-empty strings, cut to 200 characters: a longer name is kept truncated,
     since a dropped one would be asked for again on every chunk and never stored.

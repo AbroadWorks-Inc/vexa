@@ -1308,3 +1308,54 @@ async def test_spawn_threads_capture_signal_from_bot_context(monkeypatch, ctx, e
                       token_secret=SECRET)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
     assert inv["captureSignalEnabled"] is expected
+
+
+# ── route: a LiveKit bot calls only a VEXA_LIVEKIT_HOSTS host, for the room its id names ─────────
+#
+# The bot sends Meet's waiting-room request to the meeting_url's host, so the URL must parse as
+# that same LiveKit room: an explicit native_meeting_id never skips the host check.
+
+def test_post_bots_livekit_without_meeting_url_422(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("VEXA_LIVEKIT_HOSTS", "meet-next.olamee.com")
+    r = _client().post("/bots", headers=HEADERS,
+                       json={"platform": "livekit", "native_meeting_id": "abc-defg-hij"})
+    assert r.status_code == 422, r.text
+
+
+def test_post_bots_livekit_unlisted_host_422(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("VEXA_LIVEKIT_HOSTS", "meet-next.olamee.com")
+    r = _client().post("/bots", headers=HEADERS,
+                       json={"platform": "livekit", "native_meeting_id": "abc-defg-hij",
+                             "meeting_url": "https://evil.example.org/abc-defg-hij"})
+    assert r.status_code == 422, r.text
+    assert "VEXA_LIVEKIT_HOSTS" in r.json()["detail"]
+
+
+def test_post_bots_livekit_other_room_422(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("VEXA_LIVEKIT_HOSTS", "meet-next.olamee.com")
+    r = _client().post("/bots", headers=HEADERS,
+                       json={"platform": "livekit", "native_meeting_id": "abc-defg-hij",
+                             "meeting_url": "https://meet-next.olamee.com/xyz-wxyz-xyz"})
+    assert r.status_code == 422, r.text
+
+
+def test_post_bots_livekit_listed_room_accepted(monkeypatch):
+    """Negative control: the matching room on a listed host → 201."""
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("VEXA_LIVEKIT_HOSTS", "meet-next.olamee.com")
+    r = _client().post("/bots", headers=HEADERS,
+                       json={"platform": "livekit", "native_meeting_id": "abc-defg-hij",
+                             "meeting_url": "https://meet-next.olamee.com/abc-defg-hij"})
+    assert r.status_code == 201, r.text
+
+
+def test_post_bots_livekit_url_only_derives_room(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("VEXA_LIVEKIT_HOSTS", "meet-next.olamee.com")
+    r = _client().post("/bots", headers=HEADERS,
+                       json={"meeting_url": "https://meet-next.olamee.com/abc-defg-hij"})
+    assert r.status_code == 201, r.text
+    assert r.json()["platform"] == "livekit" and r.json()["native_meeting_id"] == "abc-defg-hij"

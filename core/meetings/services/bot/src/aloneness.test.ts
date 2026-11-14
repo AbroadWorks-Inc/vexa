@@ -1,5 +1,7 @@
 /** Deterministic proof for silence-based active-phase aloneness. */
 import {
+  alonenessAdaptersFor,
+  exactRosterAdapter,
   DEFAULT_ALONE_SILENCE_WINDOW_MS,
   DEFAULT_STREAM_PRESENCE_STALENESS_MS,
   createDeafCaptureGuardAdapter,
@@ -524,6 +526,43 @@ function fixture(windowMs = 1_000, extra: {
   f.source.onAlone(() => fired++);
   f.clock.advance(1_001); f.scheduler.tick();
   check('a muted human beside an ignored bot keeps the deaf hold', fired === 0);
+}
+
+// LiveKit reports an exact roster: people in the room keep the bot in through a silent stretch;
+// an empty room still leaves on the silence window. Other platforms keep the two default rules.
+{
+  const names = (p: string) => alonenessAdaptersFor(p).map((a) => a.name).join(',');
+  check('livekit adds the exact-roster rule', names('livekit') === 'silence,deaf-capture-guard,exact-roster', names('livekit'));
+  for (const p of ['google_meet', 'teams', 'zoom', 'jitsi']) {
+    check(`${p} keeps the default rules`, names(p) === 'silence,deaf-capture-guard', names(p));
+  }
+
+  const f = fixture(1_000, { adapters: alonenessAdaptersFor('livekit') });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeRoster?.(2);
+  f.source.onAlone(() => fired++);
+  for (let i = 0; i < 5; i++) { f.clock.advance(1_000); f.activity.observeRemoteEnergy(0); f.scheduler.tick(); }
+  check('livekit: two silent humans in the room keep the bot in', fired === 0);
+  f.activity.observeRoster?.(0);
+  f.clock.advance(1); f.activity.observeRemoteEnergy(0); f.scheduler.tick();
+  check('livekit: once the room is empty the silence window leaves', fired === 1);
+
+  check('exact roster abstains with no roster report', exactRosterAdapter.evaluate({ available: true }, 0, 1_000) === 'alone');
+}
+
+// A deaf LiveKit bot with people in the room still gets the deaf guard's hold and its one repair:
+// the roster keeps the bot in only while frames arrive.
+{
+  let repairs = 0;
+  const f = fixture(1_000, { adapters: alonenessAdaptersFor('livekit'), onCaptureFault: () => repairs++ });
+  let fired = 0;
+  f.activity.ready();
+  f.activity.observeRoster?.(2);
+  f.source.onAlone(() => fired++);
+  for (let i = 0; i < 3; i++) { f.clock.advance(600); f.activity.observeStreamPresence?.(3); f.scheduler.tick(); }
+  check('livekit deaf with humans: the capture repair runs once', repairs === 1, String(repairs));
+  check('livekit deaf with humans: the bot does not leave', fired === 0);
 }
 
 console.log(failed

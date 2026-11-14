@@ -32,7 +32,7 @@ capture bridge, and the pipeline share.
 |---|---|---|
 | Google Meet | `gmeet` | Named per-participant frames |
 | Zoom | `pertrack` | Named frames, one track per participant |
-| Teams, Jitsi | `mixed` | The server mix. Frames are unnamed. Hints carry the active speaker. |
+| Teams, Jitsi, LiveKit | `mixed` | The server mix. Frames are unnamed. Hints carry the active speaker. |
 
 Zoom is the only `pertrack` platform (`isPerTrackLanePlatform`). Teams stays on the mix. On Jitsi
 the hints are each participant's audio level in the mix (`kind: "levels"`; bot log
@@ -139,12 +139,20 @@ held nobody but itself for the whole window. Other notetaker bots named in
 `BOT_IGNORED_PARTICIPANTS` (Helm `runtime.ignoredParticipants`, comma-separated, case-insensitive
 fragments) do not count as people there; an entry whose name cannot be read always counts.
 Changing the list needs a `helm upgrade`, not a bot build, and applies to bots started after it.
+On LiveKit the participant list is exact (the page emits `roster-coverage` with
+`platform: livekit`), so a third rule, `exact-roster` (`alonenessAdaptersFor`), keeps the bot in
+while that list holds a human and audio frames still arrive, however long the room is silent; once
+it holds nobody, the silence window decides, and a bot that hears nothing at all gets the deaf
+guard's hold and repair as on every platform. Meet 1.37 has no "end for everyone", so a LiveKit meeting ends when everyone leaves. A `Disconnected` that the bot did not ask for (removed by the
+host, the room deleted, or the connection lost after livekit-client's own reconnect attempts)
+ends the bot as `evicted`, as on every platform; the reason name is in the bot log
+(`[LiveKit] REMOVAL TRIGGERED: disconnected (…)`).
 meeting-api's own `left_alone`, for a bot whose pod vanished mid-meeting (`reconcile.py`), is a
 lost bot and is retried.
 
 ## Per-speaker channels
 
-Google Meet and Jitsi record each remote channel beside the mixed master. The mixed master
+Google Meet, Jitsi and LiveKit record each remote channel beside the mixed master. The mixed master
 and `speaker-activity.jsonl` are written on every meeting. Teams stays the server mix. Zoom
 stays `pertrack`.
 
@@ -152,7 +160,7 @@ The switch is `PER_CHANNEL_RECORDING_PLATFORMS` on meeting-api
 (`bot_spawn/service.py` `per_channel_recording_enabled`): a comma-separated list of platform
 names. Unset or empty is off. A channel is recorded only when this bot is recording at all.
 Helm `meetingApi.perChannelRecordingPlatforms` sets the variable. The chart default is `""`.
-Our values set `google_meet,jitsi`.
+Our values set `google_meet,jitsi,livekit`.
 
 meeting-api sends `perChannelRecordingEnabled: true` on the invocation only when the platform
 is listed (`bot_spawn/service.py`, `invocation.py`). Off omits the field, so a bot image that
@@ -163,6 +171,7 @@ environment variable of its own.
 | Platform | What is recorded | What the first chunk stores |
 |---|---|---|
 | Google Meet | Each remote audio element `gmeet-capture` is connected to. The channel number is the index that capture assigned (`gmeet-capture.ts` `channels()`). Meet keeps a small rotating pool of those elements. | `channel_kind: gmeet`, `stream_id`. Glow names stay on the ordinary activity frames, which already carry `ch`. |
+| LiveKit | A remote audio track the session reports as subscribed (`VexaLivekit.subscribedTracks()`, `@vexa/livekit-capture`), found on the page as the WebRTC hook's `<audio>` element holding that track (`selectLivekitChannels`). LiveKit pre-allocates receivers and gives a freed one to the next subscription, so the element alone never says whose voice it is. A channel number names one person on one track (`<sid>\|<track id>`, `createLivekitChannelNumbers`); a key that is no longer subscribed is released at once and a returning key gets a new number. | `channel_kind: livekit`, `stream_id`, `participant_id` = the LiveKit participant sid, `display_name` = `participant.name` when set. The identity is never sent: a signed-in person's identity holds their email. |
 | Jitsi | A live remote stream whose id is `remote-audio-<n>` (`record-chunker/src/channel-targets.ts`). The first stream with an id gets its digits as the channel number. A later stream object under an id already used (a new bridge session numbers its streams from `remote-audio-1` again) gets the next number never used, so `stream_id` and the channel number can differ. `mixedmslabel` is not a channel. | `channel_kind: jitsi`, `stream_id`, and, when the page store has them, `participant_id` and `display_name` (`jitsiNameForStream`). |
 
 The recorder is the same `record-chunker` tap as the master, one continuous recorder per
@@ -209,15 +218,19 @@ digital silence never gets one; a real microphone does, through its noise floor.
 speakers between its few remote audio elements, so a Meet channel is not one person; the
 activity frames' glow names say who was on it when.
 
-## Google Meet recording notice
+## Recording notice (Google Meet, LiveKit)
 
 After Meet admits the bot, join posts a chat message
-(`core/meetings/modules/join/src/googlemeet/chat.ts`, `MEET_RECORDING_NOTICE`):
+(`core/meetings/modules/join/src/googlemeet/chat.ts`; the text is `RECORDING_NOTICE` in
+`join/src/shared/recording-notice.ts`). On a LiveKit meeting the same text is sent once connected
+as a text stream on topic `lk.chat`, which Meet's chat reads, and again to each participant who
+joins later, addressed to that participant only, since a text stream reaches only the people
+connected when it is sent (`announceLivekitAdmission`, `VexaLivekit.announce`):
 
 > Olanote by Olamee Corp is recording this meeting for transcription. See https://olamee.com/legal?tab=privacy for details. If you'd prefer the meeting not be recorded, ask the host to remove this bot.
 
 A missing chat control is logged and the join continues. This is not the `chat_send` act, and
-`voiceAgentEnabled` does not turn it on. Teams, Zoom, and Jitsi are unchanged.
+`voiceAgentEnabled` does not turn it on. Teams, Zoom, and Jitsi post nothing.
 
 ## The runtime pod
 

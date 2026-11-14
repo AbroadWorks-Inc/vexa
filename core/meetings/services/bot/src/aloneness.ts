@@ -229,6 +229,30 @@ export function createDeafCaptureGuardAdapter(options: { stalenessMs?: number } 
 
 export const deafCaptureGuardAdapter: AlonenessAdapter = createDeafCaptureGuardAdapter();
 
+/**
+ * A platform whose roster is exact (LiveKit names every participant from the room itself) keeps the
+ * bot in while that roster holds a human, however long the room is silent. It abstains with no
+ * report or an empty room, so the silence window still decides when everyone has left, and while
+ * no frames arrive, so a deaf bot gets the deaf guard's hold and repair (a veto would end the
+ * evaluation before it).
+ */
+export const exactRosterAdapter: AlonenessAdapter = {
+  name: 'exact-roster',
+  evaluate(snapshot, now, windowMs): AlonenessVerdict {
+    const hearing = snapshot.lastRemoteFrameAt !== undefined && now - snapshot.lastRemoteFrameAt < windowMs;
+    return hearing && typeof snapshot.rosterParticipants === 'number' && snapshot.rosterParticipants > 0
+      ? 'not-alone'
+      : 'alone';
+  },
+};
+
+/** The leave rules for a platform. Teams' roster can miss people (unreadable tiles), so only LiveKit's counts. */
+export function alonenessAdaptersFor(platform: string): AlonenessAdapter[] {
+  return platform === 'livekit'
+    ? [silenceAlonenessAdapter, deafCaptureGuardAdapter, exactRosterAdapter]
+    : [silenceAlonenessAdapter, deafCaptureGuardAdapter];
+}
+
 export function resolveAloneSilenceWindowMs(
   explicitEveryoneLeftTimeout: number | undefined,
   env: NodeJS.ProcessEnv = process.env,

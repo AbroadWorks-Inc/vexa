@@ -3,9 +3,9 @@ terminal's ``clients/terminal/src/surfaces/meetingId.ts`` (same id formats, same
 
 Used by ``POST /meetings`` / ``PATCH /meetings/{id}`` (a planned meeting created from a pasted
 link) and by ``calendar_sync`` (extracting the joinable link out of an ICS event's LOCATION /
-DESCRIPTION). Pure string logic — no I/O, no framework imports; the one config read is
-``VEXA_JITSI_HOSTS`` (P14, declared in config.v1.json), consulted per call so tests and
-reloads see the live env.
+DESCRIPTION). Pure string logic — no I/O, no framework imports; the config reads are
+``VEXA_LIVEKIT_HOSTS`` and ``VEXA_JITSI_HOSTS`` (P14, declared in config.v1.json), consulted per
+call so tests and reloads see the live env.
 
 Id formats (mirrors the dashboard join-form):
   * google_meet → ``abc-defg-hij``
@@ -15,6 +15,9 @@ Id formats (mirrors the dashboard join-form):
                   ``VEXA_JITSI_HOSTS``-declared deployments always; *jitsi* / meet-labelled
                   hosts on pasted links only. The room name is deployment-scoped, so the raw
                   URL rides alongside as ``meeting_url`` — never reconstructed from the id.
+  * livekit     → the room code ``abc-defg-hij`` of a website meeting on a ``VEXA_LIVEKIT_HOSTS``
+                  host, checked before every other host rule, in every mode. The raw URL rides
+                  alongside as ``meeting_url``: the bot asks that host's waiting room to enter.
 """
 from __future__ import annotations
 
@@ -62,6 +65,13 @@ def _has_passcode_param(query: str) -> bool:
     return bool((params.get("password") or [""])[0] or (params.get("pwd") or [""])[0])
 
 
+def configured_livekit_hosts() -> set[str]:
+    """Deployment-declared LiveKit website-meeting hostnames (``VEXA_LIVEKIT_HOSTS``,
+    comma-separated). Empty means no link is read as LiveKit."""
+    raw = os.getenv("VEXA_LIVEKIT_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
 def _configured_jitsi_hosts() -> set[str]:
     """Deployment-declared Jitsi hostnames (``VEXA_JITSI_HOSTS``, comma-separated) — for
     self-hosted deployments whose hostname carries neither "jitsi" nor a "meet" label. A
@@ -91,6 +101,19 @@ def parse_meeting_url(raw: str, *, generic_hosts: bool = True) -> Optional[tuple
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
     if host:
+        # A trailing-dot spelling of a listed host is the same host: it is read here (and refused,
+        # since it is not bare), never handed to the Jitsi rules below.
+        if host.rstrip(".") in configured_livekit_hosts():
+            # The bot asks this host's waiting room to let it in, over https: the bare host only,
+            # no port, credentials or ;params, so a link cannot point the bot elsewhere on the host.
+            code = parsed.path.strip("/").lower()
+            bare = (
+                parsed.scheme.lower() == "https"
+                and parsed.netloc.lower() == host
+                and not host.endswith(".")
+                and not parsed.params
+            )
+            return ("livekit", code) if bare and _GMEET_ID.match(code) else None
         if _host_is(host, "meet.google.com"):
             code = next((p for p in reversed(parsed.path.split("/")) if p), "").lower()
             return ("google_meet", code) if _GMEET_ID.match(code) else None

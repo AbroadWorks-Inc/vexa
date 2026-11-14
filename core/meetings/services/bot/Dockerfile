@@ -68,7 +68,7 @@ RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
 # runs build-browser-utils.mjs, which esbuild-bundles these bricks' dist into
 # window.VexaBrowserUtils (the global capture-bridge.ts injects via addInitScript) —
 # so their dist/ must already exist when the bot build runs.
-RUN pnpm --filter "@vexa/capture-codec" --filter "@vexa/gmeet-capture" --filter "@vexa/mixed-capture-core" --filter "@vexa/record-chunker" --filter "@vexa/jitsi-capture" --filter "@vexa/teams-capture" --filter "@vexa/zoom-capture" run build
+RUN pnpm --filter "@vexa/capture-codec" --filter "@vexa/gmeet-capture" --filter "@vexa/mixed-capture-core" --filter "@vexa/record-chunker" --filter "@vexa/jitsi-capture" --filter "@vexa/livekit-capture" --filter "@vexa/teams-capture" --filter "@vexa/zoom-capture" run build
 
 # Build @vexa/bot and everything it depends on (the `...` selector pulls the deps;
 # pnpm runs them in topological order, each package's own `build` = tsc → dist/).
@@ -154,6 +154,8 @@ COPY --from=builder /build /app
 # /app, so place it there explicitly so window.VexaBrowserUtils is present on every
 # page navigation (the gmeet per-channel + mixed-lane capture wiring depends on it).
 COPY --from=builder /build/core/meetings/services/bot/dist/browser-utils.global.js /app/browser-utils.global.js
+# The LiveKit page bundle (join/src/livekit loads it into the bot's own LiveKit page).
+COPY --from=builder /build/core/meetings/services/bot/dist/livekit-page.global.js /app/livekit-page.global.js
 
 # The baked HF model cache (mixed-lane pyannote segmentation), carried from the
 # builder. VEXA_HF_CACHE points the @huggingface/transformers env.cacheDir here

@@ -2,7 +2,13 @@
  * Channel selection is pure: a stream id either is a Jitsi remote-audio channel
  * or it is not. Run: npx tsx src/channel-targets.test.ts
  */
-import { createJitsiChannelNumbers, jitsiChannel, selectJitsiChannels } from "./channel-targets.js";
+import {
+  createJitsiChannelNumbers,
+  createLivekitChannelNumbers,
+  jitsiChannel,
+  selectJitsiChannels,
+  selectLivekitChannels,
+} from "./channel-targets.js";
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = "") => {
@@ -55,6 +61,36 @@ check("a later id whose digits are free keeps them", numbers.channelFor({}, "rem
 check("after that the next free number is above the highest", numbers.channelFor({}, "remote-audio-2") === 10);
 check("remote-audio-0 keeps 0 on a fresh session", createJitsiChannelNumbers().channelFor({}, "remote-audio-0") === 0);
 
+
+// LiveKit: a channel is a subscribed track, matched to the hook's element by track id. The hook
+// also mirrors receivers LiveKit pre-allocates, which carry nobody until a subscription lands.
+const lk = (streamId: string, trackId: string, paused = false, audioTracks = 1) => ({ streamId, trackId, paused, audioTracks });
+const lkSelected = selectLivekitChannels(
+  [lk("s1", "t1"), lk("s2", "t2"), lk("s9", "t9"), lk("s3", "t3", true), lk("s4", "t4", false, 0), lk("s1b", "t1")],
+  [
+    { trackId: "t1", sid: "PA_a", name: "Asha" },
+    { trackId: "t2", sid: "PA_b", name: "" },
+    { trackId: "t3", sid: "PA_c", name: "Cy" },
+    { trackId: "t4", sid: "PA_d", name: "Di" },
+  ],
+);
+check(
+  "livekit keeps only live subscribed tracks, once per key, and omits an empty name",
+  JSON.stringify(lkSelected) === JSON.stringify([
+    { streamId: "s1", key: "PA_a|t1", sid: "PA_a", name: "Asha" },
+    { streamId: "s2", key: "PA_b|t2", sid: "PA_b" },
+  ]),
+  JSON.stringify(lkSelected),
+);
+check("livekit selects nothing when nothing is subscribed", selectLivekitChannels([lk("s1", "t1")], []).length === 0);
+
+const lkNumbers = createLivekitChannelNumbers();
+check("livekit numbers start at 0", lkNumbers.channelFor("PA_a|t1") === 0);
+check("a second key gets the next number", lkNumbers.channelFor("PA_b|t2") === 1);
+check("a known key keeps its number", lkNumbers.channelFor("PA_a|t1") === 0);
+check("a reused receiver carrying another person is a new channel", lkNumbers.channelFor("PA_c|t1") === 2);
+lkNumbers.forget("PA_a|t1");
+check("a forgotten key that returns gets a number never used before", lkNumbers.channelFor("PA_a|t1") === 3);
 
 if (failed) {
   console.error(`\n❌ channel-targets: ${failed} check(s) FAILED.`);

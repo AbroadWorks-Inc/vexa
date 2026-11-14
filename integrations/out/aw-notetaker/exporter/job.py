@@ -390,7 +390,7 @@ class ChannelIdentityMissing(Exception):
 def _channel_identity(channel: int, metadata: object) -> Mapping[str, Any]:
     """The identity a channel recorder stamps on its first chunk, which
     meeting-api keeps in the media file's `metadata` (full recording only):
-    the kind (`gmeet`/`jitsi`) and the recorder's start on the epoch clock,
+    the kind (`gmeet`/`jitsi`/`livekit`) and the recorder's start on the epoch clock,
     plus the stream and the speaker's ids and name when known.
 
     Without kind and start a channel can be neither named nor placed on the
@@ -398,7 +398,7 @@ def _channel_identity(channel: int, metadata: object) -> Mapping[str, Any]:
     the meeting without channels.
     """
     meta = metadata if isinstance(metadata, Mapping) else {}
-    if meta.get("channel_kind") not in ("gmeet", "jitsi") or (
+    if meta.get("channel_kind") not in ("gmeet", "jitsi", "livekit") or (
         type(meta.get("recorder_start_epoch_ms")) is not int
     ):
         raise ChannelIdentityMissing(

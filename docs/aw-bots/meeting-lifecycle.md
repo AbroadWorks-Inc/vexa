@@ -19,7 +19,13 @@ lets a sender push the same entry again and change nothing.
 
 `ENTRY_BLOCKED_HOSTS` is empty (the code default and our Helm value). A Jitsi link on a host in
 `VEXA_JITSI_HOSTS`, including `meet.abroadworks.com`, takes the same `PUT /v2/entries` path as
-Meet, Teams, and Zoom. A host on the block list is still `platform_not_enabled`.
+Meet, Teams, and Zoom. A LiveKit link `https://<host>/<abc-defg-hij>` on a host in
+`VEXA_LIVEKIT_HOSTS` (`meet-next.olamee.com`) is a `livekit` meeting whose native id is the room code;
+LiveKit hosts are checked before the Jitsi rules, and `POST /bots` refuses a `livekit` bot whose
+`meeting_url` is not that room on a listed host. The host is checked when the link arrives: a
+meeting accepted while its host was listed still gets its bot after the host is removed, so remove a
+LiveKit host only when no meeting on it is planned. A host on the block list is still
+`platform_not_enabled`.
 
 ## When the bot goes
 

@@ -81,6 +81,8 @@ import {
   createRecordingTap,
   selectJitsiChannels,
   createJitsiChannelNumbers,
+  selectLivekitChannels,
+  createLivekitChannelNumbers,
 } from ${JSON.stringify(RECORD)};
 import {
   createJitsiSpeakers,
@@ -116,6 +118,8 @@ const VexaBrowserUtils = {
   createRecordingTap,        // capture-bridge.ts: w.VexaBrowserUtils.createRecordingTap
   selectJitsiChannels,       // capture-bridge.ts: the Jitsi streams that are speaker channels
   createJitsiChannelNumbers, // capture-bridge.ts: a channel number per Jitsi stream object
+  selectLivekitChannels,     // capture-bridge.ts: the LiveKit streams whose track is subscribed
+  createLivekitChannelNumbers, // capture-bridge.ts: a channel number per LiveKit person-and-track key
   // ── jitsi lane (dominant-speaker naming hints + chat over the app's own state) ──
   createJitsiSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createJitsiSpeakers
   jitsiNameForStream,        // capture-bridge.ts: name a remote-audio stream at recorder start
@@ -174,3 +178,19 @@ console.log('  - createMixedAudioCapture / installRemoteAudioHook / selectTeamsM
 console.log('  - createJitsiSpeakers / createJitsiChat / sendJitsiChatMessage');
 console.log('  - createTeamsSpeakers / createTeamsCaptions / createZoomSpeakers / createTrackNameResolver');
 console.log('  - window.performLeaveAction');
+
+// The LiveKit page's own bundle. livekit-client (~1 MB) is loaded only by the bot's LiveKit page
+// (join/src/livekit), never by the meeting pages every other platform runs, so it is a separate
+// file and not part of VexaBrowserUtils.
+const LIVEKIT_OUT = path.join(__dirname, 'dist', 'livekit-page.global.js');
+await build({
+  entryPoints: [moduleEntry('livekit-capture').replace(/index\.js$/, 'page.js')],
+  bundle: true,
+  format: 'iife',
+  platform: 'browser',
+  target: ['chrome120'],
+  outfile: LIVEKIT_OUT,
+  legalComments: 'none',
+  logLevel: 'info',
+});
+console.log(`✅ LiveKit page bundle created: ${LIVEKIT_OUT} (${fs.statSync(LIVEKIT_OUT).size} bytes) → window.VexaLivekit`);
