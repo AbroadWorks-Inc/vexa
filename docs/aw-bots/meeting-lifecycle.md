@@ -128,8 +128,12 @@ LiveKit admission (`core/meetings/modules/join/src/livekit/knock.ts`, `join.ts`)
   and connects audio-only; admission is the room reaching `connected`
   (`[LiveKit] Connected to room <code>`).
 - `denied` is `awaiting_admission_rejected`, not retried. Still waiting at the end of the lobby
-  budget is `awaiting_admission_timeout`.
-- A 429, a 5xx or a network error backs off 4 seconds, then 5, inside the budget. Any other HTTP
+  budget is `awaiting_admission_timeout`; never reaching the waiting room in that time is
+  `join_failure`.
+- Each call has a 3-second limit (`KNOCK_INTERVAL_MS`): without one, Node's `fetch` waits up to
+  300 seconds, and the bot would lose its place, overrun the budget and ignore a stop for that long.
+- A 429, a 5xx, a network error or a call with no answer within 3 seconds backs off 4 seconds, then
+  5, inside the budget. Any other HTTP
   error (404: no such room), a body that is not JSON, a redirect, or an `accepted` answer without a
   `wss`/`https` LiveKit URL and token is `join_failure`.
 - A room where another participant publishes end-to-end encrypted media is left at once as

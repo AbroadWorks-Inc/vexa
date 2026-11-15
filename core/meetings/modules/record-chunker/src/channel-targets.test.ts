@@ -75,9 +75,9 @@ const lkSelected = selectLivekitChannels(
   ],
 );
 check(
-  "livekit keeps only live subscribed tracks, once per key, and omits an empty name",
+  "livekit keeps only live subscribed tracks, once per key",
   JSON.stringify(lkSelected) === JSON.stringify([
-    { streamId: "s1", key: "PA_a|t1", sid: "PA_a", name: "Asha" },
+    { streamId: "s1", key: "PA_a|t1", sid: "PA_a" },
     { streamId: "s2", key: "PA_b|t2", sid: "PA_b" },
   ]),
   JSON.stringify(lkSelected),

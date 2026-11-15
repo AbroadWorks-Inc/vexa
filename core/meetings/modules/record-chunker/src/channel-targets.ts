@@ -90,7 +90,6 @@ export interface LivekitChannelTarget {
   /** `<participant sid>|<track id>`: one person on one track. */
   key: string;
   sid: string;
-  name?: string;
 }
 
 /**
@@ -112,7 +111,7 @@ export function selectLivekitChannels(
     const key = `${track.sid}|${track.trackId}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ streamId: candidate.streamId, key, sid: track.sid, ...(track.name ? { name: track.name } : {}) });
+    out.push({ streamId: candidate.streamId, key, sid: track.sid });
   }
   return out;
 }
