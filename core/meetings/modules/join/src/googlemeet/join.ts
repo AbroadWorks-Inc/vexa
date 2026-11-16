@@ -310,82 +310,6 @@ export function withPinnedMeetLocale(meetingUrl: string, locale: string): string
   }
 }
 
-/** Budget for locating the guest name input; the refusal watcher shares it. */
-const NAME_INPUT_TIMEOUT_MS = 120000;
-
-/** How often the refusal watcher samples the tab's URL. */
-const GUEST_REFUSAL_POLL_MS = 1000;
-
-/** Greppable reason for a guest Google moved off the lobby before it could knock. */
-const GUEST_REFUSED_MESSAGE =
-  "Google refused the guest join: the tab left the Meet lobby before a name input appeared";
-
-/** The host Google serves the Meet lobby from. */
-const MEET_LOBBY_HOST = "meet.google.com";
-
-/**
- * True when the tab is no longer on the Meet lobby host, which is how a refused
- * guest presents: Google answers the join page with an early 403 and moves the
- * tab away (observed landing: workspace.google.com/products/meet).
- *
- * Host EQUALITY, never substring — `meet.google.com.evil.example` is a different
- * host and reads as a refusal. The `/meet/<code>` path form is on the lobby host
- * and so is NOT a refusal; senders paste that form out of their address bar and
- * those meetings join normally.
- *
- * An unparseable or host-less URL (`about:blank`, a page not yet navigated) is
- * not evidence and reads false, so a fault in this detector can only ever let a
- * run continue — never strand a healthy one.
- */
-export function isGuestRefusalUrl(currentUrl: string): boolean {
-  let host: string;
-  try {
-    host = new URL(currentUrl).host.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (host === "") return false;
-  return host !== MEET_LOBBY_HOST;
-}
-
-/** Clock and sleep injected so the watcher is testable without real timers. */
-export interface GuestRefusalPollOptions {
-  timeoutMs: number;
-  pollMs: number;
-  sleep: (ms: number) => Promise<void>;
-  now: () => number;
-}
-
-/**
- * Poll the tab's URL until it leaves the Meet lobby host or the budget elapses.
- *
- * Raced against the name-input wait: without it the bot spends that whole wait
- * (120 s, join.ts) hunting a control that a refused tab will never show, then
- * matches the generic `input[type="text"]` on whatever page it landed on and
- * reports "join button not found" — the wrong reason, two minutes late.
- *
- * Returns true only on a URL that is positively off the lobby host. Every other
- * outcome — budget elapsed, `page.url()` throwing on a closed page — returns
- * false, so this watcher can only ever end a run that was already lost.
- */
-export async function pollForGuestRefusal(
-  page: { url: () => string },
-  opts: GuestRefusalPollOptions
-): Promise<boolean> {
-  const deadline = opts.now() + opts.timeoutMs;
-  while (opts.now() < deadline) {
-    let current: string | null = null;
-    try {
-      current = page.url();
-    } catch {
-      current = null;
-    }
-    if (current !== null && isGuestRefusalUrl(current)) return true;
-    await opts.sleep(opts.pollMs);
-  }
-  return false;
-}
-
 export async function joinGoogleMeeting(
   page: Page,
   meetingUrl: string,
@@ -527,47 +451,12 @@ export async function joinGoogleMeeting(
     // Anonymous flow: enter bot name and ask to join
     log("Attempting to find name input field...");
 
-    // The name-input wait and the refusal watcher run together. A tab Google has
-    // refused never renders a name input, so without the watcher the wait burns
-    // its whole budget and then matches the generic `input[type="text"]` on the
-    // page the tab was moved to — typing the bot name into a newsletter field and
-    // reporting "join button not found", which is not what happened.
-    const nameWait = waitForAnySelector(
+    const { handle: nameHandle, selector: nameFieldSelector } = await waitForAnySelector(
       page,
       googleNameInputSelectors,
-      NAME_INPUT_TIMEOUT_MS,
+      120000,
       "name input"
     );
-    // Settled either way below; this keeps a losing rejection from surfacing as an
-    // unhandled rejection while the refusal branch is throwing.
-    nameWait.catch(() => { /* handled by the await below */ });
-
-    const refusalWait = pollForGuestRefusal(page, {
-      timeoutMs: NAME_INPUT_TIMEOUT_MS,
-      pollMs: GUEST_REFUSAL_POLL_MS,
-      sleep: (ms: number) => page.waitForTimeout(ms),
-      now: () => Date.now(),
-    });
-
-    const winner = await Promise.race([
-      nameWait.then((hit) => ({ kind: "name" as const, hit })),
-      refusalWait.then((refused) => ({ kind: "refusal" as const, refused })),
-    ]);
-
-    if (winner.kind === "refusal" && winner.refused) {
-      let observed = "?";
-      try { observed = page.url(); } catch { /* best-effort */ }
-      try {
-        await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-guest-refused.png', fullPage: true });
-      } catch { /* best-effort */ }
-      log(`🚫 ${GUEST_REFUSED_MESSAGE} (url=${observed})`);
-      throw new AdmissionError("join_failure", `${GUEST_REFUSED_MESSAGE} (url=${observed})`);
-    }
-
-    // Either the name input won the race, or the watcher finished with no refusal
-    // and the wait decides — including its own descriptive timeout.
-    const { handle: nameHandle, selector: nameFieldSelector } =
-      winner.kind === "name" ? winner.hit : await nameWait;
     log("Name input field found.");
 
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-name-field-found.png', fullPage: true });
