@@ -8,9 +8,7 @@
  */
 import type { Page } from "playwright";
 import { joinGoogleMeeting } from "./googlemeet/join";
-import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent, KNOCK_LOST_MESSAGE } from "./googlemeet/admission";
-import { joinWithReknock } from "./googlemeet/reknock";
-import { AdmissionError } from "./shared/admission";
+import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent } from "./googlemeet/admission";
 import { announceGoogleMeetAdmission } from "./googlemeet/chat";
 import { prepareForRecording, leaveGoogleMeet } from "./googlemeet/leave";
 import { startGoogleRemovalMonitor } from "./googlemeet/removal";
@@ -32,10 +30,6 @@ import { startLivekitRemovalMonitor } from "./livekit/removal";
 import { startDebugView } from "./shared/escalation";
 import { setHooks, type BotConfig, type Hooks, type JoinState } from "./_host";
 import { JOIN_BROWSER_ARGS, getJoinBrowserArgs } from "./browser-args";
-
-/** Hard cap on repeat asks, so a pathological expiry loop still terminates.
- *  The admission budget is the real governor; this only bounds the pathological case. */
-const MEET_MAX_KNOCKS = 5;
 
 export type { BotConfig, Hooks, JoinState };
 export { startDebugView, setHooks };
@@ -136,26 +130,9 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     );
     admitted = true;
   } else if (platform === "google_meet") {
-    // Google withdraws an unauthenticated guest's "Ask to join" after about a
-    // minute, with neither an admission nor a denial. A bot dispatched ahead of
-    // the meeting would spend its only visible minute before anyone arrived, so
-    // that outcome — and only that one — is re-asked until the budget is spent.
-    admitted = await joinWithReknock(
-      {
-        join: () => joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig),
-        waitForAdmission: (remainingMs: number) =>
-          waitForGoogleMeetingAdmission(page, remainingMs, botConfig),
-        isExpiredKnock: (e: unknown) =>
-          e instanceof AdmissionError
-          && e.outcome === "lobby_timeout"
-          && e.message === KNOCK_LOST_MESSAGE,
-        now: () => Date.now(),
-        log: (m: string) => console.log(`[Meet] ${m}`),
-      },
-      {
-        totalBudgetMs: botConfig.automaticLeave!.waitingRoomTimeout,
-        maxKnocks: MEET_MAX_KNOCKS,
-      },
+    await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
+    admitted = await waitForGoogleMeetingAdmission(
+      page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
   } else {
     // Explicit refusal, never a fallthrough: an unknown platform used to silently run the GOOGLE

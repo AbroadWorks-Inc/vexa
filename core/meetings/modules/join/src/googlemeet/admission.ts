@@ -83,7 +83,7 @@ const captchaSuppressionSince = new WeakMap<object, number>();
 // `awaiting_admission_timeout`: nobody answered, a legit retry with a fresh knock) — not the rest
 // of the lobby budget on a dead page and then `join_failure`, the join layer's own failure class.
 export const KNOCK_LOST_GRACE_MS = 20_000;
-export const KNOCK_LOST_MESSAGE =
+const KNOCK_LOST_MESSAGE =
   "Google Meet withdrew the join request: the waiting room vanished with no admission and no denial " +
   "(Meet drops an unanswered 'Ask to join' after about 10 minutes)";
 
