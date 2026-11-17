@@ -3,6 +3,7 @@ import { log, randomDelay, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
 import {
   googleNameInputSelectors,
+  googleContinueAsGuestSelectors,
   googleJoinButtonSelectors,
   googleMicrophoneButtonSelectors,
   googleCameraButtonSelectors,
@@ -12,6 +13,7 @@ import {
   googleLobbyCtaMaxLabelChars
 } from "./selectors";
 import { HumanizedInteractor, MOCAP_LIBRARY } from "./humanized";
+import { watchGoogleJoinRefusal, throwIfGoogleJoinRefused } from "./refusal";
 import { AdmissionError } from "../shared/admission";
 import { resolveBotUiLocale } from "../browser-args";
 
@@ -212,16 +214,20 @@ export async function describeSelectorMiss(
  * Wait for the FIRST of an ordered selector list to become visible
  * (locale-agnostic selectors first, English text fallbacks last). Returns the
  * matched handle and the selector that won. On total failure: screenshot + LOUD
- * throw carrying the observed locale/URL.
+ * throw carrying the observed locale/URL. `guard` runs before every poll and
+ * ends the wait by throwing (Meet refusing the join, refusal.ts).
  */
 export async function waitForAnySelector(
   page: Page,
   selectors: string[],
   timeoutMs: number,
-  label: string
+  label: string,
+  guard?: () => Promise<void>,
+  recordButtonsOnMiss = false
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   do {
+    if (guard) await guard();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
       log(`Located ${label} via selector: ${hit.selector}`);
@@ -230,7 +236,35 @@ export async function waitForAnySelector(
     await page.waitForTimeout(SELECTOR_POLL_MS);
   } while (Date.now() - started < timeoutMs);
 
-  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, null));
+  // A miss is never blind: when asked, record the visible text-button labels (the same structural
+  // scan the lobby CTA wait uses; button labels only, never page text).
+  let labels: string[] | null = null;
+  if (recordButtonsOnMiss) {
+    try { labels = (await scanLobbyPrimaryCta(page)).labels; } catch { labels = null; }
+  }
+  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, labels));
+}
+
+/** Press «Continue as guest» when, and only when, the guest step is on screen. At most once per page. */
+const pressedGuestStep = new WeakSet<Page>();
+export async function pressContinueAsGuestIfPresent(
+  page: Page,
+  click: (handle: ElementHandle<Element>, label: string) => Promise<void>
+): Promise<boolean> {
+  if (pressedGuestStep.has(page)) return false;
+  const hit = await firstVisibleSelector(page, googleContinueAsGuestSelectors);
+  if (!hit) return false;
+  pressedGuestStep.add(page);
+  try {
+    await click(hit.handle, "continue_as_guest");
+  } catch (e) {
+    // A failed press must not change how the join ends: the wait carries on to its normal
+    // 120 s «Could not locate name input» miss (which monitoring counts and which records the labels).
+    log(`«Continue as guest» press failed (${e instanceof Error ? e.message.slice(0, 120) : "unknown"}); continuing the name-field wait.`);
+    return false;
+  }
+  log(`Pressed «Continue as guest» on the pre-join guest step (via ${hit.selector}).`);
+  return true;
 }
 
 /**
@@ -256,7 +290,8 @@ export async function waitForLobbyCta(
   page: Page,
   selectors: string[],
   timeoutMs: number,
-  label: string
+  label: string,
+  guard?: () => Promise<void>
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   const graceMs = Math.min(CTA_SCAN_GRACE_MS, Math.floor(timeoutMs / 3));
@@ -265,6 +300,7 @@ export async function waitForLobbyCta(
   // no text-labelled button", never "the scan never got to look".
   let lastLabels: string[] | null = null;
   do {
+    if (guard) await guard();
     const hit = await firstVisibleSelector(page, selectors);
     if (hit) {
       log(`Located ${label} via selector: ${hit.selector}`);
@@ -316,6 +352,10 @@ export async function joinGoogleMeeting(
   botName: string,
   botConfig: BotConfig
 ): Promise<void> {
+  // Before navigating: Meet can refuse the join during the lobby load or on the click, and
+  // answers on the network first (refusal.ts). Every lobby wait below stops on that refusal.
+  watchGoogleJoinRefusal(page);
+  const refused = (stage: string) => () => throwIfGoogleJoinRefused(page, stage);
   const navUrl = withPinnedMeetLocale(meetingUrl, resolveBotUiLocale());
   await page.goto(navUrl, { waitUntil: "domcontentloaded" });
   await page.bringToFront();
@@ -455,7 +495,15 @@ export async function joinGoogleMeeting(
       page,
       googleNameInputSelectors,
       120000,
-      "name input"
+      "name input",
+      // Two things can end or unblock this wait: Meet refusing the join (throws), and the
+      // «Continue as guest» step standing in front of the name field (pressed once, then the
+      // wait continues normally). Neither changes how a normal lobby behaves.
+      async () => {
+        await refused("lobby, name input")();
+        await pressContinueAsGuestIfPresent(page, clickHandle);
+      },
+      true
     );
     log("Name input field found.");
 
@@ -482,7 +530,8 @@ export async function joinGoogleMeeting(
       page,
       googleJoinButtonSelectors,
       60000,
-      "join button"
+      "join button",
+      refused("lobby, join button")
     );
     await clickHandle(joinHandle!, "ask_to_join");
     log(`${botName} joined the Google Meet Meeting.`);
