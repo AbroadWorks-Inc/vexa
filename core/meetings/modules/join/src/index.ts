@@ -12,6 +12,7 @@ import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent } from "./
 import { announceGoogleMeetAdmission } from "./googlemeet/chat";
 import { prepareForRecording, leaveGoogleMeet } from "./googlemeet/leave";
 import { startGoogleRemovalMonitor } from "./googlemeet/removal";
+import { knockUntilGoogleAccepts, googleKnockConfig } from "./googlemeet/refusal";
 import { joinMicrosoftTeams } from "./msteams/join";
 import { waitForTeamsMeetingAdmission, checkForTeamsAdmissionSilent } from "./msteams/admission";
 import { prepareForRecording as prepareForTeamsRecording, leaveMicrosoftTeams } from "./msteams/leave";
@@ -130,9 +131,19 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     );
     admitted = true;
   } else if (platform === "google_meet") {
-    await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
-    admitted = await waitForGoogleMeetingAdmission(
-      page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
+    // Meet can refuse a knock outright ("You can't join this video call"); that refusal is flaky
+    // per knock, so knock again inside the SAME lobby budget rather than ending the join
+    // (googlemeet/refusal.ts). The budget is never extended — each knock gets only what is left.
+    const knock = googleKnockConfig();
+    admitted = await knockUntilGoogleAccepts(
+      page,
+      botConfig.automaticLeave!.waitingRoomTimeout,
+      async (remainingMs) => {
+        await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
+        return waitForGoogleMeetingAdmission(page, remainingMs, botConfig);
+      },
+      Date.now,
+      { freshen: !botConfig.authenticated && knock.wipe, backoffMs: knock.backoffMs, maxKnocks: knock.maxKnocks },
     );
   } else {
     // Explicit refusal, never a fallthrough: an unknown platform used to silently run the GOOGLE

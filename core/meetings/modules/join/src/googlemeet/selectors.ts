@@ -129,6 +129,16 @@ export const googleRejectionIndicators: string[] = [
   'button[aria-label*="try again"]'
 ];
 
+// Meet refusing the knock itself: no meeting device is created, so the host is never asked
+// (googlemeet/refusal.ts). The network 403 on ResolveMeetingSpace/CreateMeetingDevice is the primary
+// signal; this screen is the visible confirmation. Deliberately ONLY the "video call" wording —
+// "Return to home screen" (line 54) belongs to the WAITING ROOM and must never appear here, and the
+// "can't join this call" variants above are host-side rejections, a different outcome.
+export const googleJoinRefusedIndicators: string[] = [
+  "text=You can't join this video call",
+  'text=You can’t join this video call', // typographic apostrophe
+];
+
 export const googleAdmissionIndicators: string[] = [
   // Meeting toolbar and controls (most reliable admission indicators)
   'button[aria-label*="Chat"]',
@@ -349,6 +359,17 @@ export const googleMicrophoneButtonSelectors: string[] = [
 // could not fill its name. The lobby has exactly one editable text input, so
 // match by structure/role; keep the English aria-label + placeholder as
 // fallbacks.
+// Guest step (seen 12 Nov 2026): some pre-join pages show «Continue as guest» / «Or sign in to join»
+// BEFORE the name field. It is the button a person presses to join as a guest; pressing it changes
+// nothing about how the bot presents itself. English text: the UI locale is pinned (#856).
+// Measured 17 Nov 2026: this step appears on INSTANT ("New meeting") rooms, not on scheduled
+// calendar meetings — which is all this deployment joins. Kept because it costs one poll and
+// turns a dead 120 s wait into a join if Google ever rolls it out to scheduled links.
+export const googleContinueAsGuestSelectors: string[] = [
+  'button:has-text("Continue as guest")',
+  '[role="button"]:has-text("Continue as guest")'
+];
+
 export const googleNameInputSelectors: string[] = [
   // Locale-agnostic: the single text input in the pre-join lobby form.
   'input[jsname][type="text"]',
