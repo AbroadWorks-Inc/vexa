@@ -400,29 +400,13 @@ def _reconcile_join_evidence(
         return None
 
 
-async def _escalate_untracked_zombie(
-    meeting_id: Any,
-    status: str,
-    session_uid: str,
-    bot_container_id: Optional[str],
-    post_lifecycle: Callable[[dict], Awaitable[Any]],
-    tracker: dict,
-    *,
-    grace: float,
-    log: Any,
-    stop_requested: bool = False,
-) -> bool:
-    """Advance a continuously-untracked meeting to ``failed`` — through the bot's OWN lifecycle
-    callback, with the evidence note as the transition's reason. WARN, not error: this is the
-    system converging on its declared policy, not a fresh surprise.
-
+def _presumed_lost_terminal(
+    status: str, session_uid: str, reason: str, *, stop_requested: bool
+) -> dict:
+    """The ``failed`` lifecycle event for a bot the sweep presumes lost without the runtime's proof.
     A PRE-ACTIVE row is attributed to the stage it was lost in (``_pre_active_completion_reason``),
     so a bot that never reached the meeting is filed truthfully and stays RE-SPAWNABLE (#862 —
     ``left_alone`` is an active-phase reason, and using it here cancelled the legitimate retry)."""
-    reason = (
-        f"workload {bot_container_id} untracked for >{int(grace)}s; presumed lost — "
-        "runtime restart or external removal"
-    )
     pre_active = status in _PRE_ACTIVE_STATUSES
     completion_reason = (
         _pre_active_completion_reason(status, stop_requested) if pre_active else "left_alone"
@@ -440,6 +424,29 @@ async def _escalate_untracked_zombie(
         )
         if evidence is not None:
             body["join_evidence"] = evidence
+    return body
+
+
+async def _escalate_untracked_zombie(
+    meeting_id: Any,
+    status: str,
+    session_uid: str,
+    bot_container_id: Optional[str],
+    post_lifecycle: Callable[[dict], Awaitable[Any]],
+    tracker: dict,
+    *,
+    grace: float,
+    log: Any,
+    stop_requested: bool = False,
+) -> bool:
+    """Advance a continuously-untracked meeting to ``failed`` (``_presumed_lost_terminal``) —
+    through the bot's OWN lifecycle callback, with the evidence note as the transition's reason.
+    WARN, not error: this is the system converging on its declared policy, not a fresh surprise."""
+    reason = (
+        f"workload {bot_container_id} untracked for >{int(grace)}s; presumed lost — "
+        "runtime restart or external removal"
+    )
+    body = _presumed_lost_terminal(status, session_uid, reason, stop_requested=stop_requested)
     log.warning(
         "nonterminal-reconcile: meeting %s (%s) escalated to failed — %s",
         meeting_id, status, reason,
@@ -486,7 +493,9 @@ async def reconcile_stale_nonterminal_sweep(
     F-I, ``sweeps.item_failures.run_pages``). A probe or delete the runtime doesn't answer follows
     ``runtime_bound`` (retried, bounded by the row's age since its ``updated_at``); a refused
     delete or a terminal that can't be posted is one of the row's ``SWEEP_MAX_ITEM_FAILURES``
-    tries; a 404 is bounded by the untracked window. Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
+    tries; a 404 is bounded by the untracked window. A row the sweep gives up ends ``failed``
+    with its workload left pending teardown (``close_given_up``), so it never holds its link.
+    Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
     ``list_stale_nonterminal``, and a redelivered terminal is an idempotent 200 no-op at the callback.
 
     Returns the number of meetings reconciled."""
@@ -646,6 +655,30 @@ async def reconcile_stale_nonterminal_sweep(
             )
         reconciled += 1
 
+    async def close_given_up(row: tuple, error: Optional[BaseException]) -> None:
+        """A given-up row would otherwise hold its link for good, so it ends ``failed``. Either it
+        is quiet past ``UNPROVEN_TEARDOWN_MAX_AGE_S`` (longer than a bot's own active ceiling), or
+        the sweep had already decided to end it and only the workload's delete went unconfirmed.
+        That workload goes on the pending-teardown list ``retry_unproven_teardowns`` keeps
+        deleting."""
+        from ..bot_spawn.ports import unproven_teardown
+
+        nonlocal reconciled
+        meeting_id, status, session_uid, bot_container_id, stop_requested = row[:5]
+        workload = session_workload(runtime, meeting_id, session_uid, bot_container_id)
+        if workload and hasattr(repo, "merge_meeting_data"):
+            await repo.merge_meeting_data(
+                meeting_id, lambda data: unproven_teardown(data, workload)
+            )
+        why = "" if error is None else f" ({type(error).__name__})"
+        reason = (
+            f"the reconcile sweep gave this meeting up{why}; workload {workload} teardown pending"
+        )
+        await post_lifecycle(
+            _presumed_lost_terminal(status, session_uid, reason, stop_requested=stop_requested)
+        )
+        reconciled += 1
+
     try:
         await run_pages(
             item_failures, STALE_NONTERMINAL_SWEEP,
@@ -655,7 +688,7 @@ async def reconcile_stale_nonterminal_sweep(
                 after=after, limit=limit,
             ),
             limit=limit, after_of=lambda row: row[0], item_id_of=lambda row: str(row[0]),
-            user_id_of=lambda row: None, action=one,
+            user_id_of=lambda row: None, action=one, on_given_up=close_given_up,
         )
     except Exception:
         log.exception("nonterminal-reconcile: list_stale_nonterminal failed")

@@ -1678,6 +1678,7 @@ async def test_the_general_reconcile_sweep_prunes_old_failure_records(monkeypatc
 async def test_a_stale_row_whose_delete_keeps_failing_is_given_up_and_counted():
     """I2: the general sweep's row whose delete the runtime keeps refusing is counted each pass
     and given up after ``SWEEP_MAX_ITEM_FAILURES``, under its own sweep name."""
+    from meeting_api.bot_spawn.ports import pending_teardowns
     from meeting_api.lifecycle.reconcile import reconcile_stale_nonterminal_sweep
 
     repo = _stale_repo()
@@ -1694,10 +1695,12 @@ async def test_a_stale_row_whose_delete_keeps_failing_is_given_up_and_counted():
             log=_Log(),
             item_failures=failures,
         )
-    assert runtime.deleted == ["mtg-1-w", "mtg-1-w"]
+    # Two refused deletes by the sweep; the third is the unproven-teardown sweep chasing the
+    # workload the given-up row's close left pending.
+    assert runtime.deleted == ["mtg-1-w", "mtg-1-w", "mtg-1-w"]
     assert failures.gave_up == {("stale-nonterminal", "1")}
     assert _reconcile_items("stale-nonterminal", "given_up") == given_up + 1
-    assert repo._meetings[1]["status"] == "stopping"
+    assert [t["workload"] for t in pending_teardowns(repo._meetings[1]["data"])] == ["mtg-1-w"]
 
 
 # ── a runtime outage is never a reconcile row's failure (I1's rule, §6.9 F-I) ──────────────
