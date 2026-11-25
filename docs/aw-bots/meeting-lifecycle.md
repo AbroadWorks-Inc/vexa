@@ -194,6 +194,20 @@ Untouched give-up rows are pruned after `SWEEP_ITEM_FAILURES_RETENTION_S` (READM
 
 A runtime that does not answer is counted `runtime_unreachable` and is not that item's failure.
 A teardown in that state is chased until `UNPROVEN_TEARDOWN_MAX_AGE_S` (default 21600 seconds).
+A reconcile row quiet for longer than that is given up on its first unanswered runtime call.
+
+The reconcile sweep (`lifecycle/reconcile.py`) ends a quiet `joining`, `awaiting_admission`,
+`needs_help` or `active` meeting only on proof that its workload is gone. `requested` is the
+exception. A bot's first act is reporting `joining`, so a meeting still `requested` after
+`VEXA_LOBBY_BUDGET_S` plus 60 seconds has a bot that never started. The runtime reports a pod
+waiting for a node (`Pending`) as `running`, so the sweep does not wait for its answer: it deletes
+the pod, and the meeting ends `failed` with `join_failure` at stage `requested`. The retry rules
+above then apply.
+
+A meeting the reconcile sweep gives up ends `failed` at once, so it never keeps holding its link.
+Its pod, never proven gone, is added to `data.unproven_teardown`, and the unproven-teardown sweep
+keeps deleting it. A user's stop still decides the reason (`stopped`). meeting-api refusing a
+sweep's terminal (any 4xx or 5xx) counts as one of that item's failures, never as done.
 
 An entry write that loses a database race is run again `INTAKE_CONFLICT_RETRIES` times (default
 3), then answered 500.
