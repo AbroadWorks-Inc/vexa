@@ -28,7 +28,12 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NoReturn, Optional
 
-from ..bot_spawn.ports import SpawnFailed, WorkloadUnknown
+from ..bot_spawn.ports import (
+    PRE_ACTIVE_MEETING_STATUSES,
+    SpawnFailed,
+    WorkloadUnknown,
+    unproven_teardown,
+)
 from ..settings import seconds
 from ..sweeps.item_failures import ItemDeferred, ItemExpired
 from .machine import dominant_completion_reason
@@ -141,6 +146,21 @@ class UntrackedEscalationFailed(Exception):
     bounded tries)."""
 
 
+class TerminalRefused(Exception):
+    """The lifecycle entry answered a sweep's terminal with a 4xx/5xx (not stored, status
+    unreadable, invalid): one of the row's bounded tries, never taken as done."""
+
+
+async def _post_terminal(post_lifecycle: Callable[[dict], Awaitable[Any]], body: dict) -> Any:
+    """Post a sweep's terminal through ``post_lifecycle``; ``TerminalRefused`` unless it was taken."""
+    status = await post_lifecycle(body)
+    if isinstance(status, int) and status >= 400:
+        raise TerminalRefused(
+            f"{body.get('status')} for session {body.get('connection_id')} refused ({status})"
+        )
+    return status
+
+
 async def reconcile_stale_stopping_sweep(
     repo: Any,
     runtime: Optional[Any],
@@ -181,8 +201,9 @@ async def reconcile_stale_stopping_sweep(
                 failed=TeardownNotConfirmed, expired=StaleRowExpired,
             )
         # 2. Complete it through the bot's own lifecycle callback.
-        status = await post_lifecycle(
-            {"connection_id": session_uid, "status": "completed", "completion_reason": "stopped"}
+        status = await _post_terminal(
+            post_lifecycle,
+            {"connection_id": session_uid, "status": "completed", "completion_reason": "stopped"},
         )
         reconciled += 1
         log.info("stop-reconcile completed stuck meeting %s (session %s) → %s",
@@ -199,22 +220,21 @@ async def reconcile_stale_stopping_sweep(
     return reconciled
 
 
-# Statuses where the bot NEVER reported `active` — a hung row here means the bot never started/joined
-# and never will, so it reconciles to `failed` (attributed to the stage it died in). `active`/`stopping`
-# (the bot WAS live) reconcile to `completed`.
-_PRE_ACTIVE_NONTERMINAL = frozenset({"requested", "joining", "awaiting_admission", "needs_help"})
-
-# Statuses where a BOT MAY BE ALIVE and legitimately QUIET — either in the meeting (`active`) or on
-# its way in (`requested`/`joining`/`awaiting_admission`/`needs_help`). Silence does NOT mean
-# the bot is gone: an ACTIVE bot stops bumping `updated_at` through a silent room, and a bot parked in
-# a waiting room reports `awaiting_admission` ONCE and then polls for up to the lobby budget the
-# control plane itself handed it (``bot_spawn.service.LOBBY_BUDGET_MS``) — there is no heartbeat on
-# either path. So the reap on ALL of these is gated on POSITIVE evidence the bot's workload is no
-# longer alive (runtime liveness), NOT on `updated_at`/segment staleness. `stopping` is EXCLUDED: a
-# stop was requested, so it reaps on its short grace regardless (its bot SHOULD be leaving).
-_LIVENESS_GATED = frozenset(
-    {"requested", "joining", "awaiting_admission", "needs_help", "active"}
-)
+# Statuses where a BOT MAY BE ALIVE and legitimately QUIET — in the meeting (`active`) or on its way
+# in (`joining`/`awaiting_admission`/`needs_help`). Silence does NOT mean the bot is gone: an ACTIVE
+# bot stops bumping `updated_at` through a silent room, and a bot parked in a waiting room reports
+# `awaiting_admission` ONCE and then polls for up to the lobby budget the control plane itself handed
+# it (``bot_spawn.service.LOBBY_BUDGET_MS``) — there is no heartbeat on either path. So these end only
+# on POSITIVE evidence the workload is gone (the runtime tracks it and reports it terminal), never on
+# `updated_at` staleness; a runtime 404 is not that evidence (a recreated runtime forgets live bots).
+# `stopping` is EXCLUDED: a stop was requested, so it ends on its short grace (its bot SHOULD be
+# leaving). `requested` is EXCLUDED: a bot's first act is `joining`, so a row still `requested` past
+# its pre-active grace never started, and the runtime reports a Pending pod (no node to run on) as
+# `running`.
+_LIVENESS_GATED = frozenset({"joining", "awaiting_admission", "needs_help", "active"})
+# Statuses whose workload is probed: the gated ones, and `requested` for the runtime's answer about it
+# (the evidence on its terminal, an unanswered or untracked probe).
+_PROBED = _LIVENESS_GATED | {"requested"}
 
 # runtime.v1 workload states that mean the bot is STILL ALIVE in the meeting (the workload exists and is
 # not torn down). A TRACKED workload in any other state is positive evidence the bot exited. A 404
@@ -397,6 +417,52 @@ def _reconcile_join_evidence(
         return None
 
 
+def _sweep_terminal(
+    status: str,
+    session_uid: str,
+    reason: Optional[str],
+    *,
+    stop_requested: bool,
+    torn_down: bool,
+) -> dict:
+    """The terminal lifecycle event a sweep posts to end a meeting's bot session.
+
+    A PRE-ACTIVE row ends ``failed``, attributed to the stage it was in
+    (``_pre_active_completion_reason``) with the typed join evidence of that stage, so a bot that
+    never reached the meeting is filed truthfully and stays re-spawnable. A row whose bot was live
+    ends ``completed`` when its workload's teardown was confirmed (``torn_down``), and ``failed`` at
+    the ``active`` stage when the bot is only presumed lost. A user's stop decides the reason and is
+    carried back onto ``meeting.data`` so the derived ``stopped`` still shows."""
+    body: dict[str, Any] = {"connection_id": session_uid}
+    pre_active = status in PRE_ACTIVE_MEETING_STATUSES
+    if pre_active:
+        body.update(
+            status="failed",
+            **_stage_fields(status),
+            completion_reason=_pre_active_completion_reason(status, stop_requested),
+        )
+    else:
+        body.update(
+            status="completed" if torn_down else "failed",
+            completion_reason=dominant_completion_reason(
+                "left_alone", stop_requested=stop_requested
+            ),
+        )
+        if not torn_down:
+            body["failure_stage"] = "active"
+    if reason is not None:
+        body["reason"] = reason
+    if pre_active:
+        evidence = _reconcile_join_evidence(
+            status=status, completion_reason=body["completion_reason"], detail=reason,
+        )
+        if evidence is not None:
+            body["join_evidence"] = evidence
+    if stop_requested:
+        body["data"] = {"stop_requested": True}
+    return body
+
+
 async def _escalate_untracked_zombie(
     meeting_id: Any,
     status: str,
@@ -409,41 +475,23 @@ async def _escalate_untracked_zombie(
     log: Any,
     stop_requested: bool = False,
 ) -> bool:
-    """Advance a continuously-untracked meeting to ``failed`` — through the bot's OWN lifecycle
-    callback, with the evidence note as the transition's reason. WARN, not error: this is the
-    system converging on its declared policy, not a fresh surprise.
-
-    A PRE-ACTIVE row is attributed to the stage it was lost in (``_pre_active_completion_reason``),
-    so a bot that never reached the meeting is filed truthfully and stays RE-SPAWNABLE (#862 —
-    ``left_alone`` is an active-phase reason, and using it here cancelled the legitimate retry)."""
+    """Advance a continuously-untracked meeting to its terminal (``_sweep_terminal``) —
+    through the bot's OWN lifecycle callback, with the evidence note as the transition's reason.
+    WARN, not error: this is the system converging on its declared policy, not a fresh surprise."""
     reason = (
         f"workload {bot_container_id} untracked for >{int(grace)}s; presumed lost — "
         "runtime restart or external removal"
     )
-    pre_active = status in _PRE_ACTIVE_STATUSES
-    completion_reason = (
-        _pre_active_completion_reason(status, stop_requested) if pre_active else "left_alone"
+    body = _sweep_terminal(
+        status, session_uid, reason, stop_requested=stop_requested, torn_down=False
     )
-    body = {
-        "connection_id": session_uid,
-        "status": "failed",
-        **(_stage_fields(status) if pre_active else {"failure_stage": "active"}),
-        "completion_reason": completion_reason,
-        "reason": reason,
-    }
-    if pre_active:
-        evidence = _reconcile_join_evidence(
-            status=status, completion_reason=completion_reason, detail=reason,
-        )
-        if evidence is not None:
-            body["join_evidence"] = evidence
     log.warning(
         "nonterminal-reconcile: meeting %s (%s) escalated to failed — %s",
         meeting_id, status, reason,
     )
     _log_untracked_escalated(meeting_id, status, bot_container_id, reason)
     try:
-        await post_lifecycle(body)
+        await _post_terminal(post_lifecycle, body)
         tracker.pop(meeting_id, None)
         return True
     except Exception:  # noqa: BLE001 — best-effort; the window stays open, retried next sweep
@@ -483,7 +531,9 @@ async def reconcile_stale_nonterminal_sweep(
     F-I, ``sweeps.item_failures.run_pages``). A probe or delete the runtime doesn't answer follows
     ``runtime_bound`` (retried, bounded by the row's age since its ``updated_at``); a refused
     delete or a terminal that can't be posted is one of the row's ``SWEEP_MAX_ITEM_FAILURES``
-    tries; a 404 is bounded by the untracked window. Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
+    tries; a 404 is bounded by the untracked window. A row the sweep gives up ends ``failed``
+    with its workload left pending teardown (``close_given_up``), so it never holds its link.
+    Best-effort per meeting — never raises. Idempotent: an already-terminal row is not listed by
     ``list_stale_nonterminal``, and a redelivered terminal is an idempotent 200 no-op at the callback.
 
     Returns the number of meetings reconciled."""
@@ -515,18 +565,8 @@ async def reconcile_stale_nonterminal_sweep(
         since = _row_since(row, 5)
         bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         probe, probe_info = "unknown", None
-        # LIVENESS GATE (the correctness fix): for a status where a bot may be alive and legitimately
-        # QUIET — in the meeting (`active`) or on its way in (`requested`/`joining`/
-        # `awaiting_admission`/`needs_help`) — `updated_at` staleness is NOT evidence the bot is gone. Segments
-        # stop bumping it through a silent room, and a lobby bot emits `awaiting_admission` ONCE and
-        # then polls silently for the whole budget we handed it (#862: the sweep force-deleted
-        # HEALTHY bots that were still waiting to be let in, at 300s of a 600s wait). Only POSITIVE
-        # evidence ("gone": the kernel TRACKS the workload and reports it terminal) reaps. A 404
-        # ("untracked") is NOT evidence — a recreated runtime forgets live bots (the orphaned-live-bot
-        # incident advanced a live, capturing meeting to `completed` on exactly that 404). `stopping`
-        # is exempt (a stop was requested → it converges on its grace, gated on a CONFIRMED teardown
-        # below).
-        if status in _LIVENESS_GATED and bot_container_id:
+        # See _LIVENESS_GATED: only proof the workload is gone ends a possibly-live meeting.
+        if status in _PROBED and bot_container_id:
             probe, probe_info = await _probe_bot_workload(runtime, bot_container_id, log=log)
             if probe == "untracked":
                 _log_workload_untracked(meeting_id, status, bot_container_id)
@@ -552,7 +592,7 @@ async def reconcile_stale_nonterminal_sweep(
                     unreachable=True, since=since, now=wall,
                     failed=TeardownNotConfirmed, expired=StaleRowExpired,
                 )
-            if probe != "gone":
+            if probe != "gone" and status in _LIVENESS_GATED:
                 # ALIVE or UNKNOWN → do not reap a possibly-live, bot-present meeting.
                 # (No bot_container_id at all falls through to the time-based reap — there is no
                 #  live workload that could be holding the meeting open.)
@@ -591,42 +631,19 @@ async def reconcile_stale_nonterminal_sweep(
                 await escalate(meeting_id, status, session_uid, bot_container_id,
                                stop_requested, grace=esc_grace)
             return
-        terminal = "failed" if status in _PRE_ACTIVE_NONTERMINAL else "completed"
-        body: dict[str, Any] = {"connection_id": session_uid, "status": terminal}
-        if terminal == "completed":
-            body["completion_reason"] = dominant_completion_reason(
-                "left_alone", stop_requested=stop_requested
-            )
-            if stop_requested:
-                body["data"] = {"stop_requested": True}
-        else:
-            # ATTRIBUTE, never manufacture (#862). The reason is DERIVED from the stage the bot
-            # died in, and the note carries the probe's own answer (workload state, exit code) —
-            # the only things this sweep actually knows. A default of `left_alone` would be a claim
-            # with no evidence behind it (the sweep issued the delete itself): an active-phase reason
-            # on a bot that never got in.
-            body["completion_reason"] = _pre_active_completion_reason(status, stop_requested)
-            body["reason"] = (
-                f"{_workload_evidence(bot_container_id, probe_info)}; "
-                f"reconciled to failed at {status} (never reached active)"
-            )
-            # The TYPED axes on the same evidence (#1059/#1058): the stage the row died in decides
-            # WHAT (a lobby exhausted vs an admission signal that never came) and, with it, WHO —
-            # a host who never answered vs our own join layer. Without this the sweep's own
-            # `join_failure` rows stay as unaggregatable as the 83 that motivated the issue.
-            evidence = _reconcile_join_evidence(
-                status=status,
-                completion_reason=body["completion_reason"],
-                detail=body["reason"],
-            )
-            if evidence is not None:
-                body["join_evidence"] = evidence
-            if stop_requested:
-                body["data"] = {"stop_requested": True}
-        result = await post_lifecycle(body)
+        # The note is the probe's own answer (workload state, exit code): what this sweep knows.
+        reason = (
+            f"{_workload_evidence(bot_container_id, probe_info)}; "
+            f"reconciled to failed at {status} (never reached active)"
+            if status in PRE_ACTIVE_MEETING_STATUSES else None
+        )
+        body = _sweep_terminal(
+            status, session_uid, reason, stop_requested=stop_requested, torn_down=True
+        )
+        result = await _post_terminal(post_lifecycle, body)
         reconciled += 1
         log.info("nonterminal-reconcile %s meeting %s (status %s, session %s) → %s",
-                 terminal, meeting_id, status, session_uid, result)
+                 body["status"], meeting_id, status, session_uid, result)
 
     async def escalate(
         meeting_id: Any, status: str, session_uid: str, bot_container_id: Optional[str],
@@ -642,6 +659,31 @@ async def reconcile_stale_nonterminal_sweep(
             )
         reconciled += 1
 
+    async def close_given_up(row: tuple, error: Optional[BaseException]) -> None:
+        """A given-up row would otherwise hold its link for good, so it ends ``failed``. Either it
+        is quiet past ``UNPROVEN_TEARDOWN_MAX_AGE_S`` (longer than a bot's own active ceiling), or
+        the sweep had already decided to end it and only the workload's delete went unconfirmed.
+        That workload goes on the pending-teardown list ``retry_unproven_teardowns`` keeps
+        deleting."""
+        nonlocal reconciled
+        meeting_id, status, session_uid, bot_container_id, stop_requested = row[:5]
+        workload = session_workload(runtime, meeting_id, session_uid, bot_container_id)
+        if workload and hasattr(repo, "merge_meeting_data"):
+            await repo.merge_meeting_data(
+                meeting_id, lambda data: unproven_teardown(data, workload)
+            )
+        why = "" if error is None else f" ({type(error).__name__})"
+        reason = (
+            f"the reconcile sweep gave this meeting up{why}; workload {workload} teardown pending"
+        )
+        await _post_terminal(
+            post_lifecycle,
+            _sweep_terminal(
+                status, session_uid, reason, stop_requested=stop_requested, torn_down=False
+            ),
+        )
+        reconciled += 1
+
     try:
         await run_pages(
             item_failures, STALE_NONTERMINAL_SWEEP,
@@ -651,7 +693,7 @@ async def reconcile_stale_nonterminal_sweep(
                 after=after, limit=limit,
             ),
             limit=limit, after_of=lambda row: row[0], item_id_of=lambda row: str(row[0]),
-            user_id_of=lambda row: None, action=one,
+            user_id_of=lambda row: None, action=one, on_given_up=close_given_up,
         )
     except Exception:
         log.exception("nonterminal-reconcile: list_stale_nonterminal failed")
@@ -901,10 +943,6 @@ def _log_untracked_escalated(meeting_id, status, workload_id, reason) -> None:
 
 # Workload states the runtime kernel reports as TERMINAL (the workload is gone).
 TERMINAL_WORKLOAD_STATES = frozenset({"destroyed", "failed", "exited", "crashed", "stopped", "error"})
-# Meeting statuses where the bot has NOT yet reported `active` — a terminal workload here means the bot
-# never got in and never will (image-pull fail, OOM, crash on boot, a blocker it escalated as
-# `needs_help`), so it can be classed `failed` unambiguously.
-_PRE_ACTIVE_STATUSES = frozenset({"requested", "joining", "awaiting_admission", "needs_help"})
 # Meeting statuses where a bot WAS (or is being) live in the meeting — a `stopping` row is a user-stop
 # in flight, and `active` means the bot reported live. `stopping` belongs here because the
 # stop path writes it ONLY over a status the bot reached the meeting in; a stop against a pre-active
@@ -1000,7 +1038,7 @@ async def synthesize_terminal_for_dead_workload(
         return False
     status = info.get("status")
     stop_requested = bool(info.get("stop_requested"))
-    if status in _PRE_ACTIVE_STATUSES:
+    if status in PRE_ACTIVE_MEETING_STATUSES:
         body = {
             "connection_id": info["session_uid"],
             "status": "failed",
@@ -1075,7 +1113,7 @@ async def synthesize_failed_for_dead_workload(
     except Exception as e:  # noqa: BLE001 — lookup is best-effort
         log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
         return False
-    if not info or info.get("status") not in _PRE_ACTIVE_STATUSES:
+    if not info or info.get("status") not in PRE_ACTIVE_MEETING_STATUSES:
         return False  # old contract: only pre-active drove a synthetic failed
     return await synthesize_terminal_for_dead_workload(
         repo, workload_id, state, drive_failed, log=log

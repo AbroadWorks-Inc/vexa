@@ -34,6 +34,7 @@ from meeting_api.lifecycle.machine import (
     BotStatus,
     LifecycleSink,
     MeetingStore,
+    TransitionSource,
     can_transition,
     durable_status_repairs_edge,
 )
@@ -944,8 +945,9 @@ from meeting_api.bot_spawn.fakes import FakeRuntimeClient  # noqa: E402
 
 
 def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grace=300.0,
-                          preactive_grace=None):
-    """Run ONE general sweep with a real RuntimeClient injected (so the liveness gate is exercised)."""
+                          preactive_grace=None, post=None):
+    """Run ONE general sweep with a real RuntimeClient injected (so the liveness gate is exercised).
+    ``post`` replaces the bot-callback poster (e.g. with the production runtime-destroy one)."""
     import logging
 
     async def _post(body: dict):
@@ -953,7 +955,7 @@ def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grac
 
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
-        repo, runtime, _post, stop_grace=stop_grace, active_grace=active_grace,
+        repo, runtime, post or _post, stop_grace=stop_grace, active_grace=active_grace,
         log=logging.getLogger("test.reconcile"),
         item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
@@ -1039,6 +1041,7 @@ def test_active_with_unknown_liveness_is_not_reaped():
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="active")
     repo._meetings[m["id"]]["bot_container_id"] = "wl-x"
+    _set_updated_age(repo, m["id"], 400)  # past the active grace, well inside a meeting's length
     runtime = _BrokenRuntime()
     client = TestClient(create_app(meeting_repo=repo))
 
@@ -1621,10 +1624,10 @@ def test_live_lobby_bot_is_not_reaped_past_the_active_grace():
     assert runtime.deleted == [], "the live workload must NOT be torn down"
 
 
-@pytest.mark.parametrize("status", ["requested", "joining", "awaiting_admission"])
+@pytest.mark.parametrize("status", ["joining", "awaiting_admission"])
 def test_every_pre_active_status_is_liveness_gated(status):
-    """The gate covers the whole pre-active span, not just the lobby: `requested` (spawned, not yet
-    reported) and `joining` (driving the join UI) are equally quiet-but-live states."""
+    """The gate covers the reported pre-active span, not just the lobby: `joining` (driving the
+    join UI) is as quiet-but-live as the waiting room. `requested` is the exception, below."""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status=status)
     repo._meetings[m["id"]]["bot_container_id"] = "wl-pre"
@@ -1636,6 +1639,111 @@ def test_every_pre_active_status_is_liveness_gated(status):
     assert _run_general_sweep_rt(client, repo, runtime) == 0
     assert repo._meetings[m["id"]]["status"] == status
     assert runtime.deleted == []
+
+
+def _sweep_with_production_poster(repo, runtime):
+    """One general sweep posting terminals the way production does (runtime-destroy, forced)."""
+    app = create_app(meeting_repo=repo)
+
+    async def _post(body: dict):
+        status_code, _ = await app.state.apply_lifecycle_event(
+            body,
+            transition_source=TransitionSource.RUNTIME_DESTROY,
+            force_terminal_on_destroy=True,
+        )
+        return status_code
+
+    return _run_general_sweep_rt(TestClient(app), repo, runtime, post=_post)
+
+
+@pytest.mark.parametrize("state", ["starting", "running"])
+def test_requested_past_the_pre_active_grace_is_reaped_although_the_runtime_says_alive(state):
+    """A bot's first act is `joining`, so a row still `requested` past the pre-active grace never
+    started — the runtime reports a Pending pod (no node to run on) as `running`. The sweep tears
+    the workload down and ends the meeting `failed` through the production poster."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-pending"
+    runtime = FakeRuntimeClient(
+        workloads={"wl-pending": {"workloadId": "wl-pending", "state": state}}
+    )
+
+    assert _sweep_with_production_poster(repo, runtime) == 1
+    assert runtime.deleted == ["wl-pending"]
+    assert repo._meetings[m["id"]]["status"] == "failed"
+    assert repo._meetings[m["id"]]["data"]["completion_reason"] == "join_failure"
+
+
+def test_a_given_up_row_ends_failed_with_its_workload_left_pending_teardown():
+    """A row quiet past UNPROVEN_TEARDOWN_MAX_AGE_S is given up on the first probe the runtime
+    doesn't answer. It must not keep holding its link: it ends `failed`, and its workload — never
+    proven gone — goes on the pending-teardown list the unproven-teardown sweep keeps deleting."""
+    from meeting_api.bot_spawn.ports import pending_teardowns
+
+    class _UnansweringRuntime(FakeRuntimeClient):
+        async def get_workload(self, workload_id):
+            raise RuntimeError("runtime unreachable")
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")  # updated_at 2026-06-20: far past the 6 h max age
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lost"
+
+    assert _sweep_with_production_poster(repo, _UnansweringRuntime()) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"]["completion_reason"] == "join_failure"
+    assert "gave this meeting up (StaleRowExpired)" in row["data"]["reason"]
+    assert [t["workload"] for t in pending_teardowns(row["data"])] == ["wl-lost"]
+
+
+def test_a_given_up_user_stop_still_ends_as_the_users_stop():
+    """A user stopped the meeting and the runtime never answered the delete: the give-up's close
+    carries the stop (reason ``stopped``, ``data.stop_requested``), not a bot failure."""
+
+    class _DeleteUnanswered(FakeRuntimeClient):
+        async def delete_workload(self, workload_id):
+            raise RuntimeError("runtime unreachable")
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="stopping")  # updated_at 2026-06-20: far past the 6 h max age
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-leaving"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True
+
+    assert _sweep_with_production_poster(repo, _DeleteUnanswered()) == 1
+    data = repo._meetings[m["id"]]["data"]
+    assert data["completion_reason"] == "stopped"
+    assert data["stop_requested"] is True
+
+
+def test_a_refused_close_of_a_given_up_row_is_counted_never_taken_as_done():
+    """The lifecycle entry answers a terminal it did not take with a 4xx/5xx and does not raise
+    (503: the meeting status could not be read). The give-up's close must count each refusal and
+    be given up in turn, never pass as the row ended."""
+    import logging
+
+    class _UnansweringRuntime(FakeRuntimeClient):
+        async def get_workload(self, workload_id):
+            raise RuntimeError("runtime unreachable")
+
+    async def _refused(body: dict):
+        return 503
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")  # updated_at 2026-06-20: far past the 6 h max age
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lost"
+    failures = InMemoryItemFailures(max_failures=2)
+    close = ("stale-nonterminal", f"give-up:{m['id']}")
+
+    for _ in range(3):
+        ended = asyncio.run(reconcile_stale_nonterminal_sweep(
+            repo, _UnansweringRuntime(), _refused, stop_grace=45.0, active_grace=300.0,
+            log=logging.getLogger("test.reconcile"), item_failures=failures,
+        ))
+        assert ended == 0
+
+    assert failures.counts[close] == 2
+    assert close in failures.gave_up
+    assert repo._meetings[m["id"]]["status"] == "requested"
 
 
 def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence():
