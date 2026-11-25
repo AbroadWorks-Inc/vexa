@@ -205,13 +205,16 @@ async def reconcile_stale_stopping_sweep(
 _PRE_ACTIVE_NONTERMINAL = frozenset({"requested", "joining", "awaiting_admission", "needs_help"})
 
 # Statuses where a BOT MAY BE ALIVE and legitimately QUIET — either in the meeting (`active`) or on
-# its way in (`requested`/`joining`/`awaiting_admission`/`needs_help`). Silence does NOT mean
-# the bot is gone: an ACTIVE bot stops bumping `updated_at` through a silent room, and a bot parked in
-# a waiting room reports `awaiting_admission` ONCE and then polls for up to the lobby budget the
-# control plane itself handed it (``bot_spawn.service.LOBBY_BUDGET_MS``) — there is no heartbeat on
-# either path. So the reap on ALL of these is gated on POSITIVE evidence the bot's workload is no
-# longer alive (runtime liveness), NOT on `updated_at`/segment staleness. `stopping` is EXCLUDED: a
-# stop was requested, so it reaps on its short grace regardless (its bot SHOULD be leaving).
+# its way in (`joining`/`awaiting_admission`/`needs_help`). Silence does NOT mean the bot is gone: an
+# ACTIVE bot stops bumping `updated_at` through a silent room, and a bot parked in a waiting room
+# reports `awaiting_admission` ONCE and then polls for up to the lobby budget the control plane itself
+# handed it (``bot_spawn.service.LOBBY_BUDGET_MS``) — there is no heartbeat on either path. So the
+# reap on ALL of these is gated on POSITIVE evidence the bot's workload is no longer alive (runtime
+# liveness), NOT on `updated_at`/segment staleness. `requested` is probed for that evidence but not
+# gated on it: a bot's first act is `joining`, so a row still `requested` past its pre-active grace
+# never started, and the runtime reports a Pending pod (no node to run on) as `running`. `stopping`
+# is EXCLUDED: a stop was requested, so it reaps on its short grace regardless (its bot SHOULD be
+# leaving).
 _LIVENESS_GATED = frozenset(
     {"requested", "joining", "awaiting_admission", "needs_help", "active"}
 )
@@ -516,16 +519,17 @@ async def reconcile_stale_nonterminal_sweep(
         bot_container_id = session_workload(runtime, meeting_id, session_uid, bot_container_id)
         probe, probe_info = "unknown", None
         # LIVENESS GATE (the correctness fix): for a status where a bot may be alive and legitimately
-        # QUIET — in the meeting (`active`) or on its way in (`requested`/`joining`/
-        # `awaiting_admission`/`needs_help`) — `updated_at` staleness is NOT evidence the bot is gone. Segments
+        # QUIET — in the meeting (`active`) or on its way in (`joining`/`awaiting_admission`/
+        # `needs_help`) — `updated_at` staleness is NOT evidence the bot is gone. Segments
         # stop bumping it through a silent room, and a lobby bot emits `awaiting_admission` ONCE and
         # then polls silently for the whole budget we handed it (#862: the sweep force-deleted
         # HEALTHY bots that were still waiting to be let in, at 300s of a 600s wait). Only POSITIVE
         # evidence ("gone": the kernel TRACKS the workload and reports it terminal) reaps. A 404
         # ("untracked") is NOT evidence — a recreated runtime forgets live bots (the orphaned-live-bot
-        # incident advanced a live, capturing meeting to `completed` on exactly that 404). `stopping`
-        # is exempt (a stop was requested → it converges on its grace, gated on a CONFIRMED teardown
-        # below).
+        # incident advanced a live, capturing meeting to `completed` on exactly that 404). An ALIVE
+        # answer for `requested` does not hold the row: past its pre-active grace the bot never
+        # started (see `_LIVENESS_GATED`). `stopping` is exempt (a stop was requested → it converges
+        # on its grace, gated on a CONFIRMED teardown below).
         if status in _LIVENESS_GATED and bot_container_id:
             probe, probe_info = await _probe_bot_workload(runtime, bot_container_id, log=log)
             if probe == "untracked":
@@ -552,7 +556,7 @@ async def reconcile_stale_nonterminal_sweep(
                     unreachable=True, since=since, now=wall,
                     failed=TeardownNotConfirmed, expired=StaleRowExpired,
                 )
-            if probe != "gone":
+            if probe != "gone" and not (probe == "alive" and status == "requested"):
                 # ALIVE or UNKNOWN → do not reap a possibly-live, bot-present meeting.
                 # (No bot_container_id at all falls through to the time-based reap — there is no
                 #  live workload that could be holding the meeting open.)

@@ -34,6 +34,7 @@ from meeting_api.lifecycle.machine import (
     BotStatus,
     LifecycleSink,
     MeetingStore,
+    TransitionSource,
     can_transition,
     durable_status_repairs_edge,
 )
@@ -944,8 +945,9 @@ from meeting_api.bot_spawn.fakes import FakeRuntimeClient  # noqa: E402
 
 
 def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grace=300.0,
-                          preactive_grace=None):
-    """Run ONE general sweep with a real RuntimeClient injected (so the liveness gate is exercised)."""
+                          preactive_grace=None, post=None):
+    """Run ONE general sweep with a real RuntimeClient injected (so the liveness gate is exercised).
+    ``post`` replaces the bot-callback poster (e.g. with the production runtime-destroy one)."""
     import logging
 
     async def _post(body: dict):
@@ -953,7 +955,7 @@ def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grac
 
     extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
-        repo, runtime, _post, stop_grace=stop_grace, active_grace=active_grace,
+        repo, runtime, post or _post, stop_grace=stop_grace, active_grace=active_grace,
         log=logging.getLogger("test.reconcile"),
         item_failures=InMemoryItemFailures(max_failures=5), **extra,
     ))
@@ -1621,10 +1623,10 @@ def test_live_lobby_bot_is_not_reaped_past_the_active_grace():
     assert runtime.deleted == [], "the live workload must NOT be torn down"
 
 
-@pytest.mark.parametrize("status", ["requested", "joining", "awaiting_admission"])
+@pytest.mark.parametrize("status", ["joining", "awaiting_admission"])
 def test_every_pre_active_status_is_liveness_gated(status):
-    """The gate covers the whole pre-active span, not just the lobby: `requested` (spawned, not yet
-    reported) and `joining` (driving the join UI) are equally quiet-but-live states."""
+    """The gate covers the reported pre-active span, not just the lobby: `joining` (driving the
+    join UI) is as quiet-but-live as the waiting room. `requested` is the exception, below."""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status=status)
     repo._meetings[m["id"]]["bot_container_id"] = "wl-pre"
@@ -1636,6 +1638,35 @@ def test_every_pre_active_status_is_liveness_gated(status):
     assert _run_general_sweep_rt(client, repo, runtime) == 0
     assert repo._meetings[m["id"]]["status"] == status
     assert runtime.deleted == []
+
+
+@pytest.mark.parametrize("state", ["starting", "running"])
+def test_requested_past_the_pre_active_grace_is_reaped_although_the_runtime_says_alive(state):
+    """A bot's first act is `joining`, so a row still `requested` past the pre-active grace never
+    started — the runtime reports a Pending pod (no node to run on) as `running`. The sweep tears
+    the workload down and ends the meeting `failed` through the production poster."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-pending"
+    runtime = FakeRuntimeClient(
+        workloads={"wl-pending": {"workloadId": "wl-pending", "state": state}}
+    )
+    app = create_app(meeting_repo=repo)
+
+    async def _post(body: dict):
+        status_code, _ = await app.state.apply_lifecycle_event(
+            body,
+            transition_source=TransitionSource.RUNTIME_DESTROY,
+            force_terminal_on_destroy=True,
+        )
+        return status_code
+
+    reaped = _run_general_sweep_rt(TestClient(app), repo, runtime, post=_post)
+
+    assert reaped == 1
+    assert runtime.deleted == ["wl-pending"]
+    assert repo._meetings[m["id"]]["status"] == "failed"
+    assert repo._meetings[m["id"]]["data"]["completion_reason"] == "join_failure"
 
 
 def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence():
