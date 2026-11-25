@@ -1696,6 +1696,37 @@ def test_a_given_up_row_ends_failed_with_its_workload_left_pending_teardown():
     assert [t["workload"] for t in pending_teardowns(row["data"])] == ["wl-lost"]
 
 
+def test_a_refused_close_of_a_given_up_row_is_counted_never_taken_as_done():
+    """The lifecycle entry answers a terminal it did not take with a 4xx/5xx and does not raise
+    (503: the meeting status could not be read). The give-up's close must count each refusal and
+    be given up in turn, never pass as the row ended."""
+    import logging
+
+    class _UnansweringRuntime(FakeRuntimeClient):
+        async def get_workload(self, workload_id):
+            raise RuntimeError("runtime unreachable")
+
+    async def _refused(body: dict):
+        return 503
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")  # updated_at 2026-06-20: far past the 6 h max age
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lost"
+    failures = InMemoryItemFailures(max_failures=2)
+    close = ("stale-nonterminal", f"give-up:{m['id']}")
+
+    for _ in range(3):
+        ended = asyncio.run(reconcile_stale_nonterminal_sweep(
+            repo, _UnansweringRuntime(), _refused, stop_grace=45.0, active_grace=300.0,
+            log=logging.getLogger("test.reconcile"), item_failures=failures,
+        ))
+        assert ended == 0
+
+    assert failures.counts[close] == 2
+    assert close in failures.gave_up
+    assert repo._meetings[m["id"]]["status"] == "requested"
+
+
 def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence():
     """A1 — when the probe says the workload is GENUINELY gone, the reason is DERIVED from the stage
     (`awaiting_admission` → `awaiting_admission_timeout`) and carries the probe's own evidence

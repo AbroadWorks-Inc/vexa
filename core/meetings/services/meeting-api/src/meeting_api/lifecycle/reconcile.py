@@ -141,6 +141,21 @@ class UntrackedEscalationFailed(Exception):
     bounded tries)."""
 
 
+class TerminalRefused(Exception):
+    """The lifecycle entry answered a sweep's terminal with a 4xx/5xx (not stored, status
+    unreadable, invalid): one of the row's bounded tries, never taken as done."""
+
+
+async def _post_terminal(post_lifecycle: Callable[[dict], Awaitable[Any]], body: dict) -> Any:
+    """Post a sweep's terminal through ``post_lifecycle``; ``TerminalRefused`` unless it was taken."""
+    status = await post_lifecycle(body)
+    if isinstance(status, int) and status >= 400:
+        raise TerminalRefused(
+            f"{body.get('status')} for session {body.get('connection_id')} refused ({status})"
+        )
+    return status
+
+
 async def reconcile_stale_stopping_sweep(
     repo: Any,
     runtime: Optional[Any],
@@ -181,8 +196,9 @@ async def reconcile_stale_stopping_sweep(
                 failed=TeardownNotConfirmed, expired=StaleRowExpired,
             )
         # 2. Complete it through the bot's own lifecycle callback.
-        status = await post_lifecycle(
-            {"connection_id": session_uid, "status": "completed", "completion_reason": "stopped"}
+        status = await _post_terminal(
+            post_lifecycle,
+            {"connection_id": session_uid, "status": "completed", "completion_reason": "stopped"},
         )
         reconciled += 1
         log.info("stop-reconcile completed stuck meeting %s (session %s) → %s",
@@ -453,7 +469,7 @@ async def _escalate_untracked_zombie(
     )
     _log_untracked_escalated(meeting_id, status, bot_container_id, reason)
     try:
-        await post_lifecycle(body)
+        await _post_terminal(post_lifecycle, body)
         tracker.pop(meeting_id, None)
         return True
     except Exception:  # noqa: BLE001 — best-effort; the window stays open, retried next sweep
@@ -636,7 +652,7 @@ async def reconcile_stale_nonterminal_sweep(
                 body["join_evidence"] = evidence
             if stop_requested:
                 body["data"] = {"stop_requested": True}
-        result = await post_lifecycle(body)
+        result = await _post_terminal(post_lifecycle, body)
         reconciled += 1
         log.info("nonterminal-reconcile %s meeting %s (status %s, session %s) → %s",
                  terminal, meeting_id, status, session_uid, result)
@@ -674,8 +690,9 @@ async def reconcile_stale_nonterminal_sweep(
         reason = (
             f"the reconcile sweep gave this meeting up{why}; workload {workload} teardown pending"
         )
-        await post_lifecycle(
-            _presumed_lost_terminal(status, session_uid, reason, stop_requested=stop_requested)
+        await _post_terminal(
+            post_lifecycle,
+            _presumed_lost_terminal(status, session_uid, reason, stop_requested=stop_requested),
         )
         reconciled += 1
 
