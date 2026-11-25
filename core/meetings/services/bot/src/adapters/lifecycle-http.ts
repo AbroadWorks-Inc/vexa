@@ -21,7 +21,7 @@ import type { LifecycleSink, PrimaryReachability } from '../ports.js';
  *  inject a fake without pulling in DOM/undici types. */
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number }>;
 
 export interface HttpLifecycleSinkOptions {
@@ -37,15 +37,13 @@ export interface HttpLifecycleSinkOptions {
   backoffMs?: number;
   /** Sleep impl (injected so the test runs instantly). Default real setTimeout. */
   sleep?: (ms: number) => Promise<void>;
-  /** Max attempts for the REACHABILITY probe (`emitReachable`, #530) — a longer bounded budget
-   *  than a normal emit so it rides out transient CNI-programming lag, but capped WELL under the
-   *  meeting-api `requested` grace. Default 6 (with `reachBackoffMs` 300 ⇒ ≤ ~9.3s total). */
-  reachRetries?: number;
-  /** Base backoff (ms) for the reachability probe; doubles each retry. Default 300ms. */
-  reachBackoffMs?: number;
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** One reachability probe's time limit. The orchestrator repeats the probe until its own deadline
+ *  (orchestrator.ts CONTROL_PLANE_REACH_DEADLINE_MS), so a probe that hangs must not outlive it. */
+const REACH_ATTEMPT_TIMEOUT_MS = 5_000;
 
 /** Build the live HTTP lifecycle sink. `emit` POSTs the event with bounded retry/backoff and
  *  never throws — a permanent failure is logged and swallowed (the bot keeps running). */
@@ -60,15 +58,12 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
     retries = 5,
     backoffMs = 500,
     sleep = realSleep,
-    reachRetries = 6,
-    reachBackoffMs = 300,
   } = opts;
 
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (internalSecret) headers['x-internal-secret'] = internalSecret;
 
   const attempts = Math.max(1, retries);
-  const reachAttempts = Math.max(1, reachRetries);
 
   async function emit(event: LifecycleEvent): Promise<void> {
     const body = JSON.stringify(event);
@@ -90,28 +85,26 @@ export function createHttpLifecycleSink(opts: HttpLifecycleSinkOptions): Lifecyc
     );
   }
 
-  // The reachability gate's first-emit probe (#530). Emits the (joining) event AND reports whether
-  // the primary channel is REACHABLE. Any HTTP response — 2xx OR non-2xx — proves the channel is
-  // up (P18) and returns `reachable` immediately (near-zero latency on the fast path). Only when
-  // EVERY attempt fails at the network layer (no response — the CNI-lag signature) is it
-  // `unreachable`. Never throws (P14).
+  // The reachability gate's first-emit probe (#530): ONE time-limited attempt that emits the
+  // (joining) event AND reports whether the primary channel is REACHABLE. Any HTTP response proves
+  // the channel is up (P18) and returns `reachable`. A 5xx answer means meeting-api was reached but
+  // did not store the event, so the event is delivered through `emit`'s bounded retry before the
+  // verdict is returned. No response (a network error or the time limit — the CNI-lag signature) is
+  // `unreachable`; the orchestrator owns the retries and the deadline. Never throws (P14).
   async function emitReachable(event: LifecycleEvent): Promise<PrimaryReachability> {
-    const body = JSON.stringify(event);
-    let lastErr: string | undefined;
-    for (let attempt = 1; attempt <= reachAttempts; attempt++) {
-      try {
-        // A response of ANY status means the callback host answered → the channel is up.
-        await fetchImpl(callbackUrl, { method: 'POST', headers, body });
-        return 'reachable';
-      } catch (e) {
-        lastErr = (e as Error)?.message ?? String(e);
-      }
-      if (attempt < reachAttempts) await sleep(reachBackoffMs * 2 ** (attempt - 1));
+    let res: { ok: boolean; status: number };
+    try {
+      res = await fetchImpl(callbackUrl, {
+        method: 'POST', headers, body: JSON.stringify(event), signal: AbortSignal.timeout(REACH_ATTEMPT_TIMEOUT_MS),
+      });
+    } catch (e) {
+      console.error(
+        `[bot] lifecycle.v1 ${event.status} reachability probe: primary channel UNREACHABLE: ${(e as Error)?.message ?? String(e)}`,
+      );
+      return 'unreachable';
     }
-    console.error(
-      `[bot] lifecycle.v1 ${event.status} reachability probe: primary channel UNREACHABLE after ${reachAttempts} attempt(s): ${lastErr ?? 'unknown'}`,
-    );
-    return 'unreachable';
+    if (res.status >= 500) await emit(event);
+    return 'reachable';
   }
 
   return { emit, emitReachable };

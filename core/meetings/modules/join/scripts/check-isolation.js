@@ -47,8 +47,9 @@ for (const file of walk(SRC)) {
         violations.push(`${rel}: relative import escapes package → "${spec}"`);
       }
     } else {
-      // bare: must be a Node builtin or a declared dependency
-      const top = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+      // bare: must be a Node builtin (either spelling, `fs` or `node:fs`) or a declared dependency
+      const bare = spec.replace(/^node:/, "");
+      const top = bare.startsWith("@") ? bare.split("/").slice(0, 2).join("/") : bare.split("/")[0];
       if (!NODE_BUILTINS.has(top) && !allowedPkgs.has(top)) {
         violations.push(`${rel}: undeclared external dependency → "${spec}"`);
       }

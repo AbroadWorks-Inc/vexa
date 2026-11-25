@@ -200,3 +200,42 @@ async def test_connect_auto_subscribes_user_channel_and_forwards():
 
     ws.disconnect()
     await task
+
+
+# ── the socket is held to the REST routes' key scopes ─────────────────────────────────────────────
+
+class _ScopedAuthorizer(FakeAuthorizer):
+    """A key with the given scopes; records whether the subscribe hop was asked at all."""
+
+    def __init__(self, scopes):
+        super().__init__(user={"user_id": 7, "scopes": list(scopes), "max_concurrent": 3},
+                         valid_key=API_KEY, auth_map=AUTH_MAP)
+        self.asked = 0
+
+    async def authorize_subscribe(self, api_key, meetings):
+        self.asked += 1
+        return await super().authorize_subscribe(api_key, meetings)
+
+
+async def test_a_key_that_reads_no_meeting_status_opens_no_socket():
+    """`GET /meetings` takes `tx` and `GET /bots/status` takes `bot`: an `erase`-only key may read
+    neither over REST, so it gets no status frames either — `insufficient_scope`, close 4403."""
+    ws = _WS(inbound=[SUBSCRIBE], api_key=API_KEY)
+    redis, auth = FakeRedis(), _ScopedAuthorizer(["erase"])
+    await _run_multiplex(ws, auth, redis)
+    assert ws.sent and ws.sent[0]["error"] == "insufficient_scope"
+    assert ws.close_code == 4403
+    assert auth.asked == 0 and not redis._subs
+
+
+async def test_a_bot_only_key_cannot_subscribe_to_a_transcript():
+    """A subscription streams the transcript `GET /transcripts/{platform}/{native_meeting_id}` serves
+    to `tx` keys: a `bot`-only key is refused it, nothing is asked downstream, the socket stays open."""
+    ws = _WS(inbound=[SUBSCRIBE], api_key=API_KEY)
+    redis, auth = FakeRedis(), _ScopedAuthorizer(["bot"])
+    await _run_multiplex(ws, auth, redis)
+    errs = [f for f in ws.sent if f.get("type") == "error"]
+    assert errs and errs[0]["error"] == "insufficient_scope", ws.sent
+    assert not any(f.get("type") == "subscribed" for f in ws.sent)
+    assert auth.asked == 0
+    assert ws.close_code is None

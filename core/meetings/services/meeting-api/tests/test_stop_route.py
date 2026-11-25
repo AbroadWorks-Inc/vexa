@@ -336,3 +336,21 @@ def test_stop_without_a_live_meeting_404s_and_never_cancels_a_plan():
         row = asyncio.run(repo.get_meeting(plan["id"]))
         assert row["status"] == "scheduled"
         assert "stop_requested" not in row["data"]
+
+
+def test_a_stop_on_a_lobby_snapshot_never_walks_an_admitted_bot_back():
+    """The stop reads the row, then the bot is admitted, then the stop writes. The snapshot's
+    `awaiting_admission` must not overwrite `active` (that files the meeting "never admitted");
+    the stop flag still lands."""
+    from meeting_api.lifecycle.stop_router import _mark_stop_requested
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, user_id=1, platform="google_meet", native="lob-by", status="awaiting_admission")
+    snapshot = asyncio.run(repo.get_meeting(m["id"]))
+    asyncio.run(repo.update_meeting_status(session_uid=f"sess-{m['id']}", status="active"))
+
+    asyncio.run(_mark_stop_requested(repo, snapshot))
+
+    row = asyncio.run(repo.get_meeting(m["id"]))
+    assert row["status"] == "active"
+    assert row["data"]["stop_requested"] is True

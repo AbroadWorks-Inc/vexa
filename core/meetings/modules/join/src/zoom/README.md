@@ -12,6 +12,14 @@ meeting in progress"). A hold is waited out within the 10-min host budget (then 
 outcome `lobby_timeout`); a page that is none of these for 30 s ends as `name_input_missing`
 (outcome `join_failure`) with the page's URL, title and text in the message.
 
+Zoom's anti-bot wall ("Automated bots aren't allowed … must use Zoom RTMS … Sign in to join") has
+one definition, `matchZoomBotBlock` (`prejoin-state.ts`), checked before the sign-in texts and at
+every stage: before the name field, before the Join button wait, and during admission. Wherever it
+is seen the join ends the same way, `refuseZoomBotBlock` (`admission.ts`): `blocked` to the host,
+then `zoom_requires_rtms`, outcome `denial` (never retried). A sign-in page without the wall's
+words stays `auth_required`, outcome `auth_session_missing`. A webinar link (`/w/<id>`) is not
+supported: `zoom_webinar_unsupported`, outcome `denial`, before any navigation.
+
 `incoming-video.ts` (`stopZoomIncomingVideo`) turns participants' video off once the bot is in the
 call, through the footer More menu's "Stop Incoming Video", and confirms the item then reads "Start
 Incoming Video". The bot needs only the audio and the active-speaker tile; each camera that is on

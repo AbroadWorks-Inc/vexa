@@ -32,7 +32,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gateway import create_app
-from conftest import FakeAuthorizer, FakeDownstream, FakeRedis, VALID_KEY, needs_agent
+from conftest import FakeAuthorizer, FakeDownstream, FakeRedis, VALID_KEY, asgi_status, needs_agent
 
 AUTH = {"x-api-key": VALID_KEY}
 SSE_ACCEPT = {"accept": "text/event-stream"}
@@ -278,6 +278,23 @@ def test_post_mcp_subpath_and_delete_forward_buffered():
     assert client.delete("/mcp", headers=AUTH).status_code == 200
     assert ds.buffered_calls[-1]["method"] == "DELETE"
     assert ds.opened is False
+
+
+async def test_mcp_tail_is_re_encoded_segment_by_segment_and_dot_segments_are_refused():
+    """The `{path:path}` tail arrives decoded: a dot segment would walk the hop out of `/mcp/`, and
+    a decoded `?` would graft a query. Each segment stays data; a dot segment is a 400."""
+    ds = StreamingDownstream(buffered_status=200)
+    app, _ = _app(ds)
+    for method, path in [
+        ("POST", "/mcp/%2E%2E/v2%252Fmeetings%252Fabc"),
+        ("DELETE", "/mcp/a/%2E%2E/%2E%2E/v2/meetings/abc"),
+        ("GET", "/mcp/x%2F%2E%2E%2Fadmin"),
+    ]:
+        assert await asgi_status(app, method, path, AUTH) == 400, path
+    assert ds.buffered_calls == [] and ds.opened is False
+
+    assert await asgi_status(app, "POST", "/mcp/a%3Fb/c%252Fd", AUTH) == 200
+    assert ds.buffered_calls[-1]["url"] == f"{MCP_URL}/mcp/a%3Fb/c%252Fd"
 
 
 # ---------------------------------------------------------------- row 3: typed refusals

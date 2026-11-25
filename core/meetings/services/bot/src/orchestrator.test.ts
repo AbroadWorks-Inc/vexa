@@ -16,7 +16,7 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, type MeetingResult } from './orchestrator.js';
+import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, CONTROL_PLANE_REACH_DEADLINE_MS, type MeetingResult } from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
 import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
@@ -524,11 +524,16 @@ async function main(): Promise<void> {
       async join(report) { joinCalls++; await report('awaiting_admission'); await report('active'); return 'admitted'; },
       onRemoval() { return () => {}; }, async leave() {}, async withdraw() {},
     };
+    let t = 0;
+    let probes = 0;
     const res = await createOrchestrator(inv(), {
       lifecycle: gateSink, join: spyJoin, pipeline: noopPipeline(), acts: noopActs(),
-      aloneness: noopAloneness(), reachability: { async probeSecondary() { return false; } },
+      aloneness: noopAloneness(), reachability: { async probeSecondary() { probes++; return false; } },
+      clockMs: () => t, sleep: async (ms) => { t += ms; },
     }).run();
     check('gate both-down: NO join attempted (refused before meeting navigation)', joinCalls === 0, `joinCalls=${joinCalls}`);
+    check('gate both-down: kept probing both channels until the deadline, not one round',
+      t === CONTROL_PLANE_REACH_DEADLINE_MS && probes > 1, `t=${t} probes=${probes}`);
     check('gate both-down: exit code 3 (dedicated infra signal)', res.exitCode === CONTROL_PLANE_UNREACHABLE_EXIT, String(res.exitCode));
     check('gate both-down: terminal failed', res.status === 'failed');
     check('gate both-down: failure_stage=requested (distinct from a real join failure)', last(events).failure_stage === 'requested', JSON.stringify(last(events)));
@@ -538,6 +543,29 @@ async function main(): Promise<void> {
     check('gate both-down: exit_code on the event = 3', last(events).exit_code === CONTROL_PLANE_UNREACHABLE_EXIT, String(last(events).exit_code));
     check('gate both-down: terminal event still conforms to lifecycle.v1', allConform(events), ajv.errorsText(validateLifecycle.errors));
     check('gate both-down: never reached active', !seq(events).includes('active'), JSON.stringify(seq(events)));
+  }
+
+  // ── #530 gate: a pod network that comes up 40 s after boot (a fresh node) → proceed ──
+  // Both channels fail every probe until the fake clock passes 40 s, then the primary answers. The
+  // bot must still be probing then: it gives up only at CONTROL_PLANE_REACH_DEADLINE_MS.
+  {
+    let t = 0;
+    const events: LifecycleEvent[] = [];
+    const gateSink: LifecycleSink = {
+      async emit(e) { events.push(e); },
+      async emitReachable(e) { events.push(e); return (t >= 40_000 ? 'reachable' : 'unreachable') as PrimaryReachability; },
+    };
+    let fireLeave: (a: { action: 'leave' }) => void = () => {};
+    const o = createOrchestrator(inv(), {
+      lifecycle: gateSink, join: mockJoin('admitted'), pipeline: noopPipeline(), acts: noopActs((f) => { fireLeave = f; }),
+      aloneness: noopAloneness(), reachability: { async probeSecondary() { return false; } },
+      clockMs: () => t, sleep: async (ms) => { t += ms; },
+    });
+    const runP = o.run();
+    setTimeout(() => fireLeave({ action: 'leave' }), 5);
+    const res = await runP;
+    check('gate late network: joined once the network came up (no exit 3)', res.status === 'completed' && res.exitCode === 0, JSON.stringify(res));
+    check('gate late network: no infra_fault emitted', !events.some((e) => e.infra_fault), JSON.stringify(seq(events)));
   }
 
   // ── #530 gate: primary DOWN but SECONDARY up → proceed (either-channel rule) ──

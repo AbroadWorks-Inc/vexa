@@ -1,5 +1,5 @@
 {
-  "what": "The table every meeting-URL redactor is held to: the TypeScript one in @vexa/join (src/shared/url-redaction.ts) and the Python one vendored into meeting-api, agent and flows (meeting_url_redaction.py). Each suite reads its own byte-identical copy (gate:fact-parity, fact meeting-url-redaction-vectors).",
+  "what": "The table every meeting-URL redactor is held to: the TypeScript one in @vexa/join (src/shared/url-redaction.ts) and the Python one in meeting-api (meeting_url_redaction.py). Each suite reads its own byte-identical copy; meeting-api's test_meeting_url_secrets.py fails when they differ.",
   "redact_url": [
     {"why": "Zoom passcode", "in": "https://us05web.zoom.us/j/81234567890?pwd=AbCdEf123.1", "out": "https://us05web.zoom.us/j/81234567890?pwd=***"},
     {"why": "Zoom passcode, long spelling, on a hosted front door", "in": "https://zoom-lfx.platform.linuxfoundation.org/meeting/91234567890?password=6c1a2b3c-0000-4d4d-8e8e-111122223333", "out": "https://zoom-lfx.platform.linuxfoundation.org/meeting/91234567890?password=***"},

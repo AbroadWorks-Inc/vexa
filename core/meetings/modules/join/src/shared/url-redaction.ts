@@ -9,7 +9,8 @@
  * the VALUE of every secret-named query or fragment parameter becomes `***`, and credentials in the
  * authority become `***@`. Pure string work, never a URL parser: the Python twin
  * (`meeting_url_redaction.py`) must produce the same bytes, and both are held to one vector table
- * (`meeting-url-redaction-vectors.json`, gate:fact-parity).
+ * (`meeting-url-redaction-vectors.json`; meeting-api's copy is checked byte-identical by
+ * `test_meeting_url_secrets.py`).
  */
 
 const SECRET_NAMES = new Set(["pwd", "password", "passcode", "p", "tk", "zak", "jwt", "token", "sig", "signature"]);

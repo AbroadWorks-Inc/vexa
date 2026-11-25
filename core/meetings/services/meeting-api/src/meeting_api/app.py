@@ -859,9 +859,18 @@ def _mount_lifecycle(
                 transition_source=current.transition_source.value,
             )
 
+        def _status_unknown(event: str, error: Exception, detail: str) -> tuple[int, dict]:
+            # Whether the row holds this report is unknown: this copy of the record is dropped
+            # and the bot is answered 503, so its retry is applied from the row.
+            sink.store.forget(connection_id)
+            log_event(event, audience="system", level="warning", span="lifecycle.callback",
+                      fields={"to": rec.status.value if rec.status else None,
+                              "error": str(error)})
+            return 503, {"status": "error", "detail": detail}
+
         # Persist the FSM advance to the DB meeting row → durable + queryable (GET /meetings reflects
-        # it, survives a restart), not only the in-process MeetingStore. Best-effort: a DB hiccup must
-        # never fail the bot's lifecycle callback (the in-process FSM already advanced).
+        # it, survives a restart), not only the in-process MeetingStore. A write that raises is
+        # answered 503 (`_status_unknown`), so the bot sends the report again.
         # On an idempotent replay (change.no_op) the FSM did not actually advance — skip the
         # re-persist + re-deliver so a redelivered terminal does not fire a duplicate webhook /
         # publish. We still return 200 (handled below) — the redelivery is acknowledged as a no-op.
@@ -869,9 +878,10 @@ def _mount_lifecycle(
         if rec.status is not None and not change.no_op:
             try:
                 meeting_row = await _write_status(change)
-            except Exception as e:  # noqa: BLE001 — persistence is best-effort
-                log_event("lifecycle_persist_failed", audience="system", level="warning",
-                          span="lifecycle.callback", fields={"error": str(e)})
+            except Exception as e:  # noqa: BLE001 — answered 503, the bot retries
+                return _status_unknown(
+                    "lifecycle_persist_failed", e, "meeting status could not be stored"
+                )
             # The local edge was legal, so the write named only that `from`. Another
             # replica may already have stored a later status (`awaiting_admission`
             # while this copy still says `joining`). Re-read and apply once from the
@@ -938,11 +948,10 @@ def _mount_lifecycle(
                         if not change.no_op and rec.status is not None:
                             try:
                                 meeting_row = await _write_status(change)
-                            except Exception as e:  # noqa: BLE001 — persistence is best-effort
-                                log_event(
-                                    "lifecycle_persist_failed", audience="system",
-                                    level="warning", span="lifecycle.callback",
-                                    fields={"error": str(e)},
+                            except Exception as e:  # noqa: BLE001 — answered 503, the bot retries
+                                return _status_unknown(
+                                    "lifecycle_persist_failed", e,
+                                    "meeting status could not be stored",
                                 )
         # The row is the meeting's status. A report the row did not take, while the row holds
         # another status the bot moves, is answered as not stored: this copy of the record is
@@ -953,11 +962,9 @@ def _mount_lifecycle(
                     session_uid=connection_id
                 )
             except Exception as read_error:  # noqa: BLE001 — answered 503, the bot retries
-                sink.store.forget(connection_id)
-                log_event("lifecycle_status_unknown", audience="system", level="warning",
-                          span="lifecycle.callback",
-                          fields={"to": rec.status.value, "error": str(read_error)})
-                return 503, {"status": "error", "detail": "meeting status could not be read"}
+                return _status_unknown(
+                    "lifecycle_status_unknown", read_error, "meeting status could not be read"
+                )
             stored = stored_state.get("status") if isinstance(stored_state, dict) else None
             if stored in LIVE_BOT_STATUSES and bot_status_from_persisted(stored) is not rec.status:
                 sink.store.forget(connection_id)
@@ -1084,6 +1091,10 @@ def _mount_lifecycle(
                         log_event("user_meeting_status_publish_failed", audience="system",
                                   level="warning", span="lifecycle.callback",
                                   fields={"error": str(e)})
+        # A row that finished with this record's terminal answers every later report of the
+        # session (a redelivery is rehydrated from it), so the record is not kept.
+        if row_finished and rec.status is not None and persisted_status == rec.status.value:
+            sink.store.forget(connection_id)
         log_event(
             "meeting_lifecycle_advanced", audience="user", span="lifecycle.callback",
             meeting_id=rec.connection_id,

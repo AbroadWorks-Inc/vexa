@@ -46,7 +46,6 @@ from exporter.queue import (  # noqa: E402
     PendingQueue,
     WorkerState,
     run_worker,
-    sweep_once,
 )
 from exporter.storage import Storage  # noqa: E402
 from exporter.vexa_client import MeetingApi  # noqa: E402
@@ -55,6 +54,7 @@ from tests.builders import (  # noqa: E402
     MEETING_UUID,
     meeting_event,
     meeting_v2,
+    sweep_once,
 )
 
 WEBHOOK_SECRET = "test-secret"
@@ -1728,6 +1728,52 @@ def test_caplog_shows_job_failure_and_quarantine(
     assert "export job failed" in messages
     assert f"meeting_id={MEETING_UUID}" in messages
     assert "quarantine" in messages
+
+
+def test_meetings_given_up_without_a_result_are_counted_on_metrics(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three outcomes meeting-api never counts: an item that is not a v2
+    meeting, a quarantine whose failed report is refused (the gateway is not
+    reachable here), and bookkeeping that keeps failing after the job. Each
+    is served once on GET /metrics in aw_export_total{state="failed"}."""
+    settings = _settings(max_attempts=1)
+    queue = PendingQueue(storage, settings.vexa_bucket)
+    deps = _deps(storage, settings)
+    worker = WorkerState(settings.concurrency)
+
+    def failing_job(
+        envelope: dict[str, Any], deps: Deps, rerun: bool = False, progress: Any = None
+    ) -> ExportResult:
+        raise RuntimeError("boom")
+
+    queue.enqueue(
+        {"event_type": "meeting.completed", "data": {"meeting": LEGACY_MEETING}}
+    )
+    asyncio.run(sweep_once(queue, deps, worker=worker))
+    queue.enqueue(_envelope())
+    asyncio.run(sweep_once(queue, deps, job=failing_job, worker=worker))
+    assert queue.pending_ids() == []
+    queue.enqueue(_envelope())
+
+    def denied(meeting_id: str) -> None:
+        raise RuntimeError("AccessDenied")
+
+    monkeypatch.setattr(queue, "done", denied)
+    asyncio.run(sweep_once(queue, deps, job=_ok_job([]), worker=worker))
+
+    client = TestClient(
+        create_app(settings, queue, deps, start_worker=False, worker=worker)
+    )
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain; version=0.0.4")
+    samples = [line for line in resp.text.splitlines() if not line.startswith("#")]
+    assert samples == [
+        'aw_export_total{state="failed",reason="bookkeeping_failed"} 1',
+        'aw_export_total{state="failed",reason="not_a_v2_meeting"} 1',
+        'aw_export_total{state="failed",reason="report_refused"} 1',
+    ]
 
 
 def test_import_main_module_is_safe() -> None:

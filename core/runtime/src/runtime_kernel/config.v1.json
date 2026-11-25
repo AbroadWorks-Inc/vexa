@@ -359,6 +359,22 @@
    "default": "<tempdir>/vexa-workloads",
    "description": "process-backend workload log dir — per-workload stdout/stderr capture (the process analog of docker logs); fail-open to DEVNULL if unwritable",
    "targets": []
+  },
+  {
+   "key": "INTERNAL_API_SECRET",
+   "class": "defaulted",
+   "default": "(unset — every route but /health is refused with 401)",
+   "secret": true,
+   "description": "the internal-tier secret every caller of the workload and schedule API presents as x-internal-secret (constant-time compare); /health alone is open. The same value meeting-api holds. A PUBLISHED PLACEHOLDER is refused at boot: it is the whole runtime API handed to anyone who read the repository (F95).",
+   "forbidden_values": [
+     "vexa-internal-secret",
+     "lite-internal-secret",
+     "changeme",
+     "change-me",
+     "CHANGE-ME",
+     "default",
+     "secret"
+   ]
   }
  ],
  "capabilities": {
@@ -392,11 +408,5 @@
     }
    }
   }
- },
- "surface_only": [
-  {
-   "key": "INTERNAL_API_SECRET",
-   "reason": "set on the runtime by compose/helm/lite but never read by runtime code (the internal-call secret is a gateway↔admin-api↔meeting-api concern) — documented drift surfaced by gate:config-contract; candidate for a deploy-surface cleanup"
-  }
- ]
+ }
 }

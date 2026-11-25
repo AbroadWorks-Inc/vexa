@@ -459,23 +459,25 @@ class _FlakyRepo(InMemoryMeetingRepo):
         return await super().get_lifecycle_state_by_session(session_uid=session_uid)
 
 
-def test_a_status_the_row_did_not_take_is_answered_409_and_lands_on_retry():
-    """The `active` write fails and the row still says `joining`. The bot is told (409),
-    sends `active` again, and the row becomes `active`."""
+@pytest.mark.parametrize("stored,to", [("requested", "joining"), ("joining", "active")])
+def test_a_status_write_that_raises_is_answered_503_and_lands_on_retry(stored, to):
+    """The write raises, so whether the row took the report is unknown. The bot is told (503),
+    sends it again, and the retry is applied from the row. `requested` included: a `joining`
+    answered 200 there left the row `requested` while the bot recorded."""
     repo = _FlakyRepo()
     _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
-    assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    if stored == "joining":
+        assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
 
     repo.fail_writes = 1
-    first = _post(client, connection_id="sess-uid", status="active")
-    assert first.status_code == 409, first.text
-    assert first.json()["stored"] == "joining" and first.json()["to"] == "active"
-    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "joining"
+    first = _post(client, connection_id="sess-uid", status=to)
+    assert first.status_code == 503, first.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == stored
 
-    retry = _post(client, connection_id="sess-uid", status="active")
+    retry = _post(client, connection_id="sess-uid", status=to)
     assert retry.status_code == 200, retry.text
-    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == to
 
 
 def test_completed_on_a_row_that_never_stored_active_is_409():
@@ -498,18 +500,42 @@ def test_completed_on_a_row_that_never_stored_active_is_409():
 
 
 def test_an_unreadable_row_answers_503_and_the_retry_lands():
+    """The write is refused (another replica stored `awaiting_admission`) and the row cannot be
+    read back: 503, and the retry is applied from the row."""
     repo = _FlakyRepo()
-    _seed(repo, status="requested")
+    meeting = _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
     assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
+    repo.set_status(meeting["id"], "awaiting_admission")
 
-    repo.fail_writes, repo.fail_reads = 1, 2  # the write, the repair read, the stored check
+    repo.fail_reads = 2  # the repair read, the stored check
     r = _post(client, connection_id="sess-uid", status="active")
     assert r.status_code == 503, r.text
 
     retry = _post(client, connection_id="sess-uid", status="active")
     assert retry.status_code == 200, retry.text
     assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "active"
+
+
+def test_a_finished_row_drops_its_record_and_a_redelivery_is_still_200():
+    """Once the row holds the session's terminal, the record is not kept in memory; a
+    redelivered terminal is rehydrated from the row and acknowledged as a no-op."""
+    repo = InMemoryMeetingRepo()
+    _seed(repo, status="requested")
+    app = create_app(meeting_repo=repo)
+    client = TestClient(app)
+    _post(client, connection_id="sess-uid", status="joining")
+    _post(client, connection_id="sess-uid", status="active")
+    assert app.state.lifecycle_store.get("sess-uid") is not None
+
+    done = dict(connection_id="sess-uid", status="completed", exit_code=0,
+                completion_reason="left_alone")
+    assert _post(client, **done).status_code == 200
+    assert app.state.lifecycle_store.get("sess-uid") is None
+
+    again = _post(client, **done)
+    assert again.status_code == 200, again.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "completed"
 
 
 @pytest.mark.parametrize("stored", ["completed", "failed", "requested"])
@@ -1276,6 +1302,27 @@ def test_runtime_destroyed_completes_stopping_meeting_and_stops_reaper():
     assert repo.list_stale_stopping_sync() == []
 
 
+def test_a_refused_runtime_terminal_is_not_reported_as_driven(caplog):
+    """The lifecycle entry answers a terminal it did not take with a status code and does not
+    raise. A refusal is not a driven terminal: False, and no "drove synthetic" line."""
+    import logging
+
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="joining")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-refused"
+
+    async def _refused(body: dict):
+        return 409
+
+    with caplog.at_level(logging.INFO, logger="test.runtime-cb"):
+        drove = asyncio.run(synthesize_terminal_for_dead_workload(
+            repo, "wl-refused", "exited", _refused, log=logging.getLogger("test.runtime-cb"),
+        ))
+    assert drove is False
+    assert "drove synthetic" not in caplog.text
+    assert "refused (409)" in caplog.text
+
+
 def test_runtime_destroyed_completes_active_meeting():
     """An `active` meeting whose workload is runtime-confirmed `destroyed` WITHOUT its own terminal
     callback (killed before it could POST `completed`) also completes — it reached active, so
@@ -1641,7 +1688,7 @@ def test_every_pre_active_status_is_liveness_gated(status):
     assert runtime.deleted == []
 
 
-def _sweep_with_production_poster(repo, runtime):
+def _sweep_with_production_poster(repo, runtime, **grace):
     """One general sweep posting terminals the way production does (runtime-destroy, forced)."""
     app = create_app(meeting_repo=repo)
 
@@ -1653,7 +1700,7 @@ def _sweep_with_production_poster(repo, runtime):
         )
         return status_code
 
-    return _run_general_sweep_rt(TestClient(app), repo, runtime, post=_post)
+    return _run_general_sweep_rt(TestClient(app), repo, runtime, post=_post, **grace)
 
 
 @pytest.mark.parametrize("state", ["starting", "running"])
@@ -1672,6 +1719,41 @@ def test_requested_past_the_pre_active_grace_is_reaped_although_the_runtime_says
     assert runtime.deleted == ["wl-pending"]
     assert repo._meetings[m["id"]]["status"] == "failed"
     assert repo._meetings[m["id"]]["data"]["completion_reason"] == "join_failure"
+
+
+PREACTIVE_GRACE = 960.0  # VEXA_LOBBY_BUDGET_S 900 + 60
+
+
+def test_requested_whose_bot_exited_is_closed_at_the_active_grace():
+    """A `requested` row runs no lobby budget: a bot that exited at boot (exit 3, control plane
+    unreachable) is closed once the row is past the active grace, not the pre-active one."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-exit3"
+    _set_updated_age(repo, m["id"], 400)  # past active (300), inside pre-active (960)
+    runtime = FakeRuntimeClient(workloads={
+        "wl-exit3": {"workloadId": "wl-exit3", "state": "exited", "exitCode": 3},
+    })
+    reaped = _sweep_with_production_poster(repo, runtime, preactive_grace=PREACTIVE_GRACE)
+    assert reaped == 1
+    assert repo._meetings[m["id"]]["status"] == "failed"
+
+
+@pytest.mark.parametrize("age,held", [(400, True), (1000, False)])
+def test_an_alive_requested_workload_is_held_until_the_pre_active_grace(age, held):
+    """A Pending pod reads `running`: a `requested` row whose workload is alive is left alone
+    until the pre-active grace, then closed."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-pending"
+    _set_updated_age(repo, m["id"], age)
+    runtime = FakeRuntimeClient(
+        workloads={"wl-pending": {"workloadId": "wl-pending", "state": "running"}}
+    )
+    reaped = _sweep_with_production_poster(repo, runtime, preactive_grace=PREACTIVE_GRACE)
+    assert reaped == (0 if held else 1)
+    assert repo._meetings[m["id"]]["status"] == ("requested" if held else "failed")
+    assert runtime.deleted == ([] if held else ["wl-pending"])
 
 
 def test_a_given_up_row_ends_failed_with_its_workload_left_pending_teardown():

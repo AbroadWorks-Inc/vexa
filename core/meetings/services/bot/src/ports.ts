@@ -106,9 +106,9 @@ export interface TranscriptSink {
 
 /** The reachability verdict of the FIRST (load-bearing) lifecycle emit (#530). `reachable` iff
  *  the primary control-plane channel answered AT ALL — a 2xx OR a non-2xx HTTP response both
- *  prove the channel is up (P18's "can I reach my dependency?" answered yes); only when EVERY
- *  attempt fails at the network layer (no response — the CNI-programming-lag signature) is it
- *  `unreachable`. */
+ *  prove the channel is up (P18's "can I reach my dependency?" answered yes); only when the
+ *  attempt gets no response (a network error or its time limit — the CNI-programming-lag signature)
+ *  is it `unreachable`. */
 export type PrimaryReachability = 'reachable' | 'unreachable';
 
 /** lifecycle.v1 egress — the orchestrator emits one status report per transition. The real
@@ -125,7 +125,8 @@ export interface LifecycleSink {
 
 /** The SECONDARY control-plane channel probe (#530) — consulted ONLY when the first `joining`
  *  emit is `unreachable` on the primary channel. The live adapter PINGs redis; `true` iff up.
- *  Either-channel-up ⇒ the bot can still report ⇒ proceed; BOTH down ⇒ refuse to join. */
+ *  Either-channel-up ⇒ the bot can still report ⇒ proceed; BOTH down until the orchestrator's
+ *  deadline ⇒ refuse to join. */
 export interface ControlPlaneProbe {
   /** Probe the secondary channel (redis). Returns `true` iff reachable. MUST NOT throw — a probe
    *  fault resolves to `false` (unreachable) at the adapter. */

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from runtime_kernel import Runtime, RuntimeState, StartFailed, StopReason, WorkloadSpec
 from runtime_kernel.api import create_app
 from runtime_kernel.backend import WorkloadHandle
+from conftest import INTERNAL
 
 _MISSING_IMAGE_MSG = "docker create vexa-w1 failed (404): No such image: vexaai/vexa-bot:dev"
 
@@ -72,7 +73,7 @@ def test_post_workloads_dead_at_start_is_502_not_a_false_201(capsys):
     502 naming the missing image — NOT a bare 201 — and logs ``workload_spawn_failed``, never
     ``workload_spawned``."""
     app = create_app(Runtime(backend=_DeadAtStartBackend(), profiles={"bot": ["run"]}))
-    client = TestClient(app)
+    client = TestClient(app, headers=INTERNAL)
 
     r = client.post("/workloads", json={"workloadId": "w1", "profile": "bot", "env": {}})
 
@@ -96,5 +97,5 @@ def test_post_workloads_healthy_spawn_still_201():
             return None
 
     app = create_app(Runtime(backend=_OkBackend(), profiles={"bot": ["run"]}))
-    r = TestClient(app).post("/workloads", json={"workloadId": "w1", "profile": "bot", "env": {}})
+    r = TestClient(app, headers=INTERNAL).post("/workloads", json={"workloadId": "w1", "profile": "bot", "env": {}})
     assert r.status_code == 201 and r.json()["state"] == "running"

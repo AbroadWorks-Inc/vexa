@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://vexa.ai/contracts/ws.v1",
   "title": "ws.v1 — the public live WebSocket multiplex (/ws), frozen to vexa main",
-  "description": "The /ws endpoint api-gateway serves: api_key auth (x-api-key header or ?api_key=), a subscribe/unsubscribe control protocol, and forwarded live data messages — transcript (the per-speaker confirmed/pending bundle) + transcription_segment from tc:meeting:{id}:mutable, meeting.status from bm:meeting:{id}:status, chat_message from va:meeting:{id}:chat. The gateway forwards the raw redis payload verbatim, so data messages are type-tagged and additive (extra fields allowed). Shapes are the canonical 0.10.6 contract (vexa-0.11 api-gateway + meetings.publish_meeting_status_change).",
+  "description": "The /ws endpoint api-gateway serves: api_key auth (the x-api-key header; never the URL), a subscribe/unsubscribe control protocol, and forwarded live data messages — transcript (the per-speaker confirmed/pending bundle) + transcription_segment from tc:meeting:{id}:mutable, meeting.status from bm:meeting:{id}:status, chat_message from va:meeting:{id}:chat. The gateway forwards the raw redis payload verbatim, so data messages are type-tagged and additive (extra fields allowed). Shapes are the canonical 0.10.6 contract (vexa-0.11 api-gateway + meetings.publish_meeting_status_change).",
   "$defs": {
     "MeetingRef": {
       "type": "object",

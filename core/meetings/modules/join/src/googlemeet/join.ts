@@ -16,7 +16,7 @@ import { HumanizedInteractor, MOCAP_LIBRARY } from "./humanized";
 import { watchGoogleJoinRefusal, throwIfGoogleJoinRefused } from "./refusal";
 import { AdmissionError } from "../shared/admission";
 import { resolveBotUiLocale } from "../browser-args";
-import { redactMeetingUrl, rethrowRedacted } from "../shared/url-redaction";
+import { redactMeetingUrl, redactUrlsIn, rethrowRedacted } from "../shared/url-redaction";
 
 /** Thrown when authenticated mode detects a signed-out browser profile. Extends AdmissionError so
  *  the JoinDriver's single `instanceof` catch maps the typed `auth_session_missing` outcome to a
@@ -72,6 +72,10 @@ export const STRUCTURAL_CTA_ORIGIN = "structural:lobby-primary-cta";
  *  one candidate passed — see findLobbyPrimaryCta. `labels` is every candidate's
  *  visible text, kept for the failure diagnostic. */
 export interface LobbyCtaScan { el: Element | null; labels: string[] }
+/** What a scan saw: the visible text-button labels (empty = the page showed none), or SCAN_FAILED
+ *  when the scan itself threw, which says nothing about the page. */
+export const SCAN_FAILED = "scan_failed";
+export type ButtonLabels = string[] | typeof SCAN_FAILED;
 export interface LobbyCtaScanOptions { iconGlyphSelector: string; maxLabelChars: number }
 
 /**
@@ -127,7 +131,7 @@ export function findLobbyPrimaryCta(opts: LobbyCtaScanOptions): LobbyCtaScan {
 /** Run findLobbyPrimaryCta in the page and lift the winner into an ElementHandle. */
 async function scanLobbyPrimaryCta(
   page: Page
-): Promise<{ handle: ElementHandle<Element> | null; labels: string[] }> {
+): Promise<{ handle: ElementHandle<Element> | null; labels: ButtonLabels }> {
   const opts: LobbyCtaScanOptions = {
     iconGlyphSelector: googleLobbyIconGlyphSelectors.join(", "),
     maxLabelChars: googleLobbyCtaMaxLabelChars,
@@ -139,7 +143,7 @@ async function scanLobbyPrimaryCta(
     const handle = (await scan.getProperty("el")).asElement();
     return { handle: (handle as ElementHandle<Element>) || null, labels: labels || [] };
   } catch {
-    return { handle: null, labels: [] };
+    return { handle: null, labels: SCAN_FAILED };
   } finally {
     if (scan) { try { await scan.dispose(); } catch { /* best-effort */ } }
   }
@@ -199,7 +203,7 @@ export async function describeSelectorMiss(
   selectors: string[],
   timeoutMs: number,
   label: string,
-  candidateLabels: string[] | null
+  candidateLabels: ButtonLabels | null
 ): Promise<string> {
   const shot = `/app/storage/screenshots/bot-checkpoint-${label.replace(/[^a-z0-9]+/gi, "-")}-not-found.png`;
   try { await page.screenshot({ path: shot, fullPage: true }); } catch { /* best-effort */ }
@@ -207,7 +211,7 @@ export async function describeSelectorMiss(
   const context = await observedPageContext(page);
   const seen = candidateLabels === null
     ? ""
-    : `; visible text buttons: ${candidateLabels.length === 0 ? "(none)" : candidateLabels.map((t) => `"${t}"`).join(" | ")}`;
+    : `; visible text buttons: ${candidateLabels === SCAN_FAILED ? "(scan failed)" : candidateLabels.length === 0 ? "(none)" : candidateLabels.map((t) => `"${t}"`).join(" | ")}`;
   return `Could not locate ${label} by any locale-agnostic or English selector after ${timeoutMs}ms (${context}${seen})`;
 }
 
@@ -239,10 +243,7 @@ export async function waitForAnySelector(
 
   // A miss is never blind: when asked, record the visible text-button labels (the same structural
   // scan the lobby CTA wait uses; button labels only, never page text).
-  let labels: string[] | null = null;
-  if (recordButtonsOnMiss) {
-    try { labels = (await scanLobbyPrimaryCta(page)).labels; } catch { labels = null; }
-  }
+  const labels = recordButtonsOnMiss ? (await scanLobbyPrimaryCta(page)).labels : null;
   throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, labels));
 }
 
@@ -265,6 +266,32 @@ export async function pressContinueAsGuestIfPresent(
     return false;
   }
   log(`Pressed «Continue as guest» on the pre-join guest step (via ${hit.selector}).`);
+  return true;
+}
+
+/** How long the name-field wait lets the lobby show nothing before it reloads it. */
+export const BLANK_LOBBY_RELOAD_AFTER_MS = 30_000;
+/** Pages whose blank-lobby check has run. Checked once per page, at the mark, never again. */
+const checkedBlankLobby = new WeakSet<Page>();
+/**
+ * Reload the lobby once when, BLANK_LOBBY_RELOAD_AFTER_MS into the name-field wait, it shows neither
+ * the name field nor any text button: a lobby that rendered nothing does not recover by itself,
+ * and the wait carries on within its own budget after the reload. A scan that failed is not a blank
+ * page, and a failed reload is logged and the wait carries on.
+ */
+export async function reloadBlankLobbyOnce(page: Page, waitStartedAt: number): Promise<boolean> {
+  if (checkedBlankLobby.has(page) || Date.now() - waitStartedAt < BLANK_LOBBY_RELOAD_AFTER_MS) return false;
+  checkedBlankLobby.add(page);
+  if (await firstVisibleSelector(page, googleNameInputSelectors)) return false;
+  const scan = await scanLobbyPrimaryCta(page);
+  if (scan.handle) { try { await scan.handle.dispose(); } catch { /* best-effort */ } }
+  if (scan.labels === SCAN_FAILED || scan.labels.length > 0) return false;
+  log(`Lobby shows no name field and no button ${Math.round((Date.now() - waitStartedAt) / 1000)}s in — reloading it once.`);
+  try {
+    await page.reload({ waitUntil: "domcontentloaded" });
+  } catch (e) {
+    log(`Lobby reload failed (${redactUrlsIn(e instanceof Error ? e.message : String(e)).slice(0, 200)}); continuing the name-field wait.`);
+  }
   return true;
 }
 
@@ -299,7 +326,7 @@ export async function waitForLobbyCta(
   let polls = 0;
   // null until the scan has actually run: "(none)" must mean "the lobby showed
   // no text-labelled button", never "the scan never got to look".
-  let lastLabels: string[] | null = null;
+  let lastLabels: ButtonLabels | null = null;
   do {
     if (guard) await guard();
     const hit = await firstVisibleSelector(page, selectors);
@@ -492,17 +519,19 @@ export async function joinGoogleMeeting(
     // Anonymous flow: enter bot name and ask to join
     log("Attempting to find name input field...");
 
+    const nameWaitStartedAt = Date.now();
     const { handle: nameHandle, selector: nameFieldSelector } = await waitForAnySelector(
       page,
       googleNameInputSelectors,
       120000,
       "name input",
-      // Two things can end or unblock this wait: Meet refusing the join (throws), and the
-      // «Continue as guest» step standing in front of the name field (pressed once, then the
-      // wait continues normally). Neither changes how a normal lobby behaves.
+      // Three things can end or unblock this wait: Meet refusing the join (throws), the
+      // «Continue as guest» step standing in front of the name field (pressed once), and a lobby
+      // that rendered nothing (reloaded once). None changes how a normal lobby behaves.
       async () => {
         await refused("lobby, name input")();
         await pressContinueAsGuestIfPresent(page, clickHandle);
+        await reloadBlankLobbyOnce(page, nameWaitStartedAt);
       },
       true
     );

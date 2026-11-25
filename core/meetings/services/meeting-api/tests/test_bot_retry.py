@@ -819,7 +819,7 @@ class _Http:
     def __init__(self, code: int) -> None:
         self.code = code
 
-    async def post(self, url, json=None, timeout=None):
+    async def post(self, url, json=None, headers=None, timeout=None):
         return _Resp(self.code)
 
 
@@ -1344,7 +1344,7 @@ class _DeleteHttp:
     def __init__(self, code: int) -> None:
         self.code = code
 
-    async def delete(self, url, timeout=None):
+    async def delete(self, url, headers=None, timeout=None):
         return _DeleteResp(self.code)
 
 

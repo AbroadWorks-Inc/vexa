@@ -34,7 +34,16 @@ ZAK = "eyJ0eXAiOiJKV1QiLCJob3N0In0.c2VjcmV0LWhvc3QtdG9rZW4.sig"
 PWD = "S3cr3tPasscode"
 JOIN = f"https://us05web.zoom.us/j/81234567890?pwd={PWD}"
 WITH_ZAK = f"{JOIN}&zak={ZAK}"
-VECTORS = json.loads((Path(__file__).resolve().parent / "fixtures" / "meeting-url-redaction-vectors.json").read_text())
+VECTORS_FILE = Path(__file__).resolve().parent / "fixtures" / "meeting-url-redaction-vectors.json"
+VECTORS = json.loads(VECTORS_FILE.read_text())
+#: The TypeScript twin's copy of the same table (`@vexa/join` url-redaction.ts).
+JOIN_VECTORS_FILE = (
+    Path(__file__).resolve().parents[3] / "modules" / "join" / "src" / "shared" / VECTORS_FILE.name
+)
+
+
+def test_the_vector_table_is_the_one_the_typescript_twin_reads():
+    assert VECTORS_FILE.read_bytes() == JOIN_VECTORS_FILE.read_bytes()
 
 
 # ── the shared table ──────────────────────────────────────────────────────────────────────────────

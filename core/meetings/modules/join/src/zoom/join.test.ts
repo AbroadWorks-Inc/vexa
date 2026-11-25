@@ -6,7 +6,8 @@
  * Run: npx tsx src/zoom/join.test.ts
  */
 
-import { buildZoomWebClientUrl } from './join';
+import { buildZoomWebClientUrl, ZOOM_WEBINAR_UNSUPPORTED } from './join';
+import { AdmissionError } from '../shared/admission';
 
 let passed = 0;
 let failed = 0;
@@ -160,6 +161,17 @@ expectThrows(
   () => buildZoomWebClientUrl('https://zoom.us/s/not-a-number?zak=x'),
   'Cannot extract meeting ID',
 );
+
+console.log('\n=== buildZoomWebClientUrl — webinar links: a permanent verdict ===');
+
+{
+  let err: any = null;
+  try { buildZoomWebClientUrl('https://us06web.zoom.us/w/81234567890?tk=reg-token-1'); } catch (e) { err = e; }
+  expect('webinar /w/<id> — AdmissionError, not a plain (retried) Error', err instanceof AdmissionError, true);
+  expect('webinar /w/<id> — outcome denial (never re-sent)', err?.outcome, 'denial');
+  expect('webinar /w/<id> — the reason names it', String(err?.message).includes(`${ZOOM_WEBINAR_UNSUPPORTED}:`), true);
+  expect('webinar /w/<id> — the registration token is redacted', String(err?.message).includes('reg-token-1'), false);
+}
 
 console.log(`\n=== summary: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

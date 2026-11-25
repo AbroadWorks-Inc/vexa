@@ -24,9 +24,9 @@ from exporter.export_result import (
     ExportReportError,
 )
 from exporter.job import Deps, ExportResult
-from exporter.queue import PendingQueue, sweep_once
+from exporter.queue import PendingQueue
 from exporter.storage import Storage
-from tests.builders import meeting_event, write_silent_wav
+from tests.builders import meeting_event, sweep_once, write_silent_wav
 
 UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
 KEY = "test-exporter-key"

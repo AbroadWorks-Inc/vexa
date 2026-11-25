@@ -13,9 +13,8 @@ still join.
 
 Pure string work, never a URL parser: the TypeScript twin (``@vexa/join``
 ``src/shared/url-redaction.ts``) must produce the same bytes, and both are held to one vector table
-(``meeting-url-redaction-vectors.json``). This file is vendored byte-identically into every image
-that needs it (gate:fact-parity, fact ``meeting-url-redaction``); edit the meeting-api copy and copy
-it verbatim.
+(``meeting-url-redaction-vectors.json``), whose two copies ``tests/test_meeting_url_secrets.py``
+checks are byte-identical.
 """
 from __future__ import annotations
 

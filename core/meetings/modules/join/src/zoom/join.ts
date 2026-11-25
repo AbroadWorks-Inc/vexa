@@ -10,12 +10,18 @@ import {
   zoomPermissionDismissSelector,
 } from "./selectors";
 import { readZoomPreJoinSnapshot, classifyZoomPreJoin, describeZoomPreJoin } from './prejoin-state';
+import { detectZoomBotBlock, refuseZoomBotBlock } from './admission';
 import { redactMeetingUrl, redactUrlsIn, rethrowRedacted } from '../shared/url-redaction';
 
 // NOTE vs the monolith: the audio-join flow (prepareZoomWebMeeting) and the
 // per-speaker capture pipeline are RECORDING/HOST concerns and stay outside
 // this brick. The join layer only enters and observes; the "Allow" permission
 // clicks below remain because Zoom gates ADMISSION-adjacent UI behind them.
+
+/** Reason codes that lead a typed pre-join failure's message (they ride into the run's last_error). */
+export const ZOOM_PREJOIN_HELD = 'zoom_prejoin_held';
+export const ZOOM_NAME_INPUT_MISSING = 'name_input_missing';
+export const ZOOM_WEBINAR_UNSUPPORTED = 'zoom_webinar_unsupported';
 
 /**
  * Build the Zoom Web Client URL from a meeting invite URL.
@@ -31,6 +37,10 @@ import { redactMeetingUrl, redactUrlsIn, rethrowRedacted } from '../shared/url-r
  *
  * For Zoom Events URLs (events.zoom.us/ejl/...) the URL is returned as-is
  * because the events page handles its own redirect to the web client.
+ *
+ * A webinar link (`/w/<id>?tk=…`) is not a meeting the web-client join can enter:
+ * it throws the PERMANENT `denial` verdict (ZOOM_WEBINAR_UNSUPPORTED), so the
+ * control plane does not send another bot at the same link.
  *
  * v0.10.5 — White-label / enterprise URL support. Some organizations
  * front Zoom behind their own portal:
@@ -53,56 +63,57 @@ import { redactMeetingUrl, redactUrlsIn, rethrowRedacted } from '../shared/url-r
  * selector waits pick up from the standard Zoom pre-join page (name input, etc.).
  */
 export function buildZoomWebClientUrl(meetingUrl: string): string {
+  let url: URL;
   try {
-    const url = new URL(meetingUrl);
-
-    // Zoom Events URLs — return as-is; the events page redirects to the web client
-    if (url.hostname === 'events.zoom.us') {
-      return meetingUrl;
-    }
-
-    // Already a web client URL — return as-is
-    if (meetingUrl.includes('/wc/')) return meetingUrl;
-
-    // Detect canonical Zoom: hostname is zoom.us or *.zoom.us
-    // (NOT zoom-lfx.platform.linuxfoundation.org, which would slip past
-    // a substring check).
-    const isCanonicalZoomHost =
-      url.hostname === 'zoom.us' || url.hostname.endsWith('.zoom.us');
-
-    // For canonical zoom.us URLs we rewrite to the web-client URL — gives
-    // a faster, more reliable join (no portal, no redirects).
-    if (isCanonicalZoomHost) {
-      const pathMatch = url.pathname.match(/\/[js]\/(\d+)/);
-      const meetingId = pathMatch?.[1];
-      if (!meetingId) {
-        throw new Error(`Cannot extract meeting ID from Zoom URL: ${redactMeetingUrl(meetingUrl)}`);
-      }
-      const pwd = url.searchParams.get('pwd') || '';
-      const wcUrl = new URL(`https://app.zoom.us/wc/${meetingId}/join`);
-      if (pwd) wcUrl.searchParams.set('pwd', pwd);
-      return wcUrl.toString();
-    }
-
-    // White-label / enterprise portal — return as-is so the bot navigates
-    // the portal page. The user can VNC in and assist with any
-    // extra-step UI (T&C, guest-name confirm, etc.). Bot picks back up
-    // once Zoom's pre-join name input renders.
-    return meetingUrl;
+    url = new URL(meetingUrl);
   } catch (err: any) {
     // If already a web client URL or unrecognised format, return as-is
     if (meetingUrl.includes('/wc/')) return meetingUrl;
     throw new Error(`Invalid Zoom meeting URL: ${redactMeetingUrl(meetingUrl)} — ${redactUrlsIn(err.message)}`);
   }
+
+  // Zoom Events URLs — return as-is; the events page redirects to the web client
+  if (url.hostname === 'events.zoom.us') {
+    return meetingUrl;
+  }
+
+  // Already a web client URL — return as-is
+  if (meetingUrl.includes('/wc/')) return meetingUrl;
+
+  // Detect canonical Zoom: hostname is zoom.us or *.zoom.us
+  // (NOT zoom-lfx.platform.linuxfoundation.org, which would slip past
+  // a substring check).
+  const isCanonicalZoomHost =
+    url.hostname === 'zoom.us' || url.hostname.endsWith('.zoom.us');
+
+  // For canonical zoom.us URLs we rewrite to the web-client URL — gives
+  // a faster, more reliable join (no portal, no redirects).
+  if (isCanonicalZoomHost) {
+    if (/^\/w\/\d+/.test(url.pathname)) {
+      throw new AdmissionError('denial', `[Zoom Web] ${ZOOM_WEBINAR_UNSUPPORTED}: Zoom webinar links are not supported; only meetings can be joined (${redactMeetingUrl(meetingUrl)})`);
+    }
+    const pathMatch = url.pathname.match(/\/[js]\/(\d+)/);
+    const meetingId = pathMatch?.[1];
+    if (!meetingId) {
+      throw new Error(`Cannot extract meeting ID from Zoom URL: ${redactMeetingUrl(meetingUrl)}`);
+    }
+    const pwd = url.searchParams.get('pwd') || '';
+    const wcUrl = new URL(`https://app.zoom.us/wc/${meetingId}/join`);
+    if (pwd) wcUrl.searchParams.set('pwd', pwd);
+    return wcUrl.toString();
+  }
+
+  // White-label / enterprise portal — return as-is so the bot navigates
+  // the portal page. The user can VNC in and assist with any
+  // extra-step UI (T&C, guest-name confirm, etc.). Bot picks back up
+  // once Zoom's pre-join name input renders.
+  return meetingUrl;
 }
 
 const HOST_NOT_STARTED_RETRY_INTERVAL_MS = 15000;
 const HOST_NOT_STARTED_MAX_WAIT_MS = 10 * 60 * 1000; // 10 minutes
 const ZOOM_PREJOIN_POLL_MS = 500;
 
-/** Reason codes that lead a typed pre-join failure's message (they ride into the run's last_error). */
-export const ZOOM_PREJOIN_HELD = 'zoom_prejoin_held';
-export const ZOOM_NAME_INPUT_MISSING = 'name_input_missing';
 
 export async function joinZoomMeeting(
   page: Page,
@@ -147,6 +158,8 @@ export async function joinZoomMeeting(
     await page.waitForTimeout(ZOOM_PREJOIN_POLL_MS);
     const snapshot = await readZoomPreJoinSnapshot(page);
     const state = classifyZoomPreJoin(snapshot);
+
+    if (state.kind === 'bot_blocked') await refuseZoomBotBlock(botConfig, state.matched, 'prejoin');
 
     if (state.kind === 'name_field') break;
 
@@ -321,20 +334,15 @@ export async function joinZoomMeeting(
   // When a reCAPTCHA frame is present we extend the wait to 15 minutes and
   // poll for the button to enable; the React client (no captcha) enables it
   // within a second or two of typing.
+  // The anti-bot wall can also land over the pre-join once the name is in: Join stays disabled
+  // for good, so the join ends here, the same way as at every other stage.
+  const wall = await detectZoomBotBlock(page);
+  if (wall) await refuseZoomBotBlock(botConfig, wall, 'prejoin_join_button');
   const captchaPresent = await page.locator('iframe[src*="recaptcha"]').first()
     .isVisible({ timeout: 500 }).catch(() => false);
-  // Second human gate: some meetings hard-block anonymous bots with a "Sign in to
-  // join / Automated bots aren't allowed … must use Zoom RTMS" modal. Join stays
-  // disabled until a human signs in (e.g. as a real Zoom account) via noVNC.
-  const signInWall = await page.locator(
-    'text=/sign in to join|bots aren.?t allowed|must use Zoom RTMS/i'
-  ).first().isVisible({ timeout: 500 }).catch(() => false);
-  const humanGate = captchaPresent || signInWall;
-  const joinEnableTimeoutMs = humanGate ? 15 * 60 * 1000 : 8000;
-  if (humanGate) {
-    const which = signInWall ? 'sign-in / bots-not-allowed wall' : 'reCAPTCHA';
-    log(`[Zoom Web] ⚠️ ${which} is gating the Join button — a HUMAN must clear it ` +
-        `via noVNC (sign in as a Zoom account / solve the captcha). ` +
+  const joinEnableTimeoutMs = captchaPresent ? 15 * 60 * 1000 : 8000;
+  if (captchaPresent) {
+    log(`[Zoom Web] ⚠️ reCAPTCHA is gating the Join button — a HUMAN must solve it via noVNC. ` +
         `Holding the browser open up to 15 min for Join to become enabled...`);
   }
   await page.waitForFunction(

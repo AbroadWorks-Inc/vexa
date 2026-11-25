@@ -108,10 +108,12 @@ fails `no_audio`, write `_export.json` and, empty, the files a full export owns 
 `{"segments": []}` (`exporter/job.py` `_write_empty_owned_files`).
 
 Every channel's identity is checked and every master asked for before any channel
-file is written (`exporter/job.py` `_export_channels`). A failure while reading the
-recording, fetching, copying, or joining logs `channel_export_failed`, writes the
-index `[]`, and does not stop the mixed export or `POST /process`; the worker then
-treats the meeting as mixed. Channel files and `channels/index.json` use the `audio`
+file is written (`exporter/job.py` `_export_channels`). A channel whose recorder
+identity is missing (`ChannelIdentityMissing`) is permanent: it logs
+`channel_export_failed`, writes the index `[]`, and the mixed export and `POST /process`
+go ahead, so the worker treats the meeting as mixed. Any other failure while reading the
+recording, fetching, copying, or joining fails the run, and the queue retries it, so a
+brief meeting-api, gateway or S3 error never drops the per-speaker transcript. Channel files and `channels/index.json` use the `audio`
 retention class (the index expires with the files it names);
 `speaker_activity_frames.json` uses `metadata`. A run that exports writes every file in
 the table, and a run that stops at `no_audio` or `too_many_recordings` writes the empty ones

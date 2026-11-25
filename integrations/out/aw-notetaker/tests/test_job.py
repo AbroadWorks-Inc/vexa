@@ -32,15 +32,16 @@ from exporter.job import (
     recording_origin_ms,
 )
 from exporter.export_result import ExportReportError
-from exporter.queue import PendingQueue, sweep_once
+from exporter.queue import PendingQueue
 from exporter.storage import Storage
-from exporter.vexa_client import TooManyRecordings
+from exporter.vexa_client import MeetingApiError, TooManyRecordings
 from tests.builders import (
     capped,
     frame,
     header,
     jitsi_lines,
     meeting_event,
+    sweep_once,
     two_speaker_gmeet_lines,
     wav_samples,
     write_constant_wav,
@@ -981,8 +982,9 @@ def test_null_ended_at_does_not_wait_forever_for_speaker_activity(
 def test_activity_not_ready_then_retry_with_activity_present_hands_off_once(
     storage: Storage,
 ) -> None:
-    """failure -> retry -> success through the durable queue: the first
-    sweep raises ActivityNotReady (backoff recorded), the file lands, the
+    """wait -> retry -> success through the durable queue: the first sweep
+    raises ActivityNotReady, which reschedules the job to the wait's deadline
+    without counting an attempt; nothing runs before it; the file lands, the
     next sweep hands off; /process is called exactly once."""
     storage_path = _put_master(storage, 25, "uid-25")
     notetaker = FakeNotetaker()
@@ -994,8 +996,12 @@ def test_activity_not_ready_then_retry_with_activity_present_hands_off_once(
     asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
 
     item = queue.load(MEETING_UUID)
-    assert item is not None and item["attempts"] == 1
+    assert item is not None and item["attempts"] == 0
+    assert item["next_attempt_at"] == 1090.0  # ended_at + 120 s, read at + 30 s
     assert "speaker activity not ready" in item["last_error"]
+    assert "lease" not in item
+    asyncio.run(sweep_once(queue, deps, now=lambda: 1089.0))
+    assert queue.load(MEETING_UUID) == item
     assert notetaker.calls == []
 
     _put_activity(
@@ -2229,23 +2235,20 @@ def test_a_channel_without_its_recorder_identity_is_not_exported(
 
 
 @pytest.mark.parametrize("failure", ["master", "copy", "recording"])
-def test_a_failed_channel_still_hands_off_the_mixed_export_with_an_empty_index(
-    storage: Storage, caplog: pytest.LogCaptureFixture, failure: str
+def test_a_channel_step_that_fails_is_retried_and_its_channels_come_back(
+    storage: Storage, failure: str
 ) -> None:
-    """ch0 is fine; ch1's master cannot be built (every master is asked for
-    before any file is written, so nothing is), or its object is missing and
-    the copy fails after ch0 is copied (ch0.webm is left; without an index the
-    worker ignores it), or the full recording that holds the channels'
-    identities cannot be read. The mixed export is handed off as usual and
-    `channels/index.json` is `[]`, so no earlier run's index survives."""
+    """ch1's master answers a gateway 503, or its object is not there to copy
+    yet, or the full recording that holds the channels' identities answers
+    503. The job fails before anything is handed off and counts one attempt;
+    the next run exports every channel and hands off once."""
     storage_path = _put_master(storage, 20, "uid-20")
     _put_activity(storage, "uid-20", two_speaker_gmeet_lines(_origin_ms()))
     ch0_path = "recordings/7/20/uid-20/ch0/master.webm"
     ch1_path = "recordings/7/20/uid-20/ch1/master.webm"
     storage.put_bytes(VEXA_BUCKET, ch0_path, b"ch0", "video/webm")
-    channel_masters = {(20, "ch0"): {"storage_path": ch0_path}}
-    if failure == "copy":
-        channel_masters[(20, "ch1")] = {"storage_path": ch1_path}
+    if failure != "copy":
+        storage.put_bytes(VEXA_BUCKET, ch1_path, b"ch1", "video/webm")
     meeting_api = FakeMeetingApi(
         recordings=[
             _audio_recording(
@@ -2258,35 +2261,48 @@ def test_a_failed_channel_still_hands_off_the_mixed_export_with_an_empty_index(
             )
         ],
         master={"storage_path": storage_path},
-        channel_masters=channel_masters,
+        channel_masters={
+            (20, "ch0"): {"storage_path": ch0_path},
+            (20, "ch1"): {"storage_path": ch1_path},
+        },
     )
-    if failure == "recording":
+    failing = [True]
+    real_recording, real_master = meeting_api.recording, meeting_api.master
 
-        def unreadable(recording_id: int) -> dict[str, Any]:
-            raise RuntimeError("gateway 503 /recordings/20")
+    def recording(recording_id: int) -> dict[str, Any]:
+        if failing[0] and failure == "recording":
+            raise MeetingApiError(503, f"/recordings/{recording_id}")
+        return real_recording(recording_id)
 
-        meeting_api.recording = unreadable  # type: ignore[method-assign]
+    def master(recording_id: int, media_type: str = "audio") -> dict[str, Any]:
+        if failing[0] and failure == "master" and media_type == "ch1":
+            raise MeetingApiError(503, f"/recordings/{recording_id}/master")
+        return real_master(recording_id, media_type)
+
+    meeting_api.recording = recording  # type: ignore[method-assign]
+    meeting_api.master = master  # type: ignore[method-assign]
     notetaker = FakeNotetaker()
     deps = _deps(storage, meeting_api, notetaker)
-    with caplog.at_level(logging.WARNING, logger="exporter"):
-        assert export_meeting(_envelope(), deps).state == "handed_off"
+    queue = PendingQueue(storage, VEXA_BUCKET)
+    queue.enqueue(_envelope())
 
+    asyncio.run(sweep_once(queue, deps, now=lambda: 1000.0))
+
+    item = queue.load(MEETING_UUID)
+    assert item is not None and item["attempts"] == 1
+    assert notetaker.calls == []
+    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") is None
+    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json") is None
+
+    failing[0] = False
+    storage.put_bytes(VEXA_BUCKET, ch1_path, b"ch1", "video/webm")
+    asyncio.run(sweep_once(queue, deps, now=lambda: 5000.0))
+
+    assert queue.pending_ids() == []
     assert notetaker.calls == [(MEETING_UUID, BASE, "google_meet")]
-    expected_left = [BASE + "channels/ch0.webm"] if failure == "copy" else []
-    assert storage.list_keys(EXPORT_BUCKET, BASE + "channels/") == sorted(
-        [BASE + "channels/index.json", *expected_left]
-    )
-    assert storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json") == []
-    assert storage.get_json(EXPORT_BUCKET, BASE + "_export.json")["state"] == (
-        "handed_off"
-    )
-    assert storage.exists(EXPORT_BUCKET, BASE + "audio.wav")
-    assert any(
-        record.getMessage().startswith(
-            f"channel_export_failed meeting_id={MEETING_UUID} vexa_meeting_id=11367 "
-        )
-        for record in caplog.records
-    )
+    index = storage.get_json(EXPORT_BUCKET, BASE + "channels/index.json")
+    assert [row["file"] for row in index] == ["ch0.webm", "ch1.webm"]
+    assert storage.get_bytes(EXPORT_BUCKET, BASE + "channels/ch1.webm") == b"ch1"
 
 
 def test_a_rerun_over_a_wav_export_indexes_only_the_opus_files(

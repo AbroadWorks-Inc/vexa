@@ -13,6 +13,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import unquote
 
 import pytest
 
@@ -53,6 +54,28 @@ needs_agent = pytest.mark.skipif(
 )
 
 VALID_KEY = "vxa_test_unit_key"
+
+
+async def asgi_status(app, method: str, raw_path: str, headers: dict) -> int:
+    """The status ``app`` answers ``method raw_path``, with the path handed over as uvicorn hands it
+    to the app: percent-decoded ONCE. ``TestClient`` cannot carry such a path — httpx normalizes
+    ``%2E%2E`` and decodes ``%25`` on the client side before the app ever sees it."""
+    sent: list = []
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+        "path": unquote(raw_path), "raw_path": raw_path.encode(), "query_string": b"",
+        "root_path": "", "scheme": "http", "server": ("testserver", 80), "client": ("1.2.3.4", 5000),
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return next(m["status"] for m in sent if m["type"] == "http.response.start")
 VALID_USER = {"user_id": 7, "scopes": ["bot", "tx", "browser"], "max_concurrent": 3, "email": "u@example.com"}
 
 

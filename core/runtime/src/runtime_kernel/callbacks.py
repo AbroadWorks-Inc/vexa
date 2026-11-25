@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Callable, Optional, Protocol
 
 logger = logging.getLogger("runtime_kernel.callbacks")
@@ -91,10 +92,13 @@ class CallbackQueue:
         # 0 ⇒ retry forever (until acked or TTL expiry, matching 0.11's durable stance).
         self.max_attempts = max_attempts
         self._seq = 0
+        # enqueue runs on the API's threadpool and on the maintenance thread (a reaped exit).
+        self._seq_lock = threading.Lock()
 
     def enqueue(self, url: str, event: dict, headers: Optional[dict] = None) -> str:
-        self._seq += 1
-        key = f"cb-{self._seq}"
+        with self._seq_lock:
+            self._seq += 1
+            key = f"cb-{self._seq}"
         self.store.put(key, {"url": url, "headers": headers or {}, "event": event, "attempts": 0})
         # Best-effort immediate attempt; whatever doesn't ack stays queued for the sweep.
         self._attempt(key)

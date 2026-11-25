@@ -502,7 +502,7 @@ async def test_http_runtime_client_delete_404_raises_workload_unknown():
             self._code = status_code
             self.deleted: list[str] = []
 
-        async def delete(self, url, timeout=None):
+        async def delete(self, url, headers=None, timeout=None):
             self.deleted.append(url)
             return _Resp(self._code)
 
@@ -517,6 +517,42 @@ async def test_http_runtime_client_delete_404_raises_workload_unknown():
     ok = _StubHttp(200)
     await HttpRuntimeClient(ok, "http://runtime:8090").delete_workload("mtg-2-d93eee39")
     assert ok.deleted == ["http://runtime:8090/workloads/mtg-2-d93eee39"]
+
+
+async def test_http_runtime_client_presents_the_internal_secret_on_every_call(monkeypatch):
+    """The runtime admits only the internal tier: spawn, teardown and the liveness probe each carry
+    INTERNAL_API_SECRET as x-internal-secret."""
+    from meeting_api.bot_spawn.adapters import HttpRuntimeClient
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", "runtime-tier-test-secret")
+    seen: list = []
+
+    class _Resp:
+        def __init__(self, status_code, body=None):
+            self.status_code = status_code
+            self._body = body or {}
+
+        def json(self):
+            return self._body
+
+    class _Http:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            seen.append(headers)
+            return _Resp(201, {"state": "starting"})
+
+        async def delete(self, url, headers=None, timeout=None):
+            seen.append(headers)
+            return _Resp(200)
+
+        async def get(self, url, headers=None, timeout=None):
+            seen.append(headers)
+            return _Resp(200, {"state": "running"})
+
+    rt = HttpRuntimeClient(_Http(), "http://runtime:8090")
+    await rt.create_workload({})
+    await rt.delete_workload("w")
+    await rt.get_workload("w")
+    assert seen == [{"x-internal-secret": "runtime-tier-test-secret"}] * 3
 
 
 async def test_http_runtime_client_create_refuses_dead_workload():
@@ -541,7 +577,7 @@ async def test_http_runtime_client_create_refuses_dead_workload():
         def __init__(self, resp):
             self._resp = resp
 
-        async def post(self, url, json=None, timeout=None):
+        async def post(self, url, json=None, headers=None, timeout=None):
             return self._resp
 
     spec = {"workloadId": "mtg-1-abc", "profile": "meeting-bot", "env": {}}
@@ -593,7 +629,7 @@ def _cc5_log():
 async def test_runtime_callback_drives_failed_for_pre_active_dead_workload():
     """A terminal workload state while the meeting is still PRE-ACTIVE → a synthetic `failed` is driven
     (the bot never started/reported and never will), so the meeting does not hang `joining` forever."""
-    from meeting_api.lifecycle.reconcile import synthesize_failed_for_dead_workload
+    from meeting_api.lifecycle.reconcile import synthesize_terminal_for_dead_workload
 
     repo = _ContainerRepo({"mtg-5-x": {"meeting_id": 5, "status": "joining", "session_uid": "sess-5"}})
     driven = []
@@ -602,7 +638,7 @@ async def test_runtime_callback_drives_failed_for_pre_active_dead_workload():
         driven.append(ev)
         return 200
 
-    ok = await synthesize_failed_for_dead_workload(repo, "mtg-5-x", "destroyed", drive_failed, log=_cc5_log())
+    ok = await synthesize_terminal_for_dead_workload(repo, "mtg-5-x", "destroyed", drive_failed, log=_cc5_log())
     assert ok is True
     assert len(driven) == 1
     ev = driven[0]
@@ -612,24 +648,8 @@ async def test_runtime_callback_drives_failed_for_pre_active_dead_workload():
     assert ev["completion_reason"] == "join_failure"
 
 
-async def test_runtime_callback_noop_when_meeting_already_active():
-    """An ACTIVE meeting is owned by the bot's own lifecycle callback — a runtime `destroyed` must NOT
-    override it (that would race a legitimate completion)."""
-    from meeting_api.lifecycle.reconcile import synthesize_failed_for_dead_workload
-
-    repo = _ContainerRepo({"mtg-6-x": {"meeting_id": 6, "status": "active", "session_uid": "sess-6"}})
-    driven = []
-
-    async def drive_failed(ev):
-        driven.append(ev)
-        return 200
-
-    ok = await synthesize_failed_for_dead_workload(repo, "mtg-6-x", "destroyed", drive_failed, log=_cc5_log())
-    assert ok is False and driven == []
-
-
 async def test_runtime_callback_noop_for_non_terminal_state_or_unknown_workload():
-    from meeting_api.lifecycle.reconcile import synthesize_failed_for_dead_workload
+    from meeting_api.lifecycle.reconcile import synthesize_terminal_for_dead_workload
 
     repo = _ContainerRepo({"mtg-7-x": {"meeting_id": 7, "status": "joining", "session_uid": "sess-7"}})
     driven = []
@@ -639,9 +659,9 @@ async def test_runtime_callback_noop_for_non_terminal_state_or_unknown_workload(
         return 200
 
     # non-terminal workload state → no-op
-    assert await synthesize_failed_for_dead_workload(repo, "mtg-7-x", "starting", drive_failed, log=_cc5_log()) is False
+    assert await synthesize_terminal_for_dead_workload(repo, "mtg-7-x", "starting", drive_failed, log=_cc5_log()) is False
     # unknown workload → no-op
-    assert await synthesize_failed_for_dead_workload(repo, "ghost", "destroyed", drive_failed, log=_cc5_log()) is False
+    assert await synthesize_terminal_for_dead_workload(repo, "ghost", "destroyed", drive_failed, log=_cc5_log()) is False
     assert driven == []
 
 

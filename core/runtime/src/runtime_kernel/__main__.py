@@ -126,32 +126,49 @@ def _kernel_grace_sec() -> float:
     return backend_grace + 5.0
 
 
-def _start_exited_pod_reaper(runtime) -> None:
-    """Delete Succeeded and Failed bot pods so a meeting node can scale to zero.
+#: A RuntimeEvent callback no receiver acks is retried on every maintenance pass (30 s apart) and
+#: dropped after this many attempts: an hour of a receiver that is down or restarting.
+CALLBACK_MAX_ATTEMPTS = 120
 
-    Boot already ran one pass, after adopt. This loop sleeps first so that pass
-    is not repeated immediately. The thread is a daemon so shutdown is not blocked.
-    """
+
+def _maintenance_pass(runtime, callbacks) -> None:
+    """Retry every RuntimeEvent callback not yet acked, then delete Succeeded and Failed bot pods
+    so a meeting node can scale to zero. One failing half never stops the other."""
+    try:
+        pending = callbacks.sweep()
+        if pending:
+            logger.info("%d runtime callback(s) still unacked", pending)
+    except Exception as exc:  # noqa: BLE001 — one bad pass must not stop the loop
+        logger.warning("callback sweep failed: %s", exc)
     if not hasattr(runtime.backend, "reap_exited"):
         return
+    try:
+        removed = runtime.reap_exited_workloads()
+        if removed:
+            logger.info("removed %d exited workload pod(s)", removed)
+    except Exception as exc:  # noqa: BLE001 — one bad pass must not stop the loop
+        logger.warning("exited-pod reaper failed: %s", exc)
 
+
+def _start_maintenance_loop(runtime, callbacks) -> None:
+    """Run ``_maintenance_pass`` every 30 s.
+
+    Boot already reaped once, after adopt, and every callback is attempted once when it is
+    queued, so the loop sleeps first. The thread is a daemon so shutdown is not blocked.
+    """
     def _loop() -> None:
         while True:
             time.sleep(30)
-            try:
-                removed = runtime.reap_exited_workloads()
-                if removed:
-                    logger.info("removed %d exited workload pod(s)", removed)
-            except Exception as exc:  # noqa: BLE001 — one bad pass must not stop the loop
-                logger.warning("exited-pod reaper failed: %s", exc)
+            _maintenance_pass(runtime, callbacks)
 
-    threading.Thread(target=_loop, name="exited-pod-reaper", daemon=True).start()
+    threading.Thread(target=_loop, name="runtime-maintenance", daemon=True).start()
 
 
 def build_production_app():
     """Wire the runtime API with the env-selected spawn backend + the env-driven profile registry,
     plus the durable cron scheduler (REDIS_URL) with a background tick loop."""
     from .api import create_app
+    from .callbacks import CallbackQueue
     from .config_preflight import preflight
     from .kernel import Runtime
     from .profiles import apply_command_overrides, default_registry, worker_image_for
@@ -210,8 +227,9 @@ def build_production_app():
                 logger.info("removed %d exited workload pod(s)", removed)
         except Exception as e:  # noqa: BLE001 — reaping is a boot aid; it must never block the boot
             logger.warning("exited-pod reaper failed: %s", e)
-        _start_exited_pod_reaper(runtime)
-    return create_app(runtime, scheduler=scheduler)
+    callbacks = CallbackQueue(max_attempts=CALLBACK_MAX_ATTEMPTS)
+    _start_maintenance_loop(runtime, callbacks)
+    return create_app(runtime, callback_queue=callbacks, scheduler=scheduler)
 
 
 def main() -> None:

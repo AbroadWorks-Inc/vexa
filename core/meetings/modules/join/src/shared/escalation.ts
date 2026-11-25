@@ -4,6 +4,9 @@ import { log, callNeedsHumanHelpCallback } from '../_host';
 
 let escalationTriggered = false;
 let vncStarted = false;
+// Set by startDebugView(): someone asked to watch this browser. Nothing else opens the live view,
+// and only a watched join is worth holding past its lobby budget.
+let liveViewEnabled = false;
 
 export interface EscalationResult {
   reason: string;
@@ -37,21 +40,22 @@ export function checkEscalation(
 }
 
 /**
- * Trigger escalation: start VNC stack and notify meeting-api.
- * Idempotent — only fires once per admission attempt.
+ * Trigger escalation: notify the host that the join needs a human.
+ * Idempotent — only fires once per admission attempt. It never opens the live view: that is
+ * startDebugView's alone, so a stuck lobby does not expose the browser to the network.
  */
 export async function triggerEscalation(botConfig: any, reason: string): Promise<void> {
   if (escalationTriggered) return;
   escalationTriggered = true;
 
   log(`[Escalation] Triggered: ${reason}`);
-  await startVncStack();
   await callNeedsHumanHelpCallback(botConfig, reason);
 }
 
 /**
  * Lazily start VNC stack on the existing Xvfb :99 display.
- * Meeting bots already render to :99 — this just exposes it.
+ * Meeting bots already render to :99 — this just exposes it, on loopback only: x11vnc has no
+ * password, so a viewer reaches it through a port-forward, never straight over the pod network.
  */
 export async function startVncStack(): Promise<void> {
   if (vncStarted) return;
@@ -83,13 +87,13 @@ export async function startVncStack(): Promise<void> {
   };
 
   // x11vnc — expose existing Xvfb display
-  safeSpawn('x11vnc', ['-display', display, '-forever', '-nopw', '-shared', '-rfbport', '5900']);
+  safeSpawn('x11vnc', ['-display', display, '-localhost', '-forever', '-nopw', '-shared', '-rfbport', '5900']);
 
   // websockify — bridge VNC to WebSocket for noVNC
   const novncDir = '/usr/share/novnc';
   const wsArgs = existsSync(novncDir)
-    ? ['--web', novncDir, '6080', 'localhost:5900']
-    : ['6080', 'localhost:5900'];
+    ? ['--web', novncDir, '127.0.0.1:6080', 'localhost:5900']
+    : ['127.0.0.1:6080', 'localhost:5900'];
   safeSpawn('websockify', wsArgs);
 
   // Wait for VNC port to be ready (up to 3s)
@@ -105,6 +109,7 @@ export async function startVncStack(): Promise<void> {
  * via CDP (any platform). Returns the endpoints so a runner can print them.
  */
 export async function startDebugView(): Promise<{ vncUrl?: string; novncUrl?: string; cdpUrl: string }> {
+  liveViewEnabled = true;
   await startVncStack();
   const onLinux = process.platform === 'linux' && !!process.env.DISPLAY;
   return {
@@ -115,10 +120,11 @@ export async function startDebugView(): Promise<{ vncUrl?: string; novncUrl?: st
 }
 
 /**
- * Extra time (ms) granted when escalation is active, so the user has time to intervene.
+ * Extra time (ms) granted when escalation is active AND the live view is open, so the person
+ * watching has time to intervene. An unwatched bot keeps its lobby budget.
  */
 export function getEscalationExtensionMs(): number {
-  return escalationTriggered ? 5 * 60 * 1000 : 0;
+  return escalationTriggered && liveViewEnabled ? 5 * 60 * 1000 : 0;
 }
 
 export function wasEscalationTriggered(): boolean {

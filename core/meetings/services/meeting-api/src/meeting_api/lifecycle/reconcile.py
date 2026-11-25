@@ -36,6 +36,7 @@ from ..bot_spawn.ports import (
 )
 from ..settings import seconds
 from ..sweeps.item_failures import ItemDeferred, ItemExpired
+from .join_evidence import CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT
 from .machine import dominant_completion_reason
 
 if TYPE_CHECKING:
@@ -228,9 +229,9 @@ async def reconcile_stale_stopping_sweep(
 # on POSITIVE evidence the workload is gone (the runtime tracks it and reports it terminal), never on
 # `updated_at` staleness; a runtime 404 is not that evidence (a recreated runtime forgets live bots).
 # `stopping` is EXCLUDED: a stop was requested, so it ends on its short grace (its bot SHOULD be
-# leaving). `requested` is EXCLUDED: a bot's first act is `joining`, so a row still `requested` past
-# its pre-active grace never started, and the runtime reports a Pending pod (no node to run on) as
-# `running`.
+# leaving). `requested` is EXCLUDED: a bot's first act is `joining`, so a `requested` row runs no lobby
+# budget. It is listed at the active grace, and an ALIVE answer (the runtime reports a Pending pod, no
+# node to run on yet, as `running`) holds it only until the pre-active grace.
 _LIVENESS_GATED = frozenset({"joining", "awaiting_admission", "needs_help", "active"})
 # Statuses whose workload is probed: the gated ones, and `requested` for the runtime's answer about it
 # (the evidence on its terminal, an unanswered or untracked probe).
@@ -314,7 +315,8 @@ async def prove_workload_gone(
 def _workload_evidence(bot_container_id: Optional[str], info: Optional[dict]) -> str:
     """The probe's answer, rendered for the terminal transition's ``reason``. This is what replaces
     the manufactured "bot gone while {status}": a reader learns WHAT the kernel reported (state,
-    exit code, stop reason) — or, honestly, that there was nothing to ask about."""
+    exit code, stop reason) — or, honestly, that there was nothing to ask about. The bot's
+    control-plane-unreachable exit code carries that marker, so the join evidence reads it."""
     if not bot_container_id:
         return "no workload recorded for this meeting"
     if not info:
@@ -323,6 +325,8 @@ def _workload_evidence(bot_container_id: Optional[str], info: Optional[dict]) ->
     code = info.get("exitCode", info.get("exit_code"))
     if code is not None:
         parts.append(f"exitCode={code}")
+        if code == CONTROL_PLANE_UNREACHABLE_EXIT:
+            parts.append(f"({CONTROL_PLANE_UNREACHABLE})")
     stop_reason = info.get("stopReason") or info.get("stop_reason")
     if stop_reason:
         parts.append(f"stopReason={stop_reason}")
@@ -407,7 +411,6 @@ def _reconcile_join_evidence(
         reason = classify_join_failure(
             completion_reason=completion_reason,
             stage=status,
-            reached_lobby=status == "awaiting_admission",
             detail=detail,
         )
         return build_join_evidence(
@@ -527,6 +530,8 @@ async def reconcile_stale_nonterminal_sweep(
     it fast), ``preactive_grace`` for a bot that has not reached the meeting yet (it holds a lobby
     budget from the control plane — our patience must OUTLAST the deadline we issued, #862), and
     ``active_grace`` for everything else (a longer idle so a momentarily-quiet live bot is not reaped).
+    `requested` runs no lobby budget: it is listed at ``active_grace``, and an alive workload (a
+    Pending pod) holds it until ``preactive_grace`` since its ``updated_at``.
     Read a page of ``SWEEP_BATCH_SIZE`` meetings at a time by id, each through ``run_item`` (§6.9
     F-I, ``sweeps.item_failures.run_pages``). A probe or delete the runtime doesn't answer follows
     ``runtime_bound`` (retried, bounded by the row's age since its ``updated_at``); a refused
@@ -552,6 +557,7 @@ async def reconcile_stale_nonterminal_sweep(
 
     limit = sweep_batch_size()
     reconciled = 0
+    requested_hold = active_grace if preactive_grace is None else preactive_grace
     tracker = _UNTRACKED_SINCE if untracked_since is None else untracked_since
     seen_untracked: set = set()
     now = time.monotonic()
@@ -592,8 +598,12 @@ async def reconcile_stale_nonterminal_sweep(
                     unreachable=True, since=since, now=wall,
                     failed=TeardownNotConfirmed, expired=StaleRowExpired,
                 )
-            if probe != "gone" and status in _LIVENESS_GATED:
-                # ALIVE or UNKNOWN → do not reap a possibly-live, bot-present meeting.
+            if (probe != "gone" and status in _LIVENESS_GATED) or (
+                probe == "alive" and status == "requested"
+                and since is not None and (wall - since).total_seconds() < requested_hold
+            ):
+                # ALIVE or UNKNOWN → do not reap a possibly-live, bot-present meeting; an alive
+                # `requested` workload (a Pending pod) only until the pre-active grace.
                 # (No bot_container_id at all falls through to the time-based reap — there is no
                 #  live workload that could be holding the meeting open.)
                 log.info("nonterminal-reconcile: skip live/unknown bot for meeting %s "
@@ -1013,10 +1023,11 @@ async def synthesize_terminal_for_dead_workload(
         and the stop-reconcile sweep re-DELETEs (now 404) every 15s forever. The confirmed destroy is
         terminal evidence → complete the meeting (it WAS active, so ``completed``), stopping the loop.
 
-    Returns True iff a synthetic terminal was driven. No-op (False) when the state isn't terminal, the
-    workload is unknown, or the meeting already reached a terminal status (the bot's own callback already
-    landed — a redelivered terminal is an idempotent 200 no-op at the callback anyway). Best-effort:
-    never raises."""
+    Returns True iff a synthetic terminal was driven and the lifecycle entry took it
+    (``_post_terminal``: a 4xx/5xx answer is a refusal, logged and False). No-op (False) when the
+    state isn't terminal, the workload is unknown, or the meeting already reached a terminal status
+    (the bot's own callback already landed — a redelivered terminal is an idempotent 200 no-op at
+    the callback anyway). Best-effort: never raises."""
     if not workload_id or state not in TERMINAL_WORKLOAD_STATES or repo is None:
         return False
     try:
@@ -1084,37 +1095,10 @@ async def synthesize_terminal_for_dead_workload(
     if producer_timestamp is not None:
         body["timestamp"] = producer_timestamp
     try:
-        await drive_terminal(body)
+        await _post_terminal(drive_terminal, body)
         log.info("runtime-callback: drove synthetic %s for meeting %s (workload %s %s, was %s)",
                  body["status"], info.get("meeting_id"), workload_id, state, status)
         return True
     except Exception as e:  # noqa: BLE001 — best-effort; the stop/stale sweeps remain the backstop
         log.warning("runtime-callback: synthetic terminal POST failed for %s: %s", workload_id, e)
         return False
-
-
-async def synthesize_failed_for_dead_workload(
-    repo: Any,
-    workload_id: Optional[str],
-    state: Optional[str],
-    drive_failed: Callable[[dict], Awaitable[Any]],
-    *,
-    log: Any,
-) -> bool:
-    """Back-compat shim (CC5): pre-#50 name that drove ONLY the pre-active → ``failed`` case. Now the
-    runtime callback consumes BOTH terminal cases (pre-active → failed, was-active → completed) via
-    ``synthesize_terminal_for_dead_workload``; this thin wrapper is retained so existing callers/tests
-    that only exercised the pre-active path keep working. It delegates for pre-active rows and returns
-    False (no-op) for anything else, preserving the old contract exactly."""
-    if not workload_id or state not in TERMINAL_WORKLOAD_STATES or repo is None:
-        return False
-    try:
-        info = await repo.find_by_container(bot_container_id=workload_id)
-    except Exception as e:  # noqa: BLE001 — lookup is best-effort
-        log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
-        return False
-    if not info or info.get("status") not in PRE_ACTIVE_MEETING_STATUSES:
-        return False  # old contract: only pre-active drove a synthetic failed
-    return await synthesize_terminal_for_dead_workload(
-        repo, workload_id, state, drive_failed, log=log
-    )

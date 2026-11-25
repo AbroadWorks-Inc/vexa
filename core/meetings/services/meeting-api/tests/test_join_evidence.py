@@ -712,6 +712,46 @@ def test_reconcile_sweep_stamps_typed_evidence(status, expected_reason, expected
     assert "timings" not in ev, "the sweep must not invent timings it never measured"
 
 
+@pytest.mark.parametrize(
+    "exit_code,expected_reason,expected_attribution",
+    [
+        (137, "unknown", "unknown"),
+        (3, "navigation_failure", "system_fault"),
+    ],
+)
+def test_reconcile_evidence_for_a_requested_row(exit_code, expected_reason, expected_attribution):
+    """A row still at ``requested``: the bot never spoke, so its evidence is ``unknown``, never
+    ``never_reached_lobby``. Exit code 3 is the bot's control-plane-unreachable abort: the
+    workload's own answer names it, so it reads ``navigation_failure``."""
+    import logging
+
+    from meeting_api.bot_spawn.fakes import FakeRuntimeClient
+    from meeting_api.lifecycle.machine import TransitionSource
+
+    repo, meeting = _repo_with_meeting(status="requested")
+    asyncio.run(repo.set_bot_container(meeting_id=meeting["id"], bot_container_id="wl-req"))
+    runtime = FakeRuntimeClient(workloads={
+        "wl-req": {"workloadId": "wl-req", "state": "exited", "exitCode": exit_code},
+    })
+    app = create_app(meeting_repo=repo)
+
+    async def _post(body: dict):
+        status_code, _ = await app.state.apply_lifecycle_event(
+            body, transition_source=TransitionSource.RUNTIME_DESTROY,
+            force_terminal_on_destroy=True,
+        )
+        return status_code
+
+    assert asyncio.run(reconcile_stale_nonterminal_sweep(
+        repo, runtime, _post, stop_grace=45.0, active_grace=300.0,
+        log=logging.getLogger("test.reconcile"),
+        item_failures=InMemoryItemFailures(max_failures=5),
+    )) == 1
+    ev = _stored_data(repo, meeting["id"])["join_evidence"]
+    assert (ev["reason"], ev["attribution"]) == (expected_reason, expected_attribution)
+    assert ev["source"] == "reconcile"
+
+
 def test_a_row_stuck_at_requested_still_cannot_be_reconciled_at_all():
     """A PRE-EXISTING gap this instrument makes visible rather than fixes, pinned so it is not
     mistaken for a taxonomy bug.

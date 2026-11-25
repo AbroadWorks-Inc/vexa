@@ -173,7 +173,4 @@ COPY licenses/onnx-community-pyannote-segmentation-3.0.LICENSE.txt /opt/hf-cache
 COPY core/meetings/services/bot/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# noVNC (browser view) — present in the env base; harmless if unused.
-EXPOSE 6080
-
 ENTRYPOINT ["/app/entrypoint.sh"]

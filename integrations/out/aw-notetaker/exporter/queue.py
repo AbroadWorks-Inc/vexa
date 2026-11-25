@@ -23,20 +23,29 @@ is recorded under `aw-exporter/events/<event_id>.json` (`meeting_id`,
 `event_type`, `sequence`), so a redelivery of it is recognised
 (`seen`) after its meeting has left the queue.
 
-Retries: a job that raises is recorded as a failure and becomes visible to
-the sweep again only after its backoff (`next_attempt_at`:
-`EXPORT_RETRY_BACKOFF_SECONDS` × 2**attempts), up to `EXPORT_MAX_ATTEMPTS`. The export result report (`export_result.py`) is a
-step of the job, so an unaccepted report is retried the same way: the re-run
-finds the folder's `_export.json` already `handed_off` and only reports
-again. When the attempts run out, the item is quarantined: an unaccepted
-report leaves the recorded outcome as it is; any other failure reads the
-folder's `_export.json` first. A folder already `handed_off` keeps its marker
-and reports `handed_off` once; once that report is accepted the item is
-finished and leaves the queue (`done`), not `failed/`. Otherwise the `failed`
-marker is written and `failed` reported once. A marker that can't be read is
-left as it is. An item whose meeting is not the §2.4 meeting
-(`NotAV2Meeting`) is quarantined on its first attempt and writes nothing to
-the export bucket.
+Retries: a job that raises is recorded as a failure and becomes visible to the
+sweep again only after its backoff (`next_attempt_at`:
+`EXPORT_RETRY_BACKOFF_SECONDS` × 2**attempts), up to `EXPORT_MAX_ATTEMPTS`. A
+job waiting for its speaker activity (`ActivityNotReady`) is not failing: it
+runs again at the wait's deadline and counts no attempt. The export result
+report (`export_result.py`) is a step of the job, so an unaccepted report is
+retried the same way: the re-run finds the folder's `_export.json` already
+`handed_off` and only reports again. When the attempts run out, the item is
+quarantined: an unaccepted report leaves the recorded outcome as it is; any
+other failure reads the folder's `_export.json` first. A folder already
+`handed_off` keeps its marker and reports `handed_off` once; once that report
+is accepted the item is finished and leaves the queue (`done`), not `failed/`.
+Otherwise the `failed` marker is written and `failed` reported once. A marker
+that can't be read is left as it is. An item whose meeting is not the §2.4
+meeting (`NotAV2Meeting`) is quarantined on its first attempt and writes
+nothing to the export bucket.
+
+meeting-api counts each export result it accepts in
+`aw_export_total{state,user_id}`. A meeting this worker gives up on with no
+result accepted there (not a v2 meeting, a refused report, a marker it can't
+read or derive, bookkeeping that keeps failing) is counted in
+`WorkerState.unreported` by reason, which `GET /metrics` serves as
+`aw_export_total{state="failed",reason}`, so one alert covers both.
 
 Crashes: a job is leased before it starts (`lease`, renewed every third of
 `EXPORT_LEASE_SECONDS` while it runs, only while it is still held) and the
@@ -78,12 +87,14 @@ import logging
 import math
 import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from exporter.export_result import ExportReportError, ReportState
 from exporter.job import (
+    ActivityNotReady,
     Deps,
     ExportResult,
     NotAV2Meeting,
@@ -254,20 +265,43 @@ class PendingQueue:
     ) -> int:
         """Count one failed attempt; the next waits `backoff_seconds` ×
         2**attempts."""
+        written = self._reschedule(
+            meeting_id,
+            error,
+            counted=True,
+            at=lambda attempts: now() + backoff_seconds * 2**attempts,
+        )
+        return int(written["attempts"])
 
-        def fail(item: dict[str, Any] | None) -> dict[str, Any]:
+    def defer(self, meeting_id: str, reason: str, *, until: float) -> None:
+        """Run the job again at `until` without counting an attempt: it is
+        waiting for its input, not failing."""
+        self._reschedule(meeting_id, reason, counted=False, at=lambda _: until)
+
+    def _reschedule(
+        self,
+        meeting_id: str,
+        error: str,
+        *,
+        counted: bool,
+        at: Callable[[int], float],
+    ) -> dict[str, Any]:
+        """Release the lease and set the next run to `at(attempts)`, counting
+        one attempt when `counted`."""
+
+        def schedule(item: dict[str, Any] | None) -> dict[str, Any]:
             if item is None:
                 raise KeyError(meeting_id)
-            attempts = int(item["attempts"]) + 1
+            attempts = int(item["attempts"]) + counted
             item["attempts"] = attempts
             item["last_error"] = error
             item.pop("lease", None)
-            item["next_attempt_at"] = now() + backoff_seconds * 2**attempts
+            item["next_attempt_at"] = at(attempts)
             return item
 
-        written = self._change(meeting_id, fail)
+        written = self._change(meeting_id, schedule)
         assert written is not None
-        return int(written["attempts"])
+        return written
 
     def done(self, meeting_id: str) -> None:
         self._storage.delete(self._bucket, self._pending_key(meeting_id))
@@ -495,9 +529,10 @@ class _Renewal:
 class WorkerState:
     """One worker's in-process state, shared by its runs and `/healthz`: its
     lease owner id, export slots, lease renewals, when each running job
-    started (monotonic clock), and the meetings whose bookkeeping after the
+    started (monotonic clock), the meetings whose bookkeeping after the
     job keeps failing (failures so far, not run again before `now()` passes
-    the second value)."""
+    the second value), and the meetings given up on with no export result
+    accepted by meeting-api, by reason."""
 
     def __init__(self, concurrency: int) -> None:
         self.owner = uuid.uuid4().hex
@@ -505,6 +540,7 @@ class WorkerState:
         self.renewals: dict[str, _Renewal] = {}
         self.started: dict[str, float] = {}
         self.held: dict[str, tuple[int, float]] = {}
+        self.unreported: Counter[str] = Counter()
 
     def overdue(self, timeout_s: float) -> list[str]:
         """The meetings whose job has run longer than `timeout_s`."""
@@ -520,6 +556,7 @@ def _hold(worker: WorkerState, meeting_id: str, settings: Settings, now: float) 
     failures = worker.held.get(meeting_id, (0, 0.0))[0] + 1
     if failures >= settings.max_attempts:
         worker.held[meeting_id] = (failures, math.inf)
+        worker.unreported["bookkeeping_failed"] += 1
         logger.error(
             "bookkeeping failed %d times in a row meeting_id=%s; not run again "
             "until the exporter restarts",
@@ -578,6 +615,7 @@ async def _run_item(
             await _give_up(
                 queue,
                 deps,
+                worker,
                 meeting_id,
                 item["envelope"],
                 int(item.get("attempts") or 0),
@@ -670,6 +708,17 @@ async def _run_leased(
     worker.started[meeting_id] = time.monotonic()
     try:
         await asyncio.to_thread(job, envelope, deps, rerun, progress)
+    except ActivityNotReady as exc:
+        await renewal.stop()
+        await asyncio.to_thread(
+            queue.defer, meeting_id, str(exc), until=now() + exc.wait_s
+        )
+        logger.info(
+            "export waits for speaker activity meeting_id=%s wait_s=%.0f",
+            meeting_id,
+            exc.wait_s,
+        )
+        return
     except NotAV2Meeting as exc:
         await renewal.stop()
         attempts = await asyncio.to_thread(
@@ -686,6 +735,7 @@ async def _run_leased(
             attempts,
         )
         await asyncio.to_thread(queue.fail, meeting_id)
+        worker.unreported["not_a_v2_meeting"] += 1
         return
     except Exception as exc:  # noqa: BLE001 - contained per id, logged
         await renewal.stop()
@@ -712,11 +762,13 @@ async def _run_leased(
                     attempts,
                 )
                 await asyncio.to_thread(queue.fail, meeting_id)
+                worker.unreported["report_refused"] += 1
             else:
                 handed_off = await asyncio.to_thread(queue.load, meeting_id)
                 await _give_up(
                     queue,
                     deps,
+                    worker,
                     meeting_id,
                     envelope,
                     attempts,
@@ -733,6 +785,7 @@ async def _run_leased(
 async def _give_up(
     queue: PendingQueue,
     deps: Deps,
+    worker: WorkerState,
     meeting_id: str,
     envelope: dict[str, Any],
     attempts: int,
@@ -742,29 +795,12 @@ async def _give_up(
 ) -> None:
     """Quarantine a meeting that is out of attempts or crashes."""
     finished = await _quarantine(
-        envelope, attempts, error, meeting_id, deps, rerun=rerun
+        envelope, attempts, error, meeting_id, deps, worker, rerun=rerun
     )
     if finished:
         await asyncio.to_thread(queue.done, meeting_id)
     else:
         await asyncio.to_thread(queue.fail, meeting_id)
-
-
-async def sweep_once(
-    queue: PendingQueue,
-    deps: Deps,
-    job: Job = export_meeting,
-    now: Callable[[], float] = time.time,
-) -> None:
-    """Run every pending meeting that is due, and wait for all of them."""
-    worker = WorkerState(deps.settings.concurrency)
-    await asyncio.gather(
-        *(
-            _run_item(queue, deps, meeting_id, job, now, worker)
-            for meeting_id in await asyncio.to_thread(queue.pending_ids)
-        ),
-        return_exceptions=True,
-    )
 
 
 async def _quarantine(
@@ -773,6 +809,7 @@ async def _quarantine(
     error: str,
     meeting_id: str,
     deps: Deps,
+    worker: WorkerState,
     *,
     rerun: bool = False,
 ) -> bool:
@@ -780,10 +817,11 @@ async def _quarantine(
     `_export.json` is already `handed_off` (notetaker-worker has it) keeps
     that marker and reports `handed_off`, unless this was a rerun: the earlier
     hand-off is not the rerun, so a rerun out of attempts is `failed`. Any
-    other gets the `failed` marker and reports `failed`. If the marker can't be read, nothing is written or
-    reported. The queue's retry budget for this meeting is spent, so any of
-    these left undone is logged for an operator's re-enqueue, which runs the
-    whole job again. True when the item is finished: the folder was handed
+    other gets the `failed` marker and reports `failed`. If the marker can't
+    be read, nothing is written or reported. The queue's retry budget for this
+    meeting is spent, so any of these left undone is logged for an operator's
+    re-enqueue, which runs the whole job again, and counted in
+    `worker.unreported`. True when the item is finished: the folder was handed
     off and that report was accepted; the caller then completes the item
     instead of moving it to failed/."""
     settings = deps.settings
@@ -795,6 +833,7 @@ async def _quarantine(
             meeting_id,
             attempts,
         )
+        worker.unreported["malformed"] += 1
         return False
     folder, body = marker
     base = settings.export_prefix + folder + "/"
@@ -812,6 +851,7 @@ async def _quarantine(
             attempts,
             type(exc).__name__,
         )
+        worker.unreported["marker_unreadable"] += 1
         return False
     state: ReportState
     report_error: str | None
@@ -843,6 +883,7 @@ async def _quarantine(
         )
     meeting_uuid = body["meeting_id"]
     if not meeting_uuid:
+        worker.unreported["malformed"] += 1
         return False
     try:
         await asyncio.to_thread(
@@ -859,6 +900,7 @@ async def _quarantine(
             meeting_id,
             exc,
         )
+        worker.unreported["report_refused"] += 1
         return False
     return state == "handed_off"
 

@@ -24,7 +24,7 @@ so a later re-enqueue runs the check again.
 
 A rerun (`rerun=True`, queued by `exporter.rerun`) exports even a handed-off
 folder: every file is written again from what aw-bots holds now, so a file
-an earlier export could not write (a channel whose master timed out) is
+an earlier export did not write is
 filled in, and the folder goes to notetaker-worker's `/process` with
 `"rerun": true`, which redoes the transcript where a plain `/process` would be
 an idempotent no-op. Before it writes anything, a rerun asks notetaker-worker
@@ -178,7 +178,12 @@ class NotAV2Meeting(Exception):
 class ActivityNotReady(Exception):
     """`speaker-activity.jsonl` is absent but the bot may still be uploading
     it (it does so in teardown, after `meeting.completed`, before the debug
-    tape); retryable (spec §4.2)."""
+    tape); the job runs again in `wait_s` seconds, at the wait's deadline,
+    and the wait is not a failed attempt (spec §4.2)."""
+
+    def __init__(self, message: str, wait_s: float) -> None:
+        super().__init__(message)
+        self.wait_s = wait_s
 
 
 @dataclass
@@ -523,9 +528,11 @@ def _export_channels(
     """Write each channel number's opus file and its `channels/index.json` row.
 
     A channel's identity and recorder clock are in the full recording (the
-    list keeps only each media file's id, type, format and size), read here,
-    under the caller's guard: a recording that can't be read costs the
-    channels, never the mixed export. One file per channel number across
+    list keeps only each media file's id, type, format and size), read here.
+    A channel without that identity raises `ChannelIdentityMissing`, and the
+    caller exports the mixed audio only; any other failure (reading a
+    recording or a master, a copy, a join) raises out of the job, so the
+    queue runs the whole export again. One file per channel number across
     sessions. The earliest piece's identity
     and offset are the index row; a later session that names someone else is
     logged and does not rename the row. Every channel's identity is checked
@@ -983,11 +990,13 @@ def export_meeting(
             deadline = parse_utc(str(ended_at)) + timedelta(
                 seconds=settings.activity_wait_seconds
             )
-            if deps.now() < deadline:
+            now = deps.now()
+            if now < deadline:
                 raise ActivityNotReady(
                     f"speaker activity not ready for vexa_meeting_id="
                     f"{vexa_meeting_id} session_uid={','.join(not_uploaded)}; "
-                    f"waiting until {deadline.isoformat()}"
+                    f"waiting until {deadline.isoformat()}",
+                    (deadline - now).total_seconds(),
                 )
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1089,7 +1098,7 @@ def export_meeting(
             _export_channels(
                 sessions, spans, base, Path(tmp_dir), deps, vexa_meeting_id
             )
-        except Exception as exc:
+        except ChannelIdentityMissing as exc:
             logger.warning(
                 "channel_export_failed meeting_id=%s vexa_meeting_id=%s "
                 "error_class=%s error=%s; exporting the mixed audio only",
