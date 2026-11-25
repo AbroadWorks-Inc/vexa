@@ -11,7 +11,9 @@
  *     page will refresh in 5 seconds, or <a id="refresh">reload the page</a> now.</p></div>`. Zoom
  *     serves it while the host's account is in a different meeting; the page reloads itself every
  *     ~5 s and turns into the pre-join once that meeting ends;
- *   - a sign-in page — the host admits only authenticated users.
+ *   - a sign-in page — the host admits only authenticated users;
+ *   - Zoom's anti-bot wall ("Automated bots aren't allowed … must use Zoom RTMS … Sign in to join").
+ *     It carries the sign-in words too, so it is recognised first (`matchZoomBotBlock`).
  *
  * The join reads the page with `readZoomPreJoinSnapshot` (in the browser) and decides with the pure
  * `classifyZoomPreJoin`, over and over until the page settles, so a page that redirects or reloads
@@ -23,8 +25,10 @@ import {
   zoomSelfRefreshingHoldSelector,
   zoomHoldHeadlineSelector,
   zoomAuthRequiredTexts,
+  zoomBotBlockTexts,
   zoomInvalidMeetingTitle,
 } from "./selectors";
+import { redactMeetingUrl } from "../shared/url-redaction";
 
 /** A reading of the page, taken in the browser. Plain data, so the classification is testable. */
 export interface ZoomPreJoinSnapshot {
@@ -43,6 +47,8 @@ export type ZoomPreJoinState =
   | { kind: "host_not_started" }
   | { kind: "hold"; headline: string }
   | { kind: "auth_required" }
+  /** Zoom refuses automated joins to this meeting; `matched` is the phrase that showed it. */
+  | { kind: "bot_blocked"; matched: string }
   /** None of the above yet: a redirect or a render is still in flight. */
   | { kind: "pending" };
 
@@ -93,9 +99,23 @@ export async function readZoomPreJoinSnapshot(page: Page): Promise<ZoomPreJoinSn
   }
 }
 
-/** Decide what the page is. The name field wins: everything else is a reason it is not there yet. */
+/**
+ * The phrase that shows Zoom refused a bot, or null. The one definition of the anti-bot wall: the
+ * pre-join, the Join button wait and the admission wait all decide with it.
+ */
+export function matchZoomBotBlock(text: string): string | null {
+  const t = text.toLowerCase();
+  return zoomBotBlockTexts.find((p) => t.includes(p.toLowerCase())) ?? null;
+}
+
+/**
+ * Decide what the page is. The anti-bot wall wins, since it can sit over the pre-join form; then the
+ * name field: everything else is a reason it is not there yet.
+ */
 export function classifyZoomPreJoin(s: ZoomPreJoinSnapshot | null): ZoomPreJoinState {
   if (!s) return { kind: "pending" };
+  const matched = matchZoomBotBlock(s.text);
+  if (matched) return { kind: "bot_blocked", matched };
   if (s.nameField) return { kind: "name_field" };
   if (s.title.toLowerCase() === zoomInvalidMeetingTitle.toLowerCase()) return { kind: "host_not_started" };
   if (s.hold) return { kind: "hold", headline: s.hold.headline };
@@ -107,7 +127,7 @@ export function classifyZoomPreJoin(s: ZoomPreJoinSnapshot | null): ZoomPreJoinS
 /** The evidence a typed pre-join failure carries: where the page was and what it said. */
 export function describeZoomPreJoin(s: ZoomPreJoinSnapshot | null): string {
   if (!s) return "page=unreadable (navigation in flight)";
-  let where = s.url;
+  let where = redactMeetingUrl(s.url);
   try {
     const u = new URL(s.url);
     where = `${u.origin}${u.pathname}${u.searchParams.has("wpk") ? " (after the ?wpk= redirect)" : ""}`;

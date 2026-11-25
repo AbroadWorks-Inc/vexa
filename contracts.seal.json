@@ -11,7 +11,7 @@
   "core/flows/contracts/flows.v1": "0c7da386737bf0b82859231c0c3d7bc63caa8fb4578ff73d0e290aa9493879b5",
   "core/gateway/contracts/api.v1": "35753cb63384a53b53c2fcd436a59b27b971c72b565b2bdb04745086fb5e3256",
   "core/gateway/contracts/logevent.v1": "7ab25cc7d935e03ea1aec29a0d717576bcfa1a37d7c412400227c98e1df3ed59",
-  "core/gateway/contracts/ws.v1": "fce6f060e455a1f5eaca3f5bac3178b2f427fbfdae92e193568d92e5094032c5",
+  "core/gateway/contracts/ws.v1": "b5c84227382d8523a7f99ea298367d9142076a5d8c2cd639b884557cc7b2f743",
   "core/identity/contracts/identity.v1": "df90ef32cad2245aa4099e9e9286b6df0e5f5ba3cfd69d41dfd7f3615f5e1917",
   "core/meetings/contracts/acts.v1": "1eaa34d27c52b0eb987a278115a1966c058f615ca16e3391b00107a6779dec4f",
   "core/meetings/contracts/captured-signal.v1": "495922d99e195524fee7bb5892119eefff8f47ef72338a0e484ff81f8650768c",

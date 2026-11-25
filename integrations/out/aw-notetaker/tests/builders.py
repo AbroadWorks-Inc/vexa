@@ -1,10 +1,17 @@
-"""Synthetic speaker-activity builders and aw-bots webhook envelopes for tests."""
+"""Synthetic speaker-activity builders, aw-bots webhook envelopes, and a
+one-pass driver of the export worker for tests."""
 
+import asyncio
 import io
 import json
+import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from exporter.job import Deps, export_meeting
+from exporter.queue import Job, PendingQueue, WorkerState, _run_item
 
 MEETING_UUID = "5f0c2b7e-8d1a-4c3e-9b6f-2a7d1e4c8b90"
 EVENT_ID = "evt_" + "7c1e0b0a" * 8
@@ -185,3 +192,24 @@ def wav_samples(data: bytes) -> tuple[list[int], int]:
         for i in range(0, len(frames), 2)
     ]
     return samples, rate
+
+
+async def sweep_once(
+    queue: PendingQueue,
+    deps: Deps,
+    job: Job = export_meeting,
+    now: Callable[[], float] = time.time,
+    worker: WorkerState | None = None,
+) -> None:
+    """One tick of `run_worker`: run every pending meeting through the
+    worker's own `_run_item` and wait for all of them. A fresh `WorkerState`
+    (a new lease owner) unless `worker` is given; pass the same one to
+    several sweeps to stand for one exporter process."""
+    worker = worker or WorkerState(deps.settings.concurrency)
+    await asyncio.gather(
+        *(
+            _run_item(queue, deps, meeting_id, job, now, worker)
+            for meeting_id in await asyncio.to_thread(queue.pending_ids)
+        ),
+        return_exceptions=True,
+    )

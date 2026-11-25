@@ -24,6 +24,7 @@ import {
   isTerminal,
 } from './contracts.js';
 import { buildJoinEvidence } from './join-evidence.js';
+import { redactUrlsIn } from '@vexa/join/url-redaction';
 import type {
   JoinDriver,
   JoinOutcome,
@@ -62,6 +63,10 @@ export interface OrchestratorDeps {
   /** Producer clock for lifecycle facts. Injected by tests; each logical event is stamped once
    *  before the lifecycle adapter performs any HTTP retry. */
   now?: () => string;
+  /** Clock (ms) and sleep for the boot reachability gate's deadline. Injected by tests; default
+   *  `Date.now` and a real timer. */
+  clockMs?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** The dedicated non-zero exit code for a pre-join control-plane-unreachable abort (#530). On
@@ -69,6 +74,14 @@ export interface OrchestratorDeps {
  *  the attributable signal an operator reads in one `kubectl describe`, distinct from a real
  *  join failure (exit 1). */
 export const CONTROL_PLANE_UNREACHABLE_EXIT = 3;
+
+/** How long the boot reachability gate (#530) keeps probing BOTH control-plane channels before it
+ *  refuses to join with exit 3. A pod on a fresh node can wait tens of seconds for its network to be
+ *  programmed; meeting-api's pre-active grace (the lobby budget plus a minute) is far longer. */
+export const CONTROL_PLANE_REACH_DEADLINE_MS = 90_000;
+/** Pause between probe rounds: doubles from the first value, never above the second. */
+const REACH_BACKOFF_MS = 500;
+const REACH_BACKOFF_CAP_MS = 5_000;
 
 /** The infra-fault tag / reason-text discriminator for the control-plane-unreachable terminal
  *  (#530). NOT a lifecycle.v1 CompletionReason — the sealed enum stays untouched; attribution
@@ -159,6 +172,21 @@ function assertRequiredPorts(deps: OrchestratorDeps): void {
  * Build the meeting orchestrator. Returns `run()` (drives the machine to a terminal state)
  * and `handle(act)` (the acts.v1 entrypoint the ActsSource adapter — or a test — feeds).
  */
+/**
+ * A lifecycle event's free text — `reason` and `join_evidence.detail` — is an error message from
+ * somewhere in the join, and it becomes the meeting's stored reason, its `last_error` and its
+ * webhook. A message that quotes the meeting URL would carry the passcode into all of them, so the
+ * URLs in it are redacted (host, path and meeting id kept) on the way out.
+ */
+export function redactEvent<E extends LifecycleEvent>(ev: E): E {
+  const out: E = { ...ev };
+  if (typeof out.reason === 'string') out.reason = redactUrlsIn(out.reason);
+  if (out.join_evidence && typeof out.join_evidence.detail === 'string') {
+    out.join_evidence = { ...out.join_evidence, detail: redactUrlsIn(out.join_evidence.detail) };
+  }
+  return out;
+}
+
 export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
   assertRequiredPorts(deps);
   const base: { connection_id: string; container_id?: string } = {
@@ -190,13 +218,13 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     if (isTerminal(status) && deps.degraded) {
       try { degraded = deps.degraded(); } catch { degraded = undefined; }
     }
-    await deps.lifecycle.emit({
+    await deps.lifecycle.emit(redactEvent({
       ...base,
       status,
       timestamp: extra.timestamp ?? eventTime(),
       ...extra,
       ...(degraded ?? {}),
-    });
+    }));
   };
 
   // The load-bearing FIRST emit (#530). `cur` is already `joining` (the initial state), so this
@@ -209,8 +237,8 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       timestamp: extra.timestamp ?? eventTime(),
       ...extra,
     };
-    if (deps.lifecycle.emitReachable) return (await deps.lifecycle.emitReachable(ev)) === 'reachable';
-    await deps.lifecycle.emit(ev);
+    if (deps.lifecycle.emitReachable) return (await deps.lifecycle.emitReachable(redactEvent(ev))) === 'reachable';
+    await deps.lifecycle.emit(redactEvent(ev));
     return true;
   };
 
@@ -241,41 +269,48 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // ── reachability gate (#530, P18) — the FIRST lifecycle emit is LOAD-BEARING ──
     // The `joining` event must be sent regardless; we consult its delivery verdict. Reachable ⇒
     // ZERO added latency (the secondary channel is never probed). Primary unreachable ⇒ probe the
-    // secondary (redis); BOTH down ⇒ refuse to join BEFORE any meeting navigation and terminate
-    // with the dedicated infra signal — rather than proceeding toward a human meeting the bot can
-    // never report about (the 2026-07-09 fresh-node signature: opaque join_failure / stuck-requested).
+    // secondary (redis). BOTH down ⇒ probe both again, backing off, until
+    // CONTROL_PLANE_REACH_DEADLINE_MS; still both down ⇒ refuse to join BEFORE any meeting
+    // navigation and terminate with the dedicated infra signal — rather than proceeding toward a
+    // human meeting the bot can never report about.
     const joiningExtra: Partial<LifecycleEvent> = base.container_id ? { container_id: base.container_id } : {};
-    const primaryReachable = await emitJoining(joiningExtra);
-    if (!primaryReachable) {
+    const clockMs = deps.clockMs ?? Date.now;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const reachDeadline = clockMs() + CONTROL_PLANE_REACH_DEADLINE_MS;
+    for (let round = 0; ; round++) {
       // Either-channel rule: EITHER channel up ⇒ the bot can still report ⇒ proceed. Absent probe
       // ⇒ treated as reachable (never abort on an un-probeable channel).
-      const secondaryReachable = deps.reachability ? await deps.reachability.probeSecondary() : true;
-      if (!secondaryReachable) {
-        // BOTH control-plane channels unreachable → refuse to join. Attempt the terminal on
-        // whichever channel answers (likely none — that is fine; on k8s the pod exit code carries
-        // it). Use the raw sink (never-throw) and mark `cur` terminal ourselves; the emit here is
-        // best-effort and must not mask the exit.
-        const unreachable = ['meeting_api_callback', 'redis'];
-        cur = 'failed';
-        const unreachableDetail =
-          `${CONTROL_PLANE_UNREACHABLE}: control plane unreachable at boot (${unreachable.join(', ')}); refused to join`;
-        await deps.lifecycle.emit({
-          ...base,
-          status: 'failed',
-          timestamp: eventTime(),
-          failure_stage: 'requested',
-          completion_reason: 'join_failure',
-          infra_fault: CONTROL_PLANE_UNREACHABLE,
-          unreachable_channels: unreachable,
-          reason: unreachableDetail,
-          exit_code: CONTROL_PLANE_UNREACHABLE_EXIT,
-          // Ours, unambiguously — the bot never reached the meeting page because OUR control plane
-          // was down. `control_plane_unreachable` is a navigation marker, so this classifies
-          // `navigation_failure` → `system_fault` and lands in the gate metric where it belongs.
-          ...joinEvidenceFor('error', 'requested', { reachedLobby: false }, unreachableDetail),
-        }).catch(() => { /* the channel that would carry this is the one that is down */ });
-        return { exitCode: CONTROL_PLANE_UNREACHABLE_EXIT, status: 'failed', completionReason: 'join_failure' };
+      if (await emitJoining(joiningExtra)) break;
+      if (!deps.reachability || await deps.reachability.probeSecondary()) break;
+      const left = reachDeadline - clockMs();
+      if (left > 0) {
+        await sleep(Math.min(REACH_BACKOFF_MS * 2 ** round, REACH_BACKOFF_CAP_MS, left));
+        continue;
       }
+      // BOTH control-plane channels unreachable for the whole deadline → refuse to join. Attempt
+      // the terminal on whichever channel answers (likely none — that is fine; on k8s the pod exit
+      // code carries it). Use the raw sink (never-throw) and mark `cur` terminal ourselves; the
+      // emit here is best-effort and must not mask the exit.
+      const unreachable = ['meeting_api_callback', 'redis'];
+      cur = 'failed';
+      const unreachableDetail =
+        `${CONTROL_PLANE_UNREACHABLE}: control plane unreachable at boot (${unreachable.join(', ')}); refused to join`;
+      await deps.lifecycle.emit({
+        ...base,
+        status: 'failed',
+        timestamp: eventTime(),
+        failure_stage: 'requested',
+        completion_reason: 'join_failure',
+        infra_fault: CONTROL_PLANE_UNREACHABLE,
+        unreachable_channels: unreachable,
+        reason: unreachableDetail,
+        exit_code: CONTROL_PLANE_UNREACHABLE_EXIT,
+        // Ours, unambiguously — the bot never reached the meeting page because OUR control plane
+        // was down. `control_plane_unreachable` is a navigation marker, so this classifies
+        // `navigation_failure` → `system_fault` and lands in the gate metric where it belongs.
+        ...joinEvidenceFor('error', 'requested', { reachedLobby: false }, unreachableDetail),
+      }).catch(() => { /* the channel that would carry this is the one that is down */ });
+      return { exitCode: CONTROL_PLANE_UNREACHABLE_EXIT, status: 'failed', completionReason: 'join_failure' };
     }
 
     // ── join → admission ──

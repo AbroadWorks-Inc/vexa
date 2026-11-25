@@ -14,6 +14,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
+from ..callback_auth import INTERNAL_SECRET_HEADER, internal_secret
 from ..lifecycle.machine import dominant_completion_reason
 from ..sessions import new_session
 from .ports import (
@@ -1505,14 +1506,20 @@ class SqlAlchemyMeetingRepo:
 
 class HttpRuntimeClient:
     """``RuntimeClient`` over the runtime.v1 HTTP kernel (``POST /workloads``). 429 → QuotaExceeded;
-    non-201 → SpawnFailed (parent ``_spawn_via_runtime_api``)."""
+    non-201 → SpawnFailed (parent ``_spawn_via_runtime_api``). Every call presents
+    ``INTERNAL_API_SECRET`` as ``x-internal-secret``: the kernel admits only the internal tier."""
 
     def __init__(self, client, runtime_api_url: str):
         self._client = client
         self._url = runtime_api_url.rstrip("/")
 
+    def _headers(self) -> dict:
+        return {INTERNAL_SECRET_HEADER: internal_secret()}
+
     async def create_workload(self, spec: dict) -> dict:
-        resp = await self._client.post(f"{self._url}/workloads", json=spec, timeout=30.0)
+        resp = await self._client.post(
+            f"{self._url}/workloads", json=spec, headers=self._headers(), timeout=30.0
+        )
         if resp.status_code == 429:
             raise QuotaExceeded("runtime kernel: owner quota exceeded")
         if resp.status_code != 201:
@@ -1545,6 +1552,7 @@ class HttpRuntimeClient:
         as done on these."""
         resp = await self._client.delete(
             f"{self._url}/workloads/{workload_id}",
+            headers=self._headers(),
             timeout=60.0,  # the kernel's graceful teardown can hold the request for its stop grace
         )
         if resp.status_code == 404:
@@ -1561,7 +1569,9 @@ class HttpRuntimeClient:
         the reconcile sweep treats it as 'untracked: fail loud, do not reap'. Any other non-200
         raises (caller treats it as 'unknown, do not reap' — fail safe toward NOT killing a
         possibly-live meeting)."""
-        resp = await self._client.get(f"{self._url}/workloads/{workload_id}", timeout=10.0)
+        resp = await self._client.get(
+            f"{self._url}/workloads/{workload_id}", headers=self._headers(), timeout=10.0
+        )
         if resp.status_code == 404:
             return None
         if resp.status_code != 200:

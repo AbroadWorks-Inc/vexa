@@ -8,8 +8,8 @@ vexa `main` (the shapes are exactly those main's **G5 WebSocket gate test** asse
 SDKs, and any client build against.
 
 ## Protocol
-- **Connect:** `ws(s)://<host>/ws` with auth `x-api-key:<token>` header **or** `?api_key=<token>`
-  query. Missing key → `{type:"error", error:"missing_api_key"}` then close `4401`.
+- **Connect:** `ws(s)://<host>/ws` with auth in the `x-api-key:<token>` header; the key is never
+  read from the URL. Missing key → `{type:"error", error:"missing_api_key"}` then close `4401`.
 - **Client → server:** `SubscribeRequest` `{action:"subscribe", meetings:[{platform, native_id}]}`
   (and `UnsubscribeRequest`). Authorization is delegated to the collector
   (`POST /ws/authorize-subscribe`) — you only receive meetings your key may read.

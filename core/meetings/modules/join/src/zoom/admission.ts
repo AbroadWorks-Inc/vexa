@@ -8,15 +8,14 @@ import {
   zoomMeetingAppSelector,
   zoomWaitingRoomTexts,
   zoomRemovalTexts,
-  zoomBotBlockTexts,
 } from "./selectors";
+import { matchZoomBotBlock } from "./prejoin-state";
 
 /**
- * Detect Zoom's post-Join anti-bot wall.
+ * Detect Zoom's anti-bot wall on the live page.
  *
- * After the bot clicks Join, meetings/accounts with the RTMS-required anti-bot
- * setting serve an admission-phase wall instead of the waiting room or the
- * meeting:
+ * Meetings/accounts with the RTMS-required anti-bot setting serve a wall
+ * instead of the pre-join, the waiting room or the meeting:
  *   "We detected you may be a bot. Automated bots aren't allowed to join this
  *    meeting or webinar and must use Zoom RTMS. … Sign in to join" + reCAPTCHA.
  *
@@ -28,21 +27,30 @@ import {
  * reason (`zoom_requires_rtms`) so the host stops polling "waiting for
  * admission" forever and can route to RTMS.
  *
- * Case-insensitive substring scan of the live page text against the known wall
- * phrases (selectors.ts: zoomBotBlockTexts). Returns the matched phrase, or null.
+ * The page's whole visible text, judged by `matchZoomBotBlock` (prejoin-state.ts).
+ * Returns the matched phrase, or null.
  */
-async function detectZoomBotBlock(page: Page): Promise<string | null> {
+export async function detectZoomBotBlock(page: Page): Promise<string | null> {
   try {
-    return await page.evaluate((phrases: string[]) => {
-      const body = (document.body?.innerText || '').toLowerCase();
-      for (const p of phrases) {
-        if (body.includes(p.toLowerCase())) return p;
-      }
-      return null;
-    }, zoomBotBlockTexts);
+    return matchZoomBotBlock(await page.evaluate(() => {
+      const b = document.body;
+      return (b && (b.innerText || b.textContent)) || '';
+    }));
   } catch {
     return null;
   }
+}
+
+/**
+ * End the join on the anti-bot wall, at whatever stage it was seen: surface `blocked` to the host,
+ * then throw the PERMANENT verdict. Zoom itself refuses browser bots here — a re-spawn hits the same
+ * wall — so it is `denial` (the closest sealed outcome; a distinct `blocked` CompletionReason needs
+ * lane:contract — see join-driver.ts), never an auth fault and never a wait for a human.
+ */
+export async function refuseZoomBotBlock(botConfig: BotConfig, matched: string, phase: string): Promise<never> {
+  log(`[Zoom Web] 🚫 Anti-bot wall detected (${phase}, matched: "${matched}") — this meeting requires Zoom RTMS; bots cannot join via the web client. Failing fast.`);
+  await callBlockedCallback(botConfig, 'zoom_requires_rtms', { matched, phase });
+  throw new AdmissionError('denial', '[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins and requires Zoom RTMS (Realtime Media Streams); route to the RTMS path');
 }
 
 /**
@@ -175,14 +183,7 @@ export async function waitForZoomMeetingAdmission(
   // forever (the wall never becomes the waiting room or the meeting).
   {
     const wall = await detectZoomBotBlock(page);
-    if (wall) {
-      log(`[Zoom Web] 🚫 Anti-bot wall detected (matched: "${wall}") — this meeting requires Zoom RTMS; bots cannot join via the web client. Failing fast.`);
-      await callBlockedCallback(botConfig, 'zoom_requires_rtms', { matched: wall, phase: 'pre_admission_poll' });
-      // PERMANENT platform verdict: Zoom itself refuses browser bots here — a re-spawn hits the
-      // same wall. `denial` is the closest sealed outcome (a distinct `blocked` CompletionReason
-      // needs lane:contract — see join-driver.ts).
-      throw new AdmissionError('denial', '[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins and requires Zoom RTMS (Realtime Media Streams); route to the RTMS path');
-    }
+    if (wall) await refuseZoomBotBlock(botConfig, wall, 'pre_admission_poll');
   }
 
   // Check if in waiting room
@@ -214,11 +215,7 @@ export async function waitForZoomMeetingAdmission(
     // wall text stream in just after the page transition). Re-scan each poll so
     // we transition to terminal `blocked` instead of accruing unknown-state time.
     const wall = await detectZoomBotBlock(page);
-    if (wall) {
-      log(`[Zoom Web] 🚫 Anti-bot wall detected during poll (matched: "${wall}") — requires Zoom RTMS. Failing fast.`);
-      await callBlockedCallback(botConfig, 'zoom_requires_rtms', { matched: wall, phase: 'admission_poll' });
-      throw new AdmissionError('denial', '[Zoom Web] zoom_requires_rtms: meeting/account blocks automated browser joins and requires Zoom RTMS (Realtime Media Streams); route to the RTMS path');
-    }
+    if (wall) await refuseZoomBotBlock(botConfig, wall, 'admission_poll');
 
     if (await isAdmitted(page)) {
       log('[Zoom Web] Bot admitted — Leave button now visible');

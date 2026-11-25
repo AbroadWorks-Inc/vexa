@@ -109,12 +109,13 @@ export const zoomRemovalTexts = [
 // wall points to (Zoom RTMS) is a server-side API, not a browser join, so the
 // honest outcome is to detect this, fail fast (reason: zoom_requires_rtms), and
 // route to RTMS — NOT to attempt evasion. Case-insensitive substring match.
+// Only bot-specific phrases: the wall's "Sign in to join" is also what a host's
+// signed-in-users-only page says (zoomAuthRequiredTexts), so it identifies neither.
 export const zoomBotBlockTexts = [
   "automated bots aren't allowed",
   "automated bots aren’t allowed", // curly apostrophe variant Zoom renders
   "must use Zoom RTMS",
   "detected you may be a bot",
-  "sign in to join",
 ];
 
 // ---- Leave dialog (after clicking Leave button) ----

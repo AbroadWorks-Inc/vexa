@@ -208,9 +208,8 @@ stage_redis() {
 # ===========================================================================
 stage_ws() {
   hd "STAGE 2 — WS client ($WS_URL)"
-  # Browser-equivalent: the dashboard sends api_key as a query param (browsers
-  # can't set WS headers), then sends the subscribe action, then pings.
-  local FULL_WS="${WS_URL}?api_key=$(printf '%s' "$TOKEN" | sed 's/ /%20/g')"
+  # The key rides in the x-api-key header (never in the URL), then the client sends the
+  # subscribe action, then pings.
   local SUB_MSG
   SUB_MSG="$(printf '{"action":"subscribe","meetings":[{"platform":"%s","native_id":"%s"}]}' \
                   "$PLATFORM" "${NATIVE_ID:-PLACEHOLDER_NATIVE_ID}")"
@@ -231,7 +230,7 @@ stage_ws() {
         sleep 25; elapsed=$((elapsed+25))
         printf '{"action":"ping"}\n'
       done
-    } | { timeout "${DURATION}s" websocat -n -t "$FULL_WS" 2>/dev/null || true; } \
+    } | { timeout "${DURATION}s" websocat -n -t -H "x-api-key: $TOKEN" "$WS_URL" 2>/dev/null || true; } \
       | while IFS= read -r frame; do log "<WS> $frame"; done
     ok "ws window closed (websocat)"
     return 0
@@ -239,14 +238,14 @@ stage_ws() {
 
   if command -v node >/dev/null 2>&1 && node -e "require('ws')" >/dev/null 2>&1; then
     log "client: node 'ws'"
-    WS_URL_FULL="$FULL_WS" SUB_MSG="$SUB_MSG" DURATION="$DURATION" node - <<'NODE'
+    WS_URL_FULL="$WS_URL" WS_TOKEN="$TOKEN" SUB_MSG="$SUB_MSG" DURATION="$DURATION" node - <<'NODE'
 const WebSocket = require('ws');
 const url = process.env.WS_URL_FULL;
 const sub = process.env.SUB_MSG;
 const dur = parseInt(process.env.DURATION, 10) * 1000;
 const ts = () => new Date().toISOString().slice(11, 23);
 const log = (m) => console.log(`${ts()} | ${m}`);
-const ws = new WebSocket(url);
+const ws = new WebSocket(url, { headers: { 'x-api-key': process.env.WS_TOKEN } });
 let ping;
 ws.on('open', () => {
   log('<WS> open — sending subscribe');

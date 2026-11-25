@@ -7,13 +7,12 @@ Proves, in isolation from the conformance contract layer, the load-bearing carve
   * verbatim body + status passthrough on success,
   * identity headers injected downstream; client-supplied identity headers stripped.
 """
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from gateway import create_app
 from gateway.ports import AuthUnavailable
-from conftest import VALID_KEY, FakeAuthorizer, FakeDownstream, FakeRedis
+from conftest import VALID_KEY, FakeAuthorizer, FakeDownstream, FakeRedis, asgi_status
 
 AUTH = {"x-api-key": VALID_KEY}
 
@@ -407,14 +406,31 @@ def test_calendar_id_is_re_encoded_into_one_downstream_segment():
 
 def test_calendar_id_dot_segments_cannot_walk_up_the_downstream_path():
     """`%2E%2E` decodes to `..`, which httpx resolves against the base path — un-encoded it turns
-    PATCH /user/calendars/{id} into a PATCH on admin-api's whole /user record."""
+    PATCH /user/calendars/{id} into a PATCH on admin-api's whole /user record. It is refused."""
     client, downstream = _client()
-    client.patch("/user/calendars/%2E%2E", headers=AUTH, json={"auto_join": False})
-    assert downstream.last["url"] == "http://admin-api/user/calendars/%2E%2E"
-    assert httpx.URL(downstream.last["url"]).path == "/user/calendars/.."
+    r = client.patch("/user/calendars/%2E%2E", headers=AUTH, json={"auto_join": False})
+    assert r.status_code == 400
+    r = client.post("/user/calendars/%2E%2E/sync", headers=AUTH)
+    assert r.status_code == 400
+    assert downstream.last is None
 
-    client.post("/user/calendars/%2E%2E/sync", headers=AUTH)
-    assert downstream.last["url"] == "http://meeting-api/user/calendars/%2E%2E/sync"
+
+async def test_native_route_params_cannot_reach_another_downstream_route():
+    """A tx key on DELETE /meetings/{platform}/{native_meeting_id} must not reach meeting-api's
+    erase (`DELETE /v2/meetings/{id}`, scope `erase`) by a dot segment plus an encoded slash."""
+    downstream = FakeDownstream()
+    app = create_app(FakeAuthorizer(user={"user_id": 7, "scopes": ["tx"], "max_concurrent": 3}),
+                     downstream, FakeRedis())
+    for method, path in [
+        ("DELETE", "/meetings/%2E%2E/v2%252Fmeetings%252Fabc"),
+        ("POST", "/meetings/%2E%2E/bots%3F/annotate"),
+        ("PUT", "/meetings/%2E/x/intent"),
+    ]:
+        assert await asgi_status(app, method, path, AUTH) == 400, path
+    assert downstream.last is None
+
+    assert await asgi_status(app, "DELETE", "/meetings/google_meet/v2%252Fmeetings", AUTH) == 200
+    assert downstream.last["url"] == "http://meeting-api/meetings/google_meet/v2%252Fmeetings"
 
 
 def test_calendar_id_with_control_character_is_4xx_not_500():

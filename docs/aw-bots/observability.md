@@ -35,6 +35,7 @@ pods.
 | `aw_meetings_by_status{status,user_id}` | Scrape-time count of non-terminal meetings |
 | `aw_webhook_pending{user_id}` | Deliveries due (`pending` or `sending`, `next_attempt_at` reached) |
 | `aw_webhook_outbox_unpublished` | Outbox rows with no `published_at` |
+| `aw_export_total{state="failed",reason}` (exporter `/metrics`) | The exporter gave a meeting up without meeting-api accepting a result: `not_a_v2_meeting`, `report_refused`, `bookkeeping_failed`, `marker_unreadable`, `malformed`. Resets when the exporter restarts. |
 
 `aw_meetings_failed_total` moves only when `write_status` sets status `failed` from a live
 status and the outcome is not `not_sent` (`intake/status.py`). The label is
@@ -74,6 +75,7 @@ increment. The `webhook_deliveries` row can still say `failed` or `dead`.
 | `AwBotsSweepStale` | critical | A meeting-api sweep has not finished a tick in the stale window |
 | `AwBotsRetentionSweepStale` | warning | Webhook retention has not run |
 | `AwBotsSweepRunCapped` | warning | A sweep stopped because it hit its batch cap |
+| `AwBotsExportFailed` | warning | An export ended `failed`, whether meeting-api accepted the result or the exporter gave the meeting up without one |
 
 No rule watches `aw_calendar_entries_sent_total{result="auth_failed"}`. If the calendar module's
 key is revoked or expires, every sync is refused and no alert fires; `AwBotsApiKeyExpiring` is the

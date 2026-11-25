@@ -4,8 +4,8 @@ One module per job; the flow is `app` → `queue` → `job`.
 
 | Module | What it does |
 |---|---|
-| `app.py` | `POST /hooks/vexa`, the aw-bots `/v2/webhooks` subscription (verifies the signature, current or previous, validates, queues `meeting.completed` and `bot.failed` once per `event_id`, never a `not_sent` meeting, answers 200 to every other event) and `GET /healthz` (503 while a job has run past `EXPORT_JOB_TIMEOUT_SECONDS`) |
-| `queue.py` | Durable queue in S3 (`aw-exporter/pending/`, `failed/`, and `events/` for the events already queued; every change a conditional write), retry with backoff, crash budget (a meeting with a crash runs alone), the worker loop |
+| `app.py` | `POST /hooks/vexa`, the aw-bots `/v2/webhooks` subscription (verifies the signature, current or previous, validates, queues `meeting.completed` and `bot.failed` once per `event_id`, never a `not_sent` meeting, answers 200 to every other event), `GET /healthz` (503 while a job has run past `EXPORT_JOB_TIMEOUT_SECONDS`), and `GET /metrics` (the meetings given up on with no export result accepted by meeting-api, `aw_export_total{state="failed",reason}`) |
+| `queue.py` | Durable queue in S3 (`aw-exporter/pending/`, `failed/`, and `events/` for the events already queued; every change a conditional write), retry with backoff (a wait for speaker activity is rescheduled, not counted), crash budget (a meeting with a crash runs alone), the worker loop |
 | `job.py` | Exports one meeting: every bot session's master audio → one `audio.wav`/`master.webm` on one clock, speaker timeline, per-speaker `channels/` when the bot recorded them, JSON files, `/process` call |
 | `activity.py` | Reads the bot's `speaker-activity.jsonl` (who-spoke-when, no audio) into speaker start/end events; the named frames wait on disk in sorted runs past a bound, so memory is flat. On the mixed lane only the mix's own frames (no channel) are that timeline. No fallback to the debug capture tape |
 | `attribution.py` | Turns those events into `speaker_timeline.json` / `participants.json`: intervals from paired frames, else from point runs, and the Zoom/Teams start anchor |

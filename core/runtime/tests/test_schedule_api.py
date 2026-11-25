@@ -7,12 +7,13 @@ from fastapi.testclient import TestClient
 from runtime_kernel import FakeClock, Scheduler
 from runtime_kernel.api import create_app
 from runtime_kernel.kernel import Runtime
+from conftest import INTERNAL
 
 
 def _client(dispatch, clock):
     sched = Scheduler(fakeredis.FakeStrictRedis(decode_responses=True), dispatch=dispatch, clock=clock)
     app = create_app(Runtime(), scheduler=sched)
-    return TestClient(app), sched
+    return TestClient(app, headers=INTERNAL), sched
 
 
 def test_schedule_register_list_and_fire():
@@ -55,6 +56,6 @@ def test_schedule_bad_spec_is_400():
 
 
 def test_schedule_503_when_not_wired():
-    client = TestClient(create_app(Runtime()))  # no scheduler
+    client = TestClient(create_app(Runtime()), headers=INTERNAL)  # no scheduler
     assert client.post("/schedule", json={"cron": "* * * * *", "request": {"url": "http://x/y"}}).status_code == 503
     assert client.get("/health").json()["checks"].get("scheduler") is None

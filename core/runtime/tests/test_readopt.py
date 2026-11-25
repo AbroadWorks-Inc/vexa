@@ -26,6 +26,7 @@ from runtime_kernel.backend import WorkloadHandle
 from runtime_kernel.docker_backend import DockerBackend
 from runtime_kernel.models import RuntimeState, WorkloadSpec, WorkloadStatus
 from runtime_kernel.store import InMemoryStore, WorkloadRecord
+from conftest import INTERNAL
 
 
 # ── a fake requests_unixsocket session over a canned docker daemon ───────────────────────────────
@@ -272,7 +273,7 @@ def test_adopt_makes_get_truthful_after_restart():
     assert status.profile == "adopted"
 
     # …and over HTTP, exactly what meeting-api polls:
-    client = TestClient(create_app(rt))
+    client = TestClient(create_app(rt), headers=INTERNAL)
     r = client.get("/workloads/mtg-2-d93eee39")
     assert r.status_code == 200, "recreated runtime must not 404 a live workload"
     assert r.json()["state"] == "running"

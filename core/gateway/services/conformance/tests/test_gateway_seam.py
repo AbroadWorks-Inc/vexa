@@ -279,16 +279,14 @@ async def test_ws_empty_api_key_is_rejected():
     assert ws.close_code == 4401
 
 
-async def test_ws_query_param_api_key_is_accepted():
-    """A valid ?api_key= (no header) is accepted — the loop runs and acks a subscribe."""
+async def test_ws_query_param_api_key_is_refused():
+    """A key in the URL (no header) is not read: the socket gets missing_api_key and no ack."""
     ws = FakeWebSocket(inbound=[json.dumps(SUBSCRIBE)], api_key=None)
     ws.query_params = {"api_key": WS_API_KEY}
     h = WSMultiplexHarness(ws, FakeRedis(), FakeAuthorizer(AUTH_MAP))
     await h.run()
-    assert not any(f.get("error") == "missing_api_key" for f in ws.sent), f"frames={ws.sent}"
-    acks = [f for f in ws.sent if f.get("type") == "subscribed"]
-    assert acks, f"no subscribed ack with ?api_key=; frames={ws.sent}"
-    assert_ws_conforms("Subscribed", acks[0])
+    assert any(f.get("error") == "missing_api_key" for f in ws.sent), f"frames={ws.sent}"
+    assert not [f for f in ws.sent if f.get("type") == "subscribed"], f"frames={ws.sent}"
 
 
 async def test_ws_authz_service_error_yields_error_frame_not_empty_ack():

@@ -9,7 +9,9 @@ enqueued, hands finished meetings to the worker in `queue.py`, and answers
 2xx to every other event (`webhook.test` included) without acting on it.
 `GET /healthz` (the liveness and readiness probe) answers 503 while any
 export has run longer than `EXPORT_JOB_TIMEOUT_SECONDS`, so a hung export
-gets the pod restarted.
+gets the pod restarted. `GET /metrics` serves, in the Prometheus text
+format, the meetings the worker gave up on with no export result accepted by
+meeting-api: `aw_export_total{state="failed",reason}` (`queue.py`).
 aw-bots retries a 5xx, so an enqueue failure is a 503; any other refusal is
 final.
 
@@ -37,7 +39,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from exporter import signature
 from exporter.config import Settings
@@ -174,5 +176,20 @@ def create_app(
             )
             return JSONResponse({"status": "export_overdue"}, status_code=503)
         return JSONResponse({"status": "ok"})
+
+    @app.get("/metrics")
+    async def metrics() -> PlainTextResponse:
+        lines = [
+            "# HELP aw_export_total Meetings given up on with no export result "
+            "accepted by meeting-api.",
+            "# TYPE aw_export_total counter",
+            *(
+                f'aw_export_total{{state="failed",reason="{reason}"}} {count}'
+                for reason, count in sorted(worker.unreported.items())
+            ),
+        ]
+        return PlainTextResponse(
+            "\n".join(lines) + "\n", media_type="text/plain; version=0.0.4"
+        )
 
     return app

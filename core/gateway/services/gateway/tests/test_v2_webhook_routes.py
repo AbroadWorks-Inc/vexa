@@ -85,8 +85,9 @@ def test_the_subscription_id_is_forwarded_as_one_opaque_segment():
     assert r.status_code == 200
     assert downstream.last["url"] == f"{ADMIN}/v2/webhooks/a%3Fuser%3Dother/deliveries"
     assert downstream.last["params"] is None
-    client.delete("/v2/webhooks/%2E%2E", headers=AUTH)
-    assert downstream.last["url"] == f"{ADMIN}/v2/webhooks/%2E%2E"
+    downstream.last = None
+    assert client.delete("/v2/webhooks/%2E%2E", headers=AUTH).status_code == 400
+    assert downstream.last is None
 
 
 def test_the_webhook_scopes_are_as_section_2_7():

@@ -274,18 +274,23 @@ async def _mark_stop_requested(repo, row: dict) -> None:
     workload is torn down directly by the caller, and the terminal is attributed to the stage it
     really reached.
 
-    A row with NO session yet (spawned so recently that the session write has not landed) still has
-    to carry the flag — it is the only durable evidence the user said no, and without it the
-    calendar would recreate this occurrence and send another bot. Fall back to a direct data merge.
+    The status is written only over the snapshot's own status (``expected_from``): ``row`` was read
+    before this request wrote anything, and the bot may have moved on since (``awaiting_admission``
+    → ``active``), which the snapshot's status must not overwrite.
+
+    The flag is the only durable evidence the user said no, and without it the calendar would
+    recreate this occurrence and send another bot. A row with NO session yet (spawned so recently
+    that the session write has not landed), or one whose status moved on, carries it through a
+    direct data merge.
     """
     status = row.get("status")
     sessions = await repo.list_sessions(meeting_id=row["id"])
-    if sessions:
-        await repo.update_meeting_status(
-            session_uid=sessions[-1],
-            status=status if status in BOOTING_STATUSES else "stopping",
-            data={"stop_requested": True},
-        )
+    if sessions and await repo.update_meeting_status(
+        session_uid=sessions[-1],
+        status=status if status in BOOTING_STATUSES else "stopping",
+        data={"stop_requested": True},
+        expected_from={status},
+    ):
         return
     merge = getattr(repo, "merge_meeting_data", None)
     if merge is not None:

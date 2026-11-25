@@ -32,15 +32,6 @@ class Storage:
     def __init__(self, client: S3Client) -> None:
         self._client = client
 
-    def exists(self, bucket: str, key: str) -> bool:
-        try:
-            self._client.head_object(Bucket=bucket, Key=key)
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
-                return False
-            raise
-        return True
-
     def size(self, bucket: str, key: str) -> int | None:
         """Object size in bytes, or None if it does not exist."""
         try:

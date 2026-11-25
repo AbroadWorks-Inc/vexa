@@ -227,6 +227,12 @@ _ADMISSION_FLOW_FAULT_MARKERS = (
     "no admission signal",
 )
 
+#: The bot's pre-join abort when its control plane is unreachable at boot (bot ``orchestrator.ts``
+#: ``CONTROL_PLANE_UNREACHABLE`` / ``CONTROL_PLANE_UNREACHABLE_EXIT``): the marker its own terminal
+#: reason starts with, and the exit code its workload ends with when that terminal never lands.
+CONTROL_PLANE_UNREACHABLE = "control_plane_unreachable"
+CONTROL_PLANE_UNREACHABLE_EXIT = 3
+
 #: Substrings in the producer's own message that positively identify a NAVIGATION failure (the bot
 #: never reached the meeting page). Matched case-insensitively against ``detail``. Kept narrow and
 #: mechanical on purpose: these are transport/browser-level strings, not interpretations of meeting
@@ -246,7 +252,7 @@ _NAVIGATION_MARKERS = (
     "unsupported platform",
     # Our own control plane being unreachable at boot: the bot deliberately never navigated to the
     # meeting. It never got as far as the page, which is what this reason means.
-    "control_plane_unreachable",
+    CONTROL_PLANE_UNREACHABLE,
 )
 
 #: Meeting statuses that mean the bot had NOT yet reported reaching the waiting room. Mirrors the

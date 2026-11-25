@@ -157,7 +157,8 @@ one transcript with speaker names:
   lands in a gap. `speaker_timeline.json` merges them; `participants.json` is the union of names.
   `_export.json.speaker_activity` is the worst session's (`missing` > `invalid` > `capped` > `ok`),
   and each session's problem is logged with its `session_uid`. The export waits
-  (`ActivityNotReady`) while any session's file is not uploaded yet.
+  (`ActivityNotReady`) while any session's file is not uploaded yet: the job runs again at the
+  wait's deadline (`ended_at` + `ACTIVITY_WAIT_SECONDS`), and the wait counts no attempt.
 - **Every recording, bounded.** `GET /recordings?meeting_id=` is read page by page (`limit`/`offset`,
   until `has_more` is false); a recording seen on two pages is listed once. More than
   `EXPORT_MAX_RECORDINGS` fails the export and exports nothing: the ERROR
@@ -183,9 +184,12 @@ one transcript with speaker names:
   2-hour, 19-speaker meeting's channels are ~270 MB as opus, ~3.5 GB as 16 kHz wav. Every parsed activity frame
   the channel transcript needs goes to `speaker_activity_frames.json` (`[]` when no session's
   activity parsed), streamed to disk as it is read, each with its channel (none for a
-  mixed-lane frame; the worker uses only frames whose channel has a file). A meeting without channels, or whose channel step failed (logged as
-  `channel_export_failed`; the mixed folder and `/process` still go out), gets the index `[]`,
-  and the worker stays on the mixed path. On a rerun the worker removes the channel files the
+  mixed-lane frame; the worker uses only frames whose channel has a file). A meeting without
+  channels, or with a channel whose recorder identity is missing (logged as
+  `channel_export_failed … ChannelIdentityMissing`; the mixed folder and `/process` still go
+  out), gets the index `[]`, and the worker stays on the mixed path. Any other failure in the
+  channel step (meeting-api, S3, ffmpeg) fails the job before the hand-off, and the queue runs
+  the whole export again. On a rerun the worker removes the channel files the
   index does not name; the exporter deletes nothing. The worker's use of these files is
   `deployment/base/notetaker/worker/README.md` in the deployment repo.
 
@@ -193,7 +197,9 @@ one transcript with speaker names:
 `GATEWAY_URL`, `EXPORTER_API_KEY` (the exporter's gateway key), `EXPORTER_WEBHOOK_SECRET` (the
 secret of its `/v2/webhooks` subscription),
 `VEXA_BUCKET`, `EXPORT_BUCKET`, `EXPORT_PREFIX`, `NOTETAKER_URL`, `EXPORT_DEBUG`,
-`EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS`, `EXPORT_RETRY_BACKOFF_SECONDS`
+`EXPORT_CONCURRENCY`, `EXPORT_SWEEP_SECONDS`, `EXPORT_MAX_ATTEMPTS` (default 5; failed runs before
+the meeting is quarantined; the retries span `EXPORT_RETRY_BACKOFF_SECONDS` × (2^`EXPORT_MAX_ATTEMPTS` − 2)
+seconds), `EXPORT_RETRY_BACKOFF_SECONDS`
 (default 30: a failed export waits this × 2^attempts seconds before its next try),
 `EXPORT_MAX_CRASHES` (default 2: runs that stopped mid-export, the pod killed or out of memory,
 before the meeting is quarantined; a crash raises nothing, so it has its own budget, checked

@@ -52,6 +52,10 @@ const SHELL = html('zoom-joining-shell.html');
 const HOLD = html('zoom-hold-host-meeting-in-progress.html');
 const PREJOIN = html('zoom-prejoin-react.html');
 
+/** Zoom's anti-bot wall, as the web client words it, laid over a page. */
+const WALL = '<div role="dialog">We detected you may be a bot. Automated bots aren\'t allowed to join this meeting or webinar and must use Zoom RTMS. <button>Sign in to join</button></div>';
+const withWall = (markup: string) => markup.replace('</body>', `${WALL}</body>`);
+
 const FIRST_URL = 'https://app.zoom.us/wc/70000000001/join?pwd=FakeTestPass.1';
 const WPK_URL = 'https://app.zoom.us/wc/70000000001/join?wpk=wcpk%7B0%7Dfake&_x_zm_rtaid=fake';
 
@@ -70,17 +74,19 @@ function snap(markup: string, url = WPK_URL): ZoomPreJoinSnapshot {
  * replacement after `redirectMs`, then the hold page until `holdMs` has passed (the page "reloads"
  * every 5 s while held), then the pre-join.
  */
-function zoomPage(opts: { redirectMs: number; holdMs: number }) {
+function zoomPage(opts: { redirectMs: number; holdMs: number; wall?: 'prejoin' | 'after_name' }) {
   let navAt = vnow;
+  const typed: string[] = [];
   const current = () => {
     const t = vnow - navAt;
     if (t < opts.redirectMs) return { markup: SHELL, url: FIRST_URL };
     if (t < opts.redirectMs + opts.holdMs) return { markup: HOLD, url: WPK_URL };
-    return { markup: PREJOIN, url: WPK_URL };
+    const walled = opts.wall === 'prejoin' || (opts.wall === 'after_name' && typed.length > 0);
+    return { markup: walled ? withWall(PREJOIN) : PREJOIN, url: WPK_URL };
   };
   const doc = () => { const c = current(); return new JSDOM(c.markup, { url: c.url }).window; };
-  const typed: string[] = [];
   const clicked: string[] = [];
+  const waits: number[] = [];
   let joinClicked = false;
   const node = (sel: string): any => ({
     first: () => node(sel),
@@ -105,7 +111,7 @@ function zoomPage(opts: { redirectMs: number; holdMs: number }) {
       }
       throw new Error(`page.waitForSelector: Timeout ${o.timeout}ms exceeded waiting for ${sel}`);
     },
-    waitForFunction: async () => {},
+    waitForFunction: async (_fn: any, _arg: any, o: { timeout?: number } = {}) => { waits.push(o.timeout ?? 0); },
     evaluate: async (fn: any, arg?: any) => {
       if (typeof fn !== 'function') return undefined;
       const w = doc();
@@ -122,10 +128,10 @@ function zoomPage(opts: { redirectMs: number; holdMs: number }) {
     keyboard: { type: async (t: string) => { typed.push(t); }, press: async () => {} },
     isClosed: () => false,
   };
-  return { page, typed, clicked, joined: () => joinClicked };
+  return { page, typed, clicked, joined: () => joinClicked, waits };
 }
 
-async function run(opts: { redirectMs: number; holdMs: number }) {
+async function run(opts: { redirectMs: number; holdMs: number; wall?: 'prejoin' | 'after_name' }) {
   const z = zoomPage(opts);
   const t0 = vnow;
   let error: any = null;
@@ -133,7 +139,7 @@ async function run(opts: { redirectMs: number; holdMs: number }) {
   try { await joinZoomMeeting(z.page, FIRST_URL, 'Vexa', { platform: 'zoom', meetingUrl: FIRST_URL } as any); }
   catch (e) { error = e; }
   const logs = stopCapture();
-  return { error, logs, typed: z.typed, joined: z.joined(), elapsedMs: vnow - t0 };
+  return { error, logs, typed: z.typed, joined: z.joined(), waits: z.waits, elapsedMs: vnow - t0 };
 }
 
 (async () => {
@@ -158,6 +164,24 @@ async function run(opts: { redirectMs: number; holdMs: number }) {
     const auth = classifyZoomPreJoin({ url: FIRST_URL, title: 'Zoom', nameField: false, hold: null, text: 'Sign in to join this meeting' });
     check('a sign-in page is auth_required', auth.kind === 'auth_required');
     check('an unreadable page (navigation in flight) is pending', classifyZoomPreJoin(null).kind === 'pending');
+    const wallText = classifyZoomPreJoin({ url: FIRST_URL, title: 'Zoom', nameField: false, hold: null,
+      text: "We detected you may be a bot. Automated bots aren't allowed to join this meeting or webinar and must use Zoom RTMS. Sign in to join" });
+    check('the anti-bot wall, though it says "Sign in to join", is bot_blocked, not auth_required',
+      wallText.kind === 'bot_blocked', JSON.stringify(wallText));
+    const wallOverForm = classifyZoomPreJoin(snap(withWall(PREJOIN)));
+    check('the wall laid over the pre-join form is bot_blocked, not name_field', wallOverForm.kind === 'bot_blocked',
+      JSON.stringify(wallOverForm));
+  }
+
+  realConsoleLog('\n=== the anti-bot wall ends the join as zoom_requires_rtms, at once ===');
+  for (const wall of ['prejoin', 'after_name'] as const) {
+    const r = await run({ redirectMs: 1500, holdMs: 0, wall });
+    check(`${wall}: an AdmissionError('denial') (permanent, not retried)`,
+      r.error instanceof AdmissionError && r.error.outcome === 'denial', String(r.error));
+    check(`${wall}: the reason is zoom_requires_rtms`, String(r.error?.message).includes('zoom_requires_rtms:'), String(r.error?.message));
+    check(`${wall}: Join was never clicked`, !r.joined);
+    check(`${wall}: no wait for a human (no 15-min Join hold)`, !r.waits.some((ms) => ms > 60_000) && r.elapsedMs < 60_000,
+      `waits=${JSON.stringify(r.waits)} elapsed=${r.elapsedMs}ms`);
   }
 
   realConsoleLog('\n=== the witness case: held 3 min on "another meeting in progress", then the pre-join ===');

@@ -618,9 +618,13 @@ def reconcile_grace_for_status(
       * ``stopping``   → ``stop_grace``      (a stop was requested: clear it fast)
       * PRE-ACTIVE     → ``preactive_grace`` (must OUTLAST the lobby budget we issued — #862)
       * everything else→ ``active_grace``    (a bot-present row: a longer idle before we look)
+
+    ``requested`` is ``active_grace``: a bot's first act is ``joining``, so no lobby budget runs
+    yet. The sweep holds a ``requested`` row whose workload is alive (a Pending pod) until
+    ``preactive_grace`` (``lifecycle.reconcile.reconcile_stale_nonterminal_sweep``).
     """
     if status == "stopping":
         return stop_grace
-    if status in PRE_ACTIVE_MEETING_STATUSES:
+    if status in PRE_ACTIVE_MEETING_STATUSES and status != "requested":
         return active_grace if preactive_grace is None else preactive_grace
     return active_grace

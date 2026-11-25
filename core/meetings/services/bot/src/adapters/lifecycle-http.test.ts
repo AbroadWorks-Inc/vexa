@@ -122,38 +122,44 @@ async function main(): Promise<void> {
     check('reach-healthy: posted the joining event verbatim', calls[0]?.body === JSON.stringify(JOINING), calls[0]?.body);
   }
 
-  // 503 (control plane UP-but-broken) → reachable (either-channel rule guards over-blocking)
+  // 503 (reached, event not stored) → reachable, and the event is redelivered until it is stored
   {
     const calls: Recorded[] = [];
-    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 503 }; };
+    const fetchImpl: FetchLike = async (url, init) => {
+      calls.push({ url, ...init });
+      return calls.length === 1 ? { ok: false, status: 503 } : { ok: true, status: 200 };
+    };
     const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, sleep: noSleep });
     const verdict = await sink.emitReachable!(JOINING);
     check('reach-503: verdict=reachable (host answered → channel is up)', verdict === 'reachable', verdict);
-    check('reach-503: returns on the first response (no needless retries)', calls.length === 1, String(calls.length));
+    check('reach-503: the unstored joining is sent again and lands', calls.length === 2, String(calls.length));
   }
 
-  // all-attempts network error (CNI-lag signature) → unreachable, bounded to reachRetries
+  // 409 (reached, refused as a conflict) → reachable, never resent
+  {
+    const calls: Recorded[] = [];
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); return { ok: false, status: 409 }; };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, sleep: noSleep });
+    const verdict = await sink.emitReachable!(JOINING);
+    check('reach-409: verdict=reachable', verdict === 'reachable', verdict);
+    check('reach-409: a refusal is not resent', calls.length === 1, String(calls.length));
+  }
+
+  // network error (CNI-lag signature) → unreachable after ONE attempt; the orchestrator owns retries
   {
     const calls: Recorded[] = [];
     const sleeps: number[] = [];
-    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); throw new Error('ECONNREFUSED'); };
-    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, reachRetries: 4, reachBackoffMs: 100, sleep: async (ms) => { sleeps.push(ms); } });
+    let signal: AbortSignal | undefined;
+    const fetchImpl: FetchLike = async (url, init) => { calls.push({ url, ...init }); signal = init.signal; throw new Error('ECONNREFUSED'); };
+    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, sleep: async (ms) => { sleeps.push(ms); } });
     let threw = false;
     let verdict: string | undefined;
     try { verdict = await sink.emitReachable!(JOINING); } catch { threw = true; }
     check('reach-down: did NOT throw (never crashes the bot)', threw === false);
     check('reach-down: verdict=unreachable', verdict === 'unreachable', String(verdict));
-    check('reach-down: bounded to reachRetries attempts', calls.length === 4, String(calls.length));
-    check('reach-down: bounded exponential backoff (100,200,400)', JSON.stringify(sleeps) === JSON.stringify([100, 200, 400]), JSON.stringify(sleeps));
-  }
-
-  // transient: network error then 200 → reachable (rides out a brief programming window)
-  {
-    let n = 0;
-    const fetchImpl: FetchLike = async () => { n++; if (n === 1) throw new Error('EAI_AGAIN'); return { ok: true, status: 200 }; };
-    const sink = createHttpLifecycleSink({ callbackUrl: 'http://cb', fetchImpl, reachRetries: 4, reachBackoffMs: 10, sleep: noSleep });
-    const verdict = await sink.emitReachable!(JOINING);
-    check('reach-transient: verdict=reachable after one retry', verdict === 'reachable' && n === 2, `${verdict}/${n}`);
+    check('reach-down: one attempt, no sleep (the orchestrator decides when to probe again)',
+      calls.length === 1 && sleeps.length === 0, `${calls.length}/${JSON.stringify(sleeps)}`);
+    check('reach-down: the attempt carries a time limit (a hung probe cannot outlive the deadline)', signal instanceof AbortSignal);
   }
 
   if (failed) { console.error(`\n❌ lifecycle-http (L3): ${failed} check(s) FAILED.`); process.exit(1); }

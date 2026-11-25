@@ -39,12 +39,6 @@ def test_get_json_returns_none_on_missing_key(storage: Storage) -> None:
     assert storage.get_json("src-bucket", "does/not/exist.json") is None
 
 
-def test_exists(storage: Storage) -> None:
-    assert storage.exists("src-bucket", "a.bin") is False
-    storage.put_bytes("src-bucket", "a.bin", b"hi", "application/octet-stream")
-    assert storage.exists("src-bucket", "a.bin") is True
-
-
 def test_copy_across_buckets(storage: Storage) -> None:
     storage.put_bytes("src-bucket", "master.webm", b"webm-bytes", "video/webm")
     storage.copy("src-bucket", "master.webm", "dst-bucket", "recordings/x/master.webm")
@@ -54,7 +48,7 @@ def test_copy_across_buckets(storage: Storage) -> None:
 def test_delete(storage: Storage) -> None:
     storage.put_bytes("src-bucket", "gone.bin", b"x", "application/octet-stream")
     storage.delete("src-bucket", "gone.bin")
-    assert storage.exists("src-bucket", "gone.bin") is False
+    assert storage.size("src-bucket", "gone.bin") is None
 
 
 def test_list_keys_paginates_over_1005_keys(storage: Storage) -> None:
