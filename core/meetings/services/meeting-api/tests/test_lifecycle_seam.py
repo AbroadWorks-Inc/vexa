@@ -1696,6 +1696,25 @@ def test_a_given_up_row_ends_failed_with_its_workload_left_pending_teardown():
     assert [t["workload"] for t in pending_teardowns(row["data"])] == ["wl-lost"]
 
 
+def test_a_given_up_user_stop_still_ends_as_the_users_stop():
+    """A user stopped the meeting and the runtime never answered the delete: the give-up's close
+    carries the stop (reason ``stopped``, ``data.stop_requested``), not a bot failure."""
+
+    class _DeleteUnanswered(FakeRuntimeClient):
+        async def delete_workload(self, workload_id):
+            raise RuntimeError("runtime unreachable")
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="stopping")  # updated_at 2026-06-20: far past the 6 h max age
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-leaving"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True
+
+    assert _sweep_with_production_poster(repo, _DeleteUnanswered()) == 1
+    data = repo._meetings[m["id"]]["data"]
+    assert data["completion_reason"] == "stopped"
+    assert data["stop_requested"] is True
+
+
 def test_a_refused_close_of_a_given_up_row_is_counted_never_taken_as_done():
     """The lifecycle entry answers a terminal it did not take with a 4xx/5xx and does not raise
     (503: the meeting status could not be read). The give-up's close must count each refusal and
