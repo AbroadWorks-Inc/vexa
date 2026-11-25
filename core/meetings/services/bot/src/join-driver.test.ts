@@ -8,7 +8,7 @@
  * Run: tsx src/join-driver.test.ts
  */
 import { AdmissionError, AuthSessionError, TeamsJoinRedirectError, TEAMS_AUTH_REDIRECT } from '@vexa/join';
-import { admissionOutcomeToJoinOutcome, joinPlatform } from './join-driver.js';
+import { admissionOutcomeToJoinOutcome, joinPlatform, wantsIncomingVideoOff } from './join-driver.js';
 import type { JoinOutcome } from './ports.js';
 
 let passed = 0, failed = 0;
@@ -63,6 +63,14 @@ check('TeamsJoinRedirectError carries the typed reasonCode in its message',
 for (const p of ['google_meet', 'teams', 'zoom', 'jitsi', 'livekit']) {
   check(`joinPlatform('${p}') drives ${p}`, joinPlatform(p) === p);
 }
+
+console.log('\n=== join-driver: incoming video off after admission (Zoom only) ===');
+check('zoom, no flag → turn incoming video off', wantsIncomingVideoOff({ platform: 'zoom' }) === true);
+check('zoom, videoReceiveEnabled false → off', wantsIncomingVideoOff({ platform: 'zoom', videoReceiveEnabled: false }) === true);
+check('zoom, videoReceiveEnabled true → keep video', wantsIncomingVideoOff({ platform: 'zoom', videoReceiveEnabled: true }) === false);
+check('google_meet → untouched', wantsIncomingVideoOff({ platform: 'google_meet' }) === false);
+check('teams → untouched', wantsIncomingVideoOff({ platform: 'teams' }) === false);
+check('jitsi → untouched', wantsIncomingVideoOff({ platform: 'jitsi' }) === false);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
