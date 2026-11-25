@@ -33,6 +33,7 @@ import { startLivekitRemovalMonitor } from "./livekit/removal";
 import { startDebugView } from "./shared/escalation";
 import { setHooks, type BotConfig, type Hooks, type JoinState } from "./_host";
 import { JOIN_BROWSER_ARGS, getJoinBrowserArgs } from "./browser-args";
+import { redactMeetingUrl } from "./shared/url-redaction";
 
 export type { BotConfig, Hooks, JoinState };
 export { startDebugView, setHooks };
@@ -79,7 +80,7 @@ export function resolvePlatform(meetingUrl: string): Platform {
     if (host === "zoom.us" || host.endsWith(".zoom.us")) return "zoom";
     if (host === "meet.jit.si" || host === "8x8.vc" || host.endsWith(".8x8.vc")) return "jitsi";
   } catch { /* fall through to throw below */ }
-  throw new Error(`Cannot infer platform from meeting URL: ${meetingUrl}`);
+  throw new Error(`Cannot infer platform from meeting URL: ${redactMeetingUrl(meetingUrl)}`);
 }
 
 /**

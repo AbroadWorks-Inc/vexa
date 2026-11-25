@@ -13,6 +13,7 @@ import {
 // teams) throws the SAME typed error the JoinDriver maps, without one platform depending on another.
 import { throwIfGoogleJoinRefused, checkForGoogleJoinRefused } from "./refusal";
 import { AdmissionError } from "../shared/admission";
+import { redactMeetingUrl } from "../shared/url-redaction";
 
 // A LIVE reCAPTCHA challenge is a VISIBLE, challenge-sized `iframe[src*="recaptcha"]` —
 // the "I'm not a robot" anchor or the opened bframe. Frame-URL presence is NOT a
@@ -201,7 +202,7 @@ export async function countRealParticipantTiles(page: Page): Promise<number> {
 export async function dumpAdmissionState(page: Page, tag: string): Promise<void> {
   if (!process.env.DEBUG_ADMISSION) return;
   try {
-    const url = page.url();
+    const url = redactMeetingUrl(page.url());
     const wr = await checkForWaitingRoomIndicators(page).catch(() => null);
     const pid = await page.locator("[data-participant-id]").evaluateAll(
       els => els.map(e => ({ id: e.getAttribute("data-participant-id"), label: e.getAttribute("aria-label") || (e.textContent || "").trim().slice(0, 30) })),
