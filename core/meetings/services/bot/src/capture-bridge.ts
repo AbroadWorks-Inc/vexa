@@ -1020,12 +1020,17 @@ export async function startCaptureBridge(
           try {
             const src = ctx.createMediaStreamSource(s);
             const proc = ctx.createScriptProcessor(4096, 1, 1);
-            const startMs = Date.now();
+            let startMs = Date.now();
             let processed = 0;
             proc.onaudioprocess = (e: any): void => {
               const input = e.inputBuffer.getChannelData(0) as Float32Array;
-              const ts = startMs + (processed / SR) * 1000;   // wall-clock of this frame's first sample
-              processed += input.length;                       // count ALL samples (silent too) → no drift
+              let ts = startMs + (processed / SR) * 1000;     // wall-clock of this frame's first sample
+              // A starved context drops render quanta: samples stop counting real time and this clock
+              // falls behind (zoom_84271560913_20261103: 1198 s of audio over a 1972 s call, every
+              // name drifting). Never let it lag the callback by more than two blocks.
+              const floorMs = Date.now() - 2 * (input.length / SR) * 1000;
+              if (ts < floorMs) { startMs += floorMs - ts; ts = floorMs; }
+              processed += input.length;                       // count ALL samples (silent too)
               let maxVal = 0;
               for (let i = 0; i < input.length; i++) { const a = Math.abs(input[i]); if (a > maxVal) maxVal = a; }
               if (maxVal <= SILENCE) return;                   // gate silence (as the mix path did)
