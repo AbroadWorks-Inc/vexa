@@ -98,6 +98,16 @@ def test_explicit_spec_resources_override_the_profile_default():
     assert be.calls[0]["resources"] == Resources(cpu=4.0, memoryMb=8192)
 
 
+def test_a_spec_that_sizes_only_cpu_keeps_the_profile_memory():
+    be = _RecordingBackend()
+    rt = _runtime(be, {"meeting-bot": Profile(
+        name="meeting-bot", runnable=Runnable(image="bot"),
+        resources=Resources(cpu=1.0, memoryMb=2560),
+    )})
+    rt.create(WorkloadSpec(workloadId="mtg-5", profile="meeting-bot", env={}, resources=Resources(cpu=2.0)))
+    assert be.calls[0]["resources"] == Resources(cpu=2.0, memoryMb=2560)
+
+
 def test_unconfigured_profile_preserves_the_optional_contract():
     """No profile default and no spec resources ⇒ None reaches the backend: the pre-#1005 shape,
     so an operator who sizes nothing keeps today's (unbounded) behaviour."""

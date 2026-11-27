@@ -213,6 +213,12 @@ def build_invocation(
     return invocation
 
 
+# CPU for the platforms that starve at the chart's 1 CPU: Zoom and Jitsi bots were throttled 74% of
+# the time and lost call audio; Meet bots used half a core (Prometheus, 2026-11-25..27). Memory
+# stays the chart's (runtime.workloadResources.meetingBot).
+_PLATFORM_CPU = {"zoom": 2, "jitsi": 2}
+
+
 def build_workload_spec(
     *,
     workload_id: str,
@@ -237,6 +243,9 @@ def build_workload_spec(
         "profile": "meeting-bot",
         "env": env,
     }
+    cpu = _PLATFORM_CPU.get(invocation.get("platform"))
+    if cpu:
+        spec["resources"] = {"cpu": cpu}
     if callback_url:
         spec["callbackUrl"] = callback_url
     conforms_workload_spec(spec)
