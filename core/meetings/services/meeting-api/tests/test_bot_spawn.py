@@ -192,6 +192,18 @@ def test_workload_spec_conforms_to_runtime_v1():
     assert spec["profile"] == "meeting-bot"
     # The invocation rides as the ONE BOT_CONFIG env var (12-factor).
     assert json.loads(spec["env"]["BOT_CONFIG"])["connectionId"] == "conn-1"
+    assert "resources" not in spec  # Meet keeps the chart's size
+
+
+def test_zoom_and_jitsi_bots_ask_for_two_cpus():
+    for platform, url in (("zoom", "https://zoom.us/j/1"), ("jitsi", "https://meet.olamee.com/x")):
+        inv = build_invocation(
+            meeting_id=1, platform=platform, meeting_url=url, bot_name="VexaBot", token="t",
+            native_meeting_id="x", connection_id="conn-1", redis_url="redis://redis:6379/0",
+        )
+        spec = build_workload_spec(workload_id="mtg-1-conn", invocation=inv)
+        conforms_workload_spec(spec)
+        assert spec["resources"] == {"cpu": 2}
 
 
 def test_meeting_token_roundtrips_under_secret():

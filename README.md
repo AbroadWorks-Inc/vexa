@@ -264,7 +264,7 @@ Every setting lives in configuration, not code:
 | Postgres / Redis disks | Helm `postgres.persistence.storageClassName`, `redis.persistence.storageClassName` | `ebs-sc-gp3` (any zone, expandable) |
 | Vexa's AI agents | Helm `agentApi.enabled` | `false` |
 | Postgres password | Helm `postgres.existingCredentialsSecret` → pre-created Secret `postgres-credentials` | `true` (the chart then creates no Secret at all) |
-| Bot size | Helm `runtime.workloadResources.meetingBot` | 1 CPU / 2560 MiB |
+| Bot size | Helm `runtime.workloadResources.meetingBot` | 1 CPU / 2560 MiB; Zoom and Jitsi get 2 CPU (meeting-api `_PLATFORM_CPU`) |
 | Our images | Helm `meetingApi.image.*`, `gateway.image.*`, `adminApi.image.*`, `runtime.browserImage` | our GHCR tags |
 | Debug tape off | admin-api platform setting `capture_signal=false` | off (turn on only to debug a meeting) |
 | Where the exporter sends meetings | exporter env `NOTETAKER_URL` | `http://notetaker-api.notetaker.svc.cluster.local:8080` |

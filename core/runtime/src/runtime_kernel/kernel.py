@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 from .backend import Backend, WorkloadHandle
 from .clock import Clock, SystemClock
-from .models import RuntimeEvent, RuntimeState, StopReason, WorkloadSpec, WorkloadStatus
+from .models import Resources, RuntimeEvent, RuntimeState, StopReason, WorkloadSpec, WorkloadStatus
 from .process_backend import ProcessBackend
 from .profiles import Profile, ProfileRegistry, Runnable, default_registry
 from .store import (
@@ -207,8 +207,14 @@ class Runtime:
             # Resource intent must cross the Backend port or it is dead contract: the schema accepts
             # `resources`, and a quota-controlled namespace rejects every container that declares
             # none. The spec's own sizing wins; otherwise the profile's deployment default (the
-            # chart's per-class sizing) applies; neither ⇒ None, today's unsized spawn.
-            effective_resources = spec.resources or profile.resources
+            # chart's per-class sizing) applies; neither ⇒ None, today's unsized spawn. Merged per
+            # dimension: meeting-api asks only for more cpu on Zoom and Jitsi, and keeps the
+            # profile's memoryMb.
+            sized = {
+                **(profile.resources.model_dump(exclude_none=True) if profile.resources else {}),
+                **(spec.resources.model_dump(exclude_none=True) if spec.resources else {}),
+            }
+            effective_resources = Resources(**sized) if sized else None
             self._handles[spec.workloadId] = self.backend.start(
                 spec.workloadId, runnable, effective_env, effective_resources,
             )
